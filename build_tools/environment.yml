@@ -1,3 +1,14 @@
+# Runtime and development environment for openmmpolymer.
+#
+#   conda env create -f build_tools/environment.yml
+#   conda activate openmmpolymer
+#   pip install -e . --no-deps
+#
+# conda-forge is not a preference here, it is the only route that works.
+# AmberTools is not a Python package (and is what ships the `packmol` binary
+# this package shells out to), and openmmforcefields >= 0.16 - forcefill's floor
+# and where the SMIRNOFF template generator learned to emit constraints and
+# virtual sites - has never been published to PyPI.
 name: openmmpolymer
 
 channels:
@@ -5,5 +16,24 @@ channels:
   - nodefaults
 
 dependencies:
-  - python>=3.14
-  - pip>=25.1
+  - python>=3.12
+  - pip
+  - numpy>=2
+  - openmm>=8.1
+  - rdkit
+  - parmed
+  # Supplies antechamber/parmchk2 for forcefill's gaff backend, and the
+  # `packmol` executable that openmmpolymer.packing invokes.
+  - ambertools
+  - packmol
+  - openff-toolkit>=0.16
+  - openmmforcefields>=0.16
+  # The graph-neural-network charge model. Without it, charges for anything
+  # longer than a ~DP 15 chain have to come from AM1-BCC, and sqm is the wall.
+  - openff-nagl
+  - openff-nagl-models
+  - pytest
+  - pytest-cov
+  - python-build
+  - pip:
+      - forcefill>=1.0
