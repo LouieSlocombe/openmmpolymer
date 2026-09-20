@@ -5,13 +5,13 @@ from importlib.metadata import version
 import numpy as np
 import pytest
 
-from template_python import __version__, line, print_hello
-from template_python.__main__ import build_parser, main
+from openmmpolymer import __version__, line, print_hello
+from openmmpolymer.__main__ import build_parser, main
 
 
 def test_version_matches_distribution_metadata() -> None:
     """The runtime version stays in sync with package metadata."""
-    assert __version__ == version("template-python")
+    assert __version__ == version("openmmpolymer")
 
 
 def test_print_hello_uses_default_name(

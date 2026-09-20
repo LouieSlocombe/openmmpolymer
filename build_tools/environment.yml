@@ -1,4 +1,4 @@
-name: template-python
+name: openmmpolymer
 
 channels:
   - conda-forge

@@ -3,7 +3,7 @@ requires = ["setuptools>=84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "template-python"
+name = "openmmpolymer"
 version = "0.0.0"
 description = "A modern, typed Python package template."
 readme = "README.md"
@@ -26,12 +26,12 @@ dependencies = [
 ]
 
 [project.scripts]
-template-python = "template_python.__main__:main"
+openmmpolymer = "openmmpolymer.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/LouieSlocombe/template_python"
-Issues = "https://github.com/LouieSlocombe/template_python/issues"
-Repository = "https://github.com/LouieSlocombe/template_python"
+Homepage = "https://github.com/LouieSlocombe/openmmpolymer"
+Issues = "https://github.com/LouieSlocombe/openmmpolymer/issues"
+Repository = "https://github.com/LouieSlocombe/openmmpolymer"
 
 [dependency-groups]
 dev = [
@@ -46,19 +46,19 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["template_python", "template_python.*"]
+include = ["openmmpolymer", "openmmpolymer.*"]
 
 [tool.setuptools.package-data]
-template_python = ["py.typed"]
+openmmpolymer = ["py.typed"]
 
 [tool.pytest.ini_options]
-addopts = "-ra --strict-config --strict-markers --cov=template_python --cov-report=term-missing"
+addopts = "-ra --strict-config --strict-markers --cov=openmmpolymer --cov-report=term-missing"
 testpaths = ["tests"]
 filterwarnings = ["error"]
 
 [tool.coverage.run]
 branch = true
-source = ["template_python"]
+source = ["openmmpolymer"]
 
 [tool.coverage.report]
 fail_under = 100
@@ -76,7 +76,7 @@ target-version = "py314"
 select = ["B", "E4", "E7", "E9", "F", "I", "RUF", "SIM", "UP"]
 
 [tool.mypy]
-files = ["template_python", "tests"]
+files = ["openmmpolymer", "tests"]
 python_version = "3.14"
 pretty = true
 show_error_codes = true
