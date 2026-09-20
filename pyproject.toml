@@ -34,7 +34,7 @@ classifiers = [
 # published to PyPI. `pip install openmmpolymer` will not give you a working
 # install; build_tools/environment.yml will.
 dependencies = [
-  "numpy>=2",
+  "numpy>=2.5.3",
   "openmm>=8.1",
   "rdkit",
   "forcefill>=1.0",
