@@ -74,6 +74,7 @@ def test_packmol_input_converts_nanometres_to_angstrom_once() -> None:
     assert "output packed.pdb" in text
     assert "structure a.pdb" in text
     assert "  number 3" in text
+    assert "  resnumbers 3" in text
 
 
 def test_packmol_region_is_inset_from_every_face() -> None:
@@ -91,6 +92,24 @@ def test_packmol_region_is_inset_from_every_face() -> None:
         seed=1,
     )
     assert "inside box 1.0000 1.0000 1.0000 23.0000 23.0000 23.0000" in text
+
+
+def test_every_structure_block_numbers_its_residues_across_the_output() -> None:
+    """One block per conformer, and packmol restarts numbering in each.
+
+    Past the twenty-sixth block the chain identifiers run out as well, so
+    molecules start sharing a chain and residue number and OpenMM merges
+    them - measured at 40 conformers, 37 residues came back instead of 40.
+    """
+    text = render_packmol_input(
+        [PackedComponent(f"c{index}.pdb", 1) for index in range(3)],
+        (40.0, 40.0, 40.0),
+        "packed.pdb",
+        tolerance_angstrom=2.0,
+        inset_angstrom=1.0,
+        seed=1,
+    )
+    assert text.count("resnumbers 3") == 3
 
 
 def test_packmol_input_skips_a_component_with_no_copies() -> None:
@@ -285,3 +304,36 @@ def test_real_packmol_reports_a_version() -> None:
     if shutil.which("packmol") is None:
         pytest.skip("packmol is not on PATH")
     assert packmol_version()[0] >= 20
+
+
+def test_conformers_are_spread_evenly_over_the_molecules() -> None:
+    """Fewer conformers than molecules still beats one conformation repeated."""
+    from openmmpolymer.packing import distribute_conformers
+
+    components = distribute_conformers(["a.pdb", "b.pdb", "c.pdb"], 10)
+    assert [component.count for component in components] == [4, 3, 3]
+    assert sum(component.count for component in components) == 10
+
+
+def test_one_conformer_per_molecule_is_one_block_each() -> None:
+    """The default, and what build_chain is set up for."""
+    from openmmpolymer.packing import distribute_conformers
+
+    components = distribute_conformers([f"{i}.pdb" for i in range(4)], 4)
+    assert all(component.count == 1 for component in components)
+
+
+def test_conformers_with_nothing_to_place_are_dropped() -> None:
+    """A zero-count block is not something packmol should be given."""
+    from openmmpolymer.packing import distribute_conformers
+
+    components = distribute_conformers(["a.pdb", "b.pdb", "c.pdb"], 2)
+    assert [component.count for component in components] == [1, 1]
+
+
+def test_distributing_over_no_conformers_is_refused() -> None:
+    """A clearer failure than dividing by zero."""
+    from openmmpolymer.packing import distribute_conformers
+
+    with pytest.raises(ValueError, match="No conformers"):
+        distribute_conformers([], 5)

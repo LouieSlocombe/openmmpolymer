@@ -10,6 +10,7 @@ import pytest
 
 from openmmpolymer.chain import (
     ChainError,
+    ChainResult,
     ChainSpec,
     assemble_chain,
     atom_names,
@@ -194,17 +195,20 @@ def test_build_chain_is_reproducible(tmp_path: Path) -> None:
 
 def test_a_different_seed_gives_different_chains(tmp_path: Path) -> None:
     """Otherwise every run of a study would pack the same cell."""
-    make = lambda seed, stem: build_chain(  # noqa: E731
-        ChainSpec(
-            monomer_smiles=PE,
-            degree_of_polymerization=12,
-            residue_name="PE",
-            seed=seed,
-        ),
-        stem,
-        n_conformers=2,
-        output_dir=tmp_path,
-    )
+
+    def make(seed: int, stem: str) -> ChainResult:
+        return build_chain(
+            ChainSpec(
+                monomer_smiles=PE,
+                degree_of_polymerization=12,
+                residue_name="PE",
+                seed=seed,
+            ),
+            stem,
+            n_conformers=2,
+            output_dir=tmp_path,
+        )
+
     assert make(1, "a").radius_of_gyration_nm != make(2, "b").radius_of_gyration_nm
 
 
@@ -292,9 +296,8 @@ def test_the_pdb_is_one_residue_and_matches_the_sdf(tmp_path: Path) -> None:
     assert next(pdb.topology.residues()).name == "PS"
     assert pdb.topology.getNumAtoms() == sdf.GetNumAtoms() == result.n_atoms
     assert sum(1 for _ in pdb.topology.bonds()) == sdf.GetNumBonds()
-    assert [atom.element.symbol for atom in pdb.topology.atoms()] == [
-        atom.GetSymbol() for atom in sdf.GetAtoms()
-    ]
+    sdf_elements = [atom.GetSymbol() for atom in sdf.GetAtoms()]  # type: ignore[no-untyped-call]
+    assert [atom.element.symbol for atom in pdb.topology.atoms()] == sdf_elements
 
 
 def test_tacticity_sets_alternating_stereocentres(tmp_path: Path) -> None:

@@ -165,7 +165,12 @@ def test_replicate_topology_repeats_the_bonds_as_well_as_the_atoms(
     assert len(positions) == 10
 
 
-def _packed_pdb(path: Path, n_molecules: int, elements: str = "CC") -> str:
+def _packed_pdb(
+    path: Path,
+    n_molecules: int,
+    elements: str = "CC",
+    residue_name: str = "DIM",
+) -> str:
     """Write a packmol-shaped output: coordinates, and no CONECT records.
 
     Written through OpenMM's own writer rather than by formatting columns by
@@ -178,7 +183,7 @@ def _packed_pdb(path: Path, n_molecules: int, elements: str = "CC") -> str:
     chain = topology.addChain()
     positions = []
     for molecule in range(n_molecules):
-        residue = topology.addResidue("DIM", chain)
+        residue = topology.addResidue(residue_name, chain)
         for index, symbol in enumerate(elements):
             topology.addAtom(
                 f"{symbol}{index + 1}", app.Element.getBySymbol(symbol), residue
@@ -384,3 +389,130 @@ def test_packed_box_is_a_plain_dataclass() -> None:
         n_molecules=1,
     )
     assert box.box_nm == (1.0, 1.0, 1.0)
+
+
+def test_a_small_hydrogen_mass_does_not_earn_a_longer_step() -> None:
+    """Repartitioning below 1.5 amu buys nothing, so the limit stays at 2 fs."""
+    spec = SystemSpec(hydrogen_mass_amu=1.2)
+    assert max_timestep_fs(300.0, spec) == pytest.approx(2.0)
+
+
+def test_hydrogen_mass_and_the_switch_reach_create_system(
+    tmp_path: Path, dimer_forcefield: Any
+) -> None:
+    """Both are optional kwargs, and both have to actually arrive."""
+    import openmm as mm
+    from openmm import unit
+
+    source = build_dimer_pdb(tmp_path / "dimer.pdb")
+    packed = _packed_pdb(tmp_path / "packed.pdb", 4)
+    box = assemble_box([PackedComponent(source, 4)], packed, (4.0, 4.0, 4.0))
+    system = build_system(
+        box,
+        dimer_forcefield,
+        SystemSpec(
+            constraints="none",
+            switch_distance_nm=1.0,
+            hydrogen_mass_amu=1.5,
+        ),
+    )
+    nonbonded = next(
+        force for force in system.getForces() if isinstance(force, mm.NonbondedForce)
+    )
+    assert nonbonded.getUseSwitchingFunction()
+    assert nonbonded.getSwitchingDistance().value_in_unit(
+        unit.nanometer
+    ) == pytest.approx(1.0)
+
+
+def test_naming_residue_templates_can_be_turned_off(
+    tmp_path: Path, dimer_forcefield: Any
+) -> None:
+    """It is a shortcut past the graph search, not a requirement."""
+    source = build_dimer_pdb(tmp_path / "dimer.pdb")
+    packed = _packed_pdb(tmp_path / "packed.pdb", 4)
+    box = assemble_box([PackedComponent(source, 4)], packed, (4.0, 4.0, 4.0))
+    system = build_system(
+        box,
+        dimer_forcefield,
+        SystemSpec(constraints="none"),
+        use_residue_templates=False,
+    )
+    assert system.getNumParticles() == 8
+
+
+def test_a_residue_the_force_field_does_not_cover_is_reported(
+    tmp_path: Path, dimer_forcefield: Any
+) -> None:
+    """The message names what failed rather than repeating OpenMM's internals."""
+    from openmm import app, unit
+
+    topology = app.Topology()
+    residue = topology.addResidue("NIT", topology.addChain())
+    nitrogen = app.Element.getBySymbol("N")
+    first = topology.addAtom("N1", nitrogen, residue)
+    second = topology.addAtom("N2", nitrogen, residue)
+    topology.addBond(first, second)
+    source = tmp_path / "nitrogen.pdb"
+    with source.open("w") as handle:
+        app.PDBFile.writeFile(
+            topology, [[0.0, 0.0, 0.0], [0.11, 0.0, 0.0]] * unit.nanometer, handle
+        )
+
+    box = assemble_box(
+        [PackedComponent(str(source), 4)],
+        _packed_pdb(tmp_path / "packed.pdb", 4, elements="NN", residue_name="NIT"),
+        (4.0, 4.0, 4.0),
+    )
+    with pytest.raises(SystemAssemblyError, match="would not build"):
+        build_system(
+            box,
+            dimer_forcefield,
+            SystemSpec(constraints="none"),
+            use_residue_templates=False,
+        )
+
+
+def test_the_reference_platform_is_always_usable() -> None:
+    """The floor of the preference order has to work, or nothing does."""
+    from openmmpolymer.mdsystem import platform_is_usable
+
+    assert platform_is_usable("Reference")
+
+
+def test_auto_selection_skips_a_platform_that_cannot_build_a_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Being listed is not the same as working.
+
+    A CUDA build compiled against a newer toolkit than the driver is listed
+    and then fails at the first Context. Without this the failure arrives at
+    the start of the first stage instead of at platform selection.
+    """
+    from openmmpolymer import mdsystem
+
+    tried: list[str] = []
+
+    def only_cpu_works(name: str) -> bool:
+        tried.append(name)
+        return name == "CPU"
+
+    monkeypatch.setattr(mdsystem, "platform_is_usable", only_cpu_works)
+    platform, properties = mdsystem.select_platform()
+    assert platform.getName() == "CPU"
+    assert properties == {}
+    assert tried[-1] == "CPU"
+
+
+def test_a_named_platform_is_used_without_being_probed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Asked for one explicitly, the caller should see its real failure."""
+    from openmmpolymer import mdsystem
+
+    def never_usable(name: str) -> bool:
+        raise AssertionError("a named platform should not be probed")
+
+    monkeypatch.setattr(mdsystem, "platform_is_usable", never_usable)
+    platform, _ = mdsystem.select_platform("Reference")
+    assert platform.getName() == "Reference"

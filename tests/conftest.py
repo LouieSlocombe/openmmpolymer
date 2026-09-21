@@ -55,6 +55,27 @@ def argon_box() -> tuple[PackedBox, Any]:
 
 
 @pytest.fixture
+def dimer_argon_run() -> Any:
+    """A cell of 32 two-atom molecules: enough for a chain measurement."""
+    from openmmpolymer.simulate import prepare_run
+
+    system, topology, positions = argon_system(64, 2.4, atoms_per_molecule=2)
+    box = PackedBox(
+        topology=topology,
+        positions_nm=positions,
+        box_nm=(2.4, 2.4, 2.4),
+        n_molecules=32,
+    )
+    return prepare_run(
+        box,
+        PolymerForceField("unused.xml", (), "AR", "smirnoff"),
+        platform="CPU",
+        seed=11,
+        system=system,
+    )
+
+
+@pytest.fixture
 def argon_run(argon_box: tuple[PackedBox, Any]) -> Any:
     """A run context over the argon cell, on the deterministic CPU platform."""
     from openmmpolymer.simulate import prepare_run

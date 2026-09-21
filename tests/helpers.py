@@ -59,7 +59,11 @@ def build_dimer_pdb(path: Path, *, separation_nm: float = 0.153) -> str:
 
 
 def argon_system(
-    n_atoms: int, box_nm: float, *, cutoff_nm: float = 0.8
+    n_atoms: int,
+    box_nm: float,
+    *,
+    cutoff_nm: float = 0.8,
+    atoms_per_molecule: int = 1,
 ) -> tuple[Any, Any, np.ndarray]:
     """Build an argon cell: a System, a Topology and positions on a lattice.
 
