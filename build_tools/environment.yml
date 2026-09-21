@@ -1,14 +1,13 @@
-# Runtime and development environment for openmmpolymer.
+# Runtime and development environment for openmmpolymer. See the
+# Installation section of README.md.
 #
 #   conda env create -f build_tools/environment.yml
 #   conda activate openmmpolymer
-#   pip install -e . --no-deps
+#   python -m pip install -e . --no-deps
 #
-# conda-forge is not a preference here, it is the only route that works.
-# AmberTools is not a Python package (and is what ships the `packmol` binary
-# this package shells out to), and openmmforcefields >= 0.16 - forcefill's floor
-# and where the SMIRNOFF template generator learned to emit constraints and
-# virtual sites - has never been published to PyPI.
+# conda-forge is the only route that works: AmberTools is not a Python package
+# (and is what ships the `packmol` binary this package shells out to), and
+# openmmforcefields >= 0.16 has never been published to PyPI.
 name: openmmpolymer
 
 channels:

@@ -10,12 +10,9 @@ cell, and take that cell through minimisation, push-off, high-temperature
 equilibration, compression, annealing and a quench — with a manifest that lets
 the run be picked up again after the queue kills it.
 
-## Requirements
+## Installation
 
-conda-forge, and not by preference. AmberTools is not a Python package at all
-(and is what supplies the `packmol` executable), and `openmmforcefields >=
-0.16` — forcefill's floor — has never been published to PyPI. `pip install
-openmmpolymer` will not give you a working install.
+Python 3.12 or newer, with the dependencies from conda-forge:
 
 ```bash
 conda env create -f build_tools/environment.yml
@@ -23,12 +20,13 @@ conda activate openmmpolymer
 python -m pip install -e . --no-deps
 ```
 
-Python 3.12 or newer.
+conda-forge is the only route that works, not a preference. AmberTools is not
+a Python package and is what supplies the `packmol` executable, and
+`openmmforcefields >= 0.16` has never been published to PyPI. `pip install
+openmmpolymer` on its own will not give you a working install.
 
-The analysis layer reads trajectories with MDAnalysis and draws them with
-matplotlib, both of which the environment file installs. The plotting helpers
-build a `matplotlib.figure.Figure` directly and never touch `pyplot`, so they
-need no display and no backend.
+The plotting helpers build a `matplotlib.figure.Figure` directly and never
+touch `pyplot`, so they need no display and no backend.
 
 ## A polyethylene melt
 
@@ -514,6 +512,13 @@ polymer gets virtual sites — `PolymerForceField.virtual_site_residues` is wher
 to look.
 
 ## Development
+
+The environment file already installs the test and lint tools. Arm the
+pre-commit hooks once, then run the same checks CI does:
+
+```bash
+pre-commit install
+```
 
 ```bash
 ruff check .
