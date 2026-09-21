@@ -40,6 +40,11 @@ dependencies:
   # mypy is here because the CI test job runs it inside this environment,
   # where the dependencies it needs types for are installed.
   - mypy
+  # For the hooks in .pre-commit-config.yaml. CI never runs pre-commit - the
+  # lint job calls ruff-action directly - so this is purely the local gate that
+  # stops a commit reaching that job already broken. `pre-commit install` in the
+  # checkout arms it; it builds its own pinned hook environments from there.
+  - pre-commit
   - pip:
       - forcefill>=1.0
       # From pip rather than conda-forge so that the version matches the one
