@@ -17,6 +17,7 @@ interpretation is left to whoever reads it.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -29,9 +30,11 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
+from .reporters import TrajectoryOptions
 from .simulate import (
     RunContext,
     StageResult,
+    quench_temperatures,
     run_anneal,
     run_compress,
     run_minimise,
@@ -119,22 +122,50 @@ class Protocol:
 
     @property
     def total_duration_ps(self) -> float:
-        """Roughly how much dynamics this protocol asks for, in picoseconds.
+        """How much dynamics this protocol asks for, in picoseconds.
 
-        Approximate on purpose: a stage's duration depends on its own options,
-        and this is for telling a user whether they asked for nanoseconds or
-        microseconds, not for scheduling.
+        Approximate on purpose - it is for telling a user whether they asked
+        for nanoseconds or microseconds, not for scheduling - but it counts
+        every stage. Three kinds state their time as a ladder rather than a
+        duration, and a budget that silently omits the most expensive stage in
+        a protocol is worse than no budget, because it gets believed.
         """
-        total = 0.0
-        for stage in self.stages:
-            options = stage.options
-            if "duration_ps" in options:
-                total += float(options["duration_ps"])
-            elif "duration_ps_each" in options:
-                total += float(options["duration_ps_each"]) * len(
-                    options.get("pressures_bar", ()) or ()
-                )
-        return total
+        return sum(_stage_duration_ps(stage) for stage in self.stages)
+
+
+def _stage_options(stage: Stage) -> dict[str, Any]:
+    """A stage's options, filled in with its runner's own defaults.
+
+    Read off the runner's signature rather than repeated here, so the numbers
+    a cost estimate is built from cannot drift away from the numbers the run
+    actually uses.
+    """
+    parameters = inspect.signature(STAGE_RUNNERS[stage.kind]).parameters
+    defaults = {
+        name: parameter.default
+        for name, parameter in parameters.items()
+        if parameter.default is not inspect.Parameter.empty
+    }
+    return {**defaults, **stage.options}
+
+
+def _stage_duration_ps(stage: Stage) -> float:
+    """How much dynamics one stage asks for, from the options it was given."""
+    options = _stage_options(stage)
+    if stage.kind == "quench":
+        ladder = options.get("temperatures_k") or quench_temperatures(
+            float(options["t_start"]),
+            float(options["t_end"]),
+            float(options["step_k"]),
+        )
+        return float(options["hold_ps"]) * len(ladder)
+    if stage.kind == "anneal":
+        ramp_ps = int(options["ramp_windows"]) * float(options["window_ps"])
+        return int(options["n_cycles"]) * 2.0 * (ramp_ps + float(options["hold_ps"]))
+    if stage.kind == "compress":
+        return float(options["duration_ps_each"]) * len(options["pressures_bar"])
+    duration = options.get("duration_ps")
+    return 0.0 if duration is None else float(duration)
 
 
 def standard_melt_equilibration(
@@ -146,6 +177,11 @@ def standard_melt_equilibration(
     compress_ps_each: float = 100.0,
     npt_ps: float = 2000.0,
     anneal_cycles: int = 3,
+    anneal_t_low_k: float | None = None,
+    anneal_window_ps: float = 20.0,
+    anneal_hold_ps: float = 50.0,
+    compress_pressures_bar: Sequence[float] | None = None,
+    npt_trajectory: TrajectoryOptions | str = "none",
 ) -> Protocol:
     """The default recipe: from a packed cell to an equilibrated melt.
 
@@ -160,6 +196,22 @@ def standard_melt_equilibration(
         compress_ps_each: Time at each rung of the pressure ladder.
         npt_ps: Time spent settling at constant pressure.
         anneal_cycles: How many melt-and-set cycles.
+        anneal_window_ps: Time at each step of an annealing ramp.
+        anneal_hold_ps: Time at the top and bottom of each cycle.
+        anneal_t_low_k: The bottom of each annealing cycle, when it should not
+            be *target_temperature_k*. A run that settles at the temperature
+            it will start cooling from needs the two separated, or the anneal
+            has nothing to cycle between.
+        compress_pressures_bar: The pressure ladder, when
+            :data:`~openmmpolymer.simulate.DEFAULT_COMPRESSION_BAR` is wrong
+            for this cell. A kilobar squeezes a sparse cell past twice the
+            nonbonded cutoff, which OpenMM refuses outright.
+        npt_trajectory: Trajectory settings for the final NPT stage. ``"none"``
+            by default, which is what every run has always written. A melt
+            cannot be shown to have equilibrated without one - the chains'
+            mean-squared displacement is the only evidence that says so - but
+            it is frames of the whole cell, so it is asked for rather than
+            assumed.
 
     Returns:
         The protocol.
@@ -180,15 +232,26 @@ def standard_melt_equilibration(
                 {
                     "temperature_k": melt_temperature_k,
                     "duration_ps_each": compress_ps_each,
+                    **(
+                        {}
+                        if compress_pressures_bar is None
+                        else {"pressures_bar": tuple(compress_pressures_bar)}
+                    ),
                 },
             ),
             Stage(
                 "04_anneal",
                 "anneal",
                 {
-                    "t_low": target_temperature_k,
+                    "t_low": (
+                        target_temperature_k
+                        if anneal_t_low_k is None
+                        else anneal_t_low_k
+                    ),
                     "t_high": melt_temperature_k,
                     "n_cycles": anneal_cycles,
+                    "window_ps": anneal_window_ps,
+                    "hold_ps": anneal_hold_ps,
                     "pressure_bar": pressure_bar,
                 },
             ),
@@ -199,6 +262,7 @@ def standard_melt_equilibration(
                     "temperature_k": target_temperature_k,
                     "pressure_bar": pressure_bar,
                     "duration_ps": npt_ps,
+                    "trajectory": npt_trajectory,
                 },
             ),
         ),
@@ -208,6 +272,7 @@ def standard_melt_equilibration(
 def melt_quench(
     *,
     melt_temperature_k: float = 600.0,
+    t_start: float | None = None,
     t_end: float = 200.0,
     step_k: float = 20.0,
     hold_ps: float = 200.0,
@@ -223,7 +288,10 @@ def melt_quench(
     worth looking at.
 
     Args:
-        melt_temperature_k: Where the cooling starts.
+        melt_temperature_k: The temperature the chains are mobilised at, and
+            where cooling starts unless *t_start* says otherwise.
+        t_start: Where the cooling starts, when that should not be the melt
+            temperature.
         t_end: Where it stops.
         step_k: How far it drops at each step.
         hold_ps: Time held at each temperature.
@@ -246,7 +314,7 @@ def melt_quench(
                 "06_quench",
                 "quench",
                 {
-                    "t_start": melt_temperature_k,
+                    "t_start": (melt_temperature_k if t_start is None else t_start),
                     "t_end": t_end,
                     "step_k": step_k,
                     "hold_ps": hold_ps,

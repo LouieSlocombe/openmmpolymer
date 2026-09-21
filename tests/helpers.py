@@ -7,14 +7,17 @@ what these tests need is small enough to read.
 
 from __future__ import annotations
 
+import json
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import numpy.typing as npt
 import pytest
+
+from openmmpolymer.timeseries import GlassTransition
 
 #: A force field for a two-atom "dimer" residue: enough to exercise the real
 #: ForceField path, small enough to read. The atoms are argon-like so nothing
@@ -180,6 +183,146 @@ def state_data_csv(rows: Sequence[Sequence[float]]) -> str:
     )
     body = "\n".join(",".join(repr(float(value)) for value in row) for row in rows)
     return f"{header}\n{body}\n"
+
+
+def write_quenches(
+    directory: Path,
+    stages: Mapping[str, Mapping[str, object]],
+) -> Path:
+    """Write a manifest holding several quench stages at once.
+
+    Each entry gives ``temperature_k`` and ``density_g_cm3``, and optionally
+    ``total_ps`` (the stage CSV's last time, which is what fabricates a chosen
+    cooling rate), ``segment_duration_ps`` and ``waypoints``.
+    """
+    recorded: dict[str, object] = {}
+    for stage, fields in stages.items():
+        temperature = list(cast(Sequence[float], fields["temperature_k"]))
+        density = list(cast(Sequence[float], fields["density_g_cm3"]))
+        total_ps = cast(float | None, fields.get("total_ps", 4200.0))
+        csv: str | None = None
+        if total_ps is not None:
+            csv = str(directory / f"{stage}.csv")
+            rows = [
+                [
+                    index * 1000,
+                    index * total_ps / 100.0,
+                    -1.0,
+                    1.0,
+                    0.0,
+                    300.0,
+                    13.8,
+                    0.9,
+                ]
+                for index in range(1, 101)
+            ]
+            Path(csv).write_text(state_data_csv(rows))
+        samples: dict[str, list[float]] = {
+            "segment_temperature_k": temperature,
+            "segment_density_g_cm3": density,
+        }
+        holds = fields.get("segment_duration_ps")
+        if holds is not None:
+            samples["segment_duration_ps"] = list(cast(Sequence[float], holds))
+        entry: dict[str, object] = {
+            "name": stage,
+            "csv": csv,
+            "samples": samples,
+        }
+        waypoints = fields.get("waypoints")
+        if waypoints is not None:
+            entry["waypoints"] = list(cast(Sequence[object], waypoints))
+        recorded[stage] = entry
+
+    payload = {
+        "protocol": "melt-quench",
+        "seed": 1,
+        "versions": {},
+        "system": {},
+        "stages": recorded,
+        "chains": None,
+        "box": None,
+    }
+    (directory / "manifest.json").write_text(json.dumps(payload))
+    return directory
+
+
+def write_quench(
+    directory: Path,
+    temperature_k: npt.NDArray[np.float64] | Sequence[float],
+    density_g_cm3: npt.NDArray[np.float64] | Sequence[float],
+    *,
+    with_csv: bool = True,
+    stage: str = "06_quench",
+    total_ps: float = 4200.0,
+    segment_duration_ps: Sequence[float] | None = None,
+    waypoints: Sequence[object] | None = None,
+) -> Path:
+    """Write a manifest holding one quench's samples, and optionally its CSV.
+
+    *total_ps* is the knob that fabricates a chosen cooling rate: a ladder of
+    *n* points stepping *dT* and cooled at *R* K/ns needs
+    ``total_ps = n * dT * 1000 / R``.
+    """
+    return write_quenches(
+        directory,
+        {
+            stage: {
+                "temperature_k": list(temperature_k),
+                "density_g_cm3": list(density_g_cm3),
+                "total_ps": total_ps if with_csv else None,
+                "segment_duration_ps": segment_duration_ps,
+                "waypoints": waypoints,
+            }
+        },
+    )
+
+
+def two_line_curve(
+    transition_k: float = 350.0,
+    n_points: int = 21,
+    glass_slope: float = 2.0e-4,
+    melt_slope: float = 8.0e-4,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """A specific-volume curve made of two exact straight lines.
+
+    The grid is ``linspace(200, 600, n_points)``. Put *transition_k* on a grid
+    point and the fit recovers it exactly: both branches are exactly linear,
+    the best break is the knot, and both lines pass through it.
+    """
+    temperature = np.linspace(200.0, 600.0, n_points)
+    volume = np.where(
+        temperature <= transition_k,
+        1.0 + glass_slope * (temperature - transition_k),
+        1.0 + melt_slope * (temperature - transition_k),
+    )
+    return temperature, 1.0 / volume
+
+
+def transition_at(
+    cooling_rate_k_per_ns: float | None,
+    temperature_k: float,
+    *,
+    resolved: bool = True,
+    specific_volume_cm3_g: float = 1.0,
+) -> GlassTransition:
+    """A GlassTransition built by hand, for the pure rate-fit tests.
+
+    Going through a quench curve to make one would obscure what is being
+    tested: the rate fit is a function of (rate, transition) pairs and nothing
+    else.
+    """
+    return GlassTransition(
+        temperature_k=temperature_k,
+        specific_volume_cm3_g=specific_volume_cm3_g,
+        melt_expansion_per_k=8.0e-4,
+        glass_expansion_per_k=2.0e-4,
+        residual_cm3_g=0.0,
+        n_points_melt=10,
+        n_points_glass=11,
+        cooling_rate_k_per_ns=cooling_rate_k_per_ns,
+        resolved=resolved,
+    )
 
 
 class _StubFrame:

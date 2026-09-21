@@ -22,6 +22,8 @@ from openmmpolymer.protocols import (
     run_protocol,
     standard_melt_equilibration,
 )
+from openmmpolymer.reporters import TrajectoryOptions
+from openmmpolymer.simulate import DEFAULT_COMPRESSION_BAR, quench_temperatures
 
 #: A protocol short enough to run in a test but shaped like a real one.
 QUICK = Protocol(
@@ -306,3 +308,84 @@ def test_a_manifest_written_before_the_cell_was_recorded_still_loads(
     manifest = RunManifest.load(tmp_path)
     assert manifest is not None
     assert manifest.box is None
+
+
+def test_the_total_duration_counts_the_quench_it_used_to_omit() -> None:
+    """A budget that leaves out the most expensive stage gets believed."""
+    quench = melt_quench(t_end=200.0, step_k=20.0, hold_ps=200.0)
+    equilibration = standard_melt_equilibration()
+
+    ladder_ps = 200.0 * len(quench_temperatures(600.0, 200.0, 20.0))
+    assert quench.total_duration_ps == pytest.approx(
+        equilibration.total_duration_ps + ladder_ps
+    )
+
+
+def test_the_total_duration_counts_an_anneal_and_a_compression_too() -> None:
+    """Both state their time as a ladder, and both used to count as zero."""
+    only_anneal = Protocol(
+        name="anneal",
+        stages=(
+            Stage(
+                "00_anneal",
+                "anneal",
+                {"n_cycles": 2, "ramp_windows": 4, "window_ps": 10.0, "hold_ps": 5.0},
+            ),
+        ),
+    )
+    assert only_anneal.total_duration_ps == pytest.approx(2 * 2 * (4 * 10.0 + 5.0))
+
+    only_compress = Protocol(
+        name="compress",
+        stages=(Stage("00_compress", "compress", {"duration_ps_each": 50.0}),),
+    )
+    assert only_compress.total_duration_ps == pytest.approx(
+        50.0 * len(DEFAULT_COMPRESSION_BAR)
+    )
+
+
+def test_the_anneal_cycles_to_the_target_unless_told_otherwise() -> None:
+    """The default has to stay exactly what every run has always had."""
+    assert standard_melt_equilibration(target_temperature_k=430.0).stages[4].options[
+        "t_low"
+    ] == pytest.approx(430.0)
+
+
+def test_a_run_that_settles_at_the_melt_can_still_anneal() -> None:
+    """A scan settles where it will start cooling, so the two must separate.
+
+    Without this the anneal would cycle between one temperature and itself,
+    and the hottest point on the quench curve - the anchor of the melt branch
+    - would be measured on a cell still catching up from a jump.
+    """
+    protocol = standard_melt_equilibration(
+        target_temperature_k=650.0, melt_temperature_k=650.0, anneal_t_low_k=500.0
+    )
+    anneal = protocol.stages[4].options
+    assert anneal["t_low"] == pytest.approx(500.0)
+    assert anneal["t_high"] == pytest.approx(650.0)
+
+
+def test_the_equilibration_stage_writes_no_trajectory_unless_asked() -> None:
+    """Frames of the whole cell are tens of megabytes a run."""
+    assert standard_melt_equilibration().stages[5].options["trajectory"] == "none"
+    asked = standard_melt_equilibration(
+        npt_trajectory=TrajectoryOptions("xtc", interval_ps=5.0)
+    )
+    assert asked.stages[5].options["trajectory"].interval_ps == pytest.approx(5.0)
+
+
+def test_the_compression_ladder_can_be_replaced() -> None:
+    """A kilobar squeezes a sparse cell past twice the nonbonded cutoff."""
+    gentle = standard_melt_equilibration(compress_pressures_bar=(1.0, 20.0, 1.0))
+    assert gentle.stages[3].options["pressures_bar"] == (1.0, 20.0, 1.0)
+
+
+def test_a_quench_can_start_somewhere_other_than_the_melt_temperature() -> None:
+    """Welded together, a run cannot settle at one temperature and cool from
+    another - which is how the hottest point came to be measured on a cell
+    that was still reheating."""
+    assert melt_quench().stages[-1].options["t_start"] == pytest.approx(600.0)
+    assert melt_quench(t_start=520.0).stages[-1].options["t_start"] == pytest.approx(
+        520.0
+    )

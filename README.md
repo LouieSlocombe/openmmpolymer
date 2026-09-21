@@ -87,6 +87,65 @@ openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE -t 450 -o run -v
 
 Run it again and it picks up from the last stage that finished.
 
+## Finding a glass transition
+
+Resolving a transition to a few kelvin needs small temperature steps and long
+holds, and paying for that resolution from the melt temperature all the way
+down is most of the cost for none of the answer. So `run_tg_scan` goes down
+the ladder twice: a coarse scan to find roughly where the break is, then a
+fine one across a window centred on it.
+
+```python
+from openmmpolymer import TgSpec, analyse_run, run_tg_scan, write_report
+
+result = run_tg_scan(
+    run,
+    "run",
+    spec=TgSpec(melt_temperature_k=650.0, t_floor_k=150.0, npt_trajectory_ps=10.0),
+    chain_backbone=chain.backbone,
+    atoms_per_chain=chain.n_atoms,
+)
+print(result.temperature_k, result.fine_schedule.cooling_rate_k_per_ns)
+
+report = analyse_run("run")
+write_report(report)
+```
+
+The second pass starts from a state the first one saved as it went past, not
+from the equilibrated melt and not from the bottom of the coarse ladder. A
+glass remembers how it was cooled, so a fine window entered by reheating a
+solid is measuring a different thermal history from the one that located it.
+
+The scan refuses to guess. If the coarse fit reports it found a corner in
+noise rather than a transition, it stops and says so, because a fine pass is
+tens of nanoseconds and a window derived from that fit produces a curve with
+nothing in it. Pass `tg_approx_k` to name the window yourself.
+
+`cooling_rate_series` runs the fine window several times at different rates,
+all from that one configuration, and `cooling_rate_extrapolation` fits how the
+transition moves. Both passes are chunked into stages of a few nanoseconds, so
+an interrupted run resumes at the stage it stopped in rather than at the top of
+the ramp.
+
+From the command line:
+
+```bash
+openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol tg --check-melt -o run -v
+```
+
+## Reading a finished run
+
+```bash
+openmmpolymer --analyse run --figures
+```
+
+No monomer and no chemistry: a directory in, a number out. It finds the quench
+stages by what they recorded rather than by what they were called, tells the
+coarse pass from the fine one by its temperature step, checks whether the melt
+had settled before cooling started, and writes `run/analysis/tg.json` beside
+the figures. Give it several run directories to pool a cooling-rate series
+across them. The manifest is not touched.
+
 ## How it fits together
 
 | Layer | Module | What it does |
@@ -99,10 +158,11 @@ Run it again and it picks up from the last stage that finished.
 | Stages | `simulate` | minimise, push-off, NVT, compress, NPT, anneal, quench, production |
 | Protocol | `protocols` | Named stage sequences, the manifest, and resume |
 | Trajectory | `trajectory` | A finished run directory → frames, per chain, in nanometres |
-| Time series | `timeseries` | State-data CSVs, equilibration detection, the quench curve |
+| Time series | `timeseries` | State-data CSVs, equilibration detection, the quench curve, the rate extrapolation |
 | Conformation | `conformation` | `⟨R²⟩`, `Rg`, persistence length, end-to-end relaxation, COM displacement |
 | Correlations | `correlations` | Intermolecular `g(r)` and the static structure factor |
 | Plots | `plots` | A figure per result, returned rather than written |
+| Workflow | `tg` | The two-pass glass-transition scan, and reading a finished run back |
 
 ## The constraint everything follows from
 
@@ -157,6 +217,15 @@ genuinely independent samples sit behind a mean rather than how many rows do.
 chains are diffusing, because a melt short of its entanglement time is
 sub-diffusive and a coefficient fitted to that is not a diffusion coefficient.
 
+`melt_equilibration` puts those together into one verdict: the cell volume has
+to have stopped drifting faster than its own noise, *and* the chains' centres
+of mass have to have travelled further than the chains are big, diffusively.
+It needs a trajectory from the equilibration stage, which is not written unless
+asked for — `npt_trajectory` on the protocol, `npt_trajectory_ps` on a `TgSpec`,
+`--check-melt` on the command line. Without one the verdict is False and
+`unchecked` says which half was missing, because a verdict with half its
+evidence absent is not a pass.
+
 **A quench is not a Tg measurement.** `melt_quench` records a density at every
 temperature on the way down, which is the specific-volume curve a glass
 transition is read off. Every all-atom cooling rate is many orders of magnitude
@@ -166,6 +235,24 @@ reads that curve back and `glass_transition` fits the two straight lines it is
 read off, reporting the cooling rate alongside the temperature so the caveat
 travels with the number, and `resolved` False when the fit found a corner in
 noise — which is what fitting two lines to a straight one always finds.
+
+`melt_expansivity_per_k` and `glass_expansivity_per_k` report the same two
+branches as thermal expansion coefficients, `(1/v)(∂v/∂T)` in 1/K, which is
+what a dilatometry paper quotes. They are not a second check on the fit: both
+divide the same crossing volume, so the melt expanding faster than the glass is
+the slope condition `resolved` already requires.
+
+**And a rate extrapolation is an extrapolation.** `cooling_rate_extrapolation`
+fits how the transition moves with cooling rate and evaluates that fit wherever
+you ask, including at the 10 K/min a calorimeter scans at. The gap is about ten
+decades. `extrapolation_decades` reports it and `resolved` is False past two,
+so an extrapolation to an experimental rate is *always* unresolved — that is
+the design working rather than failing. The robust number is the other one:
+how far the transition moves per decade of rate, which was measured rather
+than extrapolated. Two relations are offered because over that gap they
+disagree by more than a hundred kelvin: a straight line in log rate runs away,
+and the Vogel–Fulcher–Tammann form, which has a finite limit, does not. WLF is
+not a third option — it is VFT reparameterised, and `wlf_constants` converts.
 
 **Cell size is checked against the compressed density, not the packed one.**
 OpenMM refuses a cutoff over half the box — and refuses it again mid-run once

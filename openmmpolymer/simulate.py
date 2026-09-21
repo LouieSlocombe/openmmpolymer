@@ -17,6 +17,7 @@ temperature it actually ran at.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import time
 from collections.abc import Sequence
@@ -27,7 +28,7 @@ from typing import Any
 import numpy as np
 
 from ._seeds import derive_seed, seed_random_stream
-from ._validation import require_positive
+from ._validation import require_integer, require_positive
 from .forcefield import PolymerForceField
 from .mdsystem import (
     BAROSTAT_TEMPERATURE_PARAMETER,
@@ -83,6 +84,12 @@ class StageResult:
         csv: Its numeric state data.
         samples: Anything the stage measured along the way - the quench records
             a density per temperature here.
+        waypoints: The state written at the end of each segment, one entry per
+            segment and in the same order as ``samples``. Empty unless
+            ``run_segments`` was given ``waypoints=True``, so an ordinary
+            stage carries no list of nulls into the manifest. A two-pass quench restarts its fine ladder from
+            one of these, which is the only way to continue a cooling history
+            rather than start a second one.
     """
 
     name: str
@@ -95,6 +102,7 @@ class StageResult:
     final_pdb: str | None = None
     csv: str | None = None
     samples: dict[str, list[float]] = field(default_factory=dict)
+    waypoints: tuple[str, ...] = ()
 
 
 @dataclass
@@ -368,6 +376,23 @@ def _save_final(simulation: Any, prefix: Path) -> tuple[str, str]:
     return str(state_path), str(pdb_path)
 
 
+def _save_waypoint(
+    simulation: Any, prefix: Path, index: int, temperature_k: float
+) -> str:
+    """Write the state at the end of one segment, and return where it went.
+
+    Named by index and temperature so the directory both sorts into run order
+    and says what each file is. No structure is written beside it:
+    :func:`_initialise` restarts from the serialised state alone, and a PDB per
+    temperature would double the cost of an already bulky option.
+    """
+    path = prefix.parent / (
+        f"{prefix.name}_waypoint{index:02d}_{temperature_k:.0f}K.state.xml"
+    )
+    simulation.saveState(str(path))
+    return str(path)
+
+
 def run_minimise(
     run: RunContext,
     output_prefix: str | Path = "00_minimise",
@@ -500,6 +525,8 @@ def run_segments(
     trajectory: TrajectoryOptions | str = "none",
     report_interval_ps: float = 10.0,
     state_in: str | Path | None = None,
+    waypoints: bool = False,
+    samples_per_segment: int = _SAMPLES_PER_SEGMENT,
 ) -> StageResult:
     """Run a sequence of segments in one ensemble.
 
@@ -522,6 +549,17 @@ def run_segments(
         trajectory: Trajectory settings.
         report_interval_ps: Time between state-data rows.
         state_in: The previous stage's state.
+        waypoints: Write a state at the end of every segment, not just at the
+            end of the stage. A quench's waypoints are what let a second,
+            finer pass carry on from the middle of the first one instead of
+            reheating a glass. Off by default: it costs one serialised state
+            per segment, which for a cell of tens of thousands of atoms is
+            megabytes each.
+        samples_per_segment: How many times each segment is interrupted to
+            measure its density and temperature. The mean is over the second
+            half of them, so this sets how many readings that mean rests on -
+            the default of ten leaves five, which is thin for a segment whose
+            whole purpose is a low-noise point on a curve.
 
     Returns:
         What the stage did, including a density and a temperature per segment.
@@ -533,6 +571,7 @@ def run_segments(
     if not segments:
         raise ValueError(f"Stage {name!r} has no segments to run.")
 
+    require_integer(samples_per_segment, minimum=1, name="samples_per_segment")
     hottest = max(segment.temperature_k for segment in segments)
     if timestep_fs is None:
         timestep_fs = safe_timestep_fs(hottest, run.spec)
@@ -573,7 +612,13 @@ def run_segments(
         "segment_temperature_k": [],
         "segment_density_g_cm3": [],
         "segment_mean_temperature_k": [],
+        # Recorded rather than inferred: a stage's CSV knows only its total
+        # time, so a ladder split across stages or resumed part-way through
+        # would otherwise have its cooling rate worked out wrong rather than
+        # reported as unknown.
+        "segment_duration_ps": [],
     }
+    waypoint_paths: list[str] = []
     log.info(
         "%s: %d segments, %.1f ps at %.1f fs (%d steps)%s.",
         name,
@@ -592,14 +637,23 @@ def run_segments(
         trajectory=trajectory,
         trajectory_interval=trajectory_interval,
     ) as paths:
-        for segment, steps in zip(segments, per_segment, strict=True):
+        for index, (segment, steps) in enumerate(
+            zip(segments, per_segment, strict=True)
+        ):
             set_temperature(simulation, segment.temperature_k, barostat)
             if barostat is not None:
                 set_pressure(simulation, segment.pressure_bar, barostat)
-            density, temperature = _run_segment(simulation, steps, run.total_mass_g_mol)
+            density, temperature = _run_segment(
+                simulation, steps, run.total_mass_g_mol, samples_per_segment
+            )
             samples["segment_temperature_k"].append(segment.temperature_k)
             samples["segment_density_g_cm3"].append(density)
             samples["segment_mean_temperature_k"].append(temperature)
+            samples["segment_duration_ps"].append(segment.duration_ps)
+            if waypoints:
+                waypoint_paths.append(
+                    _save_waypoint(simulation, prefix, index, segment.temperature_k)
+                )
             log.info(
                 "  %s%.0f K: %.4f g/cm3, ran at %.0f K.",
                 f"{segment.label} " if segment.label else "",
@@ -622,11 +676,15 @@ def run_segments(
         final_pdb=pdb_path,
         csv=paths.csv,
         samples=samples,
+        waypoints=tuple(waypoint_paths),
     )
 
 
 def _run_segment(
-    simulation: Any, steps: int, total_mass_g_mol: float
+    simulation: Any,
+    steps: int,
+    total_mass_g_mol: float,
+    samples_per_segment: int = _SAMPLES_PER_SEGMENT,
 ) -> tuple[float, float]:
     """Run one segment, returning its settled density and temperature.
 
@@ -635,7 +693,7 @@ def _run_segment(
     """
     from openmm import unit
 
-    chunk = max(1, steps // _SAMPLES_PER_SEGMENT)
+    chunk = max(1, steps // samples_per_segment)
     densities: list[float] = []
     temperatures: list[float] = []
     remaining = steps
@@ -994,6 +1052,59 @@ def run_anneal(
     )
 
 
+def quench_temperatures(t_start: float, t_end: float, step_k: float) -> list[float]:
+    """Return the ladder of temperatures a quench visits, hottest first.
+
+    Split out of :func:`run_quench` so that everything which needs to know how
+    long a quench is - the cost reported before it starts, the chunker that
+    splits it into resumable stages, and the stage that runs it - counts the
+    same temperatures. A ladder that does not divide evenly still ends exactly
+    at *t_end*, because the bottom of the curve is a point someone chose.
+
+    Args:
+        t_start: Where cooling starts.
+        t_end: Where it stops, always visited.
+        step_k: How far it drops at each step.
+
+    Returns:
+        The temperatures, descending.
+
+    Raises:
+        ValueError: The ramp does not descend, or the step is not positive.
+    """
+    if t_end >= t_start:
+        raise ValueError(
+            f"t_end={t_end} must be below t_start={t_start}: a quench cools."
+        )
+    require_positive(step_k, None, name="step_k")
+
+    temperatures: list[float] = []
+    temperature = t_start
+    while temperature > t_end + 1e-9:
+        temperatures.append(temperature)
+        temperature -= step_k
+    temperatures.append(t_end)
+    return temperatures
+
+
+def _descending_ladder(temperatures_k: Sequence[float]) -> list[float]:
+    """Check a caller-supplied ladder is one a quench could run."""
+    ladder = [float(value) for value in temperatures_k]
+    if not ladder:
+        raise ValueError(
+            "temperatures_k is empty, so there is nothing to hold. Give the "
+            "temperatures to visit, or leave it out and name t_start, t_end "
+            "and step_k instead."
+        )
+    for hotter, cooler in itertools.pairwise(ladder):
+        if cooler >= hotter:
+            raise ValueError(
+                f"temperatures_k goes {hotter} -> {cooler}: a quench cools, so "
+                "the ladder has to descend."
+            )
+    return ladder
+
+
 def run_quench(
     run: RunContext,
     output_prefix: str | Path = "06_quench",
@@ -1004,6 +1115,7 @@ def run_quench(
     hold_ps: float = 200.0,
     pressure_bar: float = 1.0,
     barostat: str = "isotropic",
+    temperatures_k: Sequence[float] | None = None,
     **kwargs: Any,
 ) -> StageResult:
     """Cool the cell in steps, recording the density at each temperature.
@@ -1023,7 +1135,13 @@ def run_quench(
         hold_ps: Time held at each temperature.
         pressure_bar: Pressure to hold throughout.
         barostat: Which barostat to attach.
-        **kwargs: Passed to :func:`run_segments`.
+        temperatures_k: The exact ladder to visit, replacing *t_start*,
+            *t_end* and *step_k*. A long quench is split into several stages so
+            that an interrupted run resumes at the stage it stopped in rather
+            than at the top of the ramp, and handing each piece its own slice
+            of one ladder is what keeps a temperature from being repeated or
+            skipped at every boundary.
+        **kwargs: Passed to :func:`run_segments`, including ``waypoints``.
 
     Returns:
         What the stage did. ``samples`` carries the temperatures and the
@@ -1032,18 +1150,11 @@ def run_quench(
     Raises:
         ValueError: The ramp does not descend.
     """
-    if t_end >= t_start:
-        raise ValueError(
-            f"t_end={t_end} must be below t_start={t_start}: a quench cools."
-        )
-    require_positive(step_k, None, name="step_k")
-
-    temperatures: list[float] = []
-    temperature = t_start
-    while temperature > t_end + 1e-9:
-        temperatures.append(temperature)
-        temperature -= step_k
-    temperatures.append(t_end)
+    temperatures = (
+        quench_temperatures(t_start, t_end, step_k)
+        if temperatures_k is None
+        else _descending_ladder(temperatures_k)
+    )
 
     segments = [
         Segment(value, hold_ps, pressure_bar, label=f"{value:.0f} K")

@@ -21,11 +21,23 @@ off. The break between them is a real feature of the data; the temperature it
 sits at is not comparable with an experiment, because the cooling rate here is
 some ten orders of magnitude faster. That rate is reported alongside the
 number, so the caveat travels with it.
+
+:func:`cooling_rate_extrapolation` is what closes that last gap, and it is the
+most easily misread thing here. Quench the same melt at several rates and the
+transition moves; fit how it moves and the fit can be evaluated at a rate no
+simulation could run. But the distance is about ten decades, so the answer is
+an extrapolation wearing a measurement's clothes. The result therefore carries
+how far it was extrapolated, and ``resolved`` is False past two decades - which
+means that an extrapolation to a real calorimeter is *always* unresolved. That
+is the design working rather than failing.
 """
 
 from __future__ import annotations
 
+import itertools
 import logging
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -79,6 +91,29 @@ MAX_GLASS_MELT_SLOPE_RATIO = 0.8
 #: Guards a relative quantity whose scale is zero, for a series that never
 #: moves - a constant density, or an energy held at exactly zero.
 _TINY = 1.0e-30
+
+#: A standard calorimeter scan, 10 K/min, in the K/ns this package works in.
+#: The rate an experimental glass transition is measured at, and so the rate
+#: :func:`cooling_rate_extrapolation` aims at by default.
+DSC_COOLING_RATE_K_PER_NS = 10.0 / 60.0 * 1.0e-9
+
+#: How the transition may be taken to depend on cooling rate.
+EXTRAPOLATION_FORMS = ("log_linear", "vft")
+
+#: How far past the measured rates an extrapolation may reach and still be
+#: called resolved. Two decades is generous; the gap between a quench and a
+#: calorimeter is about ten, so this is the threshold that keeps the honest
+#: answer honest.
+MAX_EXTRAPOLATION_DECADES = 2.0
+
+#: Free parameters in each form, which is what decides whether a residual
+#: means anything.
+_FORM_PARAMETERS = {"log_linear": 2, "vft": 3}
+
+#: Bracket for the VFT inner search, as natural-log gaps above the fastest
+#: measured rate. Wide enough that the optimum sitting on an end means the fit
+#: has degenerated rather than that the bracket was too narrow.
+_VFT_GAP_BRACKET = (math.log(1.0e-3), math.log(1.0e3))
 
 
 @dataclass(frozen=True)
@@ -198,6 +233,15 @@ class QuenchCurve:
         """How many temperatures were held."""
         return int(self.temperature_k.size)
 
+    @property
+    def temperature_step_k(self) -> float:
+        """The typical gap between the temperatures held.
+
+        What tells a coarse screening scan from a fine one, without having to
+        know what either stage was called.
+        """
+        return _temperature_step(self.temperature_k)
+
 
 @dataclass(frozen=True)
 class GlassTransition:
@@ -208,7 +252,8 @@ class GlassTransition:
         specific_volume_cm3_g: Specific volume at the crossing. With the two
             slopes it fixes both fitted lines, so a plot needs nothing else.
         melt_expansion_per_k: Slope of the high-temperature branch, in
-            cm^3/g/K.
+            cm^3/g/K. See :attr:`melt_expansivity_per_k` for the same thing as
+            a thermal expansion coefficient.
         glass_expansion_per_k: Slope of the low-temperature branch.
         residual_cm3_g: Root-mean-square residual of the joint fit.
         n_points_melt: Points on the high-temperature branch.
@@ -236,6 +281,123 @@ class GlassTransition:
     cooling_rate_k_per_ns: float | None
     resolved: bool
 
+    @property
+    def melt_expansivity_per_k(self) -> float:
+        """Volumetric thermal expansion coefficient of the melt, in 1/K.
+
+        ``(1/v)(dv/dT)`` at the crossing - the branch slope over the specific
+        volume the two lines meet at. The slopes above are in cm^3/g/K and
+        depend on the polymer's density; this is the dimensionless-per-kelvin
+        quantity an experiment reports.
+        """
+        return self._expansivity(self.melt_expansion_per_k)
+
+    @property
+    def glass_expansivity_per_k(self) -> float:
+        """Volumetric thermal expansion coefficient of the glass, in 1/K.
+
+        Always below :attr:`melt_expansivity_per_k` when :attr:`resolved` is
+        True, and not as a separate check: both coefficients divide the same
+        crossing volume, so their ordering is the ordering of the two slopes,
+        which is what :func:`_is_transition` already requires - and requires
+        more strictly, at a ratio of
+        :data:`MAX_GLASS_MELT_SLOPE_RATIO` rather than merely being smaller. A
+        glass that expanded as fast as its melt would not be a glass.
+        """
+        return self._expansivity(self.glass_expansion_per_k)
+
+    def _expansivity(self, slope_cm3_g_k: float) -> float:
+        """A branch slope as a coefficient, or NaN when there is no volume.
+
+        Not zero, which would read as a material that does not expand. The
+        only way here is a fit whose crossing was extrapolated somewhere the
+        data never went, and that deserves to propagate rather than look like
+        a measurement.
+        """
+        if abs(self.specific_volume_cm3_g) < _TINY:
+            return math.nan
+        return slope_cm3_g_k / self.specific_volume_cm3_g
+
+
+@dataclass(frozen=True)
+class CoolingRateExtrapolation:
+    """How the transition moves with cooling rate, and where that points.
+
+    Args:
+        form: Which relation was fitted, from :data:`EXTRAPOLATION_FORMS`.
+        cooling_rate_k_per_ns: The rates measured, ascending.
+        transition_k: The transition found at each.
+        target_rate_k_per_ns: The rate the fit was evaluated at.
+        temperature_k: The transition the fit predicts there. Always reported,
+            because the caller named a rate and asked; whether it means
+            anything is :attr:`resolved`.
+        sensitivity_k_per_decade: How far the transition moves per decade of
+            cooling rate, at the target. The robustly measured part of all
+            this, and the number worth quoting when the extrapolated one is
+            not.
+        parameters: The fitted parameters, named.
+        residual_k: Root-mean-square residual in kelvin. Zero by construction
+            when there are exactly as many rates as parameters, which says
+            nothing about the fit - hence the sample-count condition on
+            :attr:`resolved`.
+        n_rates: Rates fitted.
+        n_parameters: Free parameters in this form.
+        extrapolation_decades: How far past the measured rates the target
+            sits, in decades. Zero when it sits between them.
+        resolved: Whether every input transition resolved, there are more
+            rates than parameters, the fit is physical, and
+            :attr:`extrapolation_decades` is within
+            :data:`MAX_EXTRAPOLATION_DECADES`. A quench runs at some K/ns and a
+            calorimeter at 1e-10 K/ns, so an extrapolation to an experimental
+            rate is ten decades and never resolves. The number is still worth
+            reporting and is still not a measurement.
+    """
+
+    form: str
+    cooling_rate_k_per_ns: npt.NDArray[np.float64]
+    transition_k: npt.NDArray[np.float64]
+    target_rate_k_per_ns: float
+    temperature_k: float
+    sensitivity_k_per_decade: float
+    parameters: dict[str, float]
+    residual_k: float
+    n_rates: int
+    n_parameters: int
+    extrapolation_decades: float
+    resolved: bool
+
+    def wlf_constants(self, reference_k: float) -> tuple[float, float]:
+        """The WLF constants this VFT fit is the same relation as.
+
+        WLF and VFT are one relation in two parameterisations: with
+        ``C2 = Tr - T0`` and ``C1 = B / (ln(10) C2)`` they predict the same
+        shift factors. So this package fits VFT and converts, rather than
+        shipping a second fit of the same arithmetic under a second name.
+
+        Args:
+            reference_k: The reference temperature, usually the transition.
+
+        Returns:
+            ``(C1, C2)``.
+
+        Raises:
+            AnalysisError: This is not a VFT fit, or the reference temperature
+                is at or below the fitted ``T0``, where the constants diverge.
+        """
+        if self.form != "vft":
+            raise AnalysisError(
+                f"WLF constants come from a VFT fit; this one is {self.form!r}. "
+                "Refit with form='vft', which needs at least three rates."
+            )
+        c2 = reference_k - self.parameters["t0_k"]
+        if c2 <= 0.0:
+            raise AnalysisError(
+                f"A reference of {reference_k} K is at or below the fitted "
+                f"T0 of {self.parameters['t0_k']:.1f} K, where the WLF "
+                "constants diverge. Use a reference above it."
+            )
+        return self.parameters["b_k"] / (math.log(10.0) * c2), c2
+
 
 def read_state_data(csv_path: str | Path, *, stage: str = "") -> StateData:
     """Read a stage's numeric state-data CSV.
@@ -254,7 +416,20 @@ def read_state_data(csv_path: str | Path, *, stage: str = "") -> StateData:
     path = Path(csv_path)
     if not path.is_file():
         raise AnalysisError(f"No state-data CSV at {path}.")
-    table = np.genfromtxt(path, delimiter=",", names=True)
+    if path.stat().st_size == 0:
+        # A stage that stopped before its first report leaves the file the
+        # reporter opened and nothing in it, not even the header. numpy reads
+        # that as a malformed table rather than an empty one.
+        raise AnalysisError(
+            f"{path} is empty, so the stage stopped before it wrote any state "
+            "data. Lower report_interval_ps, or run the stage for longer."
+        )
+    try:
+        table = np.genfromtxt(path, delimiter=",", names=True)
+    except (IndexError, ValueError) as error:
+        raise AnalysisError(
+            f"{path} could not be read as a state-data CSV: {error}"
+        ) from error
     names = table.dtype.names or ()
     missing = [column for column in CSV_FIELDS.values() if column not in names]
     if missing:
@@ -349,25 +524,48 @@ def equilibration(
     )
 
 
-def quench_curve(run_dir: str | Path, stage: str = "06_quench") -> QuenchCurve:
-    """Read back the specific-volume curve a quench stage recorded.
+def _recorded_ladder(recorded: dict[str, Any]) -> tuple[list[float], list[float]]:
+    """A stage's temperatures and densities, or two empty lists."""
+    samples = recorded.get("samples") or {}
+    return (
+        list(samples.get("segment_temperature_k") or ()),
+        list(samples.get("segment_density_g_cm3") or ()),
+    )
 
-    The densities are already in the manifest: a quench holds each temperature
-    for a while and records the mean of the second half of each hold. What is
-    not in the manifest is how long the holds were, so the stage's CSV is read
-    too, purely to recover the cooling rate.
+
+def _is_quench(recorded: dict[str, Any]) -> bool:
+    """Whether a stage cooled, from the temperatures it recorded.
+
+    Every stage records a temperature and a density per segment, so holding a
+    ladder is not on its own distinctive - a compression holds seven segments
+    at one temperature and an anneal goes up as often as down. What makes a
+    quench a quench is that it visited more than one temperature and every one
+    was colder than the last.
+    """
+    temperatures, densities = _recorded_ladder(recorded)
+    if len(temperatures) < 2 or not densities:
+        return False
+    return all(cooler < hotter for hotter, cooler in itertools.pairwise(temperatures))
+
+
+def quench_stages(run_dir: str | Path) -> tuple[str, ...]:
+    """Name every stage in a run that cooled the cell down a ladder.
+
+    Found by what a stage recorded rather than by what it was called, so a
+    run that quenched twice - a coarse scan to locate the transition and a
+    fine one to resolve it - is read without anything having to agree in
+    advance on the names. Which is the coarse one is then a question for the
+    data: :attr:`QuenchCurve.temperature_step_k` tells them apart.
 
     Args:
         run_dir: A directory :func:`~openmmpolymer.protocols.run_protocol`
             wrote to.
-        stage: Which stage cooled the cell.
 
     Returns:
-        The curve, ordered by ascending temperature.
+        The stage names, in the order the manifest records them.
 
     Raises:
-        AnalysisError: There is no manifest, the stage is not in it, or it
-            recorded no per-temperature densities.
+        AnalysisError: There is no manifest, or nothing in it held a ladder.
     """
     from .protocols import RunManifest
 
@@ -375,21 +573,73 @@ def quench_curve(run_dir: str | Path, stage: str = "06_quench") -> QuenchCurve:
     manifest = RunManifest.load(directory)
     if manifest is None:
         raise AnalysisError(f"No manifest in {directory}.")
-    recorded = manifest.stages.get(stage)
-    if recorded is None:
+    found = tuple(
+        name for name, recorded in manifest.stages.items() if _is_quench(recorded)
+    )
+    if not found:
         raise AnalysisError(
-            f"The manifest in {directory} has no stage {stage!r}. It records: "
+            f"No stage in {directory} stepped down a ladder of temperatures, "
+            "so nothing there was a quench. It records: "
             f"{', '.join(manifest.stages) or 'nothing'}."
         )
-    samples = recorded.get("samples") or {}
-    temperatures = samples.get("segment_temperature_k")
-    densities = samples.get("segment_density_g_cm3")
-    if not temperatures or not densities:
-        raise AnalysisError(
-            f"Stage {stage!r} recorded no per-temperature densities, so it was "
-            "not a quench. A quench holds a ladder of temperatures and records "
-            "the density at each."
-        )
+    return found
+
+
+def quench_curve(
+    run_dir: str | Path, stage: str | Sequence[str] = "06_quench"
+) -> QuenchCurve:
+    """Read back the specific-volume curve a quench recorded.
+
+    The densities are already in the manifest: a quench holds each temperature
+    for a while and records the mean of the second half of each hold. Several
+    stages may be named, and their points are pooled into one curve - a long
+    ladder is split into stages so that an interrupted run resumes at the
+    stage it stopped in, and that split is bookkeeping rather than physics.
+
+    Args:
+        run_dir: A directory :func:`~openmmpolymer.protocols.run_protocol`
+            wrote to.
+        stage: Which stage cooled the cell, or several to pool.
+
+    Returns:
+        The curve, ordered by ascending temperature.
+
+    Raises:
+        AnalysisError: There is no manifest, a named stage is not in it, or
+            one recorded no per-temperature densities.
+    """
+    from .protocols import RunManifest
+
+    directory = Path(run_dir)
+    manifest = RunManifest.load(directory)
+    if manifest is None:
+        raise AnalysisError(f"No manifest in {directory}.")
+    names = [stage] if isinstance(stage, str) else list(stage)
+    if not names:
+        raise AnalysisError("No stage was named, so there is no curve to read.")
+
+    temperatures: list[float] = []
+    densities: list[float] = []
+    holds: list[float] = []
+    csv_paths: list[Any] = []
+    for name in names:
+        recorded = manifest.stages.get(name)
+        if recorded is None:
+            raise AnalysisError(
+                f"The manifest in {directory} has no stage {name!r}. It "
+                f"records: {', '.join(manifest.stages) or 'nothing'}."
+            )
+        step_temperatures, step_densities = _recorded_ladder(recorded)
+        if not step_temperatures or not step_densities:
+            raise AnalysisError(
+                f"Stage {name!r} recorded no per-temperature densities, so it "
+                "was not a quench. A quench holds a ladder of temperatures and "
+                "records the density at each."
+            )
+        temperatures.extend(step_temperatures)
+        densities.extend(step_densities)
+        holds.extend((recorded.get("samples") or {}).get("segment_duration_ps") or ())
+        csv_paths.append(recorded.get("csv"))
 
     temperature = np.asarray(temperatures, dtype=np.float64)
     density = np.asarray(densities, dtype=np.float64)
@@ -397,13 +647,13 @@ def quench_curve(run_dir: str | Path, stage: str = "06_quench") -> QuenchCurve:
     temperature, density = temperature[order], density[order]
     if np.any(density <= 0.0):
         raise AnalysisError(
-            f"Stage {stage!r} recorded a density of zero or less, so its "
-            "specific volume is not defined."
+            f"Stage {', '.join(names)} recorded a density of zero or less, so "
+            "its specific volume is not defined."
         )
 
-    hold_ps = _hold_ps(recorded.get("csv"), len(temperatures))
+    hold_ps = _hold_of(holds, csv_paths, names, len(temperatures))
     return QuenchCurve(
-        stage=stage,
+        stage=", ".join(names),
         temperature_k=temperature,
         density_g_cm3=density,
         specific_volume_cm3_g=1.0 / density,
@@ -481,6 +731,214 @@ def glass_transition(
     )
 
 
+def cooling_rate_extrapolation(
+    transitions: Sequence[GlassTransition],
+    *,
+    target_rate_k_per_ns: float = DSC_COOLING_RATE_K_PER_NS,
+    form: str = "log_linear",
+) -> CoolingRateExtrapolation:
+    """Fit how the transition moves with cooling rate, and evaluate the fit.
+
+    Quench the same equilibrated melt at several rates and the transition
+    shifts: slower cooling gives the cell longer to keep finding a denser
+    packing, so it stays liquid to a lower temperature. Fitting that shift is
+    the only route from a quench to a number an experiment could recognise,
+    and it is a long way - a calorimeter scans about ten decades slower than
+    the slowest quench anyone runs.
+
+    Two relations are offered, and the difference between them over that gap
+    is not small. On a melt with T0 = 300 K, B = 400 K and R0 = 1e4 K/ns,
+    measured at 2, 5 and 10 K/ns:
+
+    =============  ==================
+    form           Tg at 10 K/min
+    =============  ==================
+    ``log_linear``  189 K
+    ``vft``         313 K
+    =============  ==================
+
+    A quench overestimates an experimental transition by 20 to 50 K, which
+    puts the honest answer near 313 K. So ``log_linear`` is the default
+    because it is always determined and because its slope - how far the
+    transition moves per decade - is a genuinely measured quantity worth
+    quoting on its own; and ``vft`` is the form to reach for when the target
+    is an experimental rate and there are three or more measurements to fit.
+
+    Args:
+        transitions: Fits from :func:`glass_transition`, each carrying the
+            rate it was measured at. Two or more, and three or more for
+            ``vft``.
+        target_rate_k_per_ns: The rate to evaluate the fit at. Defaults to
+            :data:`DSC_COOLING_RATE_K_PER_NS`.
+        form: One of :data:`EXTRAPOLATION_FORMS`.
+
+    Returns:
+        The fit, what it predicts, and how far past the data that prediction
+        sits.
+
+    Raises:
+        ValueError: *form* is not one of :data:`EXTRAPOLATION_FORMS`, or the
+            target rate is not positive.
+        AnalysisError: There are too few transitions for the form, one has no
+            recorded cooling rate, or two were measured at the same rate.
+    """
+    from ._validation import require_choice, require_positive
+
+    require_choice(form, EXTRAPOLATION_FORMS, name="form")
+    target = require_positive(target_rate_k_per_ns, None, name="target_rate_k_per_ns")
+    n_parameters = _FORM_PARAMETERS[form]
+
+    if len(transitions) < 2:
+        raise AnalysisError(
+            f"{len(transitions)} transition(s) cannot show a rate dependence. "
+            "Quench the same equilibrated melt at two or more cooling rates."
+        )
+    rates: list[float] = []
+    for index, fit in enumerate(transitions):
+        measured = fit.cooling_rate_k_per_ns
+        if measured is None:
+            raise AnalysisError(
+                f"The transition at index {index} (break at "
+                f"{fit.temperature_k:.0f} K) has no cooling rate, so there is "
+                "nothing to plot it against. Its stage recorded neither its "
+                "segment durations nor a readable CSV."
+            )
+        if measured <= 0.0:
+            raise AnalysisError(
+                f"The transition at index {index} records a cooling rate of "
+                f"{measured}, which is not a rate anything was cooled at."
+            )
+        rates.append(float(measured))
+
+    rate = np.asarray(rates, dtype=np.float64)
+    if np.unique(rate).size != rate.size:
+        raise AnalysisError(
+            "Two transitions were measured at the same cooling rate, so the "
+            "fit has no rate dependence to see. Vary the hold or the "
+            "temperature step between the quenches."
+        )
+    if rate.size < n_parameters:
+        raise AnalysisError(
+            f"A {form!r} fit has {n_parameters} parameters and there are "
+            f"{rate.size} rates, so it is not determined. Measure at least "
+            f"{n_parameters} rates, or use form='log_linear'."
+        )
+
+    transition = np.asarray(
+        [fit.temperature_k for fit in transitions], dtype=np.float64
+    )
+    order = np.argsort(rate)
+    rate, transition = rate[order], transition[order]
+
+    if form == "log_linear":
+        parameters, total = _fit_log_linear(rate, transition)
+        temperature = parameters["a_k"] + parameters["b_k_per_decade"] * math.log10(
+            target
+        )
+        sensitivity = parameters["b_k_per_decade"]
+        physical = sensitivity > 0.0
+    else:
+        parameters, total, degenerate = _fit_vft(rate, transition)
+        gap = parameters["ln_r0"] - math.log(target)
+        temperature = parameters["t0_k"] + parameters["b_k"] / gap
+        sensitivity = math.log(10.0) * parameters["b_k"] / gap**2
+        physical = parameters["b_k"] > 0.0 and not degenerate
+
+    decades = _extrapolation_decades(rate, target)
+    return CoolingRateExtrapolation(
+        form=form,
+        cooling_rate_k_per_ns=rate,
+        transition_k=transition,
+        target_rate_k_per_ns=target,
+        temperature_k=float(temperature),
+        sensitivity_k_per_decade=float(sensitivity),
+        parameters=parameters,
+        residual_k=float(np.sqrt(total / rate.size)),
+        n_rates=int(rate.size),
+        n_parameters=n_parameters,
+        extrapolation_decades=decades,
+        resolved=(
+            all(fit.resolved for fit in transitions)
+            and rate.size > n_parameters
+            and physical
+            and decades <= MAX_EXTRAPOLATION_DECADES
+        ),
+    )
+
+
+def _fit_log_linear(
+    rate_k_per_ns: npt.NDArray[np.float64], transition_k: npt.NDArray[np.float64]
+) -> tuple[dict[str, float], float]:
+    """Fit ``Tg = a + b log10(R)``, reusing the straight-line fit above."""
+    (slope, intercept), total = _fit_line(np.log10(rate_k_per_ns), transition_k)
+    return {"a_k": intercept, "b_k_per_decade": slope}, total
+
+
+def _fit_vft(
+    rate_k_per_ns: npt.NDArray[np.float64], transition_k: npt.NDArray[np.float64]
+) -> tuple[dict[str, float], float, bool]:
+    """Fit ``Tg = T0 + B / (ln R0 - ln R)`` with numpy alone.
+
+    Three parameters and no scipy, but the problem separates: for any fixed
+    ``ln R0`` the relation is linear in ``T0`` and ``B``, so a three-parameter
+    nonlinear fit collapses to a one-dimensional search with an exact
+    least-squares solve inside it. ``ln R0`` is searched as a log gap above
+    the fastest measured rate, which keeps ``ln(R0/R) > 0`` for every point
+    without a constraint. A coarse sweep and three zoom rounds is some three
+    hundred solves of a tiny system: deterministic, derivative-free, and with
+    no way to fail to converge.
+
+    Returns the parameters, the sum of squared residuals, and whether the
+    optimum ran to an end of the bracket - which means the fit has degenerated
+    toward a straight line rather than found a curve.
+    """
+    log_rate = np.log(rate_k_per_ns)
+    fastest = float(log_rate.max())
+
+    def solve(gap_log: float) -> tuple[float, float, float]:
+        ln_r0 = fastest + math.exp(gap_log)
+        design = np.vstack([1.0 / (ln_r0 - log_rate), np.ones_like(log_rate)]).T
+        solution, *_ = np.linalg.lstsq(design, transition_k, rcond=None)
+        # Computed rather than taken from lstsq, which returns an empty
+        # residual array for an exactly-determined system.
+        residual = transition_k - design @ solution
+        return float(solution[0]), float(solution[1]), float(residual @ residual)
+
+    lower, upper = _VFT_GAP_BRACKET
+    grid = np.linspace(lower, upper, 181)
+    best_gap, best = lower, solve(lower)
+    for _ in range(4):
+        for candidate in grid:
+            trial = solve(float(candidate))
+            if trial[2] < best[2]:
+                best_gap, best = float(candidate), trial
+        span = float(grid[1] - grid[0])
+        grid = np.linspace(max(lower, best_gap - span), min(upper, best_gap + span), 41)
+
+    b_k, t0_k, total = best
+    degenerate = best_gap <= lower + 1.0e-9 or best_gap >= upper - 1.0e-9
+    if degenerate:
+        log.info(
+            "The VFT search ran to the edge of its bracket, so these data are "
+            "a straight line in log rate and R0 is unbounded. Report the "
+            "log-linear fit instead."
+        )
+    parameters = {"t0_k": t0_k, "b_k": b_k, "ln_r0": fastest + math.exp(best_gap)}
+    return parameters, total, degenerate
+
+
+def _extrapolation_decades(
+    rate_k_per_ns: npt.NDArray[np.float64], target_k_per_ns: float
+) -> float:
+    """How far past the measured rates the target sits, in decades."""
+    slowest, fastest = float(rate_k_per_ns.min()), float(rate_k_per_ns.max())
+    return max(
+        0.0,
+        math.log10(slowest / target_k_per_ns),
+        math.log10(target_k_per_ns / fastest),
+    )
+
+
 def _is_transition(
     temperature_k: npt.NDArray[np.float64],
     break_index: int,
@@ -501,11 +959,7 @@ def _is_transition(
     glass_slope, melt_slope = glass[0], melt[0]
     if melt_slope <= 0.0 or glass_slope > MAX_GLASS_MELT_SLOPE_RATIO * melt_slope:
         return False
-    spacing = (
-        float(np.median(np.abs(np.diff(temperature_k))))
-        if temperature_k.size > 1
-        else 0.0
-    )
+    spacing = _temperature_step(temperature_k)
     lower = float(temperature_k[break_index - 1]) - spacing
     upper = float(temperature_k[min(break_index, temperature_k.size - 1)]) + spacing
     return lower <= crossing_k <= upper
@@ -581,6 +1035,34 @@ def _fit_line(
     return (slope, intercept), total
 
 
+def _hold_of(
+    recorded_holds: Sequence[float],
+    csv_paths: Sequence[Any],
+    names: Sequence[str],
+    n_segments: int,
+) -> float | None:
+    """How long each temperature was held.
+
+    A stage that recorded its segment durations says so outright, which is the
+    only answer that survives a ladder split across stages or a stage resumed
+    part-way through. Failing that, fall back to dividing one stage's CSV by
+    its segment count - all a manifest written before those durations were
+    recorded can offer - and only for a single stage, because across several
+    that division is a different wrong number for each of them, and a wrong
+    cooling rate is worse than none.
+    """
+    if n_segments > 0 and len(recorded_holds) == n_segments:
+        return float(np.median(np.asarray(recorded_holds, dtype=np.float64)))
+    if len(names) != 1:
+        log.info(
+            "Stages %s did not record their segment durations, so the cooling "
+            "rate across them cannot be recovered.",
+            ", ".join(names),
+        )
+        return None
+    return _hold_ps(csv_paths[0], n_segments)
+
+
 def _hold_ps(csv_path: Any, n_segments: int) -> float | None:
     """How long each temperature was held, from the stage's CSV.
 
@@ -601,11 +1083,23 @@ def _hold_ps(csv_path: Any, n_segments: int) -> float | None:
     return float(series.time_ps[-1]) / n_segments
 
 
+def _temperature_step(temperature_k: npt.NDArray[np.float64]) -> float:
+    """The typical gap between the temperatures on a ladder."""
+    if temperature_k.size < 2:
+        return 0.0
+    return float(np.median(np.abs(np.diff(temperature_k))))
+
+
 def _cooling_rate(
     temperature_k: npt.NDArray[np.float64], hold_ps: float | None
 ) -> float | None:
-    """Kelvin per nanosecond, from the temperature step and the hold."""
+    """Kelvin per nanosecond, from the temperature step and the hold.
+
+    None rather than zero when the ladder never stepped: a stage that held one
+    temperature was not cooling, and a rate of zero would read as cooling
+    infinitely slowly - which is the opposite of the truth.
+    """
     if hold_ps is None or hold_ps <= 0.0 or temperature_k.size < 2:
         return None
-    step = float(np.median(np.abs(np.diff(temperature_k))))
-    return step / hold_ps * 1000.0
+    step = _temperature_step(temperature_k)
+    return None if step <= 0.0 else step / hold_ps * 1000.0

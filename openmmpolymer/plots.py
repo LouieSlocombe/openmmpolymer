@@ -9,8 +9,9 @@ else. A bare ``Figure`` needs no backend at all until something asks it to
 render, and is garbage-collected with the variable holding it.
 
 So these return a figure and write nothing. Saving it, showing it or embedding
-it is the caller's business - ``figure.savefig("density.png")`` - and the only
-code in this package that writes files stays the code that runs simulations.
+it is the caller's business - ``figure.savefig("density.png")`` - and the code
+in this package that writes files stays the code that runs simulations and the
+driver that reports on them.
 For the same reason no function takes an ``ax`` to draw into: each one owns a
 multi-panel layout, and passing axes in would break that while inviting
 ``pyplot`` back.
@@ -20,7 +21,8 @@ with its cooling rate, because the transition temperature read off it is not
 comparable with an experiment cooled ten orders of magnitude slower. A
 structure factor shades the region below ``2 pi / L``, where the cell cannot
 hold a wave. A mean-squared displacement gets a slope-one guide line, so a
-sub-diffusive curve looks sub-diffusive.
+sub-diffusive curve looks sub-diffusive. And a rate extrapolation shades the
+decades it reached across, because that is the whole story of the figure.
 """
 
 from __future__ import annotations
@@ -37,7 +39,13 @@ from .conformation import (
     MeanSquaredDisplacement,
 )
 from .correlations import RadialDistribution, StructureFactor
-from .timeseries import Equilibration, GlassTransition, QuenchCurve, StateData
+from .timeseries import (
+    CoolingRateExtrapolation,
+    Equilibration,
+    GlassTransition,
+    QuenchCurve,
+    StateData,
+)
 
 log = logging.getLogger(__name__)
 
@@ -151,6 +159,75 @@ def plot_quench_curve(
     axis.set_title(_quench_title(curve, transition), fontsize=9)
     axis.legend(fontsize=7, frameon=False)
     return figure
+
+
+def plot_cooling_rate(extrapolation: CoolingRateExtrapolation) -> Any:
+    """Plot the transition against cooling rate, and where the fit points.
+
+    The fitted curve is drawn all the way from the target rate to the fastest
+    measurement, and the region with no data in it is shaded, so the gap the
+    number was carried across is something the eye can see rather than
+    something the caption claims.
+
+    Args:
+        extrapolation: A fit from
+            :func:`~openmmpolymer.timeseries.cooling_rate_extrapolation`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axes = _figure(1, 1)
+    axis = axes[0]
+    rates = extrapolation.cooling_rate_k_per_ns
+    target = extrapolation.target_rate_k_per_ns
+    lowest = min(float(rates.min()), target)
+
+    axis.axvspan(lowest, float(rates.min()), color=_GUIDE_COLOUR, alpha=0.15)
+    span = np.geomspace(lowest, float(rates.max()), 200)
+    axis.plot(
+        span,
+        _predicted(extrapolation, span),
+        linewidth=0.9,
+        linestyle="--",
+        color=_REFERENCE_COLOUR,
+        label=f"{extrapolation.form} fit",
+    )
+    axis.plot(
+        rates,
+        extrapolation.transition_k,
+        marker="o",
+        markersize=4.0,
+        linestyle="none",
+        color=_DATA_COLOUR,
+        label="measured",
+    )
+    axis.plot(
+        [target],
+        [extrapolation.temperature_k],
+        marker="*",
+        markersize=9.0,
+        linestyle="none",
+        color=_GUIDE_COLOUR,
+        label=f"{extrapolation.temperature_k:.0f} K at {target:.3g} K/ns",
+    )
+    axis.set_xscale("log")
+    axis.set_xlabel("Cooling rate (K/ns)")
+    axis.set_ylabel("Transition temperature (K)")
+    axis.set_title(_cooling_rate_title(extrapolation), fontsize=9)
+    axis.legend(fontsize=7, frameon=False)
+    return figure
+
+
+def _predicted(extrapolation: CoolingRateExtrapolation, rate_k_per_ns: Any) -> Any:
+    """The fitted relation evaluated over a range of rates."""
+    parameters = extrapolation.parameters
+    if extrapolation.form == "log_linear":
+        return parameters["a_k"] + parameters["b_k_per_decade"] * np.log10(
+            rate_k_per_ns
+        )
+    return parameters["t0_k"] + parameters["b_k"] / (
+        parameters["ln_r0"] - np.log(rate_k_per_ns)
+    )
 
 
 def plot_conformation(series: ConformationSeries) -> Any:
@@ -342,7 +419,11 @@ def _state_title(data: StateData, settled: Equilibration | None) -> str:
 
 
 def _quench_title(curve: QuenchCurve, transition: GlassTransition | None) -> str:
-    """A title carrying the cooling rate, so the caveat travels with the plot."""
+    """A title carrying the cooling rate, so the caveat travels with the plot.
+
+    The expansion coefficients go on a second line rather than into the
+    legend, which names the two fitted branches and nothing else.
+    """
     rate = (
         "cooling rate unknown"
         if curve.cooling_rate_k_per_ns is None
@@ -352,7 +433,23 @@ def _quench_title(curve: QuenchCurve, transition: GlassTransition | None) -> str
         return f"{curve.stage}: {curve.n_points} temperatures, {rate}"
     if not transition.resolved:
         return f"{curve.stage}: no clear transition, {rate}"
-    return f"{curve.stage}: break at {transition.temperature_k:.0f} K, {rate}"
+    return (
+        f"{curve.stage}: break at {transition.temperature_k:.0f} K, {rate}\n"
+        f"aV {transition.melt_expansivity_per_k:.2e} (melt) against "
+        f"{transition.glass_expansivity_per_k:.2e} (glass) per K"
+    )
+
+
+def _cooling_rate_title(extrapolation: CoolingRateExtrapolation) -> str:
+    """A title saying how far the number was carried past the measurements."""
+    verdict = "" if extrapolation.resolved else ", not resolved"
+    return (
+        f"{extrapolation.form}: Tg = {extrapolation.temperature_k:.0f} K at "
+        f"{extrapolation.target_rate_k_per_ns:.3g} K/ns, extrapolated "
+        f"{extrapolation.extrapolation_decades:.1f} decades{verdict}\n"
+        f"{extrapolation.sensitivity_k_per_decade:.1f} K per decade over "
+        f"{extrapolation.n_rates} measured rates"
+    )
 
 
 def _conformation_title(series: ConformationSeries) -> str:

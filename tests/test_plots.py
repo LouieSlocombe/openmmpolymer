@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,19 +20,28 @@ from openmmpolymer.conformation import (
 from openmmpolymer.correlations import radial_distribution, structure_factor
 from openmmpolymer.plots import (
     plot_conformation,
+    plot_cooling_rate,
     plot_correlations,
     plot_dynamics,
     plot_quench_curve,
     plot_state_data,
 )
 from openmmpolymer.timeseries import (
+    cooling_rate_extrapolation,
     equilibration,
     glass_transition,
     quench_curve,
     read_state_data,
 )
 
-from .helpers import _lattice, random_walk_frames, state_data_csv, synthetic_ensemble
+from .helpers import (
+    _lattice,
+    random_walk_frames,
+    state_data_csv,
+    synthetic_ensemble,
+    transition_at,
+    write_quench,
+)
 
 
 @pytest.fixture
@@ -340,3 +350,83 @@ def test_a_conformation_with_no_measured_ratio_draws_no_reference_line() -> None
     )
     assert _expected_square(series) is None
     assert len(plot_conformation(series).axes[0].get_lines()) == 1
+
+
+def test_the_quench_title_reports_both_expansion_coefficients(curve: Any) -> None:
+    """On a second line, not in the legend: the legend names the two branches.
+
+    A dilatometry paper quotes aV, and this is where it becomes visible
+    without going back to the dataclass.
+    """
+    figure = plot_quench_curve(curve, transition=glass_transition(curve))
+    title = figure.axes[0].get_title()
+
+    assert "aV" in title
+    assert "melt" in title and "glass" in title
+    assert "\n" in title
+
+
+def test_an_unresolved_transition_gets_no_coefficients_on_the_figure(
+    tmp_path: Path,
+) -> None:
+    """A corner fitted into noise has no expansivities worth quoting."""
+    temperature = np.linspace(200.0, 600.0, 21)
+    straight = 1.0 / (1.0 + 5.0e-4 * temperature)
+    write_quench(tmp_path, temperature, straight)
+    unresolved = quench_curve(tmp_path)
+    figure = plot_quench_curve(unresolved, transition=glass_transition(unresolved))
+
+    assert "aV" not in figure.axes[0].get_title()
+    assert "no clear transition" in figure.axes[0].get_title()
+
+
+def rate_fit(form: str = "log_linear") -> Any:
+    """A rate extrapolation over three exactly log-linear measurements."""
+    fits = [
+        transition_at(rate, 340.0 + 20.0 * math.log10(rate))
+        for rate in (1.0, 10.0, 100.0)
+    ]
+    return cooling_rate_extrapolation(fits, form=form)
+
+
+def test_the_cooling_rate_figure_plots_one_point_per_measured_rate() -> None:
+    """Three quenches, three markers, on a log axis because rates span decades."""
+    figure = plot_cooling_rate(rate_fit())
+    axis = figure.axes[0]
+    measured = next(line for line in axis.get_lines() if line.get_label() == "measured")
+
+    assert axis.get_xscale() == "log"
+    assert len(measured.get_xdata()) == 3
+
+
+def test_the_cooling_rate_figure_shades_the_decades_it_reached_across() -> None:
+    """The gap the number was carried over is something the eye can see.
+
+    The same device the structure factor uses for the region a cell cannot
+    resolve: if the data does not reach there, the figure says so.
+    """
+    figure = plot_cooling_rate(rate_fit())
+    assert figure.axes[0].patches
+
+
+def test_an_unresolved_extrapolation_says_so_on_the_figure() -> None:
+    """Ten decades to an experimental rate, so this is the usual case."""
+    title = plot_cooling_rate(rate_fit()).axes[0].get_title()
+
+    assert "not resolved" in title
+    assert "decades" in title
+
+
+def test_the_cooling_rate_figure_draws_the_curve_a_vft_fit_predicts() -> None:
+    """A different relation has to draw a different line, not the same one."""
+    straight = plot_cooling_rate(rate_fit("log_linear"))
+    curved = plot_cooling_rate(rate_fit("vft"))
+
+    def fitted(figure: Any) -> Any:
+        return next(
+            line
+            for line in figure.axes[0].get_lines()
+            if "fit" in str(line.get_label())
+        )
+
+    assert not np.allclose(fitted(straight).get_ydata(), fitted(curved).get_ydata())

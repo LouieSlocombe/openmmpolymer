@@ -21,6 +21,7 @@ from openmmpolymer.simulate import (
     StageResult,
     density_g_cm3,
     prepare_run,
+    quench_temperatures,
     run_anneal,
     run_compress,
     run_minimise,
@@ -404,3 +405,189 @@ def test_density_and_temperature_helpers_agree_with_openmm(argon_run: Any) -> No
         expected
     )
     assert temperature_k_of(simulation) == pytest.approx(300.0, rel=0.35)
+
+
+# --------------------------------------------------------------------------
+# The ladder, its waypoints, and what a segment records
+# --------------------------------------------------------------------------
+
+
+def test_the_ladder_helper_reproduces_the_one_a_quench_runs() -> None:
+    """The cost estimate, the chunker and the stage all count from this."""
+    ladder = quench_temperatures(650.0, 150.0, 25.0)
+
+    assert len(ladder) == 21
+    assert ladder[0] == 650.0
+    assert ladder[-1] == 150.0
+    assert ladder == sorted(ladder, reverse=True)
+
+
+def test_a_ladder_that_does_not_divide_evenly_still_reaches_the_bottom() -> None:
+    """The floor is a temperature someone chose, not a rounding artefact."""
+    assert quench_temperatures(100.0, 30.0, 90.0) == [100.0, 30.0]
+
+
+def test_a_quench_can_be_given_its_temperatures_outright(argon_run: Any) -> None:
+    """A chunked pass hands each stage a slice of one ladder, not endpoints.
+
+    Deriving each chunk's endpoints from the grid is exactly the off-by-one
+    that repeats or skips a temperature at every boundary.
+    """
+    minimised = run_minimise(argon_run, "00_minimise")
+    result = run_quench(
+        argon_run,
+        "01_quench",
+        temperatures_k=[140.0, 125.0, 110.0],
+        hold_ps=0.4,
+        barostat_frequency=5,
+        state_in=minimised.final_state,
+    )
+    assert result.samples["segment_temperature_k"] == [140.0, 125.0, 110.0]
+
+
+def test_a_ladder_that_does_not_descend_is_refused(argon_run: Any) -> None:
+    """Handed a list, the guard still has to be there."""
+    with pytest.raises(ValueError, match="has to descend"):
+        run_quench(argon_run, "01_quench", temperatures_k=[100.0, 120.0])
+
+
+def test_an_empty_ladder_is_refused(argon_run: Any) -> None:
+    """There is nothing to hold, and it says what to give instead."""
+    with pytest.raises(ValueError, match="nothing to hold"):
+        run_quench(argon_run, "01_quench", temperatures_k=[])
+
+
+def test_a_stage_records_how_long_each_segment_was_held(argon_run: Any) -> None:
+    """A stage's CSV knows only its total time.
+
+    So a ladder split across stages, or resumed part-way through, would have
+    its cooling rate worked out wrong rather than reported as unknown.
+    """
+    minimised = run_minimise(argon_run, "00_minimise")
+    result = run_quench(
+        argon_run,
+        "01_quench",
+        t_start=150.0,
+        t_end=90.0,
+        step_k=30.0,
+        hold_ps=0.4,
+        barostat_frequency=5,
+        state_in=minimised.final_state,
+    )
+    assert result.samples["segment_duration_ps"] == [0.4, 0.4, 0.4]
+
+
+def test_a_quench_can_leave_a_waypoint_at_every_temperature(
+    argon_run: Any,
+) -> None:
+    """What lets a finer second pass carry on from the middle of the first."""
+    minimised = run_minimise(argon_run, "00_minimise")
+    result = run_quench(
+        argon_run,
+        "01_quench",
+        t_start=150.0,
+        t_end=90.0,
+        step_k=30.0,
+        hold_ps=0.4,
+        barostat_frequency=5,
+        waypoints=True,
+        state_in=minimised.final_state,
+    )
+    assert len(result.waypoints) == len(result.samples["segment_temperature_k"])
+    assert [Path(str(path)).name for path in result.waypoints] == [
+        "01_quench_waypoint00_150K.state.xml",
+        "01_quench_waypoint01_120K.state.xml",
+        "01_quench_waypoint02_90K.state.xml",
+    ]
+    assert all(Path(str(path)).is_file() for path in result.waypoints)
+
+
+def test_waypoints_are_off_unless_they_are_asked_for(argon_run: Any) -> None:
+    """One serialised state per temperature is megabytes for a real cell."""
+    minimised = run_minimise(argon_run, "00_minimise")
+    result = run_quench(
+        argon_run,
+        "01_quench",
+        t_start=150.0,
+        t_end=90.0,
+        step_k=30.0,
+        hold_ps=0.4,
+        barostat_frequency=5,
+        state_in=minimised.final_state,
+    )
+    assert result.waypoints == ()
+    assert list(Path().glob("*waypoint*")) == []
+
+
+def test_a_waypoint_restarts_a_stage_where_it_was_written(argon_run: Any) -> None:
+    """Written under a barostat and loaded into another one, as a scan does."""
+    import openmm as mm
+
+    minimised = run_minimise(argon_run, "00_minimise")
+    quenched = run_quench(
+        argon_run,
+        "01_quench",
+        t_start=150.0,
+        t_end=90.0,
+        step_k=30.0,
+        hold_ps=0.4,
+        barostat_frequency=5,
+        waypoints=True,
+        state_in=minimised.final_state,
+    )
+    waypoint = str(quenched.waypoints[1])
+    saved = mm.XmlSerializer.deserialize(Path(waypoint).read_text())
+
+    resumed = run_quench(
+        argon_run,
+        "02_quench",
+        temperatures_k=[120.0, 110.0],
+        hold_ps=0.4,
+        barostat_frequency=5,
+        state_in=waypoint,
+    )
+    started = mm.XmlSerializer.deserialize(Path("02_quench.state.xml").read_text())
+
+    assert resumed.samples["segment_temperature_k"] == [120.0, 110.0]
+    assert saved.getPeriodicBoxVectors() is not None
+    assert started.getPeriodicBoxVectors() is not None
+
+
+def test_the_readings_behind_a_segment_average_can_be_raised(
+    argon_run: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ten readings, halved, leaves five behind each point on a curve.
+
+    Thin for a segment whose whole purpose is a low-noise point, so a fine
+    pass asks for more.
+    """
+    import openmmpolymer.simulate as simulate
+
+    calls = 0
+    real = simulate.density_g_cm3
+
+    def counted(simulation: Any, total_mass_g_mol: float) -> float:
+        nonlocal calls
+        calls += 1
+        return float(real(simulation, total_mass_g_mol))
+
+    monkeypatch.setattr(simulate, "density_g_cm3", counted)
+    minimised = run_minimise(argon_run, "00_minimise")
+    run_nvt(
+        argon_run,
+        "01_nvt",
+        temperature_k=120.0,
+        duration_ps=1.0,
+        samples_per_segment=25,
+        state_in=minimised.final_state,
+    )
+    # The last chunk is short whenever the step count does not divide, so
+    # the loop takes one more reading than it was asked for rather than a
+    # shorter final one.
+    assert calls == pytest.approx(25, abs=1)
+
+
+def test_a_sample_count_below_one_is_refused(argon_run: Any) -> None:
+    """Zero readings is a segment that measures nothing."""
+    with pytest.raises(ValueError, match="samples_per_segment"):
+        run_nvt(argon_run, "01_nvt", duration_ps=0.2, samples_per_segment=0)

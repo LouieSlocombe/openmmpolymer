@@ -12,14 +12,25 @@ import pytest
 from openmmpolymer.reporters import CSV_COLUMNS
 from openmmpolymer.timeseries import (
     CSV_FIELDS,
+    DSC_COOLING_RATE_K_PER_NS,
+    MAX_EXTRAPOLATION_DECADES,
+    GlassTransition,
+    cooling_rate_extrapolation,
     equilibration,
     glass_transition,
     quench_curve,
+    quench_stages,
     read_state_data,
 )
 from openmmpolymer.trajectory import AnalysisError
 
-from .helpers import state_data_csv
+from .helpers import (
+    state_data_csv,
+    transition_at,
+    two_line_curve,
+    write_quench,
+    write_quenches,
+)
 
 
 def test_the_column_map_covers_every_column_a_stage_writes() -> None:
@@ -147,61 +158,6 @@ def test_too_few_rows_to_say_anything_says_so() -> None:
     """Two points fit a line exactly and say nothing about settling."""
     with pytest.raises(AnalysisError, match="too few"):
         equilibration(np.array([0.0, 1.0]), np.array([1.0, 2.0]))
-
-
-def write_quench(
-    directory: Path,
-    temperature_k: np.ndarray,
-    density_g_cm3: np.ndarray,
-    *,
-    with_csv: bool = True,
-    stage: str = "06_quench",
-) -> Path:
-    """Write a manifest holding a quench's samples, and optionally its CSV."""
-    csv = None
-    if with_csv:
-        csv = str(directory / f"{stage}.csv")
-        rows = [
-            [index * 1000, index * 42.0, -1.0, 1.0, 0.0, 300.0, 13.8, 0.9]
-            for index in range(1, 101)
-        ]
-        Path(csv).write_text(state_data_csv(rows))
-    payload = {
-        "protocol": "melt-quench",
-        "seed": 1,
-        "versions": {},
-        "system": {},
-        "stages": {
-            stage: {
-                "name": stage,
-                "csv": csv,
-                "samples": {
-                    "segment_temperature_k": list(temperature_k),
-                    "segment_density_g_cm3": list(density_g_cm3),
-                },
-            }
-        },
-        "chains": None,
-        "box": None,
-    }
-    (directory / "manifest.json").write_text(json.dumps(payload))
-    return directory
-
-
-def two_line_curve(
-    transition_k: float = 350.0,
-    n_points: int = 21,
-    glass_slope: float = 2.0e-4,
-    melt_slope: float = 8.0e-4,
-) -> tuple[np.ndarray, np.ndarray]:
-    """A specific-volume curve made of two exact straight lines."""
-    temperature = np.linspace(200.0, 600.0, n_points)
-    volume = np.where(
-        temperature <= transition_k,
-        1.0 + glass_slope * (temperature - transition_k),
-        1.0 + melt_slope * (temperature - transition_k),
-    )
-    return temperature, 1.0 / volume
 
 
 def test_a_quench_curve_comes_back_ordered_by_temperature(tmp_path: Path) -> None:
@@ -452,3 +408,403 @@ def test_a_single_temperature_has_no_cooling_rate() -> None:
 
     assert _cooling_rate(np.array([300.0]), 200.0) is None
     assert _cooling_rate(np.array([300.0, 280.0]), 0.0) is None
+
+
+# --------------------------------------------------------------------------
+# Thermal expansivity
+# --------------------------------------------------------------------------
+
+
+def test_the_expansivities_are_the_slopes_over_the_crossing_volume(
+    tmp_path: Path,
+) -> None:
+    """The slopes are cm3/g/K and depend on the density; aV is per kelvin.
+
+    The knot sits on a grid point, so the fit is exact and the crossing volume
+    is exactly the 1.0 the curve was built around - which makes the two
+    coefficients exactly the two slopes.
+    """
+    temperature, density = two_line_curve(transition_k=340.0)
+    write_quench(tmp_path, temperature, density)
+    fit = glass_transition(quench_curve(tmp_path))
+
+    assert fit.specific_volume_cm3_g == pytest.approx(1.0)
+    assert fit.melt_expansivity_per_k == pytest.approx(8.0e-4)
+    assert fit.glass_expansivity_per_k == pytest.approx(2.0e-4)
+
+
+def test_a_resolved_transition_always_expands_faster_as_a_melt(
+    tmp_path: Path,
+) -> None:
+    """Which is why it is reported rather than checked a second time.
+
+    Both coefficients divide the same crossing volume, so their ordering is
+    the ordering of the slopes, and that is already what resolved requires.
+    """
+    temperature, density = two_line_curve(transition_k=340.0)
+    write_quench(tmp_path, temperature, density)
+    fit = glass_transition(quench_curve(tmp_path))
+
+    assert fit.resolved
+    assert fit.melt_expansivity_per_k > fit.glass_expansivity_per_k
+
+
+def test_an_expansivity_with_no_volume_to_divide_by_is_not_a_number() -> None:
+    """Not zero, which would read as a material that does not expand."""
+    fit = transition_at(10.0, 350.0, specific_volume_cm3_g=0.0)
+
+    assert math.isnan(fit.melt_expansivity_per_k)
+    assert math.isnan(fit.glass_expansivity_per_k)
+
+
+# --------------------------------------------------------------------------
+# Finding and pooling quenches
+# --------------------------------------------------------------------------
+
+
+def test_quench_stages_finds_the_ladders_and_skips_everything_else(
+    tmp_path: Path,
+) -> None:
+    """Every stage records a temperature per segment; only a quench descends."""
+    temperature, density = two_line_curve(n_points=21)
+    write_quenches(
+        tmp_path,
+        {
+            "03_compress": {
+                "temperature_k": [600.0] * 7,
+                "density_g_cm3": [0.9] * 7,
+            },
+            "04_anneal": {
+                "temperature_k": [300.0, 600.0, 300.0, 600.0],
+                "density_g_cm3": [1.0, 0.9, 1.0, 0.9],
+            },
+            "05_npt": {"temperature_k": [450.0], "density_g_cm3": [0.95]},
+            "06_quench": {
+                "temperature_k": list(temperature[::-1]),
+                "density_g_cm3": list(density[::-1]),
+            },
+        },
+    )
+    assert quench_stages(tmp_path) == ("06_quench",)
+
+
+def test_a_run_with_no_quench_in_it_says_which_stages_there_are(
+    tmp_path: Path,
+) -> None:
+    """Naming what is there is the difference between a hint and a dead end."""
+    write_quenches(
+        tmp_path,
+        {"05_npt": {"temperature_k": [450.0], "density_g_cm3": [0.95]}},
+    )
+    with pytest.raises(AnalysisError, match="05_npt"):
+        quench_stages(tmp_path)
+
+
+def test_a_curve_can_be_assembled_from_several_stages(tmp_path: Path) -> None:
+    """A long ladder is split into stages for resume; the curve is still one."""
+    temperature, density = two_line_curve(transition_k=340.0)
+    descending_t, descending_d = list(temperature[::-1]), list(density[::-1])
+    write_quenches(
+        tmp_path,
+        {
+            "06_quench_00": {
+                "temperature_k": descending_t[:11],
+                "density_g_cm3": descending_d[:11],
+                "segment_duration_ps": [200.0] * 11,
+            },
+            "06_quench_01": {
+                "temperature_k": descending_t[11:],
+                "density_g_cm3": descending_d[11:],
+                "segment_duration_ps": [200.0] * 10,
+            },
+        },
+    )
+    curve = quench_curve(tmp_path, ("06_quench_00", "06_quench_01"))
+
+    assert curve.n_points == 21
+    assert curve.temperature_k[0] < curve.temperature_k[-1]
+    assert curve.hold_ps == pytest.approx(200.0)
+    assert glass_transition(curve).temperature_k == pytest.approx(340.0)
+
+
+def test_a_recorded_hold_is_preferred_to_dividing_the_csv(tmp_path: Path) -> None:
+    """The CSV division assumes one uniform hold over one whole stage.
+
+    A ladder split across stages, or resumed part-way through, breaks that
+    assumption quietly - the rate comes out wrong rather than unknown - so a
+    stage that recorded its own durations is believed instead.
+    """
+    temperature, density = two_line_curve()
+    write_quench(
+        tmp_path,
+        temperature,
+        density,
+        total_ps=4200.0,
+        segment_duration_ps=[500.0] * 21,
+    )
+    curve = quench_curve(tmp_path)
+
+    assert curve.hold_ps == pytest.approx(500.0)
+    assert curve.cooling_rate_k_per_ns == pytest.approx(40.0)
+
+
+def test_a_multi_stage_curve_without_recorded_holds_has_no_rate(
+    tmp_path: Path,
+) -> None:
+    """Across two stages the CSV division is a different wrong number each."""
+    temperature, density = two_line_curve()
+    write_quenches(
+        tmp_path,
+        {
+            "a": {
+                "temperature_k": list(temperature[:11][::-1]),
+                "density_g_cm3": list(density[:11][::-1]),
+            },
+            "b": {
+                "temperature_k": list(temperature[11:][::-1]),
+                "density_g_cm3": list(density[11:][::-1]),
+            },
+        },
+    )
+    assert quench_curve(tmp_path, ("a", "b")).cooling_rate_k_per_ns is None
+
+
+def test_a_stage_that_held_one_temperature_has_no_cooling_rate(
+    tmp_path: Path,
+) -> None:
+    """Zero would read as cooling infinitely slowly, the opposite of the truth."""
+    write_quench(tmp_path, [450.0], [0.95], segment_duration_ps=[200.0])
+    assert quench_curve(tmp_path).cooling_rate_k_per_ns is None
+
+
+def test_an_empty_state_data_file_is_refused_rather_than_crashing(
+    tmp_path: Path,
+) -> None:
+    """A stage killed before its first report leaves the file and nothing in it."""
+    empty = tmp_path / "05_npt.csv"
+    empty.write_text("")
+    with pytest.raises(AnalysisError, match="empty"):
+        read_state_data(empty)
+
+
+# --------------------------------------------------------------------------
+# Cooling-rate extrapolation
+# --------------------------------------------------------------------------
+
+
+def log_linear_rates(tmp_path: Path) -> tuple[GlassTransition, ...]:
+    """Three quenches whose transitions sit exactly on a line in log rate.
+
+    Knots on grid points, so each fit is exact; total_ps chosen so the
+    recovered rates are 1, 10 and 100 K/ns. That makes Tg = 340 + 20 log10(R),
+    and every number the fit reports is a round one.
+    """
+    stages = {}
+    for transition_k, total_ps in (
+        (340.0, 420000.0),
+        (360.0, 42000.0),
+        (380.0, 4200.0),
+    ):
+        temperature, density = two_line_curve(transition_k=transition_k)
+        stages[f"q{transition_k:.0f}"] = {
+            "temperature_k": list(temperature[::-1]),
+            "density_g_cm3": list(density[::-1]),
+            "total_ps": total_ps,
+        }
+    write_quenches(tmp_path, stages)
+    return tuple(
+        glass_transition(quench_curve(tmp_path, name)) for name in sorted(stages)
+    )
+
+
+def test_a_quench_ladder_recovers_the_rate_it_was_built_to_have(
+    tmp_path: Path,
+) -> None:
+    """The fixture's whole job, pinned so the fit tests rest on something."""
+    fits = log_linear_rates(tmp_path)
+    assert [fit.cooling_rate_k_per_ns for fit in fits] == [
+        pytest.approx(1.0),
+        pytest.approx(10.0),
+        pytest.approx(100.0),
+    ]
+    assert [fit.temperature_k for fit in fits] == [
+        pytest.approx(340.0),
+        pytest.approx(360.0),
+        pytest.approx(380.0),
+    ]
+
+
+def test_the_transition_extrapolates_exactly_along_a_line_in_log_rate(
+    tmp_path: Path,
+) -> None:
+    """Two decades below the data, 340 + 20 * (-2) and nothing else."""
+    fit = cooling_rate_extrapolation(
+        log_linear_rates(tmp_path), target_rate_k_per_ns=0.01
+    )
+
+    assert fit.temperature_k == pytest.approx(300.0)
+    assert fit.sensitivity_k_per_decade == pytest.approx(20.0)
+    assert fit.extrapolation_decades == pytest.approx(2.0)
+    assert fit.residual_k == pytest.approx(0.0, abs=1.0e-9)
+    assert fit.resolved
+
+
+def test_a_target_between_the_measured_rates_is_not_an_extrapolation(
+    tmp_path: Path,
+) -> None:
+    """Zero decades, and the only case where resolved means much."""
+    fit = cooling_rate_extrapolation(
+        log_linear_rates(tmp_path), target_rate_k_per_ns=30.0
+    )
+
+    assert fit.extrapolation_decades == 0.0
+    assert fit.resolved
+
+
+def test_an_extrapolation_to_an_experimental_rate_is_never_resolved(
+    tmp_path: Path,
+) -> None:
+    """Ten decades. The number is still reported; the claim is not made."""
+    fit = cooling_rate_extrapolation(log_linear_rates(tmp_path))
+
+    assert fit.target_rate_k_per_ns == pytest.approx(DSC_COOLING_RATE_K_PER_NS)
+    assert fit.extrapolation_decades > MAX_EXTRAPOLATION_DECADES
+    assert math.isfinite(fit.temperature_k)
+    assert not fit.resolved
+
+
+def test_a_vft_fit_recovers_the_parameters_it_was_built_from() -> None:
+    """Three rates exactly determine it, and the search has to find them."""
+    t0, b_k, r0 = 300.0, 400.0, 1.0e4
+    rates = (2.0, 5.0, 10.0)
+    fits = [transition_at(r, t0 + b_k / math.log(r0 / r)) for r in rates]
+
+    fit = cooling_rate_extrapolation(fits, form="vft")
+
+    assert fit.parameters["t0_k"] == pytest.approx(t0, rel=1.0e-4)
+    assert fit.parameters["b_k"] == pytest.approx(b_k, rel=1.0e-4)
+    assert math.exp(fit.parameters["ln_r0"]) == pytest.approx(r0, rel=1.0e-3)
+    expected = t0 + b_k / math.log(r0 / DSC_COOLING_RATE_K_PER_NS)
+    assert fit.temperature_k == pytest.approx(expected, rel=1.0e-4)
+
+
+def test_the_two_forms_disagree_by_a_hundred_kelvin_over_ten_decades() -> None:
+    """Which is the whole argument for offering both.
+
+    A quench overestimates an experimental transition by 20 to 50 K, so on
+    this melt the honest answer is near 313 K. The straight line in log rate
+    runs away to 190 K; VFT, which has a finite limit, does not.
+    """
+    t0, b_k, r0 = 300.0, 400.0, 1.0e4
+    fits = [transition_at(r, t0 + b_k / math.log(r0 / r)) for r in (2.0, 5.0, 10.0)]
+
+    straight = cooling_rate_extrapolation(fits, form="log_linear")
+    curved = cooling_rate_extrapolation(fits, form="vft")
+
+    assert straight.temperature_k == pytest.approx(190.0, abs=2.0)
+    assert curved.temperature_k == pytest.approx(313.0, abs=2.0)
+    assert curved.temperature_k - straight.temperature_k > 100.0
+
+
+def test_the_wlf_constants_are_the_vft_ones_rewritten() -> None:
+    """WLF and VFT are one relation, so one fit answers for both."""
+    t0, b_k, r0 = 300.0, 400.0, 1.0e4
+    fits = [transition_at(r, t0 + b_k / math.log(r0 / r)) for r in (2.0, 5.0, 10.0)]
+    fit = cooling_rate_extrapolation(fits, form="vft")
+
+    reference = 350.0
+    c1, c2 = fit.wlf_constants(reference)
+
+    assert c2 == pytest.approx(reference - t0, rel=1.0e-3)
+    assert c1 == pytest.approx(b_k / (math.log(10.0) * c2), rel=1.0e-3)
+
+
+def test_wlf_constants_need_a_reference_above_the_fitted_floor() -> None:
+    """Below T0 they diverge, and a divergent constant is not a constant."""
+    t0, b_k, r0 = 300.0, 400.0, 1.0e4
+    fits = [transition_at(r, t0 + b_k / math.log(r0 / r)) for r in (2.0, 5.0, 10.0)]
+    fit = cooling_rate_extrapolation(fits, form="vft")
+
+    with pytest.raises(AnalysisError, match="diverge"):
+        fit.wlf_constants(250.0)
+
+
+def test_wlf_constants_come_only_from_a_vft_fit() -> None:
+    """A straight line in log rate has no T0 to reference them to."""
+    fits = [transition_at(r, 340.0 + 20.0 * math.log10(r)) for r in (1.0, 10.0, 100.0)]
+    fit = cooling_rate_extrapolation(fits, form="log_linear")
+
+    with pytest.raises(AnalysisError, match="VFT"):
+        fit.wlf_constants(350.0)
+
+
+def test_a_vft_search_that_degenerates_to_a_straight_line_says_so() -> None:
+    """Exactly log-linear data sends R0 to infinity; that is not a fit."""
+    fits = [transition_at(r, 340.0 + 20.0 * math.log10(r)) for r in (1.0, 10.0, 100.0)]
+
+    assert not cooling_rate_extrapolation(fits, form="vft").resolved
+
+
+def test_a_transition_that_rises_as_cooling_slows_is_not_resolved() -> None:
+    """Cooling more slowly gives the melt longer to keep up, never less."""
+    fits = [transition_at(r, 400.0 - 20.0 * math.log10(r)) for r in (1.0, 10.0, 100.0)]
+
+    assert not cooling_rate_extrapolation(fits).resolved
+
+
+def test_a_fit_over_transitions_that_did_not_resolve_does_not_resolve() -> None:
+    """Fitting a line through three corners found in noise finds a fourth."""
+    fits = [
+        transition_at(r, 340.0 + 20.0 * math.log10(r), resolved=r != 10.0)
+        for r in (1.0, 10.0, 100.0)
+    ]
+
+    assert not cooling_rate_extrapolation(fits, target_rate_k_per_ns=30.0).resolved
+
+
+def test_exactly_as_many_rates_as_parameters_does_not_resolve() -> None:
+    """The residual is then zero by construction and says nothing."""
+    fits = [transition_at(r, 340.0 + 20.0 * math.log10(r)) for r in (1.0, 100.0)]
+    fit = cooling_rate_extrapolation(fits, target_rate_k_per_ns=30.0)
+
+    assert fit.n_rates == fit.n_parameters
+    assert fit.residual_k == pytest.approx(0.0, abs=1.0e-9)
+    assert not fit.resolved
+
+
+def test_vft_needs_more_rates_than_it_has_parameters() -> None:
+    """Two points cannot determine three numbers, and it says which."""
+    fits = [transition_at(r, 340.0 + 20.0 * math.log10(r)) for r in (1.0, 100.0)]
+
+    with pytest.raises(AnalysisError, match="3 parameters"):
+        cooling_rate_extrapolation(fits, form="vft")
+
+
+def test_one_rate_cannot_show_a_rate_dependence() -> None:
+    """It takes two measurements to see something move."""
+    with pytest.raises(AnalysisError, match="rate dependence"):
+        cooling_rate_extrapolation([transition_at(10.0, 350.0)])
+
+
+def test_two_quenches_at_the_same_rate_are_refused() -> None:
+    """A degenerate design matrix, and nothing to learn from it either."""
+    fits = [transition_at(10.0, 350.0), transition_at(10.0, 352.0)]
+
+    with pytest.raises(AnalysisError, match="same cooling rate"):
+        cooling_rate_extrapolation(fits)
+
+
+def test_a_transition_with_no_recorded_rate_is_refused() -> None:
+    """There is nothing to plot it against, and it says which one."""
+    fits = [transition_at(10.0, 350.0), transition_at(None, 340.0)]
+
+    with pytest.raises(AnalysisError, match="index 1"):
+        cooling_rate_extrapolation(fits)
+
+
+def test_an_unknown_extrapolation_form_is_refused_at_the_call_site() -> None:
+    """An argument, so a ValueError, like every other choice in the package."""
+    fits = [transition_at(r, 340.0 + 20.0 * math.log10(r)) for r in (1.0, 10.0)]
+
+    with pytest.raises(ValueError, match="form="):
+        cooling_rate_extrapolation(fits, form="arrhenius")
