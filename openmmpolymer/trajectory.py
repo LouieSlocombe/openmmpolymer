@@ -14,6 +14,13 @@ single frame - and every stage writes ``<stem>.pdb``, unwrapped, with the box in
 its ``CRYST1`` record. A one-frame :class:`Ensemble` off that snapshot is the
 fallback, not an error.
 
+Only the binary formats are read back. A stage asked for ``pdb`` writes a real
+multi-frame trajectory to ``<stem>_trajectory.pdb``, and it is deliberately not
+read here: the format records no time at all, so every lag in a displacement or
+a relaxation would be a fabrication. It is a format for looking at a run in a
+viewer; ``xtc`` is the one for measuring it. A stage that wrote one is pointed
+at ``xtc`` rather than quietly analysed as a single frame.
+
 MDAnalysis supplies coordinates and box vectors; everything else comes from
 OpenMM. The molecule partition, the atom count, the masses and the elements are
 read from the topology PDB through :func:`~openmmpolymer.packing.read_pdb`, the
@@ -53,9 +60,9 @@ from .protocols import RunManifest
 
 log = logging.getLogger(__name__)
 
-#: Trajectory extensions this package can read back, in the order they are
-#: looked for. ``pdb`` is deliberately absent: a stage's final snapshot is
-#: written to ``<stem>.pdb`` too, so that path is not reliably a trajectory.
+#: Trajectory extensions this package reads back, in the order they are looked
+#: for. ``pdb`` is deliberately absent: it carries no frame times, so nothing
+#: here could put a lag on an axis. See this module's docstring.
 READABLE_FORMATS = ("xtc", "dcd")
 
 #: Ångström per nanometre. MDAnalysis reports both coordinates and box lengths
@@ -374,6 +381,15 @@ def _coordinate_paths(prefix: Path) -> tuple[str | None, str | None]:
                 f"no topology of its own, so {topology.name} is needed to read "
                 "it."
             )
+    written_as_pdb = prefix.with_name(f"{prefix.name}_trajectory.pdb")
+    if written_as_pdb.is_file():
+        log.info(
+            "%s holds this stage's frames, but a PDB trajectory records no "
+            "frame times, so it is being read as the closing snapshot only. "
+            "Run the stage with trajectory='xtc' to measure anything "
+            "time-dependent.",
+            written_as_pdb.name,
+        )
     snapshot = prefix.with_suffix(".pdb")
     return None, str(snapshot) if snapshot.is_file() else None
 

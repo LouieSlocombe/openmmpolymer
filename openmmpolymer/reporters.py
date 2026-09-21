@@ -26,7 +26,9 @@ from typing import Any, NamedTuple
 log = logging.getLogger(__name__)
 
 #: Trajectory formats. ``xtc`` is the default: it is compressed, and a melt run
-#: long enough to be interesting writes tens of gigabytes as DCD.
+#: long enough to be interesting writes tens of gigabytes as DCD. ``pdb`` is
+#: written to ``<stem>_trajectory.pdb`` rather than ``<stem>.pdb``, which is
+#: the stage's closing structure - see :func:`_path_for`.
 TRAJECTORY_FORMATS = ("xtc", "dcd", "pdb", "none")
 
 #: The numeric CSV's columns, in order. Every one is a number, so
@@ -68,8 +70,10 @@ class ReporterPaths:
     Args:
         csv: The numeric state data.
         log: The human-readable progress log.
-        trajectory: The trajectory, if one was written.
-        topology: The topology written beside a binary trajectory.
+        trajectory: The trajectory, if one was written. Never the same file as
+            the stage's closing structure, even in PDB format.
+        topology: The topology written beside a binary trajectory. None for a
+            PDB trajectory, which carries its own.
         state: The portable restart state.
     """
 
@@ -175,6 +179,31 @@ def rotate_existing(path: str | Path) -> str | None:
         attempt += 1
 
 
+def _path_for(output_prefix: str | Path, trajectory_format: str) -> Path:
+    """Where a stage's trajectory goes, for *trajectory_format*.
+
+    Every format but one is ``<stem>.<format>``. A PDB trajectory is written to
+    ``<stem>_trajectory.pdb`` instead, because ``<stem>.pdb`` is already taken:
+    :func:`openmmpolymer.simulate.run_segments` writes the stage's closing
+    structure there at the end of every stage. Sharing the path meant two
+    writers holding one file open and the snapshot overwriting every frame, so
+    asking for ``pdb`` produced a file that was neither a trajectory nor
+    reliably a snapshot. The suffixed name follows ``<stem>_topology.pdb``,
+    which is already written beside a binary trajectory.
+
+    Args:
+        output_prefix: Stem for every file a stage writes.
+        trajectory_format: One of :data:`TRAJECTORY_FORMATS`.
+
+    Returns:
+        The path to write the trajectory to.
+    """
+    prefix = Path(output_prefix)
+    if trajectory_format == "pdb":
+        return prefix.with_name(f"{prefix.name}_trajectory.pdb")
+    return prefix.with_suffix(f".{trajectory_format}")
+
+
 def _trajectory_reporter(path: Path, interval: int, options: TrajectoryOptions) -> Any:
     """Build the trajectory reporter for *options*."""
     from openmm import app
@@ -276,7 +305,7 @@ def reporting(
         )
 
         if options.format != "none":
-            trajectory_path = prefix.with_suffix(f".{options.format}")
+            trajectory_path = _path_for(prefix, options.format)
             rotate_existing(trajectory_path)
             if options.format in {"xtc", "dcd"}:
                 # Neither format carries a topology, and this is written now

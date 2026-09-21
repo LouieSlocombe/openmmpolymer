@@ -487,3 +487,43 @@ def test_a_manifest_recording_nonsense_for_its_cell_is_treated_as_silent() -> No
     assert _recorded_int({"atoms_per_chain": True}, "atoms_per_chain") is None
     assert _recorded_int({"atoms_per_chain": "12"}, "atoms_per_chain") is None
     assert _recorded_int({"atoms_per_chain": 12}, "atoms_per_chain") == 12
+
+
+def test_a_pdb_trajectory_is_not_mistaken_for_the_closing_snapshot(
+    dimer_argon_run: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A PDB trajectory records no frame times, so it is read as the closing
+    snapshot rather than analysed with fabricated lags - and the run is told
+    which format to use if it wanted the frames measured."""
+    import logging
+
+    from openmmpolymer.reporters import TrajectoryOptions
+    from openmmpolymer.simulate import run_nvt
+
+    result = run_nvt(
+        dimer_argon_run,
+        "02_nvt",
+        temperature_k=120.0,
+        duration_ps=2.0,
+        friction_ps=20.0,
+        trajectory=TrajectoryOptions("pdb", interval_ps=0.5),
+    )
+    for name in ("02_nvt.pdb", "02_nvt_trajectory.pdb"):
+        (tmp_path / name).write_bytes(Path(name).read_bytes())
+    write_manifest(
+        tmp_path,
+        {"02_nvt": {"final_pdb": str(tmp_path / "02_nvt.pdb")}},
+        box={"n_molecules": 32, "atoms_per_chain": 2},
+    )
+    assert result.final_pdb == "02_nvt.pdb"
+
+    with caplog.at_level(logging.INFO, logger="openmmpolymer.trajectory"):
+        found = stage_files(tmp_path, "02_nvt")
+    assert found.trajectory is None
+    assert found.topology is not None
+    assert found.topology.endswith("02_nvt.pdb")
+    assert "trajectory='xtc'" in caplog.text
+
+    ensemble = open_run(tmp_path, "02_nvt")
+    assert ensemble.is_snapshot
+    assert ensemble.n_frames == 1
