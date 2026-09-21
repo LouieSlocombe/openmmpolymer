@@ -829,15 +829,21 @@ def run_modulus_scan(
 
 
 def _last_state(summary: RunSummary, directory: Path) -> str:
-    """The state the equilibration finished at, whether it ran or resumed."""
-    if summary.results:
-        return summary.results[-1].final_state
-    manifest = RunManifest.load(directory)
-    if manifest is not None:
-        for name in reversed(list(manifest.stages)):
-            state = manifest.stages[name].get("final_state")
-            if state and Path(state).is_file():
-                return str(state)
+    """The state the equilibration finished at, whether it ran or resumed.
+
+    Taken from the summary, which threads the state through skipped stages as
+    well as run ones, and not by scanning the manifest for the last thing with
+    a state file. The manifest is in run order, so on a resume the last entry
+    is whatever the previous attempt got furthest through - a deformation, a
+    load or a shear - and every pass branches from the *equilibrated* cell,
+    not from one that has already been pulled. Worse than the wrong starting
+    configuration: ``run_modulus_scan`` reads the strain origin off this
+    state, so the strain every remaining chunk reports would be measured
+    against a cell that was already at five per cent.
+    """
+    state = summary.final_state
+    if state and state != "None" and Path(state).is_file():
+        return str(state)
     raise MechanicalError(
         f"{directory} has no finished equilibration stage to deform from. "
         "Run the equilibration first, or delete the manifest and start over."

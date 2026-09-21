@@ -326,6 +326,39 @@ def test_every_pass_starts_from_the_same_equilibrated_cell(
     assert len(record["reference_box_nm"]) == 3
 
 
+def test_a_resumed_scan_still_starts_from_the_equilibrated_cell(
+    argon_scan_run: Any,
+) -> None:
+    """The case the test above cannot see, and the one that matters.
+
+    On a fresh run the equilibration's stages are the only ones that have
+    run, so anything that looks for "the last state" finds the right one. On a
+    resume they are all skipped and the manifest - which is in run order -
+    already holds every deformation after them, so looking backwards through
+    it lands on the end of a strained pass instead. Both halves of the scan
+    then go wrong: passes that had not finished would branch from a cell that
+    was already at the top of the ladder, and the strain origin read off that
+    state is a stretched cell, so every strain still to be recorded would be
+    measured against the wrong length.
+
+    Asserted on the box rather than only on the file name, because the cubic
+    shape is what says it is the equilibrated cell and not a deformed one -
+    a shear pass leaves the volume alone and would pass a name-only check by
+    luck.
+    """
+    spec = replace(QUICK, load_stresses_bar=None, bulk_pressures_bar=None)
+    run_modulus_scan(argon_scan_run, "run", spec=spec, **QUICK_EQUILIBRATION)
+    fresh = json.loads((Path("run") / WORKFLOW_NAME).read_text())
+
+    run_modulus_scan(argon_scan_run, "run", spec=spec, **QUICK_EQUILIBRATION)
+    resumed = json.loads((Path("run") / WORKFLOW_NAME).read_text())
+
+    assert Path(resumed["start_state"]).name.startswith("05_npt")
+    assert resumed["reference_box_nm"] == pytest.approx(fresh["reference_box_nm"])
+    origin = resumed["reference_box_nm"]
+    assert origin == pytest.approx([origin[0]] * 3)
+
+
 def test_a_resume_that_asks_for_something_else_is_refused(
     argon_scan_run: Any,
 ) -> None:
