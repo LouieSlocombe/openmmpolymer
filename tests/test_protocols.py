@@ -270,3 +270,39 @@ def test_chain_dimensions_are_recorded_in_the_manifest(
     assert summary.chains is not None
     manifest = json.loads(Path(summary.manifest_path).read_text())
     assert manifest["chains"]["expected_characteristic_ratio"] == 7.0
+
+
+def test_the_manifest_records_what_was_in_the_cell(argon_run: Any) -> None:
+    """SystemSpec records the settings a run was given but not the thing it was
+    given them for, so analysis of a finished run had to infer the block
+    structure every measurement indexes by."""
+    summary = run_protocol(QUICK, argon_run, "run")
+    manifest = RunManifest.load(Path(summary.run_dir))
+    assert manifest is not None
+    assert manifest.box == {
+        "n_molecules": 64,
+        "atoms_per_chain": 1,
+        "box_nm": [2.4, 2.4, 2.4],
+    }
+
+
+def test_a_manifest_written_before_the_cell_was_recorded_still_loads(
+    tmp_path: Path,
+) -> None:
+    """RunManifest.load passes every key through as a keyword argument, so a
+    new field has to be optional or every run already on disk stops resuming."""
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "protocol": "old",
+                "seed": 1,
+                "versions": {},
+                "system": {},
+                "stages": {},
+                "chains": None,
+            }
+        )
+    )
+    manifest = RunManifest.load(tmp_path)
+    assert manifest is not None
+    assert manifest.box is None

@@ -39,6 +39,12 @@ dependencies = [
   "rdkit",
   "forcefill>=1.0",
   "openff-toolkit>=0.16",
+  # The analysis layer. MDAnalysis reads the trajectories this package writes -
+  # openmm.app's XTCFile and DCDFile are write-only - and matplotlib draws them.
+  # The floor is 2.10 because only build 1 of 2.10.0 has a py314 conda-forge
+  # build, and CI runs 3.14.
+  "MDAnalysis>=2.10",
+  "matplotlib>=3.8",
 ]
 
 [project.scripts]
@@ -136,12 +142,23 @@ show_error_codes = true
 strict = true
 warn_unreachable = true
 
-# None of these ship type information. `openmm.*` does not match the top-level
-# module `openmm`, so both are listed. rdkit ships rdkit-stubs and forcefill
-# ships py.typed, so neither belongs here - and `strict` implies
-# warn_unused_configs, so an override that matches nothing fails the type check.
+# None of these ship type information. A wildcard does not match the top-level
+# module it names, so `openmm` and `MDAnalysis` are each listed twice. rdkit
+# ships rdkit-stubs, and forcefill and matplotlib ship py.typed, so none of
+# those belongs here: an override that matches nothing is dead config. It does
+# not fail the type check - `strict` does not imply warn_unused_configs, and an
+# unused-section note exits zero - so nothing will tell you it is dead. That is
+# the reason to keep this list honest by hand.
 [[tool.mypy.overrides]]
-module = ["openmm", "openmm.*", "openff.*", "parmed.*", "openmmforcefields.*"]
+module = [
+  "openmm",
+  "openmm.*",
+  "openff.*",
+  "parmed.*",
+  "openmmforcefields.*",
+  "MDAnalysis",
+  "MDAnalysis.*",
+]
 ignore_missing_imports = true
 
 # forcefill ships py.typed, but how it resolves depends on how it was

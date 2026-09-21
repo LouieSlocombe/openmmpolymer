@@ -91,6 +91,70 @@ def argon_run(argon_box: tuple[PackedBox, Any]) -> Any:
 
 
 @pytest.fixture
+def dimer_trajectory(dimer_argon_run: Any) -> Any:
+    """A real ten-frame XTC and its topology, written by a real stage.
+
+    The analysis layer's job is reading what this package writes, so the
+    fixture is this package writing it rather than a hand-made file. Sixty-four
+    argon atoms on the CPU platform run at some thousands of steps a second, so
+    a two-picosecond stage costs a quarter of a second.
+
+    ``interval_ps`` is set explicitly: left alone, frames land at ten times the
+    state-data interval, and the ten-picosecond default would put the first one
+    after the stage had ended.
+    """
+    from openmmpolymer.reporters import TrajectoryOptions
+    from openmmpolymer.simulate import run_minimise, run_nvt
+
+    minimised = run_minimise(dimer_argon_run, "00_minimise")
+    return run_nvt(
+        dimer_argon_run,
+        "02_nvt",
+        temperature_k=120.0,
+        duration_ps=2.0,
+        friction_ps=20.0,
+        trajectory=TrajectoryOptions("xtc", interval_ps=0.2),
+        state_in=minimised.final_state,
+    )
+
+
+@pytest.fixture
+def dimer_run_directory(dimer_trajectory: Any, tmp_path: Path) -> Path:
+    """A run directory with a manifest, as ``run_protocol`` would leave one.
+
+    Written here rather than by running a protocol because what the analysis
+    needs is the manifest's shape, and a protocol run would cost every stage to
+    get it.
+    """
+    import json
+
+    manifest = {
+        "protocol": "fixture",
+        "seed": 11,
+        "versions": {},
+        "system": {},
+        "stages": {
+            "02_nvt": {
+                "name": "02_nvt",
+                "steps": dimer_trajectory.steps,
+                "final_state": dimer_trajectory.final_state,
+                "final_pdb": dimer_trajectory.final_pdb,
+                "csv": dimer_trajectory.csv,
+                "samples": {},
+            }
+        },
+        "chains": None,
+        "box": {
+            "n_molecules": 32,
+            "atoms_per_chain": 2,
+            "box_nm": [2.4, 2.4, 2.4],
+        },
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    return tmp_path
+
+
+@pytest.fixture
 def fake_packmol(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """Put a stub packmol on PATH that copies a prepared answer into place.
 

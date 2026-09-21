@@ -72,7 +72,15 @@ def test_the_hard_dependencies_are_declared(project: dict[str, object]) -> None:
         entry.split(">")[0].split("=")[0].strip()
         for entry in project["project"]["dependencies"]  # type: ignore[index]
     }
-    assert {"numpy", "openmm", "rdkit", "forcefill", "openff-toolkit"} <= declared
+    assert {
+        "numpy",
+        "openmm",
+        "rdkit",
+        "forcefill",
+        "openff-toolkit",
+        "MDAnalysis",
+        "matplotlib",
+    } <= declared
 
 
 def test_no_dependency_is_a_direct_url(project: dict[str, object]) -> None:
@@ -115,9 +123,13 @@ def test_the_package_ships_its_typing_marker() -> None:
 def test_the_conda_environment_covers_the_hard_dependencies() -> None:
     """conda-forge is the only install route that resolves, so it must be right."""
     text = (PYPROJECT.parent / "build_tools" / "environment.yml").read_text()
-    for package in ("openmm", "rdkit", "ambertools", "openff-toolkit"):
+    for package in ("openmm", "rdkit", "ambertools", "openff-toolkit", "mdanalysis"):
         assert f"- {package}" in text
     assert "forcefill" in text
+    # Spelled out rather than left to `- matplotlib` matching it by substring,
+    # because which of the two is asked for is the point: the plotting helpers
+    # never touch pyplot, so the GUI toolkit would be dead weight.
+    assert "- matplotlib-base" in text
     # packmol comes from ambertools; asking for it separately makes the
     # environment unsolvable, because conda-forge's builds of it pin numpy < 2.
     assert "\n  - packmol" not in text

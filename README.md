@@ -25,6 +25,11 @@ python -m pip install -e . --no-deps
 
 Python 3.12 or newer.
 
+The analysis layer reads trajectories with MDAnalysis and draws them with
+matplotlib, both of which the environment file installs. The plotting helpers
+build a `matplotlib.figure.Figure` directly and never touch `pyplot`, so they
+need no display and no backend.
+
 ## A polyethylene melt
 
 ```python
@@ -93,6 +98,11 @@ Run it again and it picks up from the last stage that finished.
 | System | `mdsystem` | Replicated topology, packmol's coordinates, `createSystem` |
 | Stages | `simulate` | minimise, push-off, NVT, compress, NPT, anneal, quench, production |
 | Protocol | `protocols` | Named stage sequences, the manifest, and resume |
+| Trajectory | `trajectory` | A finished run directory → frames, per chain, in nanometres |
+| Time series | `timeseries` | State-data CSVs, equilibration detection, the quench curve |
+| Conformation | `conformation` | `⟨R²⟩`, `Rg`, persistence length, end-to-end relaxation, COM displacement |
+| Correlations | `correlations` | Intermolecular `g(r)` and the static structure factor |
+| Plots | `plots` | A figure per result, returned rather than written |
 
 ## The constraint everything follows from
 
@@ -138,11 +148,24 @@ of gyration and the measured characteristic ratio against the expected one, so
 you can see whether the chains have relaxed at their own scale. It does not
 assert that they have.
 
+What can settle the question is a trajectory. `end_to_end_relaxation` measures
+how fast the end-to-end vector decorrelates and reports `decorrelated` — False,
+for every protocol shipped here, because none of them runs for a Rouse time.
+`equilibration` does the same for any single series, and says how many
+genuinely independent samples sit behind a mean rather than how many rows do.
+`centre_of_mass_msd` refuses to divide by six until the log-log slope says the
+chains are diffusing, because a melt short of its entanglement time is
+sub-diffusive and a coefficient fitted to that is not a diffusion coefficient.
+
 **A quench is not a Tg measurement.** `melt_quench` records a density at every
 temperature on the way down, which is the specific-volume curve a glass
 transition is read off. Every all-atom cooling rate is many orders of magnitude
 faster than any experiment, so the transition sits well above the measured one.
-The shape is informative; the number is not directly comparable.
+The shape is informative; the number is not directly comparable. `quench_curve`
+reads that curve back and `glass_transition` fits the two straight lines it is
+read off, reporting the cooling rate alongside the temperature so the caveat
+travels with the number, and `resolved` False when the fit found a corner in
+noise — which is what fitting two lines to a straight one always finds.
 
 **Cell size is checked against the compressed density, not the packed one.**
 OpenMM refuses a cutoff over half the box — and refuses it again mid-run once

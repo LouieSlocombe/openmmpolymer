@@ -34,6 +34,17 @@ dependencies:
   # longer than a ~DP 15 chain have to come from AM1-BCC, and sqm is the wall.
   - openff-nagl
   - openff-nagl-models
+  # The trajectory reader the analysis layer is built on. conda-forge spells it
+  # lowercase; PyPI and the import spell it MDAnalysis. >=2.10 because only
+  # build 1 of 2.10.0 has a py314 build, and CI runs 3.14. It brings netcdf4,
+  # h5py, gsd and pytng with it, because MDAnalysis.coordinates imports every
+  # reader eagerly.
+  - mdanalysis>=2.10
+  # matplotlib-base rather than matplotlib: openmmpolymer.plots builds a
+  # matplotlib.figure.Figure directly and never touches pyplot, so no GUI
+  # toolkit is needed. ambertools already pulls this in transitively, which is
+  # exactly why it is named here - an accident is not a declaration.
+  - matplotlib-base
   - pytest
   - pytest-cov
   - python-build

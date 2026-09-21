@@ -48,14 +48,16 @@ class TrajectoryOptions(NamedTuple):
 
     Args:
         format: One of :data:`TRAJECTORY_FORMATS`.
-        interval_ps: Time between frames.
+        interval_ps: Time between frames. None means ten times the state-data
+            interval, which is what a stage gets when it names a format as a
+            bare string rather than building one of these.
         enforce_periodic_box: Whether to wrap molecules into the cell. Off by
             default: wrapping splits a chain that straddles a face, and a split
             chain has a meaningless radius of gyration.
     """
 
     format: str = "xtc"
-    interval_ps: float = 10.0
+    interval_ps: float | None = None
     enforce_periodic_box: bool = False
 
 

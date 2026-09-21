@@ -176,3 +176,71 @@ def test_the_csv_columns_are_the_documented_ones(argon_run: Any) -> None:
     header = Path(paths.csv).read_text().splitlines()[0]
     assert len(header.split(",")) == len(CSV_COLUMNS)
     assert "Progress" not in header
+
+
+def test_a_requested_frame_interval_is_what_the_trajectory_gets(
+    dimer_argon_run: Any,
+) -> None:
+    """TrajectoryOptions.interval_ps is documented as the time between frames,
+    and was read nowhere: the stride came from the state-data interval instead,
+    so a caller asking for a frame every picosecond got something unrelated.
+    """
+    from openmm.app.internal.xtc_utils import get_xtc_nframes
+
+    from openmmpolymer.reporters import TrajectoryOptions
+    from openmmpolymer.simulate import run_nvt
+
+    run_nvt(
+        dimer_argon_run,
+        "02_nvt",
+        temperature_k=120.0,
+        duration_ps=2.0,
+        friction_ps=20.0,
+        trajectory=TrajectoryOptions("xtc", interval_ps=0.5),
+    )
+    # 2 ps at 2 fs is 1000 steps; a frame every 0.5 ps is every 250 of them.
+    assert get_xtc_nframes(b"02_nvt.xtc") == 4
+
+
+def test_naming_a_format_as_a_string_keeps_the_interval_it_always_had(
+    dimer_argon_run: Any,
+) -> None:
+    """Making interval_ps real should not quietly change what every existing
+    stage writes, and a bare format string is what the stages pass."""
+    from openmm.app.internal.xtc_utils import get_xtc_nframes
+
+    from openmmpolymer.simulate import run_nvt
+
+    run_nvt(
+        dimer_argon_run,
+        "02_nvt",
+        temperature_k=120.0,
+        duration_ps=2.0,
+        friction_ps=20.0,
+        trajectory="xtc",
+        report_interval_ps=0.02,
+    )
+    # Unchanged behaviour: ten times the state-data interval, so every 100 steps.
+    assert get_xtc_nframes(b"02_nvt.xtc") == 10
+
+
+def test_a_stage_too_short_to_reach_a_frame_says_so(
+    dimer_argon_run: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """It writes an unreadable empty trajectory, and the default interval of
+    ten picoseconds does it to any stage shorter than that."""
+    import logging
+
+    from openmmpolymer.reporters import TrajectoryOptions
+    from openmmpolymer.simulate import run_nvt
+
+    with caplog.at_level(logging.WARNING, logger="openmmpolymer.simulate"):
+        run_nvt(
+            dimer_argon_run,
+            "02_nvt",
+            temperature_k=120.0,
+            duration_ps=2.0,
+            friction_ps=20.0,
+            trajectory=TrajectoryOptions("xtc", interval_ps=10.0),
+        )
+    assert "no frames in it" in caplog.text

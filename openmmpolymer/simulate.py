@@ -557,6 +557,17 @@ def run_segments(
     per_segment = [steps_for(segment.duration_ps, timestep_fs) for segment in segments]
     total_steps = sum(per_segment)
     report_interval = steps_for(report_interval_ps, timestep_fs)
+    trajectory_interval = _frame_interval(trajectory, timestep_fs)
+    if trajectory_interval is not None and trajectory_interval > total_steps:
+        log.warning(
+            "%s: a frame every %d steps, but the stage is only %d steps long, so "
+            "the trajectory will have no frames in it. Lower interval_ps below "
+            "%.4g ps to get one.",
+            name,
+            trajectory_interval,
+            total_steps,
+            total_steps * timestep_fs / 1000.0,
+        )
 
     samples: dict[str, list[float]] = {
         "segment_temperature_k": [],
@@ -579,6 +590,7 @@ def run_segments(
         total_steps=total_steps,
         report_interval=report_interval,
         trajectory=trajectory,
+        trajectory_interval=trajectory_interval,
     ) as paths:
         for segment, steps in zip(segments, per_segment, strict=True):
             set_temperature(simulation, segment.temperature_k, barostat)
@@ -677,6 +689,30 @@ def _check_temperature(
 #: Timesteps are rounded down to a multiple of this, so a derated step is a
 #: round number rather than 1.4142 fs.
 _TIMESTEP_QUANTUM_FS = 0.25
+
+
+def _frame_interval(
+    trajectory: TrajectoryOptions | str, timestep_fs: float
+) -> int | None:
+    """Steps between trajectory frames, or None to take the default.
+
+    ``TrajectoryOptions.interval_ps`` is a time because that is what a caller
+    knows; the reporter needs a step count, and only the stage knows the
+    timestep it settled on. None is passed straight through so that
+    :func:`openmmpolymer.reporters.reporting` keeps its own default of ten
+    times the state-data interval, which is what a stage naming a bare format
+    string has always got.
+
+    Args:
+        trajectory: Trajectory settings, or just a format name.
+        timestep_fs: The timestep the stage is running at.
+
+    Returns:
+        Steps between frames, or None for the reporter's default.
+    """
+    if isinstance(trajectory, str) or trajectory.interval_ps is None:
+        return None
+    return steps_for(trajectory.interval_ps, timestep_fs)
 
 
 def safe_timestep_fs(temperature_k: float, spec: SystemSpec) -> float:

@@ -369,6 +369,13 @@ class RunManifest:
         system: The System settings, as recorded floats.
         stages: One entry per completed stage, keyed by name.
         chains: The chain dimensions measured at the end.
+        box: What was in the cell - ``n_molecules``, ``atoms_per_chain`` and
+            ``box_nm``. :class:`~openmmpolymer.mdsystem.SystemSpec` records the
+            settings a run was given but not the thing it was given them for,
+            and every molecule being a copy of the same chain is the invariant
+            the whole package indexes by, so analysis of a finished run should
+            be able to read it rather than infer it. None for a manifest
+            written before this was recorded.
     """
 
     protocol: str
@@ -377,6 +384,7 @@ class RunManifest:
     system: dict[str, Any] = field(default_factory=dict)
     stages: dict[str, dict[str, Any]] = field(default_factory=dict)
     chains: dict[str, Any] | None = None
+    box: dict[str, Any] | None = None
 
     def save(self, run_dir: str | Path) -> str:
         """Write the manifest into *run_dir*, atomically."""
@@ -484,6 +492,11 @@ def run_protocol(
     manifest.seed = run.seed
     manifest.versions = _versions()
     manifest.system = asdict(run.spec)
+    manifest.box = {
+        "n_molecules": run.box.n_molecules,
+        "atoms_per_chain": run.box.topology.getNumAtoms() // run.box.n_molecules,
+        "box_nm": list(run.box.box_nm),
+    }
 
     results: list[StageResult] = []
     skipped: list[str] = []
