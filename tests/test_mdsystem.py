@@ -227,6 +227,33 @@ def test_assemble_box_refuses_a_packed_file_with_the_wrong_atom_count(
         assemble_box([PackedComponent(source, 3)], packed, (3.0, 3.0, 3.0))
 
 
+def test_a_packed_file_missing_atoms_is_told_why_that_happens(
+    tmp_path: Path,
+) -> None:
+    """Atoms going missing has one cause in practice, and it is worth naming.
+
+    Two molecules sharing a chain identifier and a residue number read as one
+    residue described twice, and the PDB parser discards the second copy.
+    Measured on a real 45-conformer pack without ``resnumbers 3``: 1406 atoms
+    came back instead of 1710, eight whole molecules gone, after one warning.
+    """
+    source = build_dimer_pdb(tmp_path / "dimer.pdb")
+    packed = _packed_pdb(tmp_path / "packed.pdb", 2)
+    with pytest.raises(SystemAssemblyError, match="dropped the duplicates"):
+        assemble_box([PackedComponent(source, 3)], packed, (3.0, 3.0, 3.0))
+
+
+def test_a_packed_file_with_extra_atoms_is_not_blamed_on_numbering(
+    tmp_path: Path,
+) -> None:
+    """The duplicate-numbering explanation only fits atoms going missing."""
+    source = build_dimer_pdb(tmp_path / "dimer.pdb")
+    packed = _packed_pdb(tmp_path / "packed.pdb", 4)
+    with pytest.raises(SystemAssemblyError) as raised:
+        assemble_box([PackedComponent(source, 3)], packed, (3.0, 3.0, 3.0))
+    assert "dropped the duplicates" not in str(raised.value)
+
+
 def test_assemble_box_refuses_a_packed_file_with_the_elements_in_a_new_order(
     tmp_path: Path,
 ) -> None:

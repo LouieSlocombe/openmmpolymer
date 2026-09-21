@@ -206,11 +206,25 @@ def assemble_box(
     packed_topology, positions = read_packed_pdb(packed_pdb)
 
     if positions.shape[0] != topology.getNumAtoms():
+        short = topology.getNumAtoms() - positions.shape[0]
+        cause = (
+            # Atoms going missing has one cause in practice, and it is worth
+            # naming: two molecules sharing a chain identifier and a residue
+            # number, which the PDB parser reads as one residue described
+            # twice and silently discards the second copy of.
+            " Atoms are missing rather than extra, which means the packed "
+            "file has molecules sharing a chain and residue number and the "
+            "parser dropped the duplicates. Every structure block needs "
+            "`resnumbers 3`, which render_packmol_input() emits - so this "
+            "file was packed by something else, or by an older version."
+            if short > 0
+            else ""
+        )
         raise SystemAssemblyError(
             f"{packed_pdb} holds {positions.shape[0]} atoms but replicating "
-            f"the input structures gives {topology.getNumAtoms()}. The "
-            "components passed here are not the ones packmol was given, or "
-            "not in the same order."
+            f"the input structures gives {topology.getNumAtoms()}.{cause} "
+            "Otherwise the components passed here are not the ones packmol "
+            "was given, or not in the same order."
         )
     _check_element_order(topology, packed_topology, packed_pdb)
 
