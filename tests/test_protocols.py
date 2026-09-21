@@ -273,6 +273,7 @@ def test_chain_dimensions_are_recorded_in_the_manifest(
     assert summary.chains is not None
     manifest = json.loads(Path(summary.manifest_path).read_text())
     assert manifest["chains"]["expected_characteristic_ratio"] == 7.0
+    assert manifest["chains"]["backbone"] == [0, 1]
 
 
 def test_the_manifest_records_what_was_in_the_cell(argon_run: Any) -> None:

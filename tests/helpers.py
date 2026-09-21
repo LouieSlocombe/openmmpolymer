@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, cast
 
@@ -835,3 +836,75 @@ def write_relaxation(
             "mean_temperature_k": temperature_k,
         }
     return _write_manifest(run_dir, stages)
+
+
+def write_polymer_snapshot(
+    run_dir: Path,
+    *,
+    stage: str = "05_npt",
+    n_chains: int = 4,
+    box_nm: float = 4.0,
+    side_group: bool = True,
+) -> tuple[int, ...]:
+    """Write a closing structure of straight five-carbon chains, bonds recorded.
+
+    Written through OpenMM so the CONECT records are the ones a real stage
+    leaves. Each chain is a rod of five carbons 0.153 nm apart along x, a side
+    carbon on the middle one when *side_group* is set, and one hydrogen on the
+    last - so a backbone inferred from the bond graph has something to leave
+    out, and ``<R^2>`` is exactly ``(4 * 0.153)^2``.
+
+    Returns:
+        The true backbone, ``(0, 1, 2, 3, 4)``.
+    """
+    import openmm as mm
+    from openmm import app, unit
+
+    spacing = 0.153
+    topology = app.Topology()
+    carbon = app.Element.getBySymbol("C")
+    hydrogen = app.Element.getBySymbol("H")
+    positions: list[Any] = []
+    for chain_index in range(n_chains):
+        residue = topology.addResidue("POL", topology.addChain())
+        offset = box_nm * (chain_index + 0.5) / n_chains
+        carbons = [topology.addAtom(f"C{i}", carbon, residue) for i in range(5)]
+        for first, second in pairwise(carbons):
+            topology.addBond(first, second)
+        positions.extend(mm.Vec3(0.5 + spacing * i, offset, 0.5) for i in range(5))
+        if side_group:
+            side = topology.addAtom("C5", carbon, residue)
+            topology.addBond(carbons[2], side)
+            positions.append(mm.Vec3(0.5 + 2.0 * spacing, offset + 0.15, 0.5))
+        cap = topology.addAtom("H1", hydrogen, residue)
+        topology.addBond(carbons[4], cap)
+        positions.append(mm.Vec3(0.5 + 4.0 * spacing, offset, 0.61))
+    topology.setPeriodicBoxVectors(
+        [mm.Vec3(box_nm, 0, 0), mm.Vec3(0, box_nm, 0), mm.Vec3(0, 0, box_nm)]
+        * unit.nanometer
+    )
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    pdb = run_dir / f"{stage}.pdb"
+    with pdb.open("w") as handle:
+        app.PDBFile.writeFile(topology, positions * unit.nanometer, handle)
+    path = _write_manifest(
+        run_dir,
+        {
+            stage: {
+                "name": stage,
+                "final_pdb": str(pdb),
+                "final_state": None,
+                "csv": None,
+                "samples": {},
+            }
+        },
+    )
+    record = json.loads(path.read_text())
+    record["box"] = {
+        "n_molecules": n_chains,
+        "atoms_per_chain": topology.getNumAtoms() // n_chains,
+        "box_nm": [box_nm, box_nm, box_nm],
+    }
+    path.write_text(json.dumps(record, indent=2))
+    return (0, 1, 2, 3, 4)

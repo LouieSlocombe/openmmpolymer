@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +54,7 @@ from .packing import (
 from .protocols import Protocol, melt_quench, run_protocol, standard_melt_equilibration
 from .relaxation import relax_stages
 from .simulate import RELAX_MODES, prepare_run
+from .structure import analyse_structure, structure_stages, write_structure_report
 from .tg import (
     TgSpec,
     analyse_run,
@@ -676,6 +678,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="radius of gyration in nm, overriding the manifest",
     )
     analysis.add_argument(
+        "--structure-stage",
+        default=None,
+        metavar="STAGE",
+        help="the stage whose coordinates to measure (default: the last stage "
+        "with a trajectory, else the last stage's closing snapshot)",
+    )
+    analysis.add_argument(
+        "--backbone",
+        type=_ints,
+        default=None,
+        help="comma-separated backbone atom indices within one chain, e.g. "
+        "0,1,4,5; overrides what the run recorded and the bond-graph inference",
+    )
+    analysis.add_argument(
+        "--no-structure",
+        action="store_true",
+        help="skip the structure and dynamics report",
+    )
+    analysis.add_argument(
+        "--stride",
+        type=_positive_int,
+        default=1,
+        help="measure every Nth frame (default: %(default)s); g(r) and S(q) "
+        "are further capped at 50 and 8 frames",
+    )
+    analysis.add_argument(
         "--no-figures",
         action="store_true",
         help="write the record but no figures",
@@ -708,6 +736,33 @@ def _floats(text: str) -> tuple[float, ...]:
             "the pass in --skip to drop it."
         )
     return values
+
+
+def _ints(text: str) -> tuple[int, ...]:
+    """Parse a comma-separated list of atom indices, at the front door."""
+    try:
+        values = tuple(int(part) for part in text.split(",") if part.strip())
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a comma-separated list of integers, e.g. '0,1,4,5'."
+        ) from error
+    if len(values) < 2:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} names {len(values)} atom(s); a backbone of one atom has no "
+            "end-to-end vector."
+        )
+    return values
+
+
+def _positive_int(text: str) -> int:
+    """Parse a count that has to be at least one, at the front door."""
+    try:
+        value = int(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer.") from error
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a positive integer.")
+    return value
 
 
 def _rates(text: str) -> tuple[float, ...]:
@@ -1133,10 +1188,12 @@ def _analyse(arguments: argparse.Namespace) -> int:
         _has_stages(first, find) for find in (deform_stages, load_stages, shear_stages)
     )
     relaxed = _has_stages(first, relax_stages)
-    if not quenched and not deformed and not relaxed:
+    structured = not arguments.no_structure and _has_stages(first, structure_stages)
+    if not quenched and not deformed and not relaxed and not structured:
         print(
             f"nothing in {first} was a quench, a deformation or a relaxation, "
-            "so there is nothing to report",
+            "and no stage left coordinates to measure, so there is nothing to "
+            "report",
             flush=True,
         )
         return 1
@@ -1147,7 +1204,144 @@ def _analyse(arguments: argparse.Namespace) -> int:
         _analyse_mechanics(arguments, first)
     if relaxed:
         _analyse_relaxation(arguments, first)
+    if structured:
+        _analyse_structure(arguments, first)
     return 0
+
+
+def _analyse_structure(arguments: argparse.Namespace, run_dir: Path) -> None:
+    """Report the structure and dynamics, and write them out."""
+    report = analyse_structure(
+        run_dir,
+        stage=arguments.structure_stage,
+        backbone=arguments.backbone,
+        stride=int(arguments.stride),
+    )
+    for line in _structure_lines(report):
+        print(line, flush=True)
+    for note in report.notes:
+        print(f"note: {note}", flush=True)
+
+    files = write_structure_report(
+        report,
+        arguments.output_dir,
+        figures=not arguments.no_figures,
+        figure_format=cast(str, arguments.figure_format),
+    )
+    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
+
+
+def _structure_lines(report: Any) -> list[str]:
+    """One line per measurement, each carrying its own caveat."""
+    frames = (
+        "single snapshot"
+        if report.is_snapshot
+        else f"{report.n_frames} frames at {report.interval_ps:g} ps"
+    )
+    lines = [
+        f"structure: stage {report.stage} ({frames}), {report.n_chains} chains "
+        f"of {report.atoms_per_chain} atoms"
+    ]
+    if report.backbone is None:
+        lines.append("backbone: unknown, so no chain measurements")
+    else:
+        origin = report.backbone_source + (
+            "" if report.backbone_file is None else f" from {report.backbone_file}"
+        )
+        lines.append(f"backbone: {len(report.backbone)} atoms, {origin}")
+
+    distribution = report.distribution
+    if distribution is not None:
+        lines.append(
+            f"g(r): first peak {distribution.first_peak_height:.2f} at "
+            f"{distribution.first_peak_nm:.3f} nm, {distribution.n_pairs:,} "
+            f"intermolecular pairs over {distribution.n_frames} frame(s)"
+        )
+    structure = report.structure
+    if structure is not None:
+        if structure.first_peak_per_nm > 0.0:
+            lines.append(
+                f"S(q): peak at {structure.first_peak_per_nm:.1f} /nm; nothing "
+                f"below {structure.q_min_per_nm:.1f} /nm is resolvable in this cell"
+            )
+        else:
+            lines.append(
+                f"S(q): no resolvable peak above {structure.q_min_per_nm:.1f} /nm"
+            )
+
+    conformation = report.conformation
+    if conformation is not None:
+        mean = conformation.mean
+        line = (
+            f"chains: <R^2> = {mean.mean_squared_end_to_end_nm2:.3f} nm2, "
+            f"Rg = {mean.mean_radius_of_gyration_nm:.3f} nm, "
+            f"C = {mean.characteristic_ratio:.2f} against an expected "
+            f"{mean.expected_characteristic_ratio:.2f}"
+        )
+        if not mean.consistent:
+            line += " - not consistent with a relaxed melt"
+        if conformation.settled is not None:
+            line += (
+                ", <R^2> settled"
+                if conformation.settled.equilibrated
+                else ", <R^2> still moving"
+            )
+        lines.append(line)
+
+    persistence = report.persistence
+    if persistence is not None:
+        lines.append(_persistence_line(persistence))
+
+    displacement = report.displacement
+    if displacement is not None:
+        if displacement.diffusion_coefficient_cm2_s is None:
+            lines.append(
+                f"MSD: slope {displacement.log_slope:.2f}, not diffusive, so no "
+                "diffusion coefficient"
+            )
+        else:
+            lines.append(
+                f"MSD: slope {displacement.log_slope:.2f}, "
+                f"D = {displacement.diffusion_coefficient_cm2_s:.3e} cm2/s"
+            )
+
+    relaxation = report.relaxation
+    if relaxation is not None:
+        if relaxation.relaxation_time_ps is None:
+            lines.append(
+                f"end-to-end: not decorrelated in {relaxation.trajectory_ps:.0f} "
+                "ps; the relaxation time is longer than the run"
+            )
+        else:
+            lines.append(
+                f"end-to-end: relaxes in {relaxation.relaxation_time_ps:.0f} ps"
+            )
+
+    recorded = report.recorded_chains
+    if recorded is not None:
+        lines.append(
+            "manifest recorded at the end of the run: "
+            f"<R^2> = {recorded.mean_squared_end_to_end_nm2:.3f} nm2, "
+            f"Rg = {recorded.mean_radius_of_gyration_nm:.3f} nm"
+        )
+    return lines
+
+
+def _persistence_line(persistence: Any) -> str:
+    """One line for a persistence length, with the extrapolation caveat."""
+    if not math.isfinite(persistence.persistence_length_nm):
+        return (
+            "persistence length: no decay along the chain "
+            f"({persistence.contour_length_nm:.2f} nm contour), rod-like"
+        )
+    line = (
+        f"persistence length: {persistence.persistence_length_nm:.3f} nm over "
+        f"{persistence.n_bonds} bonds ({persistence.contour_length_nm:.2f} nm "
+        "contour)"
+    )
+    if not persistence.decayed:
+        line += " - never decayed to 1/e within the chain, so this is an extrapolation"
+    return line
 
 
 def _analyse_mechanics(arguments: argparse.Namespace, run_dir: Path) -> None:

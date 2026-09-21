@@ -148,7 +148,8 @@ across them. The manifest is not touched.
 
 It works out what to report from what the directory recorded: a run that
 quenched gets a glass transition, a run that was deformed gets its elastic
-constants, and a run that did both gets both.
+constants, a run that did both gets both, and any run whose stages left
+coordinates gets its structure read back as well.
 
 ## Measuring a modulus
 
@@ -268,6 +269,35 @@ openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol relax -t 298 --step-strain
 and `--linearity-strains 0.01,0.06` to check the strain was small enough to
 mean anything.
 
+## Looking at the structure
+
+```python
+from openmmpolymer import analyse_structure, write_structure_report
+
+report = analyse_structure("run", backbone=chain.backbone)
+print(report.distribution.first_peak_nm, report.conformation.mean.characteristic_ratio)
+write_structure_report(report)
+```
+
+Every finished stage leaves its closing structure, and a stage asked for a
+trajectory leaves frames, so any run has something to say about how its chains
+are arranged. `analyse_structure` reads the last stage that wrote a trajectory,
+or failing that the last stage's closing snapshot, and measures what that stage
+can support: the intermolecular `g(r)` and the structure factor always; `⟨R²⟩`,
+`Rg`, the characteristic ratio and the persistence length when the backbone is
+known; the centre-of-mass displacement and the end-to-end relaxation only from
+a trajectory. Whatever cannot be measured becomes a note rather than an error,
+and `structure.json` records which stage was read and why, where the backbone
+came from, and every curve. `g(r)` and `S(q)` are capped at 50 and 8 frames
+however long the trajectory is, because past that they stop changing and the
+structure factor is the expensive one.
+
+```bash
+openmmpolymer --analyse run --backbone 0,1,4,5
+openmmpolymer --analyse run --structure-stage 05_npt --stride 4
+openmmpolymer --analyse run --no-structure
+```
+
 ## How it fits together
 
 | Layer | Module | What it does |
@@ -290,6 +320,7 @@ mean anything.
 | Workflow | `tg` | The two-pass glass-transition scan, and reading a finished run back |
 | Workflow | `mechanical` | The extension, the load, bulk and shear passes, and the report |
 | Workflow | `viscoelastic` | The step-strain scan, its replicas, and the report |
+| Workflow | `structure` | Reading a finished run's `g(r)`, `S(q)`, chain dimensions, persistence length, displacement and end-to-end relaxation back, and the report |
 
 ## The constraint everything follows from
 
@@ -352,6 +383,20 @@ asked for — `npt_trajectory` on the protocol, `npt_trajectory_ps` on a `TgSpec
 `--check-melt` on the command line. Without one the verdict is False and
 `unchecked` says which half was missing, because a verdict with half its
 evidence absent is not a pass.
+
+**The manifest does not know the backbone.** The backbone atom indices come
+from the attachment points the caps consumed when the chain was built, and
+nothing downstream can recover them from the structure alone. The workflow
+drivers record them as `chain_backbone` in their own `*_workflow.json`; a plain
+protocol run records them nowhere. So `analyse_structure` looks for a backbone
+in that order — given, recorded by a workflow, recorded in the manifest — and
+failing all three infers one from the bond graph as the longest shortest path
+through one chain's heavy atoms. For a linear polymer that is the backbone,
+unless a side group on the last unit reaches further than the chain end does,
+in which case the inferred path ends on it and the end-to-end vector carries
+one extra bond. The report says which source it used in `backbone_source`,
+and `--backbone` overrides all of them. Opening a trajectory also leaves
+MDAnalysis' offset files beside it, so reading a run touches its directory.
 
 **A quench is not a Tg measurement.** `melt_quench` records a density at every
 temperature on the way down, which is the specific-volume curve a glass

@@ -26,6 +26,7 @@ from .helpers import (
     transition_at,
     two_line_curve,
     write_deformation,
+    write_polymer_snapshot,
     write_quench,
 )
 
@@ -531,12 +532,78 @@ def test_analysing_a_relaxation_directory_reports_and_writes_it(
     assert (tmp_path / "analysis" / "relaxation.png").is_file()
 
 
-def test_a_directory_that_is_neither_quench_nor_deformation_nor_relaxation(
+def test_a_directory_that_is_none_of_the_four_kinds_is_refused(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The refusal names all three, so it says what would have been reported."""
+    """The refusal names all four, so it says what would have been reported."""
     (tmp_path / "manifest.json").write_text(
         '{"protocol": "x", "seed": 1, "stages": {"05_npt": {"samples": {}}}}'
     )
     assert main(["--analyse", str(tmp_path)]) == 1
-    assert "quench, a deformation or a relaxation" in capsys.readouterr().out
+    captured = capsys.readouterr().out
+    assert "quench, a deformation or a relaxation" in captured
+    assert "coordinates" in captured
+
+
+# --------------------------------------------------------------------------
+# The structure report, and what --analyse dispatches on
+# --------------------------------------------------------------------------
+
+
+def test_analyse_reports_structure_when_a_stage_left_coordinates(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A plain run with a closing structure is enough for a report."""
+    write_polymer_snapshot(Path("run"))
+    exit_code = main(["--analyse", "run", "--no-figures", "--backbone", "0,1,2,3,4"])
+    captured = capsys.readouterr().out
+    assert exit_code == 0
+    assert "g(r):" in captured
+    assert "backbone: 5 atoms, argument" in captured
+    assert "chains: <R^2>" in captured
+    assert "rod-like" in captured
+    assert Path("run/analysis/structure.json").is_file()
+
+
+def test_the_structure_flags_are_parsed() -> None:
+    arguments = build_parser().parse_args(
+        [
+            "--analyse",
+            "run",
+            "--structure-stage",
+            "03_npt",
+            "--backbone",
+            "0,1,4",
+            "--stride",
+            "4",
+            "--no-structure",
+        ]
+    )
+    assert arguments.structure_stage == "03_npt"
+    assert arguments.backbone == (0, 1, 4)
+    assert arguments.stride == 4
+    assert arguments.no_structure
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--backbone", "0,x"],
+        ["--backbone", "3"],
+        ["--stride", "0"],
+        ["--stride", "two"],
+    ],
+)
+def test_a_malformed_structure_flag_is_refused_at_the_front_door(
+    flags: list[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--analyse", "run", *flags])
+
+
+def test_no_structure_leaves_a_structure_only_directory_with_nothing_to_report(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    write_polymer_snapshot(Path("run"))
+    assert main(["--analyse", "run", "--no-structure"]) == 1
+    assert "nothing to report" in capsys.readouterr().out

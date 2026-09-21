@@ -16,6 +16,7 @@ from openmmpolymer.conformation import (
     centre_of_mass_msd,
     chain_conformation,
     end_to_end_relaxation,
+    persistence_length,
 )
 from openmmpolymer.correlations import radial_distribution, structure_factor
 from openmmpolymer.elasticity import (
@@ -30,6 +31,7 @@ from openmmpolymer.plots import (
     plot_correlations,
     plot_dynamics,
     plot_moduli,
+    plot_persistence,
     plot_quench_curve,
     plot_state_data,
     plot_stress_strain,
@@ -44,7 +46,9 @@ from openmmpolymer.timeseries import (
 
 from .helpers import (
     _lattice,
+    freely_rotating_chain,
     random_walk_frames,
+    rod_positions,
     state_data_csv,
     synthetic_ensemble,
     transition_at,
@@ -608,3 +612,49 @@ def test_a_spectrum_figure_marks_what_lies_past_the_end_of_the_run() -> None:
         text.get_text() for text in figure.axes[0].get_legend().get_texts()
     )
     assert "past the end of the run" in labels
+
+
+def test_the_persistence_figure_draws_the_threshold_and_the_fit() -> None:
+    """The length is read where the correlation crosses 1/e, so both the line
+    and the exponential it was fitted with are drawn through the points."""
+    positions = freely_rotating_chain(60, 0.153, 0.5, n_chains=300, seed=11)
+    measured = persistence_length(
+        synthetic_ensemble(positions, n_chains=300), range(61)
+    )
+    figure = plot_persistence(measured)
+    axis = figure.axes[0]
+    assert axis.get_xlabel() == "Separation (bonds)"
+    assert axis.get_ylabel() == "<cos theta(s)>"
+    assert len(axis.get_lines()) == 3
+    assert "1/e" in axis.get_legend_handles_labels()[1]
+    assert "l_p =" in axis.get_title()
+    assert not axis.patches
+
+
+def test_a_rod_is_shaded_past_the_end_of_the_chain() -> None:
+    """Nothing to fit, so no fit line, and the region the chain does not reach
+    is what the figure is about."""
+    measured = persistence_length(
+        synthetic_ensemble(rod_positions(6, 0.153), n_chains=1), range(6)
+    )
+    figure = plot_persistence(measured)
+    axis = figure.axes[0]
+    assert len(axis.get_lines()) == 2
+    assert len(axis.patches) == 1
+    assert "rod-like" in axis.get_title()
+
+
+def test_an_extrapolated_persistence_length_says_so() -> None:
+    """A chain shorter than its own persistence length gives a number, and
+    the title and the shading say it was reached for."""
+    positions = freely_rotating_chain(12, 0.153, 5.0, n_chains=200, seed=5)
+    measured = persistence_length(
+        synthetic_ensemble(positions, n_chains=200), range(13)
+    )
+    assert not measured.decayed
+    figure = plot_persistence(measured)
+    axis = figure.axes[0]
+    assert "extrapolated" in axis.get_title()
+    assert len(axis.get_lines()) == 3
+    assert len(axis.patches) == 1
+    assert axis.get_xlim()[1] > 12.0

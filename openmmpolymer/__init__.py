@@ -156,6 +156,7 @@ from .plots import (
     plot_correlations,
     plot_dynamics,
     plot_moduli,
+    plot_persistence,
     plot_quench_curve,
     plot_relaxation,
     plot_relaxation_spectrum,
@@ -218,6 +219,13 @@ from .stress import (
     pressure_tensor_bar,
     stress_tensor_bar,
     tensile_stress_bar,
+)
+from .structure import (
+    StructureReport,
+    analyse_structure,
+    infer_backbone,
+    structure_stages,
+    write_structure_report,
 )
 from .tg import (
     MeltEquilibration,
@@ -345,6 +353,7 @@ __all__ = [
     "StressError",
     "StressStrain",
     "StructureFactor",
+    "StructureReport",
     "SystemAssemblyError",
     "SystemSpec",
     "TgError",
@@ -358,6 +367,7 @@ __all__ = [
     "analyse_mechanics",
     "analyse_relaxation",
     "analyse_run",
+    "analyse_structure",
     "assemble_box",
     "assemble_chain",
     "assign_charges",
@@ -394,6 +404,7 @@ __all__ = [
     "fit_kww",
     "fit_prony",
     "glass_transition",
+    "infer_backbone",
     "load_curve",
     "load_positions_nm",
     "load_stages",
@@ -415,6 +426,7 @@ __all__ = [
     "plot_correlations",
     "plot_dynamics",
     "plot_moduli",
+    "plot_persistence",
     "plot_quench_curve",
     "plot_relaxation",
     "plot_relaxation_spectrum",
@@ -468,6 +480,7 @@ __all__ = [
     "stress_strain",
     "stress_tensor_bar",
     "structure_factor",
+    "structure_stages",
     "tensile_stress_bar",
     "tg_coarse_scan",
     "tg_fine_scan",
@@ -475,5 +488,6 @@ __all__ = [
     "write_mechanical_report",
     "write_relaxation_report",
     "write_report",
+    "write_structure_report",
     "youngs_modulus",
 ]

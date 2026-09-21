@@ -29,7 +29,9 @@ the one an experiment measures. A relaxation modulus gets two of these at
 once: the level its own baseline scatter could not see past is shaded, and
 the readings behind each point are drawn underneath, because the early part
 of that curve rests on one reading a bin and looks far more certain than it
-is.
+is. A persistence length shades the separations past the end of the chain,
+because a fit that had to reach past the molecule to find 1/e is an
+extrapolation whatever number it came back with.
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ from .conformation import (
     ConformationSeries,
     EndToEndRelaxation,
     MeanSquaredDisplacement,
+    PersistenceLength,
 )
 from .correlations import RadialDistribution, StructureFactor
 from .elasticity import ElasticModulus, PoissonRatio, StressStrain
@@ -893,3 +896,97 @@ def plot_relaxation_spectrum(prony: PronyFit) -> Any:
     )
     spectrum.legend(fontsize=7, frameon=False)
     return figure
+
+
+def plot_persistence(length: PersistenceLength) -> Any:
+    """Plot the bond-direction correlation along the backbone, and its decay.
+
+    The 1/e line is where the persistence length is read off, so it is drawn.
+    A curve that never gets down to it within the chain has been fitted and
+    then extrapolated past the end of the molecule, and that region is shaded:
+    a persistence length longer than the chain it was measured on should look
+    like one.
+
+    Args:
+        length: A measurement from
+            :func:`~openmmpolymer.conformation.persistence_length`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axes = _figure(1, 1)
+    axis = axes[0]
+    separation = length.separation
+    last = float(separation[-1]) if separation.size else float(length.n_bonds)
+    fitted = (
+        math.isfinite(length.persistence_length_nm)
+        and length.persistence_length_nm > 0.0
+        and length.bond_length_nm > 0.0
+    )
+    x_max = last
+    if not length.decayed:
+        x_max = 1.5 * last
+        if fitted:
+            reach = 1.2 * length.persistence_length_nm / length.bond_length_nm
+            x_max = max(x_max, min(reach, 10.0 * last))
+
+    axis.plot(
+        separation,
+        length.correlation,
+        marker="o",
+        markersize=3.0,
+        linewidth=0.9,
+        color=_DATA_COLOUR,
+        label="measured",
+    )
+    axis.axhline(
+        DECORRELATION_THRESHOLD,
+        color=_GUIDE_COLOUR,
+        linewidth=0.8,
+        linestyle="--",
+        label="1/e",
+    )
+    if fitted:
+        span = np.linspace(0.0, x_max, 200)
+        axis.plot(
+            span,
+            np.exp(-span * length.bond_length_nm / length.persistence_length_nm),
+            linewidth=0.8,
+            linestyle="--",
+            color=_REFERENCE_COLOUR,
+            label=f"exp(-s l_b / l_p), l_p = {length.persistence_length_nm:.2f} nm",
+        )
+    if not length.decayed:
+        axis.axvspan(
+            last,
+            x_max,
+            color=_REFERENCE_COLOUR,
+            alpha=0.12,
+            lw=0,
+            label="past the end of the chain",
+        )
+        axis.set_xlim(0.0, x_max)
+    axis.set_xlabel("Separation (bonds)")
+    axis.set_ylabel("<cos theta(s)>")
+    axis.set_title(_persistence_title(length), fontsize=9)
+    axis.legend(fontsize=7, frameon=False)
+    return figure
+
+
+def _persistence_title(length: PersistenceLength) -> str:
+    """A title that says whether the length was measured or extrapolated."""
+    contour = f"{length.contour_length_nm:.2f} nm contour"
+    fitted = length.persistence_length_nm
+    if math.isinf(fitted):
+        return f"no decay along a {contour} ({length.n_bonds} bonds): rod-like"
+    if not fitted > 0.0:
+        return f"no persistence length could be fitted over a {contour}"
+    if not length.decayed:
+        return (
+            f"l_p = {fitted:.2f} nm, extrapolated: not decayed to 1/e within "
+            f"the {contour}"
+        )
+    return (
+        f"l_p = {fitted:.2f} nm from {length.n_bonds} bonds of "
+        f"{length.bond_length_nm:.3f} nm ({contour})"
+    )

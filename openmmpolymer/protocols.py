@@ -633,6 +633,10 @@ def run_protocol(
     )
     if dimensions is not None:
         manifest.chains = asdict(dimensions)
+        # The backbone beside the dimensions it produced, so a later analysis
+        # can measure the same thing without having to guess the path.
+        assert chain_backbone is not None  # _measure_chains returned dimensions
+        manifest.chains["backbone"] = [int(index) for index in chain_backbone]
     manifest_path = manifest.save(directory)
 
     return RunSummary(
