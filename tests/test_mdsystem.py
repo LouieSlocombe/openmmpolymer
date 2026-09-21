@@ -22,6 +22,7 @@ from openmmpolymer.mdsystem import (
     check_box,
     check_target_density,
     check_timestep,
+    find_barostat,
     make_barostat,
     max_timestep_fs,
     minimum_mass_g_mol,
@@ -543,3 +544,91 @@ def test_a_named_platform_is_used_without_being_probed(
     monkeypatch.setattr(mdsystem, "platform_is_usable", never_usable)
     platform, _ = mdsystem.select_platform("Reference")
     assert platform.getName() == "Reference"
+
+
+# --------------------------------------------------------------------------
+# Per-axis and flexible barostats
+# --------------------------------------------------------------------------
+
+
+def test_an_anisotropic_barostat_takes_a_pressure_per_axis() -> None:
+    """Which is what makes a uniaxial load rather than a hydrostatic one."""
+    import openmm as mm
+    from openmm import unit
+
+    barostat = make_barostat(
+        "anisotropic", 300.0, 1.0, 25, 7, pressures_bar=(1.0, 1.0, -50.0)
+    )
+    pressures = barostat.getDefaultPressure().value_in_unit(unit.bar)
+    assert (pressures[0], pressures[1], pressures[2]) == pytest.approx(
+        (1.0, 1.0, -50.0)
+    )
+    assert isinstance(barostat, mm.MonteCarloAnisotropicBarostat)
+
+
+def test_an_axis_can_be_frozen_while_the_others_move() -> None:
+    """The uniaxial-strain ensemble, in one flag."""
+    barostat = make_barostat(
+        "anisotropic", 300.0, 1.0, 25, 7, scale_axes=(True, True, False)
+    )
+    assert (barostat.getScaleX(), barostat.getScaleY(), barostat.getScaleZ()) == (
+        True,
+        True,
+        False,
+    )
+
+
+def test_a_barostat_that_cannot_move_anything_is_refused() -> None:
+    """It is not an ensemble; a frequency of zero is how to ask for a probe."""
+    with pytest.raises(ValueError, match="frequency=0"):
+        make_barostat(
+            "anisotropic", 300.0, 1.0, 25, 7, scale_axes=(False, False, False)
+        )
+
+
+def test_per_axis_settings_are_refused_by_the_barostats_that_have_no_axes() -> None:
+    """Silently ignoring them would give a run that is not the one asked for."""
+    for kind in ("isotropic", "flexible"):
+        with pytest.raises(ValueError, match="anisotropic"):
+            make_barostat(kind, 300.0, 1.0, 25, 7, pressures_bar=(1.0, 1.0, 2.0))
+        with pytest.raises(ValueError, match="anisotropic"):
+            make_barostat(kind, 300.0, 1.0, 25, 7, scale_axes=(True, True, False))
+
+
+def test_a_flexible_barostat_is_found_rather_than_invisible() -> None:
+    """It is not a MonteCarloBarostat subclass, so an isinstance chain misses it.
+
+    Which would also mean the guard against a System carrying two barostats
+    could not see one of them.
+    """
+    import openmm as mm
+
+    for kind, expected in (
+        ("isotropic", mm.MonteCarloBarostat),
+        ("anisotropic", mm.MonteCarloAnisotropicBarostat),
+        ("flexible", mm.MonteCarloFlexibleBarostat),
+    ):
+        system = mm.System()
+        system.addForce(make_barostat(kind, 300.0, 1.0, 25, 7))
+        assert barostat_kind(system) == kind
+        found = find_barostat(system)
+        assert found is not None
+        assert isinstance(found[1], expected)
+    assert not issubclass(mm.MonteCarloFlexibleBarostat, mm.MonteCarloBarostat)
+
+
+def test_two_barostats_are_still_refused_when_one_is_flexible() -> None:
+    """The guard has to see every kind, or it only guards some of them."""
+    import openmm as mm
+
+    system = mm.System()
+    system.addForce(make_barostat("anisotropic", 300.0, 1.0, 25, 7))
+    system.addForce(make_barostat("flexible", 300.0, 1.0, 0, 9))
+    with pytest.raises(SystemAssemblyError, match="2 barostats"):
+        find_barostat(system)
+
+
+def test_a_barostat_may_be_built_at_zero_frequency() -> None:
+    """A probe attached only so that its pressure readout can be called."""
+    barostat = make_barostat("flexible", 300.0, 1.0, 0, 7)
+    assert barostat.getFrequency() == 0

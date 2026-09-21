@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -10,10 +11,23 @@ from typing import Any
 import numpy as np
 import pytest
 
-from openmmpolymer.__main__ import _DESTS, PROTOCOLS, _tg_spec, build_parser, main
+from openmmpolymer.__main__ import (
+    _DESTS,
+    PROTOCOLS,
+    _modulus_spec,
+    _protocol_options,
+    _tg_spec,
+    build_parser,
+    main,
+)
 from openmmpolymer.protocols import melt_quench
 
-from .helpers import transition_at, two_line_curve, write_quench
+from .helpers import (
+    transition_at,
+    two_line_curve,
+    write_deformation,
+    write_quench,
+)
 
 
 def test_the_parser_says_what_the_command_does() -> None:
@@ -308,3 +322,130 @@ def test_a_tg_run_at_several_rates_reports_each_and_then_the_fit(
     assert "log_linear" in printed
     assert "not resolved" in printed
     assert "per decade" in printed
+
+
+# --------------------------------------------------------------------------
+# The modulus protocol, and what --analyse dispatches on
+# --------------------------------------------------------------------------
+
+
+def test_the_flat_mechanics_flags_reach_the_spec_a_scan_takes() -> None:
+    """The modulus factory takes **kwargs, so the general check cannot see it."""
+    parameters = inspect.signature(_modulus_spec).parameters
+    for option in PROTOCOLS["modulus"].options:
+        assert option in parameters, option
+
+
+def test_the_mechanics_flags_arrive_where_they_were_aimed() -> None:
+    """Parsed, mapped through the destination table, and into the spec."""
+    arguments = build_parser().parse_args(
+        [
+            "[*]CC[*]",
+            "--protocol",
+            "modulus",
+            "-t",
+            "310",
+            "--strain-increment",
+            "0.001",
+            "--max-strain",
+            "0.03",
+            "--replicas",
+            "2",
+            "--deform-axis",
+            "0",
+            "--load-stresses",
+            "0,150,300",
+        ]
+    )
+    spec = _modulus_spec(**_protocol_options(arguments, PROTOCOLS["modulus"]))
+    assert spec.temperature_k == pytest.approx(310.0)
+    assert spec.strain_increment == pytest.approx(0.001)
+    assert spec.max_strain == pytest.approx(0.03)
+    assert spec.n_replicas == 2
+    assert spec.axis == 0
+    assert spec.load_stresses_bar == (0.0, 150.0, 300.0)
+
+
+def test_a_pass_named_in_skip_is_dropped() -> None:
+    """Clearer than passing an empty list to the flag that configures it."""
+    arguments = build_parser().parse_args(
+        ["[*]CC[*]", "--protocol", "modulus", "--skip", "bulk", "shear"]
+    )
+    spec = _modulus_spec(**_protocol_options(arguments, PROTOCOLS["modulus"]))
+    assert spec.bulk_pressures_bar is None
+    assert spec.shear_strains is None
+    assert spec.load_stresses_bar is not None
+
+
+def test_a_malformed_number_list_is_refused_at_the_front_door() -> None:
+    """With a message about the flag, not a traceback from inside a run."""
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["[*]CC[*]", "--load-stresses", "not,numbers"])
+
+
+def test_analyse_reports_mechanics_when_the_directory_holds_a_deformation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Dispatched on what the run recorded, not on a second flag."""
+    write_deformation(Path("run"), modulus_mpa=2000.0, poisson=0.35)
+    exit_code = main(["--analyse", "run", "--no-figures"])
+    captured = capsys.readouterr().out
+    assert exit_code == 0
+    assert "E = 2000 MPa" in captured
+    assert "nu = 0.350" in captured
+    assert Path("run/analysis/mechanics.json").is_file()
+
+
+def test_analyse_reports_both_when_the_directory_holds_both(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One verb, and it does not have to be told which kind of run this was."""
+    Path("run").mkdir()
+    temperature, density = two_line_curve(transition_k=340.0)
+    write_quench(
+        Path("run"),
+        temperature[::-1],
+        density[::-1],
+        segment_duration_ps=[1000.0] * 21,
+    )
+    write_deformation(Path("run"), modulus_mpa=1800.0)
+    exit_code = main(["--analyse", "run", "--no-melt-check", "--no-figures"])
+    captured = capsys.readouterr().out
+    assert exit_code == 0
+    assert "E = 1800 MPa" in captured
+    assert "quenches:" in captured
+    assert Path("run/analysis/tg.json").is_file()
+    assert Path("run/analysis/mechanics.json").is_file()
+
+
+def test_analyse_says_so_when_a_directory_holds_neither(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Rather than raising from inside a reader that was asked the wrong thing."""
+    Path("run").mkdir()
+    Path("run/manifest.json").write_text(
+        json.dumps(
+            {
+                "protocol": "t",
+                "seed": 1,
+                "versions": {},
+                "system": {},
+                "stages": {},
+                "chains": None,
+                "box": None,
+            }
+        )
+    )
+    exit_code = main(["--analyse", "run"])
+    assert exit_code == 1
+    assert "nothing to report" in capsys.readouterr().out
+
+
+def test_the_strain_rate_is_printed_with_the_modulus(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The caveat travels with the number, on the command line too."""
+    write_deformation(Path("run"))
+    main(["--analyse", "run", "--no-figures"])
+    assert "strain/ns" in capsys.readouterr().out

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import math
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
 from ._seeds import derive_seed, seed_random_stream
 from ._validation import require_integer, require_positive
@@ -43,7 +45,10 @@ from .reporters import TrajectoryOptions, reporting, steps_for
 
 log = logging.getLogger(__name__)
 
-#: Barostat pressure parameters, per kind. The anisotropic barostat needs three.
+#: Barostat pressure parameters, per kind. The anisotropic barostat needs
+#: three. The flexible one shares the isotropic one's name - observed from
+#: ``MonteCarloFlexibleBarostat.Pressure()``, not assumed from the class
+#: hierarchy, which has none in common.
 _PRESSURE_PARAMETERS = {
     "isotropic": ("MonteCarloPressure",),
     "anisotropic": (
@@ -51,6 +56,7 @@ _PRESSURE_PARAMETERS = {
         "MonteCarloPressureY",
         "MonteCarloPressureZ",
     ),
+    "flexible": ("MonteCarloPressure",),
 }
 
 #: Largest force, in kJ/mol/nm, a minimised cell may still carry. Above this
@@ -190,6 +196,8 @@ def _build_simulation(
     barostat: str | None,
     pressure_bar: float,
     barostat_frequency: int,
+    pressures_bar: Sequence[float] | None = None,
+    scale_axes: Sequence[bool] = (True, True, True),
 ) -> Any:
     """Build a Simulation for one stage, with the ensemble it needs."""
     import openmm as mm
@@ -205,6 +213,8 @@ def _build_simulation(
                 barostat_frequency,
                 derive_seed(run.seed, "barostat", label),
                 scale_molecules_as_rigid=run.spec.scale_molecules_as_rigid,
+                pressures_bar=pressures_bar,
+                scale_axes=scale_axes,
             )
         )
     integrator = mm.LangevinMiddleIntegrator(
@@ -223,6 +233,8 @@ def _initialise(
     label: str,
     state_in: str | Path | None,
     temperature_k: float | None,
+    *,
+    reuse_velocities: bool = True,
 ) -> None:
     """Put the simulation at its starting point.
 
@@ -230,6 +242,21 @@ def _initialise(
     than through ``loadState``. A state saved under NPT carries the barostat's
     global parameters, and setting one of those on a Context that has no
     barostat raises - which would make every NPT-to-NVT transition a failure.
+
+    Args:
+        run: The run context.
+        simulation: The simulation to place.
+        label: The stage label, which every derived seed hangs off.
+        state_in: A previous stage's state, or None for the packed cell.
+        temperature_k: The temperature to draw velocities at, where any are
+            drawn.
+        reuse_velocities: Whether to carry the saved state's velocities over.
+            False re-draws them from the Maxwell-Boltzmann distribution at
+            *temperature_k*, seeded off *label*. That is what makes several
+            runs from one equilibrated configuration into independent
+            samples: inheriting the velocities as well as the positions gives
+            the same trajectory every time, and a spread computed over those
+            replicas would be a spread of zero dressed up as an error bar.
     """
     import openmm as mm
 
@@ -246,6 +273,16 @@ def _initialise(
     simulation.context.setPeriodicBoxVectors(*state.getPeriodicBoxVectors())
     simulation.context.setPositions(state.getPositions())
     simulation.context.computeVirtualSites()
+    if not reuse_velocities:
+        if temperature_k is None:
+            raise SimulationError(
+                f"Stage {label!r} asked for fresh velocities without a "
+                "temperature to draw them at."
+            )
+        simulation.context.setVelocitiesToTemperature(
+            temperature_k, derive_seed(run.seed, "velocities", label)
+        )
+        return
     try:
         simulation.context.setVelocities(state.getVelocities())
     except Exception:  # pragma: no cover - a state saved without velocities
@@ -291,6 +328,41 @@ def set_pressure(simulation: Any, pressure_bar: float, barostat: str) -> None:
     """
     for name in _PRESSURE_PARAMETERS[barostat]:
         simulation.context.setParameter(name, pressure_bar)
+
+
+def set_pressures(
+    simulation: Any, pressures_bar: Sequence[float], barostat: str
+) -> None:
+    """Set a different pressure on each axis, in bar.
+
+    Only the anisotropic barostat has three; for the other two this is
+    :func:`set_pressure` and every entry must agree, because silently
+    applying the first of three to all of them is how a uniaxial load becomes
+    a hydrostatic one without anything saying so.
+
+    Args:
+        simulation: The running simulation.
+        pressures_bar: One pressure per axis.
+        barostat: Which barostat is attached.
+
+    Raises:
+        ValueError: Three different pressures were given to a barostat that
+            holds one.
+    """
+    values = tuple(float(value) for value in pressures_bar)
+    if len(values) != 3:
+        raise ValueError(f"pressures_bar={pressures_bar!r} must have three entries.")
+    names = _PRESSURE_PARAMETERS[barostat]
+    if len(names) == 1:
+        if len(set(values)) != 1:
+            raise ValueError(
+                f"A {barostat} barostat holds one pressure, but "
+                f"{values} are three different ones."
+            )
+        simulation.context.setParameter(names[0], values[0])
+        return
+    for name, value in zip(names, values, strict=True):
+        simulation.context.setParameter(name, value)
 
 
 def density_g_cm3(simulation: Any, total_mass_g_mol: float) -> float:
@@ -1202,4 +1274,900 @@ def run_production(
         barostat=None if pressure_bar is None else "isotropic",
         trajectory=trajectory,
         **kwargs,
+    )
+
+
+# --------------------------------------------------------------------------
+# Deformation
+# --------------------------------------------------------------------------
+
+
+#: How many standard errors the realised lateral pressure may sit from the
+#: one the barostat was set to before the stage says so. Scaled to the
+#: window's own noise rather than fixed, because a constant in bar is either
+#: never reached or reached every step depending on the cell.
+LATERAL_SIGMA_TOLERANCE = 4.0
+
+#: A floor under that, so a window that happened to be very quiet does not
+#: warn about a difference of no consequence.
+LATERAL_PRESSURE_FLOOR_BAR = 100.0
+
+
+def _box_lengths_nm(simulation: Any) -> npt.NDArray[np.float64]:
+    """The three cell edge lengths, in nanometres."""
+    from openmm import unit
+
+    vectors = simulation.context.getState().getPeriodicBoxVectors(asNumpy=True)
+    lengths = np.asarray(vectors.value_in_unit(unit.nanometer), dtype=np.float64)
+    return np.asarray([lengths[axis][axis] for axis in range(3)], dtype=np.float64)
+
+
+def _positions_nm(simulation: Any) -> npt.NDArray[np.float64]:
+    """Whole-molecule positions, in nanometres.
+
+    Deliberately without ``enforcePeriodicBox``: wrapping puts the two halves
+    of a molecule that straddles a face on opposite sides of the cell, and its
+    centre of mass somewhere in the middle of neither.
+    """
+    from openmm import unit
+
+    state = simulation.context.getState(getPositions=True)
+    return np.asarray(
+        state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+        dtype=np.float64,
+    )
+
+
+def _apply_positions(
+    simulation: Any,
+    positions_nm: npt.NDArray[np.float64],
+    vectors_nm: Any,
+    *,
+    tolerance: float = 1.0e-8,
+) -> None:
+    """Put a new box and new positions onto a live Context, constraints intact.
+
+    An affine strain moves every atom, which stretches every constrained
+    bond it is not parallel to. ``applyConstraints`` puts them back before
+    anything reads an energy, and ``applyVelocityConstraints`` does the same
+    for the velocity components along them - without it the thermostat spends
+    the next picosecond removing motion the constraint does not allow, and
+    the temperature reads high.
+
+    Measured with the usual ``constraints="hbonds"``: a strain increment of
+    0.002 stretches the longest constrained bond by 0.2 pm, and the repair
+    moves no atom further than 2e-4 nm.
+    """
+    from openmm import unit
+
+    simulation.context.setPeriodicBoxVectors(*vectors_nm)
+    simulation.context.setPositions(positions_nm * unit.nanometer)
+    simulation.context.computeVirtualSites()
+    if simulation.system.getNumConstraints():
+        simulation.context.applyConstraints(tolerance)
+        simulation.context.applyVelocityConstraints(tolerance)
+
+
+def _sample_mechanics(
+    simulation: Any,
+    steps: int,
+    total_mass_g_mol: float,
+    samples: int,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], float, float]:
+    """Run one window: its mean stress, that mean's error, density and temperature.
+
+    Averaged over the second half, as every other stage here averages, because
+    the first half is the cell responding to whatever was just done to it. The
+    stress is the noisy one: OpenMM warns that the instantaneous pressure
+    fluctuates enormously, so the number that matters is this mean and the
+    spread behind it.
+    """
+    from openmm import unit
+
+    from .stress import stress_tensor_bar
+
+    chunk = max(1, steps // samples)
+    stresses: list[npt.NDArray[np.float64]] = []
+    densities: list[float] = []
+    temperatures: list[float] = []
+    remaining = steps
+    while remaining > 0:
+        simulation.step(min(chunk, remaining))
+        remaining -= chunk
+        energy = (
+            simulation.context.getState(getEnergy=True)
+            .getPotentialEnergy()
+            .value_in_unit(unit.kilojoule_per_mole)
+        )
+        if not np.isfinite(energy):
+            raise SimulationError(
+                "The potential energy went to NaN during a deformation. The "
+                "strain increment is too large for the relaxation time, or "
+                "the timestep is too long. Lower strain_increment, raise "
+                "relax_ps, or minimise after each step."
+            )
+        stresses.append(stress_tensor_bar(simulation))
+        densities.append(density_g_cm3(simulation, total_mass_g_mol))
+        temperatures.append(temperature_k_of(simulation))
+
+    half = max(1, len(densities) // 2)
+    window = np.stack(stresses[-half:])
+    # Averaged column by column over the components that were measured. A
+    # plain nanmean over an all-NaN off-diagonal - which is every off-diagonal
+    # under an anisotropic barostat - warns "mean of empty slice", and this
+    # package runs its tests with warnings as errors.
+    measured = np.isfinite(window).all(axis=0)
+    mean_stress = np.full((3, 3), np.nan, dtype=np.float64)
+    mean_stress[measured] = window[:, measured].mean(axis=0)
+    spread = np.full((3, 3), np.nan, dtype=np.float64)
+    if window.shape[0] > 1:
+        spread[measured] = window[:, measured].std(axis=0, ddof=1) / math.sqrt(
+            window.shape[0]
+        )
+    return (
+        mean_stress,
+        spread,
+        float(np.mean(densities[-half:])),
+        float(np.mean(temperatures[-half:])),
+    )
+
+
+def run_deform(
+    run: RunContext,
+    output_prefix: str | Path = "06_deform",
+    *,
+    temperature_k: float = 298.15,
+    pressure_bar: float = 1.0,
+    axis: int = 2,
+    strain_increment: float = 0.002,
+    n_steps: int = 25,
+    relax_ps: float = 50.0,
+    strain_start: float = 0.0,
+    reference_box_nm: Sequence[float] | None = None,
+    minimise_each_step: bool = False,
+    new_velocities: bool = False,
+    samples_per_step: int = 20,
+    barostat_frequency: int = 25,
+    timestep_fs: float | None = None,
+    friction_ps: float = 1.0,
+    trajectory: TrajectoryOptions | str = "none",
+    report_interval_ps: float = 10.0,
+    state_in: str | Path | None = None,
+    waypoints: bool = False,
+) -> StageResult:
+    """Stretch the cell along one axis in steps, measuring the stress at each.
+
+    OpenMM has no continuous deformation, so a strain rate is a staircase:
+    scale the box by one increment, let the cell relax under a barostat that
+    holds the other two axes at pressure and leaves the driven one alone, and
+    read the stress. The driven axis is held by giving the anisotropic
+    barostat ``scale_axes`` with that entry False, which stops it undoing the
+    strain while still reporting the pressure along it.
+
+    The strain is applied by translating whole molecules, not by scaling atoms
+    - see :func:`openmmpolymer.stress.scale_molecules` for why that is the
+    only option with constraints on, and why it is also what makes the
+    measured stress mean what it says.
+
+    Args:
+        run: The run context.
+        output_prefix: Stem for this stage's files.
+        temperature_k: The temperature to deform at. Above the polymer's glass
+            transition this measures a rubber, which is a real number about a
+            different material state; nothing here knows which side of it you
+            are on.
+        pressure_bar: The pressure the two lateral axes are held at.
+        axis: The axis to stretch, 0, 1 or 2.
+        strain_increment: Engineering strain added per step.
+        n_steps: How many increments to apply.
+        relax_ps: Time to relax after each increment. The mean is over the
+            second half, so this is twice the averaging window.
+        strain_start: The strain the cell is already carrying. Non-zero when a
+            ladder has been split across stages so it can be resumed.
+        reference_box_nm: The unstrained cell edges, all three. None takes
+            the current ones, which is right only when *strain_start* is
+            zero - a resumed chunk starts from an already-stretched cell and
+            would otherwise call that stretch the origin. All three are
+            needed and not just the driven one, because the lateral
+            contraction measured against them is Poisson's ratio.
+        minimise_each_step: Minimise briefly after each increment. Off by
+            default: rigid-molecule scaling at a strain increment of a couple
+            of parts in a thousand does not create the overlaps that per-atom
+            scaling would, and a minimisation between samples costs a
+            thermalised cell its velocities.
+        new_velocities: Draw fresh velocities rather than inheriting the
+            starting state's. This is what makes replicas independent.
+        samples_per_step: Stress readings per increment. The mean is over
+            the second half of them. Worth setting high: the instantaneous
+            pressure decorrelates in well under a picosecond, so readings
+            spaced picoseconds apart leave most of the window's statistics
+            unused, and each reading is only about six energy evaluations.
+        barostat_frequency: Steps between lateral volume moves.
+        timestep_fs: The integration timestep, or None for the longest safe
+            one.
+        friction_ps: Langevin friction.
+        trajectory: Trajectory settings.
+        report_interval_ps: Time between state-data rows.
+        state_in: The previous stage's state.
+        waypoints: Write a state at the end of every increment.
+
+    Returns:
+        What the stage did, with a strain, a stress tensor and the three box
+        lengths recorded per increment.
+
+    Raises:
+        SimulationError: The cell blew up, or stretching it took an edge below
+            what the cutoff allows.
+        ValueError: The axis or the increment is not usable.
+    """
+    from .stress import affine_scale
+
+    if axis not in (0, 1, 2):
+        raise ValueError(f"axis={axis!r} must be 0, 1 or 2.")
+    require_integer(n_steps, minimum=1, name="n_steps")
+    require_integer(samples_per_step, minimum=1, name="samples_per_step")
+    require_positive(relax_ps, None, name="relax_ps")
+    require_positive(abs(strain_increment), None, name="strain_increment")
+
+    prefix = Path(output_prefix)
+    started = time.monotonic()
+    if timestep_fs is None:
+        timestep_fs = safe_timestep_fs(temperature_k, run.spec)
+    check_timestep(timestep_fs, temperature_k, run.spec)
+
+    scale_flags = [True, True, True]
+    scale_flags[axis] = False
+    simulation = _build_simulation(
+        run,
+        prefix.name,
+        temperature_k=temperature_k,
+        timestep_fs=timestep_fs,
+        friction_ps=friction_ps,
+        barostat="anisotropic",
+        pressure_bar=pressure_bar,
+        barostat_frequency=barostat_frequency,
+        scale_axes=scale_flags,
+    )
+    _initialise(
+        run,
+        simulation,
+        prefix.name,
+        state_in,
+        temperature_k,
+        reuse_velocities=not new_velocities,
+    )
+
+    _check_molecules(prefix.name, simulation, run.box.n_molecules)
+    cutoff_nm = nonbonded_cutoff_nm(simulation.system)
+    reference = (
+        _box_lengths_nm(simulation)
+        if reference_box_nm is None
+        else np.asarray([float(value) for value in reference_box_nm], dtype=np.float64)
+    )
+    if reference.shape != (3,) or not np.all(reference > 0.0):
+        raise SimulationError(
+            f"reference_box_nm={reference.tolist()} is not three positive cell edges."
+        )
+
+    steps_each = steps_for(relax_ps, timestep_fs)
+    total_steps = steps_each * n_steps
+    samples: dict[str, list[float]] = {
+        "segment_strain": [],
+        "segment_stress_xx_bar": [],
+        "segment_stress_yy_bar": [],
+        "segment_stress_zz_bar": [],
+        "segment_box_x_nm": [],
+        "segment_box_y_nm": [],
+        "segment_box_z_nm": [],
+        "segment_temperature_k": [],
+        "segment_mean_temperature_k": [],
+        "segment_density_g_cm3": [],
+        "segment_duration_ps": [],
+    }
+    waypoint_paths: list[str] = []
+    log.info(
+        "%s: %d steps of %+.4f strain on axis %d, %.1f ps each at %.2f fs "
+        "(%d steps), lateral %g bar, L0 = %.4f nm.",
+        prefix.name,
+        n_steps,
+        strain_increment,
+        axis,
+        relax_ps,
+        timestep_fs,
+        total_steps,
+        pressure_bar,
+        reference[axis],
+    )
+
+    with reporting(
+        simulation,
+        prefix,
+        total_steps=total_steps,
+        report_interval=steps_for(report_interval_ps, timestep_fs),
+        trajectory=trajectory,
+        trajectory_interval=_frame_interval(trajectory, timestep_fs),
+    ) as paths:
+        strain = float(strain_start)
+        for index in range(n_steps):
+            factors = [1.0, 1.0, 1.0]
+            factors[axis] = 1.0 + strain_increment
+            vectors = simulation.context.getState().getPeriodicBoxVectors()
+            scaled_vectors = [
+                vector * factors[axis] if which == axis else vector
+                for which, vector in enumerate(vectors)
+            ]
+            _apply_positions(
+                simulation,
+                affine_scale(_positions_nm(simulation), factors),
+                scaled_vectors,
+            )
+            strain = (1.0 + strain) * (1.0 + strain_increment) - 1.0
+
+            _check_deformed_box(prefix.name, simulation, cutoff_nm, strain)
+
+            if minimise_each_step:
+                simulation.minimizeEnergy(maxIterations=200)
+
+            stress, error, density, realised = _sample_mechanics(
+                simulation, steps_each, run.total_mass_g_mol, samples_per_step
+            )
+            edges = _box_lengths_nm(simulation)
+            samples["segment_strain"].append(strain)
+            for which, name in enumerate("xyz"):
+                samples[f"segment_stress_{name}{name}_bar"].append(
+                    float(stress[which, which])
+                )
+                samples[f"segment_box_{name}_nm"].append(float(edges[which]))
+            samples["segment_temperature_k"].append(temperature_k)
+            samples["segment_mean_temperature_k"].append(realised)
+            samples["segment_density_g_cm3"].append(density)
+            samples["segment_duration_ps"].append(relax_ps)
+            if waypoints:
+                waypoint_paths.append(
+                    _save_waypoint(simulation, prefix, index, temperature_k)
+                )
+            _check_lateral(prefix.name, stress, error, axis, pressure_bar, strain)
+            log.info(
+                "  strain %+.4f: sigma_%s%s = %.1f +/- %.1f bar, %.4f g/cm3, "
+                "ran at %.0f K.",
+                strain,
+                "xyz"[axis],
+                "xyz"[axis],
+                float(stress[axis, axis]),
+                float(error[axis, axis]),
+                density,
+                realised,
+            )
+        state_path, pdb_path = _save_final(simulation, prefix)
+
+    samples["reference_box_nm"] = reference.tolist()
+    samples["deform_axis"] = [float(axis)]
+    return StageResult(
+        name=prefix.name,
+        steps=total_steps,
+        wall_seconds=time.monotonic() - started,
+        final_state=state_path,
+        temperature_k=temperature_k,
+        mean_temperature_k=float(np.mean(samples["segment_mean_temperature_k"])),
+        mean_density_g_cm3=samples["segment_density_g_cm3"][-1],
+        final_pdb=pdb_path,
+        csv=paths.csv,
+        samples=samples,
+        waypoints=tuple(waypoint_paths),
+    )
+
+
+def nonbonded_cutoff_nm(system: Any) -> float:
+    """The longest nonbonded cutoff actually in the System, in nanometres.
+
+    Read off the forces rather than taken from
+    :class:`~openmmpolymer.mdsystem.SystemSpec`, because the two can differ:
+    ``prepare_run`` accepts a ready-made System, and then the spec records
+    what a System *would* have been built with rather than what this one has.
+    A deformation is checked against the cutoff OpenMM will actually enforce.
+
+    Args:
+        system: The System to inspect.
+
+    Returns:
+        The cutoff in nanometres, or 0.0 when nothing in the System has one.
+    """
+    from openmm import unit
+
+    cutoffs = []
+    for force in system.getForces():
+        getter = getattr(force, "getCutoffDistance", None)
+        if getter is None:
+            continue
+        try:
+            cutoffs.append(float(getter().value_in_unit(unit.nanometer)))
+        except Exception:  # pragma: no cover - a force with no periodic cutoff
+            continue
+    return max(cutoffs, default=0.0)
+
+
+def _check_deformed_box(
+    name: str, simulation: Any, cutoff_nm: float, strain: float
+) -> None:
+    """Refuse a strain that has taken an edge below twice the cutoff.
+
+    Stretching one axis contracts the other two, so a cell that was
+    comfortable unstrained need not stay so. OpenMM refuses a cutoff over
+    half the box, and it refuses it when the next force evaluation happens
+    rather than when the box was set - which puts the error several steps
+    away from the line that caused it unless something looks here first.
+
+    Args:
+        name: The stage name, for the message.
+        simulation: The running simulation.
+        cutoff_nm: The cutoff to check against.
+        strain: The strain or applied stress reached, for the message.
+
+    Raises:
+        SimulationError: An edge is below twice the cutoff.
+    """
+    if cutoff_nm <= 0.0:
+        return
+    edges = _box_lengths_nm(simulation)
+    shortest = float(edges.min())
+    if shortest < 2.0 * cutoff_nm:
+        raise SimulationError(
+            f"{name}: at {strain:+.4g} the cell is "
+            f"{edges.round(3).tolist()} nm, and its shortest edge is below "
+            f"twice the {cutoff_nm:.2f} nm cutoff. Stretching one axis "
+            "contracts the other two, so a cell that was comfortable "
+            "unstrained need not stay so. Pack more chains, shorten the "
+            "strain ladder, or lower the cutoff."
+        )
+
+
+def _check_molecules(name: str, simulation: Any, expected: int) -> None:
+    """Say so when OpenMM groups the cell into a different number of molecules.
+
+    The molecular virial is a sum over molecules, so if two chains ended up
+    bonded to each other there are fewer of them than were packed and the
+    stress is being computed over the wrong units. In the limit where
+    everything is one molecule, a rigid volume move barely changes the
+    energy and the reported pressure is close to meaningless. This package
+    has seen packmol merge molecules before, so it is worth one line.
+    """
+    found = len(simulation.context.getMolecules())
+    if expected and found != expected:
+        log.warning(
+            "%s: OpenMM groups this cell into %d molecules, but %d chains "
+            "were packed. The stress is a sum over molecules, so if chains "
+            "have become bonded to each other it is being computed over the "
+            "wrong units.",
+            name,
+            found,
+            expected,
+        )
+
+
+def _check_lateral(
+    name: str,
+    stress: npt.NDArray[np.float64],
+    error: npt.NDArray[np.float64],
+    axis: int,
+    pressure_bar: float,
+    strain: float,
+) -> None:
+    """Say so when the lateral axes are not at the pressure they were set to.
+
+    Free, because the stress tensor is already in hand, and it checks the
+    barostat and the pressure readout against each other at once: the two
+    come from different places, and both being wrong in the same direction
+    is unlikely.
+
+    The threshold is the window's own standard error rather than a constant,
+    because the instantaneous pressure of a small cell is enormously noisy
+    and how noisy depends on the cell, the temperature and how long the
+    window was. A fixed number is either never reached or reached every
+    step; :data:`LATERAL_SIGMA_TOLERANCE` standard errors is the same
+    statement at any of them.
+    """
+    lateral = [index for index in range(3) if index != axis]
+    realised = [-float(stress[index, index]) for index in lateral]
+    errors = [float(error[index, index]) for index in lateral]
+    limits = [
+        max(LATERAL_SIGMA_TOLERANCE * value, LATERAL_PRESSURE_FLOOR_BAR)
+        if math.isfinite(value)
+        else math.inf
+        for value in errors
+    ]
+    if any(
+        abs(value - pressure_bar) > limit
+        for value, limit in zip(realised, limits, strict=True)
+    ):
+        log.warning(
+            "%s at strain %+.4f: the lateral axes read %s bar (+/- %s) "
+            "against a set point of %g. Either they have not relaxed at this "
+            "strain, or the barostat is not acting on them.",
+            name,
+            strain,
+            [round(value) for value in realised],
+            [round(value) for value in errors],
+            pressure_bar,
+        )
+
+
+def run_load(
+    run: RunContext,
+    output_prefix: str | Path = "07_load",
+    *,
+    temperature_k: float = 298.15,
+    pressure_bar: float = 1.0,
+    axis: int = 2,
+    stresses_bar: Sequence[float] = (0.0, 100.0, 200.0, 300.0),
+    duration_ps_each: float = 1000.0,
+    new_velocities: bool = False,
+    samples_per_step: int = 20,
+    barostat_frequency: int = 25,
+    timestep_fs: float | None = None,
+    friction_ps: float = 1.0,
+    trajectory: TrajectoryOptions | str = "none",
+    report_interval_ps: float = 10.0,
+    state_in: str | Path | None = None,
+) -> StageResult:
+    """Pull on one axis at a known stress and measure how far the cell gives.
+
+    The mirror image of :func:`run_deform`, and worth having precisely
+    because it shares none of its machinery. Here the stress is *imposed* -
+    the barostat is set to ``pressure - sigma`` along the driven axis and to
+    ``pressure`` on the other two - so the only thing measured is the box
+    length, which is the one quantity OpenMM reports exactly. No virial is
+    involved anywhere. Two methods that agree is evidence; one method that
+    looks reasonable is not.
+
+    What it costs is time. The cell's length is its slowest coordinate, so
+    each rung needs long enough for the box to actually settle, and a rung
+    that has not settled is a point on the wrong curve.
+    :func:`openmmpolymer.elasticity.load_curve` checks that per rung rather
+    than assuming it.
+
+    Args:
+        run: The run context.
+        output_prefix: Stem for this stage's files.
+        temperature_k: The temperature to hold.
+        pressure_bar: The pressure on the two lateral axes, and the baseline
+            the applied stress is measured from.
+        axis: The axis to pull on.
+        stresses_bar: The applied tensile stresses to step through. Starting
+            at zero gives the unstrained length the rest are measured
+            against, in the same ensemble rather than a different one.
+        duration_ps_each: Time at each rung.
+        new_velocities: Draw fresh velocities rather than inheriting them.
+        samples_per_step: Box readings per rung.
+        barostat_frequency: Steps between volume moves.
+        timestep_fs: The integration timestep, or None for the longest safe
+            one.
+        friction_ps: Langevin friction.
+        trajectory: Trajectory settings.
+        report_interval_ps: Time between state-data rows.
+        state_in: The previous stage's state.
+
+    Returns:
+        What the stage did, with the applied stress and the three box lengths
+        recorded per rung.
+
+    Raises:
+        ValueError: The axis is not 0, 1 or 2, or no stresses were given.
+    """
+    if axis not in (0, 1, 2):
+        raise ValueError(f"axis={axis!r} must be 0, 1 or 2.")
+    rungs = [float(value) for value in stresses_bar]
+    if not rungs:
+        raise ValueError("stresses_bar is empty, so there is nothing to pull with.")
+    require_integer(samples_per_step, minimum=1, name="samples_per_step")
+    require_positive(duration_ps_each, None, name="duration_ps_each")
+
+    prefix = Path(output_prefix)
+    started = time.monotonic()
+    if timestep_fs is None:
+        timestep_fs = safe_timestep_fs(temperature_k, run.spec)
+    check_timestep(timestep_fs, temperature_k, run.spec)
+
+    simulation = _build_simulation(
+        run,
+        prefix.name,
+        temperature_k=temperature_k,
+        timestep_fs=timestep_fs,
+        friction_ps=friction_ps,
+        barostat="anisotropic",
+        pressure_bar=pressure_bar,
+        barostat_frequency=barostat_frequency,
+    )
+    _initialise(
+        run,
+        simulation,
+        prefix.name,
+        state_in,
+        temperature_k,
+        reuse_velocities=not new_velocities,
+    )
+
+    steps_each = steps_for(duration_ps_each, timestep_fs)
+    total_steps = steps_each * len(rungs)
+    samples: dict[str, list[float]] = {
+        "segment_applied_stress_bar": [],
+        "segment_box_x_nm": [],
+        "segment_box_y_nm": [],
+        "segment_box_z_nm": [],
+        "segment_temperature_k": [],
+        "segment_mean_temperature_k": [],
+        "segment_density_g_cm3": [],
+        "segment_duration_ps": [],
+    }
+    log.info(
+        "%s: %d applied stresses on axis %d, %.1f ps each at %.2f fs (%d steps).",
+        prefix.name,
+        len(rungs),
+        axis,
+        duration_ps_each,
+        timestep_fs,
+        total_steps,
+    )
+
+    with reporting(
+        simulation,
+        prefix,
+        total_steps=total_steps,
+        report_interval=steps_for(report_interval_ps, timestep_fs),
+        trajectory=trajectory,
+        trajectory_interval=_frame_interval(trajectory, timestep_fs),
+    ) as paths:
+        cutoff_nm = nonbonded_cutoff_nm(simulation.system)
+        for applied in rungs:
+            targets = [pressure_bar, pressure_bar, pressure_bar]
+            # Tension is a negative pressure: pulling at sigma means holding
+            # the axis below the ambient pressure by exactly that much.
+            targets[axis] = pressure_bar - applied
+            set_pressures(simulation, targets, "anisotropic")
+            edges, density, realised = _sample_box(
+                simulation, steps_each, run.total_mass_g_mol, samples_per_step
+            )
+            # A fluid cannot hold a deviatoric stress: rather than settling
+            # at a new length it creeps, and keeps creeping until the cell
+            # is thinner than the cutoff. Saying that here beats OpenMM
+            # saying it several steps later about a box nobody set.
+            _check_deformed_box(prefix.name, simulation, cutoff_nm, applied)
+            samples["segment_applied_stress_bar"].append(applied)
+            for which, name in enumerate("xyz"):
+                samples[f"segment_box_{name}_nm"].append(float(edges[which]))
+            samples["segment_temperature_k"].append(temperature_k)
+            samples["segment_mean_temperature_k"].append(realised)
+            samples["segment_density_g_cm3"].append(density)
+            samples["segment_duration_ps"].append(duration_ps_each)
+            log.info(
+                "  %g bar: box %s nm, %.4f g/cm3, ran at %.0f K.",
+                applied,
+                edges.round(4).tolist(),
+                density,
+                realised,
+            )
+        state_path, pdb_path = _save_final(simulation, prefix)
+
+    samples["load_axis"] = [float(axis)]
+    return StageResult(
+        name=prefix.name,
+        steps=total_steps,
+        wall_seconds=time.monotonic() - started,
+        final_state=state_path,
+        temperature_k=temperature_k,
+        mean_temperature_k=float(np.mean(samples["segment_mean_temperature_k"])),
+        mean_density_g_cm3=samples["segment_density_g_cm3"][-1],
+        final_pdb=pdb_path,
+        csv=paths.csv,
+        samples=samples,
+    )
+
+
+def _sample_box(
+    simulation: Any,
+    steps: int,
+    total_mass_g_mol: float,
+    samples: int,
+) -> tuple[npt.NDArray[np.float64], float, float]:
+    """Run one window, returning its mean box edges, density and temperature."""
+    from openmm import unit
+
+    chunk = max(1, steps // samples)
+    edges: list[npt.NDArray[np.float64]] = []
+    densities: list[float] = []
+    temperatures: list[float] = []
+    remaining = steps
+    while remaining > 0:
+        simulation.step(min(chunk, remaining))
+        remaining -= chunk
+        energy = (
+            simulation.context.getState(getEnergy=True)
+            .getPotentialEnergy()
+            .value_in_unit(unit.kilojoule_per_mole)
+        )
+        if not np.isfinite(energy):
+            raise SimulationError(
+                "The potential energy went to NaN under load. The applied "
+                "stress is large enough to be pulling the cell apart rather "
+                "than straining it elastically."
+            )
+        edges.append(_box_lengths_nm(simulation))
+        densities.append(density_g_cm3(simulation, total_mass_g_mol))
+        temperatures.append(temperature_k_of(simulation))
+
+    half = max(1, len(densities) // 2)
+    return (
+        np.mean(np.stack(edges[-half:]), axis=0),
+        float(np.mean(densities[-half:])),
+        float(np.mean(temperatures[-half:])),
+    )
+
+
+def run_shear(
+    run: RunContext,
+    output_prefix: str | Path = "09_shear",
+    *,
+    temperature_k: float = 298.15,
+    strains: Sequence[float] = (0.005, 0.010, 0.015, 0.020),
+    duration_ps_each: float = 200.0,
+    plane: tuple[int, int] = (0, 2),
+    new_velocities: bool = False,
+    samples_per_step: int = 20,
+    timestep_fs: float | None = None,
+    friction_ps: float = 1.0,
+    trajectory: TrajectoryOptions | str = "none",
+    report_interval_ps: float = 10.0,
+    state_in: str | Path | None = None,
+) -> StageResult:
+    """Shear the cell in steps, measuring the shear stress at each.
+
+    Run at constant volume, and that is not a shortcut. An anisotropic
+    barostat scales only the diagonal, so it would change ``cz`` underneath
+    the measurement and with it the shear strain ``gamma = cx / cz``; a live
+    flexible barostat would relax the shear away, which is the one thing
+    being held. So the barostat here is a flexible one at ``frequency=0``: it
+    never moves the box, and exists because ``computeCurrentPressure`` is a
+    method on a barostat and OpenMM refuses it for a force that is not in the
+    Context. It is the only barostat that reports off-diagonal components.
+
+    Args:
+        run: The run context.
+        output_prefix: Stem for this stage's files.
+        temperature_k: The temperature to hold.
+        strains: The shear strains to step through, ascending.
+        duration_ps_each: Time held at each strain.
+        plane: ``(driven, gradient)`` axes - the displaced direction and the
+            direction it varies along.
+        new_velocities: Draw fresh velocities rather than inheriting them.
+        samples_per_step: Stress readings per strain.
+        timestep_fs: The integration timestep, or None for the longest safe
+            one.
+        friction_ps: Langevin friction.
+        trajectory: Trajectory settings.
+        report_interval_ps: Time between state-data rows.
+        state_in: The previous stage's state.
+
+    Returns:
+        What the stage did, with the shear strain and shear stress recorded
+        per step.
+
+    Raises:
+        SimulationError: A strain would tilt the box past what OpenMM's
+            reduced form allows.
+        ValueError: The plane or the strain ladder is not usable.
+    """
+    from .stress import affine_shear, shear_box_vectors
+
+    driven, gradient = plane
+    if driven == gradient or not {driven, gradient} <= {0, 1, 2}:
+        raise ValueError(f"plane={plane!r} must be two different axes of 0, 1, 2.")
+    ladder = [float(value) for value in strains]
+    if not ladder:
+        raise ValueError("strains is empty, so there is nothing to shear.")
+    require_integer(samples_per_step, minimum=1, name="samples_per_step")
+    require_positive(duration_ps_each, None, name="duration_ps_each")
+
+    prefix = Path(output_prefix)
+    started = time.monotonic()
+    if timestep_fs is None:
+        timestep_fs = safe_timestep_fs(temperature_k, run.spec)
+    check_timestep(timestep_fs, temperature_k, run.spec)
+
+    simulation = _build_simulation(
+        run,
+        prefix.name,
+        temperature_k=temperature_k,
+        timestep_fs=timestep_fs,
+        friction_ps=friction_ps,
+        barostat="flexible",
+        pressure_bar=1.0,
+        barostat_frequency=0,
+    )
+    _initialise(
+        run,
+        simulation,
+        prefix.name,
+        state_in,
+        temperature_k,
+        reuse_velocities=not new_velocities,
+    )
+
+    _check_molecules(prefix.name, simulation, run.box.n_molecules)
+    original = simulation.context.getState().getPeriodicBoxVectors()
+    for gamma in ladder:
+        # Checked against every rung before the first one runs, so a ladder
+        # that cannot finish does not spend an hour finding out.
+        shear_box_vectors(original, gamma, plane)
+
+    steps_each = steps_for(duration_ps_each, timestep_fs)
+    total_steps = steps_each * len(ladder)
+    samples: dict[str, list[float]] = {
+        "segment_shear_strain": [],
+        "segment_shear_stress_bar": [],
+        "segment_temperature_k": [],
+        "segment_mean_temperature_k": [],
+        "segment_density_g_cm3": [],
+        "segment_duration_ps": [],
+    }
+    log.info(
+        "%s: %d shear strains in the %s%s plane, %.1f ps each at %.2f fs "
+        "(%d steps), at constant volume.",
+        prefix.name,
+        len(ladder),
+        "xyz"[driven],
+        "xyz"[gradient],
+        duration_ps_each,
+        timestep_fs,
+        total_steps,
+    )
+
+    reference = _positions_nm(simulation)
+    with reporting(
+        simulation,
+        prefix,
+        total_steps=total_steps,
+        report_interval=steps_for(report_interval_ps, timestep_fs),
+        trajectory=trajectory,
+        trajectory_interval=_frame_interval(trajectory, timestep_fs),
+    ) as paths:
+        for gamma in ladder:
+            # Each strain is applied to the same starting configuration
+            # rather than added to the last one, so a ladder is a set of
+            # independent measurements of one cell rather than a history.
+            _apply_positions(
+                simulation,
+                affine_shear(reference, gamma, plane),
+                shear_box_vectors(original, gamma, plane),
+            )
+            stress, error, density, realised = _sample_mechanics(
+                simulation, steps_each, run.total_mass_g_mol, samples_per_step
+            )
+            samples["segment_shear_strain"].append(gamma)
+            samples["segment_shear_stress_bar"].append(float(stress[driven, gradient]))
+            samples["segment_temperature_k"].append(temperature_k)
+            samples["segment_mean_temperature_k"].append(realised)
+            samples["segment_density_g_cm3"].append(density)
+            samples["segment_duration_ps"].append(duration_ps_each)
+            log.info(
+                "  gamma %.4f: sigma_%s%s = %.1f +/- %.1f bar, ran at %.0f K.",
+                gamma,
+                "xyz"[driven],
+                "xyz"[gradient],
+                float(stress[driven, gradient]),
+                float(error[driven, gradient]),
+                realised,
+            )
+        state_path, pdb_path = _save_final(simulation, prefix)
+
+    samples["shear_plane"] = [float(driven), float(gradient)]
+    return StageResult(
+        name=prefix.name,
+        steps=total_steps,
+        wall_seconds=time.monotonic() - started,
+        final_state=state_path,
+        temperature_k=temperature_k,
+        mean_temperature_k=float(np.mean(samples["segment_mean_temperature_k"])),
+        mean_density_g_cm3=samples["segment_density_g_cm3"][-1],
+        final_pdb=pdb_path,
+        csv=paths.csv,
+        samples=samples,
     )

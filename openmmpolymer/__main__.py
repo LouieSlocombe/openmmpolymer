@@ -28,12 +28,20 @@ from typing import Any, cast
 
 from .chain import ChainSpec, build_chain
 from .charges import CHARGE_METHODS, assign_charges
+from .elasticity import deform_stages, load_stages, shear_stages
 from .forcefield import BACKENDS, build_polymer_forcefield
 from .mdsystem import (
     SystemSpec,
     assemble_box,
     check_target_density,
     prepare_box,
+)
+from .mechanical import (
+    ModulusSpec,
+    analyse_mechanics,
+    mechanical_scan,
+    run_modulus_scan,
+    write_mechanical_report,
 )
 from .packing import (
     DEFAULT_PACKING_DENSITY,
@@ -56,7 +64,9 @@ from .timeseries import (
     DSC_COOLING_RATE_K_PER_NS,
     EXTRAPOLATION_FORMS,
     cooling_rate_extrapolation,
+    quench_stages,
 )
+from .trajectory import AnalysisError
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +93,9 @@ _DESTS = {
     "target_temperature_k": "temperature",
     "melt_temperature_k": "melt_temperature",
     "pressure_bar": "pressure",
+    # The modulus protocol has one temperature rather than a melt and a
+    # target, and it is the same -t flag.
+    "temperature_k": "temperature",
 }
 
 #: Keywords every protocol factory takes.
@@ -103,6 +116,75 @@ _TG = (
     "max_total_ns",
     "check_melt",
 )
+
+
+#: The extension, and the three passes that can be skipped.
+_MECHANICS = (
+    "temperature_k",
+    "strain_increment",
+    "max_strain",
+    "relax_ps",
+    "elastic_strain_limit",
+    "replicas",
+    "deform_axis",
+    "load_stresses",
+    "bulk_pressures",
+    "shear_strains",
+    "skip",
+    "max_total_ns",
+)
+
+
+def _modulus_spec(
+    *,
+    temperature_k: float = 298.15,
+    pressure_bar: float = 1.0,
+    strain_increment: float = 0.002,
+    max_strain: float = 0.05,
+    relax_ps: float = 50.0,
+    elastic_strain_limit: float = 0.015,
+    replicas: int = 3,
+    deform_axis: int = 2,
+    load_stresses: tuple[float, ...] | None = None,
+    bulk_pressures: tuple[float, ...] | None = None,
+    shear_strains: tuple[float, ...] | None = None,
+    skip: Sequence[str] | None = None,
+    max_total_ns: float | None = None,
+) -> ModulusSpec:
+    """Turn the flat mechanics flags into the spec a scan takes.
+
+    A pass is skipped by naming it in ``--skip``, which is clearer than
+    passing an empty list to the flag that configures it.
+    """
+    dropped = set(skip or ())
+    defaults = ModulusSpec()
+    return ModulusSpec(
+        temperature_k=temperature_k,
+        pressure_bar=pressure_bar,
+        axis=deform_axis,
+        strain_increment=strain_increment,
+        max_strain=max_strain,
+        relax_ps=relax_ps,
+        elastic_strain_limit=elastic_strain_limit,
+        n_replicas=replicas,
+        load_stresses_bar=(
+            None if "load" in dropped else (load_stresses or defaults.load_stresses_bar)
+        ),
+        bulk_pressures_bar=(
+            None
+            if "bulk" in dropped
+            else (bulk_pressures or defaults.bulk_pressures_bar)
+        ),
+        shear_strains=(
+            None if "shear" in dropped else (shear_strains or defaults.shear_strains)
+        ),
+        max_total_ns=max_total_ns,
+    )
+
+
+def _modulus_protocol(**options: Any) -> Protocol:
+    """The equilibration and one extension, so --dry-run can price it."""
+    return mechanical_scan(_modulus_spec(**options))
 
 
 def _tg_spec(
@@ -143,6 +225,7 @@ PROTOCOLS = {
     "equilibrate": ProtocolEntry(standard_melt_equilibration, _TARGET + _COMMON),
     "melt-quench": ProtocolEntry(melt_quench, _TARGET + _COMMON + _QUENCH),
     "tg": ProtocolEntry(_tg_protocol, _COMMON + _QUENCH[1:] + _TG),
+    "modulus": ProtocolEntry(_modulus_protocol, ("pressure_bar", *_MECHANICS)),
 }
 
 
@@ -293,7 +376,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-total-ns",
         type=float,
         default=None,
-        help="refuse to start a tg scan longer than this",
+        help="refuse to start a tg or modulus scan longer than this",
     )
     quench.add_argument(
         "--check-melt",
@@ -342,6 +425,77 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="build, charge, parameterise and pack, but run no dynamics",
+    )
+    mechanics = parser.add_argument_group(
+        "mechanics",
+        "the extension the modulus protocol walks, and the passes beside it",
+    )
+    mechanics.add_argument(
+        "--strain-increment",
+        type=float,
+        default=0.002,
+        help="engineering strain added per step (default: %(default)s)",
+    )
+    mechanics.add_argument(
+        "--max-strain",
+        type=float,
+        default=0.05,
+        help="strain the ladder stops at (default: %(default)s)",
+    )
+    mechanics.add_argument(
+        "--relax-ps",
+        type=float,
+        default=50.0,
+        help="time to relax after each increment; the mean is over the "
+        "second half, so this is twice the averaging window "
+        "(default: %(default)s)",
+    )
+    mechanics.add_argument(
+        "--elastic-strain-limit",
+        type=float,
+        default=0.015,
+        help="strain the modulus is fitted up to (default: %(default)s)",
+    )
+    mechanics.add_argument(
+        "--replicas",
+        type=int,
+        default=3,
+        help="extensions from the same cell with fresh velocities; their "
+        "spread is the error bar (default: %(default)s)",
+    )
+    mechanics.add_argument(
+        "--deform-axis",
+        type=int,
+        default=2,
+        choices=(0, 1, 2),
+        help="axis to stretch (default: %(default)s)",
+    )
+    mechanics.add_argument(
+        "--load-stresses",
+        type=_floats,
+        default=None,
+        help="comma-separated stresses in bar for the constant-stress "
+        "cross-check, e.g. 0,100,200,300",
+    )
+    mechanics.add_argument(
+        "--bulk-pressures",
+        type=_floats,
+        default=None,
+        help="comma-separated pressures in bar for the bulk modulus, up and "
+        "back down so the hysteresis is measurable",
+    )
+    mechanics.add_argument(
+        "--shear-strains",
+        type=_floats,
+        default=None,
+        help="comma-separated shear strains for the shear modulus",
+    )
+    mechanics.add_argument(
+        "--skip",
+        nargs="*",
+        default=(),
+        choices=("load", "bulk", "shear"),
+        help="passes to leave out; the extension always runs",
     )
     analysis = parser.add_argument_group(
         "analysis", "read a finished run directory instead of building one"
@@ -405,6 +559,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="log what each step is doing",
     )
     return parser
+
+
+def _floats(text: str) -> tuple[float, ...]:
+    """Parse a comma-separated list of numbers, at the front door."""
+    try:
+        values = tuple(float(part) for part in text.split(",") if part.strip())
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a comma-separated list of numbers, e.g. '0,100,200'."
+        ) from error
+    if not values:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is empty. Leave the flag out for the default, or name "
+            "the pass in --skip to drop it."
+        )
+    return values
 
 
 def _rates(text: str) -> tuple[float, ...]:
@@ -528,6 +698,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     options = _protocol_options(arguments, entry)
     if name == "tg":
         return _run_tg_scan(arguments, run, output, chain, options)
+    if name == "modulus":
+        return _run_modulus_scan(arguments, run, output, chain, options)
 
     summary = run_protocol(
         entry.factory(**options),
@@ -630,9 +802,188 @@ def _extrapolation_line(extrapolation: Any) -> str:
     )
 
 
+def _run_modulus_scan(
+    arguments: argparse.Namespace,
+    run: Any,
+    output: Path,
+    chain: Any,
+    options: dict[str, Any],
+) -> int:
+    """Measure the elastic constants, and say what qualifies each one."""
+    result = run_modulus_scan(
+        run,
+        output,
+        spec=_modulus_spec(**options),
+        chain_backbone=chain.backbone,
+        atoms_per_chain=chain.n_atoms,
+    )
+    for line in _modulus_lines(result):
+        print(line, flush=True)
+    _print_chains(None)
+    return 0
+
+
+def _modulus_lines(result: Any) -> list[str]:
+    """One line per constant, each carrying what qualifies it."""
+    lines: list[str] = []
+    if result.youngs is None:
+        return ["modulus: nothing was deformed"]
+    spread = (
+        ""
+        if result.replica_spread_mpa is None
+        else f" +/- {result.replica_spread_mpa:.0f} over {len(result.replicas)}"
+    )
+    rate = result.schedule.strain_rate_per_ns
+    lines.append(
+        f"E = {result.youngs.modulus_mpa:.0f} MPa{spread} at {rate:.3g} "
+        f"strain/ns, {result.youngs.temperature_k:.0f} K"
+        f"{'' if result.resolved else ' (not resolved)'}"
+    )
+    if result.poisson is not None:
+        lines.append(
+            f"nu = {result.poisson.ratio:.3f}"
+            f"{'' if result.poisson.resolved else ' (not resolved)'}"
+        )
+    for label, fit in (("K", result.bulk), ("G", result.shear)):
+        if fit is not None:
+            lines.append(
+                f"{label} = {fit.modulus_mpa:.0f} MPa"
+                f"{'' if fit.resolved else ' (not resolved)'}"
+            )
+    if result.load_modulus is not None:
+        lines.append(
+            f"constant-stress cross-check: "
+            f"E = {result.load_modulus.modulus_mpa:.0f} MPa"
+        )
+    if result.consistency is not None:
+        lines.append(_consistency_line(result.consistency))
+    return lines
+
+
+def _consistency_line(check: Any) -> str:
+    """One line for the over-determination check."""
+    import math
+
+    gaps = ", ".join(
+        f"{name} {100.0 * gap:.0f}%"
+        for name, gap in (("K", check.bulk_gap), ("G", check.shear_gap))
+        if math.isfinite(gap)
+    )
+    if not gaps:
+        return (
+            f"E and nu imply K = {check.bulk_implied_mpa:.0f}, "
+            f"G = {check.shear_implied_mpa:.0f} MPa - nothing measured to "
+            "check them against"
+        )
+    return (
+        f"E and nu imply K = {check.bulk_implied_mpa:.0f}, "
+        f"G = {check.shear_implied_mpa:.0f} MPa; measured differ by {gaps}"
+        f"{'' if check.consistent else ' - not consistent'}"
+    )
+
+
+def _has_stages(run_dir: Path, find: Any) -> bool:
+    """Whether a reader finds anything of its kind in this directory.
+
+    The readers raise rather than return empty, which is the right shape for
+    a caller that asked for one thing and consistent with
+    :func:`~openmmpolymer.timeseries.quench_stages`. Here the question really
+    is "is there any", so the refusal is caught once, in the one place that
+    is asking rather than telling.
+    """
+    try:
+        find(run_dir)
+    except AnalysisError:
+        return False
+    return True
+
+
 def _analyse(arguments: argparse.Namespace) -> int:
-    """Report the transition from finished run directories, and write it out."""
+    """Report whatever a finished run directory holds, and write it out.
+
+    Dispatches on what the directory recorded rather than on a flag. A run
+    that quenched gets a glass transition, a run that was deformed gets its
+    elastic constants, a run that did both gets both, and a run that did
+    neither is an error - which is the same "find the stages by what they
+    recorded" rule the readers underneath follow.
+    """
     directories = [Path(name) for name in arguments.analyse]
+    first = directories[0]
+    quenched = _has_stages(first, quench_stages)
+    deformed = any(
+        _has_stages(first, find) for find in (deform_stages, load_stages, shear_stages)
+    )
+    if not quenched and not deformed:
+        print(
+            f"nothing in {first} was a quench or a deformation, so there is "
+            "nothing to report",
+            flush=True,
+        )
+        return 1
+
+    if quenched:
+        _analyse_tg(arguments, directories)
+    if deformed:
+        _analyse_mechanics(arguments, first)
+    return 0
+
+
+def _analyse_mechanics(arguments: argparse.Namespace, run_dir: Path) -> None:
+    """Report the elastic constants, and write them out."""
+    report = analyse_mechanics(run_dir)
+    if report.youngs is not None:
+        rate = report.youngs.strain_rate_per_ns
+        print(
+            f"E = {report.youngs.modulus_mpa:.0f} MPa"
+            + (
+                ""
+                if report.replica_spread_mpa is None
+                else f" +/- {report.replica_spread_mpa:.0f} over "
+                f"{len(report.replicas)} replicas"
+            )
+            + (" at rate unknown" if rate is None else f" at {rate:.3g} strain/ns")
+            + f", {report.youngs.temperature_k:.0f} K"
+            + ("" if report.youngs.resolved else " (not resolved)"),
+            flush=True,
+        )
+    if report.poisson is not None:
+        print(
+            f"nu = {report.poisson.ratio:.3f}"
+            f"{'' if report.poisson.resolved else ' (not resolved)'}",
+            flush=True,
+        )
+    for label, fit in (("K", report.bulk), ("G", report.shear)):
+        if fit is not None:
+            print(
+                f"{label} = {fit.modulus_mpa:.0f} MPa"
+                f"{'' if fit.resolved else ' (not resolved)'}",
+                flush=True,
+            )
+    if report.load_modulus is not None:
+        print(
+            f"constant-stress cross-check: "
+            f"E = {report.load_modulus.modulus_mpa:.0f} MPa",
+            flush=True,
+        )
+    if report.consistency is not None:
+        print(_consistency_line(report.consistency), flush=True)
+    for note in report.notes:
+        print(f"note: {note}", flush=True)
+
+    files = write_mechanical_report(
+        report,
+        arguments.output_dir,
+        figures=not arguments.no_figures,
+        figure_format=cast(str, arguments.figure_format),
+    )
+    print(
+        f"wrote {files.json} and {len(files.figures)} figure(s)",
+        flush=True,
+    )
+
+
+def _analyse_tg(arguments: argparse.Namespace, directories: Sequence[Path]) -> None:
+    """Report the glass transition from finished run directories."""
     report = analyse_run(
         directories[0],
         extra_run_dirs=directories[1:],
@@ -682,7 +1033,6 @@ def _analyse(arguments: argparse.Namespace) -> int:
         f"wrote {files.json} and {len(files.figures)} figure(s)",
         flush=True,
     )
-    return 0
 
 
 def _transition_line(label: str, fit: Any) -> str:

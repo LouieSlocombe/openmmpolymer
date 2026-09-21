@@ -136,7 +136,7 @@ openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol tg --check-melt -o run -v
 ## Reading a finished run
 
 ```bash
-openmmpolymer --analyse run --figures
+openmmpolymer --analyse run
 ```
 
 No monomer and no chemistry: a directory in, a number out. It finds the quench
@@ -145,6 +145,64 @@ coarse pass from the fine one by its temperature step, checks whether the melt
 had settled before cooling started, and writes `run/analysis/tg.json` beside
 the figures. Give it several run directories to pool a cooling-rate series
 across them. The manifest is not touched.
+
+It works out what to report from what the directory recorded: a run that
+quenched gets a glass transition, a run that was deformed gets its elastic
+constants, and a run that did both gets both.
+
+## Measuring a modulus
+
+OpenMM has no continuous deformation, so a strain rate here is a staircase:
+scale the cell by one increment, let it relax under a barostat holding the
+other two axes at pressure and leaving the driven one alone, read the stress,
+repeat. `run_modulus_scan` walks that ladder and three more passes beside it.
+
+```python
+from openmmpolymer import (
+    ModulusSpec,
+    analyse_mechanics,
+    run_modulus_scan,
+    write_mechanical_report,
+)
+
+result = run_modulus_scan(
+    run,
+    "run",
+    spec=ModulusSpec(temperature_k=298.15, max_strain=0.05),
+    chain_backbone=chain.backbone,
+    atoms_per_chain=chain.n_atoms,
+)
+print(result.youngs.modulus_mpa, result.replica_spread_mpa)
+
+write_mechanical_report(analyse_mechanics("run"))
+```
+
+Four constants come back, and the fourth is what the other three are for. `E`
+and `nu` come from the extension; `K` from a gentle pressure ladder and `G`
+from a shear ladder, each measured rather than derived. For an isotropic solid
+those four are two, so the gap between the measured `K` and `G` and the ones
+`E` and `nu` imply checks all of them at once — and unlike each of them, it is
+not a straight line fitted through a window someone chose the ends of.
+
+Every pass branches from the *same* equilibrated cell. A cell that has just
+been stretched to five per cent is not the cell the next measurement wants, so
+they are not run one after another. The replicas branch from it too, with
+fresh velocities: inheriting the equilibrated state's velocities as well as
+its positions gives the same trajectory every time, and a spread computed over
+those would be zero dressed up as an error bar.
+
+There is a second, independent estimate of `E` in there. `run_load` imposes a
+known stress with an anisotropic barostat and measures the box, so no virial
+is involved anywhere in it. The two methods share no machinery, which is what
+makes their agreement worth something; `method_gap` reports it.
+
+From the command line:
+
+```bash
+openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol modulus -t 298 -o run -v
+```
+
+and `--skip bulk shear` if `E` and `nu` are all you want.
 
 ## How it fits together
 
@@ -162,7 +220,10 @@ across them. The manifest is not touched.
 | Conformation | `conformation` | `⟨R²⟩`, `Rg`, persistence length, end-to-end relaxation, COM displacement |
 | Correlations | `correlations` | Intermolecular `g(r)` and the static structure factor |
 | Plots | `plots` | A figure per result, returned rather than written |
+| Stress | `stress` | The pressure tensor of a running cell, and the strain applied to it |
+| Elasticity | `elasticity` | Stress-strain curves, and the four elastic constants read off them |
 | Workflow | `tg` | The two-pass glass-transition scan, and reading a finished run back |
+| Workflow | `mechanical` | The extension, the load, bulk and shear passes, and the report |
 
 ## The constraint everything follows from
 
@@ -253,6 +314,42 @@ than extrapolated. Two relations are offered because over that gap they
 disagree by more than a hundred kelvin: a straight line in log rate runs away,
 and the Vogel–Fulcher–Tammann form, which has a finite limit, does not. WLF is
 not a third option — it is VFT reparameterised, and `wlf_constants` converts.
+
+**A strain rate is not quasi-static.** An increment of 0.002 relaxed for 50 ps
+is about 4x10^7 per second, against 10^-3 in a tensile test. That is the same
+ten-decade gap a cooling rate has, and the same caveat applies: the shape of
+the stress-strain curve is informative, the number is not directly comparable.
+`strain_rate_per_ns` is carried on every fit, drawn on every figure and
+printed on every line, so it cannot be quoted without it.
+
+**A modulus above Tg is a rubber modulus.** Which side of the transition
+298 K falls on is a property of the polymer, and nothing in `mechanical`
+knows it. Run `run_tg_scan` first. Below Tg the response is local and
+enthalpic and this protocol measures it; above it the stiffness is entropic,
+comes from chains being pulled out of shape, and is both far smaller and far
+slower to relax than a 50 ps window allows. A `resolved` of False on a melt is
+the honest answer rather than a failure.
+
+**The instantaneous pressure fluctuates enormously.** That is OpenMM's own
+warning about `computeCurrentPressure`, and it is the dominant source of
+error here, not a detail to work around. So the stress is sampled densely
+through each relaxation window - the pressure decorrelates in well under a
+picosecond, and readings spaced picoseconds apart throw away almost all of
+the statistics the window already paid for - averaged over the second half,
+and repeated across replicas. Where the spread does not support the number,
+`resolved` is False.
+
+**Strain is applied per atom, not per molecule.** The barostat translates
+whole molecules for a volume move, and this package insists on that; a
+deformation is the other case. Moving molecules rigidly leaves every chain
+conformation exactly as it was, and a polymer's stiffness comes from chains
+being stretched, so a rigid deformation would generate almost none of it. The
+reason the barostat cannot scale per atom - that it would evaluate a
+Metropolis energy for a configuration violating its own constraints - does
+not apply to a strain applied once and repaired immediately: `applyConstraints`
+puts the constrained bonds back before anything reads an energy. Measured at
+an increment of 0.002, the longest constrained bond stretches by 0.2 pm and
+the repair moves no atom further than 2x10^-4 nm.
 
 **Cell size is checked against the compressed density, not the packed one.**
 OpenMM refuses a cutoff over half the box — and refuses it again mid-run once

@@ -32,15 +32,22 @@ log = logging.getLogger(__name__)
 #: Constraint settings, by the name used in configuration.
 CONSTRAINTS = ("none", "hbonds", "allbonds", "hangles")
 
-#: Barostat kinds.
-BAROSTATS = ("isotropic", "anisotropic")
+#: Barostat kinds. ``flexible`` lets the whole box matrix fluctuate, including
+#: the off-diagonal elements; it is here because it is the only barostat whose
+#: ``computeCurrentPressure`` reports shear, and at ``frequency=0`` it is a
+#: pressure-tensor probe that never moves anything.
+BAROSTATS = ("isotropic", "anisotropic", "flexible")
 
 #: The global parameter each barostat reads its temperature from. They are not
 #: the same name, and setting the isotropic one on an anisotropic barostat
-#: raises rather than being ignored.
+#: raises rather than being ignored. The flexible barostat shares the isotropic
+#: one's names: observed from ``MonteCarloFlexibleBarostat.Temperature()``
+#: rather than assumed, because nothing in the class hierarchy implies it -
+#: ``MonteCarloFlexibleBarostat`` does not subclass ``MonteCarloBarostat``.
 BAROSTAT_TEMPERATURE_PARAMETER = {
     "isotropic": "MonteCarloTemperature",
     "anisotropic": "AnisotropicMonteCarloTemperature",
+    "flexible": "MonteCarloTemperature",
 }
 
 #: Platforms in the order they are tried when none is named.
@@ -497,6 +504,8 @@ def make_barostat(
     seed: int,
     *,
     scale_molecules_as_rigid: bool = True,
+    pressures_bar: Sequence[float] | None = None,
+    scale_axes: Sequence[bool] = (True, True, True),
 ) -> Any:
     """Build a barostat.
 
@@ -505,37 +514,144 @@ def make_barostat(
         temperature_k: The temperature its Metropolis test uses. This must
             agree with the integrator's; they are set separately and nothing
             checks that they match.
-        pressure_bar: The pressure.
-        frequency: Steps between volume moves.
+        pressure_bar: The pressure, on every axis that has no entry in
+            *pressures_bar*.
+        frequency: Steps between volume moves. Zero means never: the barostat
+            is then attached only so that its ``computeCurrentPressure`` can
+            be called, which OpenMM refuses for a force that is not in the
+            Context.
         seed: Its random seed. Must be non-zero, or OpenMM chooses its own and
             the run stops being reproducible.
         scale_molecules_as_rigid: Whether a volume move translates each
             molecule rigidly. See :class:`SystemSpec` for why this is on by
-            default and why turning it off needs ``constraints="none"``.
+            default and why turning it off needs ``constraints="none"``. It
+            also decides whether ``computeCurrentPressure`` reports the
+            molecular or the atomic virial.
+        pressures_bar: Per-axis pressures, for the anisotropic barostat only.
+            None applies *pressure_bar* to all three. This is what makes a
+            uniaxial load: a different pressure along one axis from the other
+            two.
+        scale_axes: Which axes an anisotropic barostat may move. Setting the
+            driven axis False is what holds an applied strain in place while
+            the other two relax to their target pressure.
 
     Returns:
         The barostat force, not yet added to a System.
+
+    Raises:
+        ValueError: *kind* is not one of :data:`BAROSTATS`, a per-axis setting
+            was given for a barostat that has no axes, or no axis may move.
     """
     import openmm as mm
     from openmm import unit
 
     require_choice(kind, BAROSTATS, name="kind")
+    axes = tuple(bool(flag) for flag in scale_axes)
+    if len(axes) != 3:
+        raise ValueError(f"scale_axes={scale_axes!r} must have three entries.")
+
+    if kind != "anisotropic":
+        # Silently ignoring these would produce a run that looks like the one
+        # that was asked for and is not - the whole reason this package builds
+        # a Simulation per stage rather than mutating one.
+        if pressures_bar is not None:
+            raise ValueError(
+                f"pressures_bar is only meaningful for an anisotropic "
+                f"barostat, not a {kind} one, which holds one pressure on "
+                "every axis."
+            )
+        if axes != (True, True, True):
+            raise ValueError(
+                f"scale_axes is only meaningful for an anisotropic barostat, "
+                f"not a {kind} one, which scales every axis together."
+            )
+
     if kind == "isotropic":
         barostat = mm.MonteCarloBarostat(
             pressure_bar * unit.bar, temperature_k * unit.kelvin, frequency
         )
+    elif kind == "flexible":
+        barostat = mm.MonteCarloFlexibleBarostat(
+            pressure_bar * unit.bar, temperature_k * unit.kelvin, frequency
+        )
     else:
+        if not any(axes):
+            raise ValueError(
+                "scale_axes=(False, False, False) is a barostat that cannot "
+                "move anything. For a pressure reading without a moving box, "
+                "attach one at frequency=0 instead."
+            )
+        three = (
+            (pressure_bar, pressure_bar, pressure_bar)
+            if pressures_bar is None
+            else tuple(float(value) for value in pressures_bar)
+        )
+        if len(three) != 3:
+            raise ValueError(
+                f"pressures_bar={pressures_bar!r} must have three entries, "
+                "one per axis."
+            )
         barostat = mm.MonteCarloAnisotropicBarostat(
-            mm.Vec3(pressure_bar, pressure_bar, pressure_bar) * unit.bar,
+            mm.Vec3(*three) * unit.bar,
             temperature_k * unit.kelvin,
-            True,
-            True,
-            True,
+            axes[0],
+            axes[1],
+            axes[2],
             frequency,
         )
     barostat.setScaleMoleculesAsRigid(scale_molecules_as_rigid)
     seed_random_stream(barostat, seed)
     return barostat
+
+
+def _barostat_types() -> dict[str, Any]:
+    """The barostat class behind each name in :data:`BAROSTATS`.
+
+    Spelled out rather than tested with one ``isinstance`` chain because the
+    three classes are siblings, not a hierarchy:
+    ``MonteCarloFlexibleBarostat.__mro__`` is ``(MonteCarloFlexibleBarostat,
+    Force, object)``. A check written as "a MonteCarloBarostat, else
+    anisotropic" therefore does not merely misname a flexible barostat, it
+    cannot see one at all - and neither can the guard below that exists to
+    catch a System carrying two.
+    """
+    import openmm as mm
+
+    return {
+        "isotropic": mm.MonteCarloBarostat,
+        "anisotropic": mm.MonteCarloAnisotropicBarostat,
+        "flexible": mm.MonteCarloFlexibleBarostat,
+    }
+
+
+def find_barostat(system: Any) -> tuple[str, Any] | None:
+    """Return the kind and the force of the barostat in *system*, or None.
+
+    Args:
+        system: The System to look in.
+
+    Returns:
+        ``(kind, force)`` for the one barostat present, or None for none.
+
+    Raises:
+        SystemAssemblyError: The System carries more than one barostat. OpenMM
+            accepts that without complaint and then applies both.
+    """
+    types = _barostat_types()
+    found = [
+        (kind, force)
+        for force in system.getForces()
+        for kind, cls in types.items()
+        if isinstance(force, cls)
+    ]
+    if len(found) > 1:
+        raise SystemAssemblyError(
+            f"The System carries {len(found)} barostats "
+            f"({', '.join(kind for kind, _ in found)}). OpenMM applies every "
+            "one of them without complaining, which is not a pressure anyone "
+            "meant to simulate."
+        )
+    return found[0] if found else None
 
 
 def barostat_kind(system: Any) -> str | None:
@@ -545,20 +661,8 @@ def barostat_kind(system: Any) -> str | None:
         SystemAssemblyError: The System carries more than one barostat. OpenMM accepts
             that without complaint and then applies both.
     """
-    import openmm as mm
-
-    found = [
-        "isotropic" if isinstance(force, mm.MonteCarloBarostat) else "anisotropic"
-        for force in system.getForces()
-        if isinstance(force, mm.MonteCarloBarostat | mm.MonteCarloAnisotropicBarostat)
-    ]
-    if len(found) > 1:
-        raise SystemAssemblyError(
-            f"The System carries {len(found)} barostats. OpenMM applies every "
-            "one of them without complaining, which is not a pressure anyone "
-            "meant to simulate."
-        )
-    return found[0] if found else None
+    found = find_barostat(system)
+    return found[0] if found is not None else None
 
 
 def platform_is_usable(name: str) -> bool:

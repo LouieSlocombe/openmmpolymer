@@ -24,6 +24,7 @@ from openmmpolymer.simulate import (
     quench_temperatures,
     run_anneal,
     run_compress,
+    run_deform,
     run_minimise,
     run_npt,
     run_nvt,
@@ -31,6 +32,7 @@ from openmmpolymer.simulate import (
     run_pushoff,
     run_quench,
     run_segments,
+    run_shear,
     safe_timestep_fs,
     set_temperature,
     temperature_k_of,
@@ -591,3 +593,229 @@ def test_a_sample_count_below_one_is_refused(argon_run: Any) -> None:
     """Zero readings is a segment that measures nothing."""
     with pytest.raises(ValueError, match="samples_per_segment"):
         run_nvt(argon_run, "01_nvt", duration_ps=0.2, samples_per_segment=0)
+
+
+# --------------------------------------------------------------------------
+# Deformation plumbing
+# --------------------------------------------------------------------------
+
+
+def test_a_stage_can_be_told_to_draw_fresh_velocities(argon_run: Any) -> None:
+    """Which is what makes two runs from one configuration independent.
+
+    Without it a replica inherits the saved state's velocities along with
+    its positions, repeats the same trajectory, and the spread over the
+    replicas is zero pretending to be an error bar.
+    """
+    from openmm import unit
+
+    from openmmpolymer.simulate import _build_simulation, _initialise
+
+    settled = run_npt(argon_run, "npt", temperature_k=120.0, duration_ps=0.4)
+
+    def velocities(reuse: bool) -> Any:
+        simulation = _build_simulation(
+            argon_run,
+            "probe" if reuse else "probe_fresh",
+            temperature_k=120.0,
+            timestep_fs=2.0,
+            friction_ps=1.0,
+            barostat=None,
+            pressure_bar=1.0,
+            barostat_frequency=25,
+        )
+        _initialise(
+            argon_run,
+            simulation,
+            "probe" if reuse else "probe_fresh",
+            settled.final_state,
+            120.0,
+            reuse_velocities=reuse,
+        )
+        return np.asarray(
+            simulation.context.getState(getVelocities=True)
+            .getVelocities(asNumpy=True)
+            .value_in_unit(unit.nanometer / unit.picosecond)
+        )
+
+    inherited, fresh = velocities(True), velocities(False)
+    assert not np.allclose(inherited, fresh)
+
+
+def test_pressures_can_be_set_per_axis(argon_run: Any) -> None:
+    """A uniaxial load is one axis held somewhere the other two are not."""
+    from openmmpolymer.simulate import _build_simulation, set_pressures
+
+    simulation = _build_simulation(
+        argon_run,
+        "aniso",
+        temperature_k=120.0,
+        timestep_fs=2.0,
+        friction_ps=1.0,
+        barostat="anisotropic",
+        pressure_bar=1.0,
+        barostat_frequency=25,
+    )
+    set_pressures(simulation, (1.0, 1.0, -20.0), "anisotropic")
+    assert simulation.context.getParameter("MonteCarloPressureZ") == pytest.approx(
+        -20.0
+    )
+    assert simulation.context.getParameter("MonteCarloPressureX") == pytest.approx(1.0)
+
+
+def test_three_different_pressures_are_refused_by_a_barostat_that_holds_one(
+    argon_run: Any,
+) -> None:
+    """Applying the first of three to all of them would not be the run asked for."""
+    from openmmpolymer.simulate import _build_simulation, set_pressures
+
+    simulation = _build_simulation(
+        argon_run,
+        "iso",
+        temperature_k=120.0,
+        timestep_fs=2.0,
+        friction_ps=1.0,
+        barostat="isotropic",
+        pressure_bar=1.0,
+        barostat_frequency=25,
+    )
+    with pytest.raises(ValueError, match="one pressure"):
+        set_pressures(simulation, (1.0, 1.0, -20.0), "isotropic")
+    set_pressures(simulation, (5.0, 5.0, 5.0), "isotropic")
+    assert simulation.context.getParameter("MonteCarloPressure") == pytest.approx(5.0)
+
+
+def test_a_cell_that_has_shrunk_below_the_cutoff_is_refused(
+    argon_run: Any,
+) -> None:
+    """Stretching one axis contracts the other two, and OpenMM has a floor.
+
+    Checked every step, because OpenMM's own complaint arrives at the next
+    force evaluation rather than at the line that caused it - several steps
+    away from the strain that produced it, and about a box nobody set.
+
+    Tested on the guard rather than through a run: making a barostat
+    actually contract a cell past its cutoff takes far more dynamics than a
+    fast test can spend, and what is being checked here is the arithmetic.
+    """
+    from openmmpolymer.simulate import (
+        _build_simulation,
+        _check_deformed_box,
+        _initialise,
+        nonbonded_cutoff_nm,
+    )
+
+    simulation = _build_simulation(
+        argon_run,
+        "probe",
+        temperature_k=120.0,
+        timestep_fs=2.0,
+        friction_ps=1.0,
+        barostat=None,
+        pressure_bar=1.0,
+        barostat_frequency=25,
+    )
+    _initialise(argon_run, simulation, "probe", None, 120.0)
+    cutoff = nonbonded_cutoff_nm(simulation.system)
+    assert cutoff > 0.0
+
+    # The fixture's cell is comfortably above twice the cutoff.
+    _check_deformed_box("probe", simulation, cutoff, 0.0)
+    # Pretending the cutoff is most of the box is the same arithmetic.
+    with pytest.raises(SimulationError, match="cutoff"):
+        _check_deformed_box("probe", simulation, 10.0, 0.05)
+
+
+def test_a_system_with_no_cutoff_is_not_checked_against_one(
+    argon_run: Any,
+) -> None:
+    """Zero means "nothing here has one", which is not a box of zero size."""
+    from openmmpolymer.simulate import _build_simulation, _check_deformed_box
+
+    simulation = _build_simulation(
+        argon_run,
+        "probe",
+        temperature_k=120.0,
+        timestep_fs=2.0,
+        friction_ps=1.0,
+        barostat=None,
+        pressure_bar=1.0,
+        barostat_frequency=25,
+    )
+    _check_deformed_box("probe", simulation, 0.0, 0.0)
+
+
+def test_a_shear_past_the_reduced_form_is_refused_before_the_ladder_runs(
+    argon_run: Any,
+) -> None:
+    """Checked against every rung up front, not discovered on the last one."""
+    from openmmpolymer.stress import StressError
+
+    minimised = run_minimise(argon_run, "min", temperature_k=120.0)
+    with pytest.raises((SimulationError, StressError), match="reduced form"):
+        run_shear(
+            argon_run,
+            "shear",
+            temperature_k=120.0,
+            strains=(0.01, 0.9),
+            duration_ps_each=0.1,
+            samples_per_step=2,
+            state_in=minimised.final_state,
+        )
+
+
+def test_a_deformation_records_a_reference_cell_and_an_axis(
+    argon_run: Any,
+) -> None:
+    """Recorded rather than recomputed, so a resumed chunk shares the origin."""
+    minimised = run_minimise(argon_run, "min", temperature_k=120.0)
+    result = run_deform(
+        argon_run,
+        "deform",
+        temperature_k=120.0,
+        n_steps=2,
+        strain_increment=0.002,
+        relax_ps=0.1,
+        samples_per_step=2,
+        axis=1,
+        state_in=minimised.final_state,
+    )
+    assert len(result.samples["reference_box_nm"]) == 3
+    assert result.samples["deform_axis"] == [1.0]
+    assert len(result.samples["segment_strain"]) == 2
+
+
+def test_a_deformation_resumed_mid_ladder_keeps_the_original_origin(
+    argon_run: Any,
+) -> None:
+    """The strain a second chunk reports is measured from the unstrained cell."""
+    minimised = run_minimise(argon_run, "min", temperature_k=120.0)
+    first = run_deform(
+        argon_run,
+        "deform_a",
+        temperature_k=120.0,
+        n_steps=2,
+        strain_increment=0.004,
+        relax_ps=0.1,
+        samples_per_step=2,
+        state_in=minimised.final_state,
+    )
+    origin = first.samples["reference_box_nm"]
+    second = run_deform(
+        argon_run,
+        "deform_b",
+        temperature_k=120.0,
+        n_steps=2,
+        strain_increment=0.004,
+        relax_ps=0.1,
+        samples_per_step=2,
+        strain_start=first.samples["segment_strain"][-1],
+        reference_box_nm=origin,
+        state_in=first.final_state,
+    )
+    assert second.samples["reference_box_nm"] == origin
+    assert second.samples["segment_strain"][0] > first.samples["segment_strain"][-1]
+    # And the recorded strain still describes the cell it was measured in.
+    assert second.samples["segment_box_z_nm"][-1] / origin[2] - 1.0 == pytest.approx(
+        second.samples["segment_strain"][-1]
+    )

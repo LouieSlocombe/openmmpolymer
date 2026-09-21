@@ -18,13 +18,21 @@ from openmmpolymer.conformation import (
     end_to_end_relaxation,
 )
 from openmmpolymer.correlations import radial_distribution, structure_factor
+from openmmpolymer.elasticity import (
+    StressStrain,
+    poisson_ratio,
+    youngs_modulus,
+)
+from openmmpolymer.mechanical import analyse_mechanics
 from openmmpolymer.plots import (
     plot_conformation,
     plot_cooling_rate,
     plot_correlations,
     plot_dynamics,
+    plot_moduli,
     plot_quench_curve,
     plot_state_data,
+    plot_stress_strain,
 )
 from openmmpolymer.timeseries import (
     cooling_rate_extrapolation,
@@ -40,7 +48,10 @@ from .helpers import (
     state_data_csv,
     synthetic_ensemble,
     transition_at,
+    write_bulk,
+    write_deformation,
     write_quench,
+    write_shear,
 )
 
 
@@ -430,3 +441,81 @@ def test_the_cooling_rate_figure_draws_the_curve_a_vft_fit_predicts() -> None:
         )
 
     assert not np.allclose(fitted(straight).get_ydata(), fitted(curved).get_ydata())
+
+
+# --------------------------------------------------------------------------
+# Mechanical figures
+# --------------------------------------------------------------------------
+
+
+def _stress_strain_curve(
+    *, modulus_mpa: float = 2000.0, poisson: float = 0.35, rate: float | None = 0.04
+) -> StressStrain:
+    """An exactly linear curve, built without touching a filesystem."""
+    strain = np.linspace(0.002, 0.02, 10)
+    return StressStrain(
+        stage="06_deform_r0_00",
+        axis=2,
+        strain=strain,
+        stress_mpa=modulus_mpa * strain,
+        lateral_strain=np.column_stack([-poisson * strain, -poisson * strain]),
+        lateral_stress_mpa=np.zeros((strain.size, 2)),
+        temperature_k=298.15,
+        strain_rate_per_ns=rate,
+    )
+
+
+def test_a_stress_strain_figure_draws_the_fit_and_its_window() -> None:
+    """Two panels: the curve with its fit, and the lateral response."""
+    curve = _stress_strain_curve()
+    fit = youngs_modulus(curve, strain_limit=0.015)
+    figure = plot_stress_strain(curve, fit=fit, poisson=poisson_ratio(curve))
+    assert len(figure.axes) == 2
+    assert figure.axes[0].get_ylabel() == "Tensile stress (MPa)"
+    assert "strain/ns" in figure.axes[0].get_title()
+
+
+def test_a_stress_strain_figure_says_when_a_rate_was_not_recorded() -> None:
+    """Rather than leaving the caveat off the figure entirely."""
+    figure = plot_stress_strain(_stress_strain_curve(rate=None))
+    assert "rate not recorded" in figure.axes[0].get_title()
+
+
+def test_an_unresolved_fit_is_labelled_as_one() -> None:
+    """A figure of a number the noise does not support should say so."""
+    curve = _stress_strain_curve(modulus_mpa=-500.0)
+    fit = youngs_modulus(curve, strain_limit=0.02)
+    assert not fit.resolved
+    figure = plot_stress_strain(curve, fit=fit)
+    labels = [text.get_text() for text in figure.axes[0].get_legend().get_texts()]
+    assert any("unresolved" in label for label in labels)
+
+
+def test_a_stress_strain_figure_needs_no_fit() -> None:
+    """The curve alone is a figure; the fit is an overlay."""
+    assert len(plot_stress_strain(_stress_strain_curve()).axes) == 2
+
+
+def test_a_moduli_figure_draws_the_measured_against_the_implied(
+    tmp_path: Path,
+) -> None:
+    """The gap between the bars and the markers is the whole point of it."""
+    write_deformation(tmp_path, modulus_mpa=2000.0, poisson=0.35)
+    write_bulk(tmp_path, stage="08_bulk", modulus_mpa=2222.0)
+    write_shear(tmp_path, modulus_mpa=741.0)
+    report = analyse_mechanics(tmp_path, strain_limit=0.05)
+    figure = plot_moduli(report)
+    axis = figure.axes[0]
+    assert [text.get_text() for text in axis.get_xticklabels()] == ["E", "K", "G"]
+    assert axis.get_ylabel() == "Modulus (MPa)"
+    assert "consistent" in axis.get_title()
+
+
+def test_a_moduli_figure_survives_a_report_with_only_a_modulus_in_it(
+    tmp_path: Path,
+) -> None:
+    """A run that skipped the other passes still gets a figure."""
+    write_deformation(tmp_path)
+    report = analyse_mechanics(tmp_path, strain_limit=0.05)
+    axis = plot_moduli(report).axes[0]
+    assert [text.get_text() for text in axis.get_xticklabels()] == ["E"]

@@ -37,12 +37,15 @@ from .simulate import (
     quench_temperatures,
     run_anneal,
     run_compress,
+    run_deform,
+    run_load,
     run_minimise,
     run_npt,
     run_nvt,
     run_production,
     run_pushoff,
     run_quench,
+    run_shear,
 )
 
 log = logging.getLogger(__name__)
@@ -59,6 +62,9 @@ STAGE_RUNNERS: dict[str, Callable[..., StageResult]] = {
     "anneal": run_anneal,
     "quench": run_quench,
     "production": run_production,
+    "deform": run_deform,
+    "load": run_load,
+    "shear": run_shear,
 }
 
 #: What the manifest is called.
@@ -164,6 +170,12 @@ def _stage_duration_ps(stage: Stage) -> float:
         return int(options["n_cycles"]) * 2.0 * (ramp_ps + float(options["hold_ps"]))
     if stage.kind == "compress":
         return float(options["duration_ps_each"]) * len(options["pressures_bar"])
+    if stage.kind == "deform":
+        return float(options["relax_ps"]) * int(options["n_steps"])
+    if stage.kind == "load":
+        return float(options["duration_ps_each"]) * len(options["stresses_bar"])
+    if stage.kind == "shear":
+        return float(options["duration_ps_each"]) * len(options["strains"])
     duration = options.get("duration_ps")
     return 0.0 if duration is None else float(duration)
 

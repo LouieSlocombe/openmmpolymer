@@ -21,8 +21,11 @@ with its cooling rate, because the transition temperature read off it is not
 comparable with an experiment cooled ten orders of magnitude slower. A
 structure factor shades the region below ``2 pi / L``, where the cell cannot
 hold a wave. A mean-squared displacement gets a slope-one guide line, so a
-sub-diffusive curve looks sub-diffusive. And a rate extrapolation shades the
-decades it reached across, because that is the whole story of the figure.
+sub-diffusive curve looks sub-diffusive. A rate extrapolation shades the
+decades it reached across, because that is the whole story of the figure. And
+a stress-strain curve is titled with its strain rate, for the same reason a
+quench curve is titled with its cooling rate: the number read off it is not
+the one an experiment measures.
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ from .conformation import (
     MeanSquaredDisplacement,
 )
 from .correlations import RadialDistribution, StructureFactor
+from .elasticity import ElasticModulus, PoissonRatio, StressStrain
 from .timeseries import (
     CoolingRateExtrapolation,
     Equilibration,
@@ -496,3 +500,208 @@ def _expected_square(series: ConformationSeries) -> float | None:
         return None
     scale = series.mean.expected_characteristic_ratio / measured
     return series.mean.mean_squared_end_to_end_nm2 * scale
+
+
+def plot_stress_strain(
+    curve: StressStrain,
+    *,
+    fit: ElasticModulus | None = None,
+    poisson: PoissonRatio | None = None,
+) -> Any:
+    """Plot stress and transverse strain against axial strain.
+
+    Two panels. The upper one is the stress-strain curve with the fitted
+    modulus drawn through it and its window shaded, so a fit that ran past
+    the linear range is visible as one. The lower is the lateral response
+    Poisson's ratio comes from, which is where a cell that never relaxed
+    sideways shows up.
+
+    Args:
+        curve: A curve from :func:`~openmmpolymer.elasticity.stress_strain`
+            or :func:`~openmmpolymer.elasticity.load_curve`.
+        fit: A fit from :func:`~openmmpolymer.elasticity.youngs_modulus`.
+            Its line is drawn and its window shaded.
+        poisson: A fit from :func:`~openmmpolymer.elasticity.poisson_ratio`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axes = _figure(2, 1, height_per_row=2.6)
+    stress, lateral = axes
+
+    stress.plot(
+        curve.strain,
+        curve.tensile_stress_mpa,
+        marker="o",
+        markersize=3.5,
+        linewidth=0.9,
+        color=_DATA_COLOUR,
+        label="measured",
+    )
+    if fit is not None and np.isfinite(fit.modulus_mpa):
+        span = np.asarray([0.0, float(curve.strain.max())], dtype=np.float64)
+        stress.plot(
+            span,
+            fit.intercept_mpa + fit.modulus_mpa * span,
+            linewidth=0.8,
+            linestyle="--",
+            color=_GUIDE_COLOUR,
+            label=(
+                f"E = {fit.modulus_mpa:.0f} MPa"
+                f"{'' if fit.resolved else ' (unresolved)'}"
+            ),
+        )
+        stress.axvspan(0.0, fit.strain_limit, color=_REFERENCE_COLOUR, alpha=0.12, lw=0)
+    stress.axhline(0.0, color=_REFERENCE_COLOUR, linewidth=0.6)
+    stress.set_ylabel("Tensile stress (MPa)")
+    stress.set_title(_stress_title(curve, fit), fontsize=9)
+    stress.legend(fontsize=7, frameon=False)
+
+    lateral.plot(
+        curve.strain,
+        curve.transverse_strain,
+        marker="o",
+        markersize=3.5,
+        linewidth=0.9,
+        color=_DATA_COLOUR,
+        label="measured",
+    )
+    if poisson is not None and np.isfinite(poisson.ratio):
+        span = np.asarray([0.0, float(curve.strain.max())], dtype=np.float64)
+        lateral.plot(
+            span,
+            -poisson.ratio * span,
+            linewidth=0.8,
+            linestyle="--",
+            color=_GUIDE_COLOUR,
+            label=(
+                f"nu = {poisson.ratio:.3f}{'' if poisson.resolved else ' (unresolved)'}"
+            ),
+        )
+    lateral.axhline(0.0, color=_REFERENCE_COLOUR, linewidth=0.6)
+    lateral.set_xlabel(f"Engineering strain along {'xyz'[curve.axis]}")
+    lateral.set_ylabel("Mean transverse strain")
+    lateral.legend(fontsize=7, frameon=False)
+    return figure
+
+
+def plot_moduli(report: Any) -> Any:
+    """Plot the measured elastic constants against the ones E and nu imply.
+
+    The bars are what was measured; the markers are what Young's modulus and
+    Poisson's ratio say ``K`` and ``G`` have to be for an isotropic solid.
+    The figure exists for the gap between them, which is the one check here
+    that is not a straight line through points someone chose the ends of. An
+    unresolved constant is drawn hollow, so a report full of numbers the
+    noise does not support looks like one.
+
+    Args:
+        report: A report from
+            :func:`~openmmpolymer.mechanical.analyse_mechanics`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axes = _figure(1, 1)
+    axis = axes[0]
+
+    labels: list[str] = []
+    values: list[float] = []
+    resolved: list[bool] = []
+    errors: list[float] = []
+    for label, fit, error in (
+        ("E", report.youngs, report.replica_spread_mpa),
+        ("K", report.bulk, None),
+        ("G", report.shear, None),
+    ):
+        if fit is None:
+            continue
+        labels.append(label)
+        values.append(float(fit.modulus_mpa))
+        resolved.append(bool(fit.resolved))
+        errors.append(0.0 if error is None else float(error))
+
+    positions = np.arange(len(labels), dtype=np.float64)
+    axis.bar(
+        positions,
+        values,
+        yerr=errors if any(errors) else None,
+        capsize=3,
+        width=0.55,
+        color=[_DATA_COLOUR if ok else "none" for ok in resolved],
+        edgecolor=_DATA_COLOUR,
+        linewidth=1.0,
+        label="measured",
+    )
+    check = getattr(report, "consistency", None)
+    if check is not None:
+        for label, implied in (
+            ("K", check.bulk_implied_mpa),
+            ("G", check.shear_implied_mpa),
+        ):
+            if label in labels and np.isfinite(implied):
+                axis.plot(
+                    [labels.index(label)],
+                    [implied],
+                    marker="_",
+                    markersize=22,
+                    markeredgewidth=2.0,
+                    linestyle="none",
+                    color=_GUIDE_COLOUR,
+                    label="implied by E and nu"
+                    if label == labels[min(len(labels) - 1, 1)]
+                    else None,
+                )
+    if report.load_modulus is not None and "E" in labels:
+        axis.plot(
+            [labels.index("E")],
+            [report.load_modulus.modulus_mpa],
+            marker="x",
+            markersize=8,
+            linestyle="none",
+            color="#7d3c98",
+            label="constant-stress cross-check",
+        )
+    axis.set_xticks(positions)
+    axis.set_xticklabels(labels)
+    axis.set_ylabel("Modulus (MPa)")
+    axis.set_title(_moduli_title(report), fontsize=9)
+    handles, names = axis.get_legend_handles_labels()
+    if handles:
+        axis.legend(handles, names, fontsize=7, frameon=False)
+    return figure
+
+
+def _stress_title(curve: StressStrain, fit: ElasticModulus | None) -> str:
+    """A title carrying the strain rate, because the modulus depends on it."""
+    control = (
+        "strain-controlled" if curve.controlled == "strain" else "stress-controlled"
+    )
+    rate = (
+        "rate not recorded"
+        if curve.strain_rate_per_ns is None
+        else f"{curve.strain_rate_per_ns:.3g} strain/ns"
+    )
+    head = f"{curve.stage} - {control}, {rate}, {curve.temperature_k:.0f} K"
+    if fit is None:
+        return head
+    return (
+        f"{head}\nE = {fit.modulus_mpa:.0f} MPa over {fit.n_points} points"
+        f"{'' if fit.resolved else ', not resolved'}"
+    )
+
+
+def _moduli_title(report: Any) -> str:
+    """A title saying whether the constants describe one isotropic solid."""
+    check = getattr(report, "consistency", None)
+    if check is None:
+        return "Elastic constants"
+    gaps = [
+        f"{name} {100.0 * gap:.0f}%"
+        for name, gap in (("K", check.bulk_gap), ("G", check.shear_gap))
+        if np.isfinite(gap)
+    ]
+    if not gaps:
+        return "Elastic constants - nothing to check them against"
+    verdict = "consistent" if check.consistent else "not consistent"
+    return f"Elastic constants - {verdict} ({', '.join(gaps)} from E and nu)"

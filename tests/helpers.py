@@ -541,3 +541,215 @@ def random_walk_frames(
     frames[:, 0::2, :] = walk
     frames[:, 1::2, :] = walk + np.array([0.0, 0.0, 0.6])
     return frames
+
+
+def ideal_gas_system(
+    n_atoms: int, box_nm: float, *, mass_amu: float = 40.0
+) -> tuple[Any, Any, np.ndarray]:
+    """A cell of particles with mass and no forces between them.
+
+    The zero-parameter ``NonbondedForce`` is not decoration: OpenMM refuses a
+    barostat in a System that uses no periodic boundary conditions, and the
+    pressure is only readable through a barostat. With every charge and every
+    epsilon zero the potential is identically zero, so the pressure is purely
+    kinetic and exactly ``sum(m v_a^2) / V`` on each axis - which makes it the
+    one test of a pressure readout that involves no statistics at all.
+
+    No ``CMMotionRemover``, so the answer is over all ``n_atoms`` rather than
+    ``n_atoms - 1``.
+    """
+    import openmm as mm
+    from openmm import app, unit
+
+    system = mm.System()
+    system.setDefaultPeriodicBoxVectors(
+        mm.Vec3(box_nm, 0, 0) * unit.nanometer,
+        mm.Vec3(0, box_nm, 0) * unit.nanometer,
+        mm.Vec3(0, 0, box_nm) * unit.nanometer,
+    )
+    nonbonded = mm.NonbondedForce()
+    nonbonded.setNonbondedMethod(mm.NonbondedForce.CutoffPeriodic)
+    nonbonded.setCutoffDistance(min(1.0, box_nm / 2.5) * unit.nanometer)
+
+    topology = app.Topology()
+    chain = topology.addChain()
+    argon = app.Element.getBySymbol("Ar")
+    for _ in range(n_atoms):
+        system.addParticle(mass_amu * unit.dalton)
+        nonbonded.addParticle(0.0, 0.3 * unit.nanometer, 0.0)
+        topology.addAtom("AR", argon, topology.addResidue("AR", chain))
+    system.addForce(nonbonded)
+    topology.setPeriodicBoxVectors(system.getDefaultPeriodicBoxVectors())
+    return system, topology, _lattice(n_atoms, box_nm)
+
+
+def rigid_rotor_system(
+    n_molecules: int, box_nm: float, *, bond_nm: float = 0.109
+) -> tuple[Any, Any, np.ndarray]:
+    """A cell of constrained diatomics with no forces between them.
+
+    The polyatomic, constrained counterpart of :func:`ideal_gas_system`, and
+    the only fixture here that can tell the molecular virial from the atomic
+    one. With no interactions the exact pressure is ``N_molecules k T / V``:
+    a rigid rotor's rotational kinetic energy does not contribute, because
+    the molecule translates as one under a volume move. An atomic virial
+    counts it and comes out 5/3 too high, which is what makes this the test
+    that pins the convention.
+    """
+    import openmm as mm
+    from openmm import app, unit
+
+    system = mm.System()
+    system.setDefaultPeriodicBoxVectors(
+        mm.Vec3(box_nm, 0, 0) * unit.nanometer,
+        mm.Vec3(0, box_nm, 0) * unit.nanometer,
+        mm.Vec3(0, 0, box_nm) * unit.nanometer,
+    )
+    nonbonded = mm.NonbondedForce()
+    nonbonded.setNonbondedMethod(mm.NonbondedForce.CutoffPeriodic)
+    nonbonded.setCutoffDistance(min(1.0, box_nm / 2.5) * unit.nanometer)
+
+    topology = app.Topology()
+    chain = topology.addChain()
+    carbon = app.Element.getBySymbol("C")
+    hydrogen = app.Element.getBySymbol("H")
+    for index in range(n_molecules):
+        system.addParticle(12.011 * unit.dalton)
+        system.addParticle(1.008 * unit.dalton)
+        nonbonded.addParticle(0.0, 0.34 * unit.nanometer, 0.0)
+        nonbonded.addParticle(0.0, 0.24 * unit.nanometer, 0.0)
+        nonbonded.addException(2 * index, 2 * index + 1, 0.0, 0.3, 0.0)
+        system.addConstraint(2 * index, 2 * index + 1, bond_nm * unit.nanometer)
+        residue = topology.addResidue("CH", chain)
+        first = topology.addAtom("C", carbon, residue)
+        second = topology.addAtom("H", hydrogen, residue)
+        topology.addBond(first, second)
+    system.addForce(nonbonded)
+    topology.setPeriodicBoxVectors(system.getDefaultPeriodicBoxVectors())
+
+    centres = _lattice(n_molecules, box_nm)
+    positions = np.empty((2 * n_molecules, 3), dtype=np.float64)
+    offsets = np.asarray(
+        [[bond_nm, 0.0, 0.0], [0.0, bond_nm, 0.0], [0.0, 0.0, bond_nm]],
+        dtype=np.float64,
+    )
+    for index, centre in enumerate(centres):
+        positions[2 * index] = centre
+        positions[2 * index + 1] = centre + offsets[index % 3]
+    return system, topology, positions
+
+
+def write_deformation(
+    run_dir: Path,
+    *,
+    modulus_mpa: float = 2000.0,
+    poisson: float = 0.35,
+    reference_nm: float = 5.0,
+    n_steps: int = 10,
+    increment: float = 0.002,
+    relax_ps: float = 50.0,
+    stage: str = "06_deform_r0_00",
+    temperature_k: float = 298.15,
+    axis: int = 2,
+) -> Path:
+    """Write a manifest holding an exactly linear stress-strain curve.
+
+    Both the modulus and the ratio are planted, so a correct fit recovers
+    them to machine precision and an assertion can be an equality rather than
+    a tolerance - the trick :func:`two_line_curve` uses for a quench.
+    """
+    lateral = [index for index in range(3) if index != axis]
+    strains = [(1.0 + increment) ** (step + 1) - 1.0 for step in range(n_steps)]
+    boxes = {
+        name: [reference_nm * (1.0 + value) for value in strains]
+        if index == axis
+        else [reference_nm * (1.0 - poisson * value) for value in strains]
+        for index, name in enumerate("xyz")
+    }
+    samples: dict[str, list[float]] = {
+        "segment_strain": list(strains),
+        f"segment_stress_{'xyz'[axis]}{'xyz'[axis]}_bar": [
+            modulus_mpa * value / 0.1 for value in strains
+        ],
+        "segment_duration_ps": [relax_ps] * n_steps,
+        "reference_box_nm": [reference_nm] * 3,
+        "deform_axis": [float(axis)],
+    }
+    for index in lateral:
+        samples[f"segment_stress_{'xyz'[index]}{'xyz'[index]}_bar"] = [0.0] * n_steps
+    for name, values in boxes.items():
+        samples[f"segment_box_{name}_nm"] = values
+    return _write_manifest(
+        run_dir, {stage: {"samples": samples, "mean_temperature_k": temperature_k}}
+    )
+
+
+def write_bulk(
+    run_dir: Path,
+    *,
+    modulus_mpa: float = 1500.0,
+    pressures_bar: Sequence[float] = (1.0, 100.0, 200.0, 300.0, 200.0, 100.0, 1.0),
+    density_g_cm3: float = 0.9,
+    stage: str = "08_bulk",
+    temperature_k: float = 298.15,
+    merge: dict[str, Any] | None = None,
+) -> Path:
+    """Write a manifest holding an exactly log-linear pressure ladder."""
+    densities = [
+        density_g_cm3 * math.exp(pressure * 0.1 / modulus_mpa)
+        for pressure in pressures_bar
+    ]
+    stages = dict(merge or {})
+    stages[stage] = {
+        "samples": {
+            "segment_pressure_bar": list(pressures_bar),
+            "segment_density_g_cm3": densities,
+        },
+        "mean_temperature_k": temperature_k,
+    }
+    return _write_manifest(run_dir, stages)
+
+
+def write_shear(
+    run_dir: Path,
+    *,
+    modulus_mpa: float = 700.0,
+    strains: Sequence[float] = (0.005, 0.010, 0.015, 0.020),
+    stage: str = "09_shear",
+    temperature_k: float = 298.15,
+    merge: dict[str, Any] | None = None,
+) -> Path:
+    """Write a manifest holding an exactly linear shear ladder."""
+    stages = dict(merge or {})
+    stages[stage] = {
+        "samples": {
+            "segment_shear_strain": list(strains),
+            "segment_shear_stress_bar": [
+                modulus_mpa * value / 0.1 for value in strains
+            ],
+        },
+        "mean_temperature_k": temperature_k,
+    }
+    return _write_manifest(run_dir, stages)
+
+
+def _write_manifest(run_dir: Path, stages: dict[str, Any]) -> Path:
+    """Write a minimal manifest holding *stages*, merging with any already there."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / "manifest.json"
+    record: dict[str, Any] = (
+        json.loads(path.read_text())
+        if path.is_file()
+        else {
+            "protocol": "test",
+            "seed": 1,
+            "versions": {},
+            "system": {},
+            "stages": {},
+            "chains": None,
+            "box": None,
+        }
+    )
+    record["stages"].update(stages)
+    path.write_text(json.dumps(record, indent=2))
+    return path

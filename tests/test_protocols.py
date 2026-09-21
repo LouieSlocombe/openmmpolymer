@@ -17,6 +17,7 @@ from openmmpolymer.protocols import (
     ProtocolError,
     RunManifest,
     Stage,
+    _stage_duration_ps,
     chain_dimensions,
     melt_quench,
     run_protocol,
@@ -389,3 +390,46 @@ def test_a_quench_can_start_somewhere_other_than_the_melt_temperature() -> None:
     assert melt_quench(t_start=520.0).stages[-1].options["t_start"] == pytest.approx(
         520.0
     )
+
+
+# --------------------------------------------------------------------------
+# The mechanical stage kinds
+# --------------------------------------------------------------------------
+
+
+def test_the_mechanical_stage_kinds_are_registered() -> None:
+    """A Stage validates its kind against this table, so absence is a refusal."""
+    for kind in ("deform", "load", "shear"):
+        assert kind in STAGE_RUNNERS
+        Stage(name=f"x_{kind}", kind=kind, options={})
+
+
+def test_every_mechanical_stage_prices_itself() -> None:
+    """A stage missing from the cost estimate is a stage that gets believed.
+
+    All three are long, so a --dry-run that left them out would under-report
+    the most expensive part of the run.
+    """
+    cases = (
+        (Stage("d", "deform", {"n_steps": 25, "relax_ps": 50.0}), 1250.0),
+        (
+            Stage(
+                "l",
+                "load",
+                {"stresses_bar": (0.0, 100.0, 200.0), "duration_ps_each": 1000.0},
+            ),
+            3000.0,
+        ),
+        (
+            Stage("s", "shear", {"strains": (0.005, 0.01), "duration_ps_each": 200.0}),
+            400.0,
+        ),
+    )
+    for stage, expected in cases:
+        assert _stage_duration_ps(stage) == pytest.approx(expected)
+
+
+def test_a_mechanical_stage_takes_its_runners_defaults() -> None:
+    """Priced from the runner's own signature, so the two cannot drift."""
+    duration = _stage_duration_ps(Stage("d", "deform", {}))
+    assert duration > 0.0
