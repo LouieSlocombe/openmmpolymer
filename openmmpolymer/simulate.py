@@ -415,10 +415,27 @@ def run_minimise(
     _initialise(run, simulation, prefix.name, state_in, temperature_k)
 
     before = simulation.context.getState(getEnergy=True).getPotentialEnergy()
-    simulation.minimizeEnergy(
-        tolerance=tolerance_kj_per_nm * unit.kilojoule_per_mole / unit.nanometer,
-        maxIterations=max_iterations,
-    )
+    if not np.isfinite(before.value_in_unit(unit.kilojoule_per_mole)):
+        raise SimulationError(
+            "The starting energy is not finite, so there is nothing for the "
+            "minimiser to descend. Atoms are on top of each other: check that "
+            "openmmpolymer.packing.check_packing passes on this cell, and "
+            "that the packed coordinates belong to this topology."
+        )
+    try:
+        simulation.minimizeEnergy(
+            tolerance=tolerance_kj_per_nm * unit.kilojoule_per_mole / unit.nanometer,
+            maxIterations=max_iterations,
+        )
+    except Exception as error:
+        # OpenMM's own message for this points at a FAQ; the cause here is
+        # almost always the packing, and saying so saves the round trip.
+        raise SimulationError(
+            f"Minimisation failed: {error}. A packed cell that does this has "
+            "overlapping molecules - repack at a lower density or with a "
+            "larger tolerance, and check openmmpolymer.packing.check_packing "
+            "passes."
+        ) from error
     after = simulation.context.getState(getEnergy=True, getForces=True)
     energy = after.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
     forces = after.getForces(asNumpy=True).value_in_unit(

@@ -14,6 +14,17 @@ default backend is ``smirnoff`` rather than ``gaff``: it is the one that
 honours the charges :mod:`openmmpolymer.charges` already assigned, and it does
 not route the molecule through antechamber, which reorders and renames atoms by
 default.
+
+One consequence of that pairing is worth knowing before it surprises anyone.
+OpenFF Sage carries virtual-site parameters, so handing it preset charges makes
+it warn - "Preset charges were provided ... alongside a force field that
+includes virtual site parameters" - on every run. It is telling you that a
+virtual site would take its charge from the force field rather than from the
+preset set, which matters only if the polymer gets any.
+:attr:`PolymerForceField.virtual_site_residues` is where to look, and
+:func:`openmmpolymer.mdsystem.prepare_box` is what acts on it. Under
+``python -W error`` the warning is an exception, so a caller running that way
+has to filter it.
 """
 
 from __future__ import annotations

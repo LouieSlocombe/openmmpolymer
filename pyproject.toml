@@ -75,7 +75,27 @@ testpaths = ["tests"]
 # Add an ignore only when a real warning is observed, and quote the observed
 # message in the comment - a module-scoped filter matches the module a warning is
 # *attributed* to, so it silently does nothing for any library using stacklevel>=2.
-filterwarnings = ["error"]
+filterwarnings = [
+  "error",
+  # Observed importing forcefill, which reaches netCDF4 through parmed:
+  #   RuntimeWarning: numpy.ndarray size changed, may indicate binary
+  #   incompatibility. Expected 16 from C header, got 96 from PyObject
+  # It is a mismatch between netCDF4's compiled extension and the numpy it
+  # runs against, in a dependency two levels down, and nothing here can act on
+  # it. Matched on the message rather than the module: a module filter matches
+  # the module a warning is *attributed* to, which for any library using
+  # stacklevel>=2 is the caller, so it would silently match nothing.
+  "ignore:numpy.ndarray size changed:RuntimeWarning",
+  # Observed on this package's default path - NAGL charges handed to the
+  # smirnoff backend - because OpenFF Sage carries virtual-site parameters:
+  #   PresetChargesAndVirtualSitesWarning: Preset charges were provided (via
+  #   `charge_from_molecules`) alongside a force field that includes virtual
+  #   site parameters.
+  # It matters only when the polymer actually gets virtual sites, which
+  # PolymerForceField.virtual_site_residues reports and the package acts on;
+  # for everything without them it is noise on every single run.
+  "ignore:Preset charges were provided",
+]
 markers = [
   "forcefield: parameterises a chain through forcefill; needs AmberTools/OpenFF (deselect with -m 'not forcefield')",
   "packmol: shells out to the real packmol binary; needs it on PATH (deselect with -m 'not packmol')",
@@ -121,7 +141,7 @@ warn_unreachable = true
 # ships py.typed, so neither belongs here - and `strict` implies
 # warn_unused_configs, so an override that matches nothing fails the type check.
 [[tool.mypy.overrides]]
-module = ["openmm", "openmm.*", "openff.*", "parmed.*"]
+module = ["openmm", "openmm.*", "openff.*", "parmed.*", "openmmforcefields.*"]
 ignore_missing_imports = true
 
 # forcefill ships py.typed, but how it resolves depends on how it was

@@ -22,10 +22,12 @@ dependencies:
   - openmm>=8.1
   - rdkit
   - parmed
-  # Supplies antechamber/parmchk2 for forcefill's gaff backend, and the
-  # `packmol` executable that openmmpolymer.packing invokes.
+  # Supplies antechamber/parmchk2 for forcefill's gaff backend, and - this is
+  # why there is no separate `packmol` entry - the `packmol` executable that
+  # openmmpolymer.packing shells out to, at <env>/bin/packmol. conda-forge
+  # does publish packmol on its own, but its builds pin numpy < 2 and asking
+  # for both makes the environment unsolvable.
   - ambertools
-  - packmol
   - openff-toolkit>=0.16
   - openmmforcefields>=0.16
   # The graph-neural-network charge model. Without it, charges for anything
@@ -35,5 +37,15 @@ dependencies:
   - pytest
   - pytest-cov
   - python-build
+  # mypy is here because the CI test job runs it inside this environment,
+  # where the dependencies it needs types for are installed.
+  - mypy
   - pip:
       - forcefill>=1.0
+      # From pip rather than conda-forge so that the version matches the one
+      # CI's lint job pins: the feedstock lags, and ruff's formatter output
+      # shifts between releases, so a lagging local copy reformats files that
+      # CI then rejects. Keep this in step with the ruff-action version in
+      # .github/workflows/ci.yml, the rev in .pre-commit-config.yaml, and the
+      # dev dependency group in pyproject.toml.
+      - ruff>=0.16.8

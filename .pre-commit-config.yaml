@@ -9,8 +9,12 @@ repos:
       - id: end-of-file-fixer
       - id: trailing-whitespace
 
+  # Pinned in three places that have to agree: here, the ruff-action version
+  # in .github/workflows/ci.yml, and the dev dependency group in
+  # pyproject.toml. The formatter's output shifts between releases, so a skew
+  # lets a locally clean tree fail the CI format gate.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.1
+    rev: v0.16.8
     hooks:
       - id: ruff-check
         args: [--fix]

@@ -25,7 +25,7 @@ import numpy.typing as npt
 from ._seeds import seed_random_stream
 from ._validation import require_choice, require_positive
 from .forcefield import PolymerForceField
-from .packing import PackedComponent, load_positions_nm
+from .packing import PackedComponent, read_packed_pdb, read_pdb
 
 log = logging.getLogger(__name__)
 
@@ -174,7 +174,7 @@ def replicate_topology(components: Sequence[PackedComponent]) -> tuple[Any, Any]
 
     modeller = app.Modeller(app.Topology(), [])
     for component in components:
-        source = app.PDBFile(component.pdb_path)
+        source = read_pdb(component.pdb_path)
         for _ in range(component.count):
             modeller.add(source.topology, source.positions)
     return modeller.topology, modeller.positions
@@ -203,7 +203,7 @@ def assemble_box(
     from openmm import unit
 
     topology, _ = replicate_topology(components)
-    positions = load_positions_nm(packed_pdb)
+    packed_topology, positions = read_packed_pdb(packed_pdb)
 
     if positions.shape[0] != topology.getNumAtoms():
         raise SystemAssemblyError(
@@ -212,7 +212,7 @@ def assemble_box(
             "components passed here are not the ones packmol was given, or "
             "not in the same order."
         )
-    _check_element_order(topology, packed_pdb)
+    _check_element_order(topology, packed_topology, packed_pdb)
 
     vectors = [
         mm.Vec3(box_nm[0], 0.0, 0.0),
@@ -229,18 +229,15 @@ def assemble_box(
     )
 
 
-def _check_element_order(topology: Any, packed_pdb: str) -> None:
+def _check_element_order(topology: Any, packed: Any, packed_pdb: str) -> None:
     """Raise unless the packed file's elements match the topology's, in order.
 
     The count matching is not enough. Two structures with the same number of
     atoms placed in the wrong order would pass that and produce a System whose
     every parameter sits on the wrong atom, with no error anywhere.
     """
-    from openmm import app
-
-    packed = app.PDBFile(packed_pdb)
     expected = [atom.element for atom in topology.atoms()]
-    found = [atom.element for atom in packed.topology.atoms()]
+    found = [atom.element for atom in packed.atoms()]
     for index, (want, got) in enumerate(zip(expected, found, strict=True)):
         if want is not got:
             raise SystemAssemblyError(
@@ -418,34 +415,46 @@ def build_system(
 
 
 def _create_system(forcefield: Any, topology: Any, kwargs: dict[str, Any]) -> Any:
-    """Call ``createSystem``, retrying without the shortcuts that can conflict."""
-    try:
-        return forcefield.createSystem(topology, **kwargs)
-    except ValueError as error:
-        if "useDispersionCorrection" in str(error):
-            # The force-field file states one thing and the spec another.
-            # OpenMM refuses rather than picking; the file wins, and says so.
-            log.warning(
-                "The force-field file sets its own dispersion-correction "
-                "policy, which overrides the one requested here: %s",
-                error,
-            )
-            kwargs.pop("useDispersionCorrection")
+    """Call ``createSystem``, retrying past the two shortcuts that can conflict.
+
+    Both retries are for settings this package adds for speed or for
+    correctness that a particular force-field file may already have an opinion
+    about. Anything else is the caller's problem, and is re-raised with the
+    context OpenMM's own message leaves out.
+    """
+    for _ in range(3):
+        try:
             return forcefield.createSystem(topology, **kwargs)
-        raise
-    except Exception as error:
-        if "residueTemplates" not in kwargs:
+        except Exception as error:
+            message = str(error)
+            if (
+                "useDispersionCorrection" in message
+                and "useDispersionCorrection" in kwargs
+            ):
+                # The file states one policy and the spec another. OpenMM
+                # refuses rather than choosing; the file wins, and says so.
+                log.warning(
+                    "The force-field file sets its own dispersion-correction "
+                    "policy, which overrides the one requested here: %s",
+                    error,
+                )
+                kwargs.pop("useDispersionCorrection")
+                continue
+            if "residueTemplates" in kwargs:
+                log.warning(
+                    "Naming residue templates explicitly did not work (%s); "
+                    "falling back to matching them by graph, which is slower.",
+                    error,
+                )
+                kwargs.pop("residueTemplates")
+                continue
             raise SystemAssemblyError(
-                f"The System would not build from {topology.getNumResidues()} "
-                f"residues: {error}"
+                f"The System would not build from "
+                f"{topology.getNumResidues()} residues: {error}"
             ) from error
-        log.warning(
-            "Naming residue templates explicitly did not work (%s); falling "
-            "back to matching them by graph, which is slower.",
-            error,
-        )
-        kwargs.pop("residueTemplates")
-        return forcefield.createSystem(topology, **kwargs)
+    raise SystemAssemblyError(  # pragma: no cover - the loop always returns or raises
+        "The System would not build after exhausting every fallback."
+    )
 
 
 def _verify_dispersion_correction(system: Any, spec: SystemSpec) -> None:
@@ -538,22 +547,59 @@ def barostat_kind(system: Any) -> str | None:
     return found[0] if found else None
 
 
+def platform_is_usable(name: str) -> bool:
+    """Whether a Context can actually be built on the named platform.
+
+    Being listed is not the same as working. A CUDA build compiled against a
+    newer toolkit than the installed driver appears in the platform list and
+    then fails with ``CUDA_ERROR_UNSUPPORTED_PTX_VERSION`` the moment a
+    Context is made - which, without this, is at the start of the first stage
+    rather than at platform selection.
+
+    Args:
+        name: The platform to try.
+
+    Returns:
+        Whether a one-particle Context could be built on it.
+    """
+    import openmm as mm
+    from openmm import unit
+
+    system = mm.System()
+    system.addParticle(1.0 * unit.dalton)
+    try:
+        mm.Context(
+            system,
+            mm.VerletIntegrator(0.001 * unit.picoseconds),
+            mm.Platform.getPlatformByName(name),
+        )
+    except Exception as error:
+        log.info("The %s platform is present but not usable: %s", name, error)
+        return False
+    return True
+
+
 def select_platform(
     name: str | None = None, precision: str = "mixed"
 ) -> tuple[Any, dict[str, str]]:
     """Choose an OpenMM platform and its properties.
 
     Args:
-        name: A platform name, or None to take the fastest available.
+        name: A platform name, or None to take the fastest that works. Named
+            explicitly, the platform is used as asked and any failure is the
+            caller's to see; chosen automatically, each candidate is tried
+            before it is picked.
         precision: ``Precision`` for the GPU platforms. Mixed rather than
             single, deliberately: these runs are long enough that single
-            precision drifts, and double costs more than the accuracy is worth.
+            precision drifts, and double costs more than the accuracy is
+            worth.
 
     Returns:
         The platform and the property dictionary to pass alongside it.
 
     Raises:
-        SystemAssemblyError: The named platform does not exist.
+        SystemAssemblyError: The named platform does not exist, or nothing
+            available works.
     """
     import openmm as mm
 
@@ -561,17 +607,27 @@ def select_platform(
         mm.Platform.getPlatform(index).getName()
         for index in range(mm.Platform.getNumPlatforms())
     }
-    if name is None:
-        chosen = next(
-            candidate for candidate in PLATFORM_PREFERENCE if candidate in available
-        )
-    elif name in available:
+    if name is not None:
+        if name not in available:
+            raise SystemAssemblyError(
+                f"Platform {name!r} is not available; this build has "
+                f"{', '.join(sorted(available))}."
+            )
         chosen = name
     else:
-        raise SystemAssemblyError(
-            f"Platform {name!r} is not available; this build has "
-            f"{', '.join(sorted(available))}."
+        chosen = next(
+            (
+                candidate
+                for candidate in PLATFORM_PREFERENCE
+                if candidate in available and platform_is_usable(candidate)
+            ),
+            "",
         )
+        if not chosen:
+            raise SystemAssemblyError(  # pragma: no cover - Reference always works
+                "No available platform could build a Context. This build has "
+                f"{', '.join(sorted(available))}."
+            )
 
     properties = {"Precision": precision} if chosen in _PRECISION_PLATFORMS else {}
     log.info(

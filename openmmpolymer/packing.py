@@ -154,6 +154,40 @@ def density_g_cm3(
     return float(total_mass * NM3_PER_CM3 / (volume_nm3 * AVOGADRO))
 
 
+def distribute_conformers(
+    pdb_paths: Sequence[str], n_molecules: int
+) -> list[PackedComponent]:
+    """Spread *n_molecules* copies over the conformers available.
+
+    One conformer per molecule is the right thing and what
+    :func:`openmmpolymer.chain.build_chain` is set up for. It is not always
+    affordable: packmol takes a separate ``structure`` block per conformer,
+    and several hundred of them is a long wait. Given fewer conformers than
+    molecules, this repeats them as evenly as it can, which still beats
+    packing one conformation many times over.
+
+    Args:
+        pdb_paths: The conformers, in any order.
+        n_molecules: How many molecules the cell holds.
+
+    Returns:
+        One component per conformer, with counts summing to *n_molecules*.
+
+    Raises:
+        ValueError: There are no conformers, or nothing to place.
+    """
+    if not pdb_paths:
+        raise ValueError("No conformers to pack.")
+    require_integer(n_molecules, name="n_molecules")
+
+    base, extra = divmod(n_molecules, len(pdb_paths))
+    return [
+        PackedComponent(path, base + (1 if index < extra else 0))
+        for index, path in enumerate(pdb_paths)
+        if base + (1 if index < extra else 0) > 0
+    ]
+
+
 def find_packmol(packmol: str | Path | None = None) -> str:
     """Locate the packmol executable.
 
@@ -266,6 +300,15 @@ def render_packmol_input(
             [
                 f"structure {component.pdb_path}",
                 f"  number {component.count}",
+                # Number residues across the whole output rather than per
+                # structure. This package writes one structure block per
+                # conformer, and packmol's default restarts residue numbering
+                # in each: past the twenty-sixth block the chain identifiers
+                # run out too, and molecules start sharing a chain and residue
+                # number. OpenMM then merges them - measured at 40 conformers,
+                # 37 residues came back instead of 40 - after one warning that
+                # is easy to miss.
+                "  resnumbers 3",
                 f"  inside box {low:.4f} {low:.4f} {low:.4f} "
                 f"{high[0]:.4f} {high[1]:.4f} {high[2]:.4f}",
                 "end structure",
@@ -414,12 +457,55 @@ def _run_packmol(binary: str, input_path: Path, timeout: float | None) -> str:
     return completed.stdout
 
 
-def load_positions_nm(packed_pdb: str | Path) -> npt.NDArray[np.float64]:
-    """Read the packed coordinates, in nanometres.
+def read_pdb(path: str | Path) -> Any:
+    """Read a PDB and close the file.
+
+    Handed a path, ``openmm.app.PDBFile`` opens it and leaves the handle to
+    the garbage collector, which under ``-W error`` is a ResourceWarning and
+    in a long build is a slow leak of descriptors. Handed an open file it
+    reads and returns, so opening it here is all it takes.
+
+    Args:
+        path: The file to read.
+
+    Returns:
+        The parsed ``PDBFile``.
+    """
+    from openmm import app
+
+    with Path(path).open() as handle:
+        return app.PDBFile(handle)
+
+
+def read_packed_pdb(packed_pdb: str | Path) -> tuple[Any, npt.NDArray[np.float64]]:
+    """Read packmol's output once, returning its topology and its positions.
 
     Read through ``openmm.app.PDBFile`` rather than by slicing columns: the
     coordinate fields are not where a naive slice puts them, and getting the z
-    column off by one is a silent error of a few tenths of an angstrom.
+    column off by one is a silent error of a few tenths of an angstrom. The
+    file is opened here rather than by path so that closing it is this
+    function's job: handed a path, ``PDBFile`` leaves the handle to the
+    garbage collector.
+
+    Args:
+        packed_pdb: packmol's output.
+
+    Returns:
+        The parsed topology - bondless, since packmol writes no CONECT
+        records - and an ``(n_atoms, 3)`` array of positions in nanometres.
+    """
+    from openmm import unit
+
+    pdb = read_pdb(packed_pdb)
+    positions = np.asarray(
+        pdb.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+        dtype=np.float64,
+    )
+    return pdb.topology, positions
+
+
+def load_positions_nm(packed_pdb: str | Path) -> npt.NDArray[np.float64]:
+    """Read the packed coordinates, in nanometres.
 
     Args:
         packed_pdb: packmol's output.
@@ -427,13 +513,7 @@ def load_positions_nm(packed_pdb: str | Path) -> npt.NDArray[np.float64]:
     Returns:
         An ``(n_atoms, 3)`` array in nanometres.
     """
-    from openmm import app, unit
-
-    pdb = app.PDBFile(str(packed_pdb))
-    return np.asarray(
-        pdb.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
-        dtype=np.float64,
-    )
+    return read_packed_pdb(packed_pdb)[1]
 
 
 def check_packing(

@@ -25,9 +25,9 @@ from .mdsystem import (
 )
 from .packing import (
     DEFAULT_PACKING_DENSITY,
-    PackedComponent,
     box_edge_nm,
     check_packing,
+    distribute_conformers,
     pack_box,
 )
 from .protocols import melt_quench, run_protocol, standard_melt_equilibration
@@ -140,6 +140,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="where everything is written (default: %(default)s)",
     )
     parser.add_argument(
+        "--conformers",
+        type=int,
+        default=None,
+        help="distinct conformations to build; they are repeated to fill the "
+        "cell (default: one per chain, which is the right thing and the "
+        "slowest to pack)",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=0xF0,
@@ -177,6 +185,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     output = Path(cast(str, arguments.output_dir))
     output.mkdir(parents=True, exist_ok=True)
     n_chains = int(arguments.chains)
+    n_conformers = min(int(arguments.conformers or n_chains), n_chains)
 
     chain = build_chain(
         ChainSpec(
@@ -187,7 +196,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             seed=int(arguments.seed),
         ),
         "chain",
-        n_conformers=n_chains,
+        n_conformers=n_conformers,
         output_dir=output / "build",
     )
     print(
@@ -220,7 +229,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(f"force field: {forcefield.forcefield_xml}", flush=True)
 
-    components = [PackedComponent(path, 1) for path in chain.pdb_paths]
+    components = distribute_conformers(list(chain.pdb_paths), n_chains)
     packed = pack_box(
         components,
         box_edge_nm(
