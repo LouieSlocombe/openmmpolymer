@@ -45,6 +45,7 @@ from .simulate import (
     run_production,
     run_pushoff,
     run_quench,
+    run_relax,
     run_shear,
 )
 
@@ -65,6 +66,7 @@ STAGE_RUNNERS: dict[str, Callable[..., StageResult]] = {
     "deform": run_deform,
     "load": run_load,
     "shear": run_shear,
+    "relax": run_relax,
 }
 
 #: What the manifest is called.
@@ -176,6 +178,13 @@ def _stage_duration_ps(stage: Stage) -> float:
         return float(options["duration_ps_each"]) * len(options["stresses_bar"])
     if stage.kind == "shear":
         return float(options["duration_ps_each"]) * len(options["strains"])
+    if stage.kind == "relax":
+        # A chunk that opens an already-strained cell repeats neither the
+        # baseline nor the ramp, so counting them would price a resumed
+        # ladder as several first chunks.
+        held = 0.0 if options["strain_applied"] else float(options["baseline_ps"])
+        ramp = 0.0 if options["strain_applied"] else float(options["ramp_ps"])
+        return held + ramp + float(options["duration_ps"])
     duration = options.get("duration_ps")
     return 0.0 if duration is None else float(duration)
 

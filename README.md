@@ -204,6 +204,70 @@ openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol modulus -t 298 -o run -v
 
 and `--skip bulk shear` if `E` and `nu` are all you want.
 
+## Watching a stress relax
+
+A modulus says how hard the cell pushes back. A *relaxation* modulus says how
+long it keeps pushing, which for a polymer is the more interesting half.
+`run_relaxation_scan` equilibrates a cell, applies one affine step strain,
+locks the box, and watches the stress decay.
+
+```python
+from openmmpolymer import (
+    RelaxationSpec,
+    analyse_relaxation,
+    run_relaxation_scan,
+    write_relaxation_report,
+)
+
+result = run_relaxation_scan(
+    run,
+    "run",
+    spec=RelaxationSpec(temperature_k=298.15, step_strain=0.03, relax_ps=50_000.0),
+    chain_backbone=chain.backbone,
+    atoms_per_chain=chain.n_atoms,
+)
+print(result.kww.beta, result.kww.mean_tau_ps, result.prony.equilibrium_mpa)
+
+write_relaxation_report(analyse_relaxation("run"))
+```
+
+What comes back is `G(t)`, and that is the measurement rather than a
+conversion. For an isotropic solid the differential stress
+`σ_zz − (σ_xx + σ_yy)/2` is exactly `2G(ε_axial − ε_lateral)`: the Lamé
+constant cancels, so a tensile step measures the shear modulus with no
+assumption about Poisson's ratio, the bulk modulus, or whether the deformation
+preserved the volume. `E(t) = 2(1 + ν)G(t)` is the derived number, and
+`youngs_modulus_mpa` takes the material's own ν rather than the one the box was
+scaled by. Writing `E(t) = σ_diff/ε₀` instead — the form the textbook gives —
+quietly assumes both are one half, and is a per cent out at a four per cent
+strain even when they are. A shear step (`mode="shear"`) skips the question
+entirely and reads `G(t)` off the off-diagonal.
+
+The box is locked for the whole hold and a barostat is attached anyway, at
+`frequency=0`. That is not a contradiction: the applied strain *is* the
+measurement so nothing may relax it away, but OpenMM reports a pressure only
+through a barostat and refuses it for a force that is not in the Context. One
+that never moves the box exists purely to be asked — the same trick `run_shear`
+uses. The stage checks the cell is where it left it and raises if not.
+
+Two fits, both numpy, because scipy is not a dependency. The stretched
+exponential separates: for a fixed exponent `ln G` is linear in `t^β`, so a
+three-parameter fit collapses to a bracketed search with an exact solve inside,
+the way the VFT fit already does. The Prony series separates differently — fix
+the time constants on a log grid and the weights are linear, subject to being
+non-negative, which is what the Lawson–Hanson solve is for. Plain least squares
+returns a negative weight in about four runs out of five, and a spectrum with
+negative weight is not a spectrum.
+
+From the command line:
+
+```bash
+openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol relax -t 298 --step-strain 0.03 -o run -v
+```
+
+and `--linearity-strains 0.01,0.06` to check the strain was small enough to
+mean anything.
+
 ## How it fits together
 
 | Layer | Module | What it does |
@@ -213,7 +277,7 @@ and `--skip bulk shear` if `E` and `nu` are all you want.
 | Force field | `forcefield` | forcefill → an ffxml, cached |
 | Packing | `packing` | Box arithmetic, packmol, and the checks that catch a bad cell |
 | System | `mdsystem` | Replicated topology, packmol's coordinates, `createSystem` |
-| Stages | `simulate` | minimise, push-off, NVT, compress, NPT, anneal, quench, production |
+| Stages | `simulate` | minimise, push-off, NVT, compress, NPT, anneal, quench, production, deform, load, shear, relax |
 | Protocol | `protocols` | Named stage sequences, the manifest, and resume |
 | Trajectory | `trajectory` | A finished run directory → frames, per chain, in nanometres |
 | Time series | `timeseries` | State-data CSVs, equilibration detection, the quench curve, the rate extrapolation |
@@ -222,8 +286,10 @@ and `--skip bulk shear` if `E` and `nu` are all you want.
 | Plots | `plots` | A figure per result, returned rather than written |
 | Stress | `stress` | The pressure tensor of a running cell, and the strain applied to it |
 | Elasticity | `elasticity` | Stress-strain curves, and the four elastic constants read off them |
+| Relaxation | `relaxation` | `G(t)` from a step strain, and the Prony and KWW fits read off it |
 | Workflow | `tg` | The two-pass glass-transition scan, and reading a finished run back |
 | Workflow | `mechanical` | The extension, the load, bulk and shear passes, and the report |
+| Workflow | `viscoelastic` | The step-strain scan, its replicas, and the report |
 
 ## The constraint everything follows from
 
@@ -350,6 +416,40 @@ not apply to a strain applied once and repaired immediately: `applyConstraints`
 puts the constrained bonds back before anything reads an energy. Measured at
 an increment of 0.002, the longest constrained bond stretches by 0.2 pm and
 the repair moves no atom further than 2x10^-4 nm.
+
+**A relaxation modulus is read against a floor.** The stage measures the cell's
+deviatoric stress for a while *before* straining it, and the scatter of that
+window is the level below which a decaying cell and a fully relaxed one are the
+same measurement. `noise_floor_mpa` carries it, the figure shades it, and both
+fits stop where the signal does — the window is truncated at the end rather than
+filtered point by point, because dropping the bins where `G` came out negative
+would drop the downward half of the noise and keep the upward half, biasing the
+tail up and `β` down. The mean stress is *not* checked: freezing the box at an
+NPT snapshot leaves the pressure wherever that fluctuation was, which is
+expected and harmless. A deviatoric stress is not, and a large one is reported.
+
+**Replicas are what make the fast end of the decay mean anything.** The stress is
+pooled into logarithmic time bins, so the earliest bins hold one reading each —
+a single run resolves about the decade around the largest stress and loses the
+rest in noise. Independent runs add bin for bin, which is the whole reason the
+bin edges come from the settings rather than from the data: a relaxation split
+across stages for resume and eight replicas of it merge by the *same* addition.
+Turn `n_replicas` up before `sample_every_ps` down.
+
+**A run that stops before the decay does has not measured a plateau.** `E_inf`
+comes out of the Prony fit whatever happens, and a spectrum that has piled its
+weight onto the slowest time constant is telling you the decay was still going
+when the data stopped. `plateau_reached` says so and `resolved` goes False. The
+grid deliberately stops at a third of the run, because an exponential as slow as
+the run is 0.99 collinear with a constant and the split between the two becomes
+arbitrary — reaching the whole window recovered 567 against a planted 400, a
+third of it recovered 404.
+
+**And a step strain is only a material property if it was small enough.** A
+relaxation modulus is one inside the linear viscoelastic region and a property of
+the deformation outside it, and no amount of looking at one strain says which you
+have. `linearity_strains` repeats the whole measurement at another; inside the
+region the curves coincide. It is off by default because it doubles the scan.
 
 **Cell size is checked against the compressed density, not the packed one.**
 OpenMM refuses a cutoff over half the box — and refuses it again mid-run once

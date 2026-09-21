@@ -332,3 +332,34 @@ def shear_box_vectors(vectors_nm: Any, gamma: float, plane: tuple[int, int]) -> 
             "longer along the driven axis."
         )
     return [mm.Vec3(*row) * unit.nanometer for row in rows]
+
+
+def deviatoric_strain(strain: float, poisson: float) -> float:
+    """Return ``e_axial - e_lateral`` for a uniaxial affine step.
+
+    The quantity a differential stress actually measures against, and the
+    reason it is worth having in one place. For an isotropic solid under an
+    imposed diagonal strain, ``sigma = 2 G e + lambda tr(e) I``, so
+
+        sigma_zz - (sigma_xx + sigma_yy) / 2 = 2 G (e_axial - e_lateral)
+
+    and the Lame constant cancels identically. The differential stress is a
+    pure deviatoric projection: it measures the shear modulus alone, with no
+    dependence on the bulk modulus, on Poisson's ratio, or on whether the step
+    happened to preserve the volume. Dividing it by the axial strain instead -
+    which is what a textbook writes - gives Young's modulus only when the
+    material's Poisson ratio is exactly one half, and is out by about one per
+    cent at a four per cent strain even then, purely from linearising the
+    lateral factor.
+
+    Args:
+        strain: The engineering strain applied along the driven axis.
+        poisson: The lateral contraction that was imposed, as the exponent in
+            ``(1 + strain) ** -poisson``. This is the deformation that was
+            applied, which need not be the material's own Poisson ratio -
+            nothing above depends on the two agreeing.
+
+    Returns:
+        The difference between the axial and lateral engineering strains.
+    """
+    return float(strain - ((1.0 + strain) ** -poisson - 1.0))

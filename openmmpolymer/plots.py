@@ -25,12 +25,18 @@ sub-diffusive curve looks sub-diffusive. A rate extrapolation shades the
 decades it reached across, because that is the whole story of the figure. And
 a stress-strain curve is titled with its strain rate, for the same reason a
 quench curve is titled with its cooling rate: the number read off it is not
-the one an experiment measures.
+the one an experiment measures. A relaxation modulus gets two of these at
+once: the level its own baseline scatter could not see past is shaded, and
+the readings behind each point are drawn underneath, because the early part
+of that curve rests on one reading a bin and looks far more certain than it
+is.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -43,6 +49,7 @@ from .conformation import (
 )
 from .correlations import RadialDistribution, StructureFactor
 from .elasticity import ElasticModulus, PoissonRatio, StressStrain
+from .relaxation import KWWFit, PronyFit, RelaxationCurve
 from .timeseries import (
     CoolingRateExtrapolation,
     Equilibration,
@@ -705,3 +712,184 @@ def _moduli_title(report: Any) -> str:
         return "Elastic constants - nothing to check them against"
     verdict = "consistent" if check.consistent else "not consistent"
     return f"Elastic constants - {verdict} ({', '.join(gaps)} from E and nu)"
+
+
+def plot_relaxation(
+    curve: RelaxationCurve,
+    *,
+    kww: KWWFit | None = None,
+    prony: PronyFit | None = None,
+    replicas: Sequence[RelaxationCurve] = (),
+) -> Any:
+    """Plot a relaxation modulus against time, with whatever was fitted to it.
+
+    Two panels, and the lower one is the point. The upper is ``G(t)`` on log
+    axes with the fits drawn through it and the baseline noise floor shaded,
+    so a decay that has run into the floor is visible as one rather than read
+    as a plateau. The lower is how many stress readings stand behind each
+    point: it falls to one a bin at the fast end, which is exactly where the
+    curve looks smoothest and is least certain, and climbs into the thousands
+    at the slow end where the modulus is smallest.
+
+    Args:
+        curve: A curve from
+            :func:`~openmmpolymer.relaxation.relaxation_curve` or
+            :func:`~openmmpolymer.relaxation.mean_curve`.
+        kww: A fit from :func:`~openmmpolymer.relaxation.fit_kww`.
+        prony: A fit from :func:`~openmmpolymer.relaxation.fit_prony`.
+        replicas: The individual runs behind an ensemble average, drawn faint
+            underneath it.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axes = _figure(2, 1, height_per_row=2.6)
+    decay, counts = axes
+
+    for replica in replicas:
+        if replica.n_points:
+            decay.plot(
+                replica.time_ps,
+                np.abs(replica.modulus_mpa),
+                linewidth=0.6,
+                color=_REFERENCE_COLOUR,
+                alpha=0.35,
+            )
+    decay.plot(
+        curve.time_ps,
+        np.abs(curve.modulus_mpa),
+        marker="o",
+        markersize=2.5,
+        linewidth=0.9,
+        color=_DATA_COLOUR,
+        label=f"measured ({curve.n_replicas} replica(s))",
+    )
+    if curve.n_points and np.any(np.isfinite(curve.standard_error_mpa)):
+        decay.fill_between(
+            curve.time_ps,
+            np.abs(curve.modulus_mpa) - curve.standard_error_mpa,
+            np.abs(curve.modulus_mpa) + curve.standard_error_mpa,
+            color=_DATA_COLOUR,
+            alpha=0.18,
+            linewidth=0,
+        )
+    if kww is not None and math.isfinite(kww.tau_ps) and curve.n_points:
+        decay.plot(
+            curve.time_ps,
+            kww.modulus_mpa * np.exp(-((curve.time_ps / kww.tau_ps) ** kww.beta)),
+            linewidth=0.9,
+            linestyle="--",
+            color=_GUIDE_COLOUR,
+            label=(
+                f"KWW: beta = {kww.beta:.2f}, <tau> = {kww.mean_tau_ps:.3g} ps"
+                f"{'' if kww.resolved else ' (unresolved)'}"
+            ),
+        )
+    if prony is not None and prony.n_terms and curve.n_points:
+        fitted = prony.equilibrium_mpa + (
+            np.exp(-curve.time_ps[:, None] / prony.tau_ps) @ prony.weights_mpa
+        )
+        decay.plot(
+            curve.time_ps,
+            fitted,
+            linewidth=0.9,
+            linestyle=":",
+            color="#6c3483",
+            label=(
+                f"Prony: {prony.n_active} terms, G_inf = "
+                f"{prony.equilibrium_mpa:.3g} MPa"
+                f"{'' if prony.plateau_reached else ' (still decaying)'}"
+            ),
+        )
+    if math.isfinite(curve.noise_floor_mpa) and curve.noise_floor_mpa > 0.0:
+        decay.axhspan(
+            0.0,
+            curve.noise_floor_mpa,
+            color=_REFERENCE_COLOUR,
+            alpha=0.18,
+            lw=0,
+            label="below the baseline noise",
+        )
+    decay.set_xscale("log")
+    decay.set_yscale("log")
+    decay.set_ylabel("|G(t)| (MPa)")
+    decay.set_title(_relaxation_modulus_title(curve), fontsize=9)
+    decay.legend(fontsize=7, frameon=False)
+
+    counts.plot(
+        curve.time_ps,
+        curve.n_samples,
+        drawstyle="steps-mid",
+        linewidth=0.9,
+        color=_REFERENCE_COLOUR,
+    )
+    counts.axhline(1.0, color=_GUIDE_COLOUR, linewidth=0.6, linestyle="--")
+    counts.set_xscale("log")
+    counts.set_yscale("log")
+    counts.set_xlabel("Time since the step strain (ps)")
+    counts.set_ylabel("Readings per bin")
+    return figure
+
+
+def _relaxation_modulus_title(curve: RelaxationCurve) -> str:
+    """A title carrying the strain and the temperature the decay belongs to."""
+    return (
+        f"{curve.mode} step of {curve.step_strain:+.3f} at "
+        f"{curve.temperature_k:.0f} K: {curve.n_points} bins over "
+        f"{curve.decades:.1f} decades"
+    )
+
+
+def plot_relaxation_spectrum(prony: PronyFit) -> Any:
+    """Plot the discrete relaxation spectrum a Prony fit found.
+
+    The weights against their time constants, with the equilibrium modulus
+    drawn beside them. Most of the weights are zero - the non-negativity
+    constraint sparsifies, so what is left is the fit saying which decades the
+    data actually constrain, and a spectrum with everything piled on the
+    slowest term is one saying the decay outlasted the run.
+
+    Args:
+        prony: A fit from :func:`~openmmpolymer.relaxation.fit_prony`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axes = _figure(1, 1)
+    spectrum = axes[0]
+
+    spectrum.stem(
+        prony.tau_ps,
+        prony.weights_mpa,
+        basefmt=" ",
+        linefmt="-",
+        markerfmt="o",
+        label="relaxation weights",
+    )
+    if math.isfinite(prony.equilibrium_mpa):
+        spectrum.axhline(
+            prony.equilibrium_mpa,
+            color=_GUIDE_COLOUR,
+            linewidth=0.8,
+            linestyle="--",
+            label=f"G_inf = {prony.equilibrium_mpa:.3g} MPa",
+        )
+    if prony.n_terms and math.isfinite(prony.window_ps[1]):
+        spectrum.axvspan(
+            prony.window_ps[1],
+            max(prony.window_ps[1] * 1.001, float(prony.tau_ps[-1]) * 10.0),
+            color=_REFERENCE_COLOUR,
+            alpha=0.12,
+            lw=0,
+            label="past the end of the run",
+        )
+    spectrum.set_xscale("log")
+    spectrum.set_xlabel("Relaxation time (ps)")
+    spectrum.set_ylabel("Weight (MPa)")
+    spectrum.set_title(
+        f"{prony.n_active} of {prony.n_terms} terms carry weight"
+        f"{'' if prony.resolved else ' (unresolved)'}",
+        fontsize=9,
+    )
+    spectrum.legend(fontsize=7, frameon=False)
+    return figure

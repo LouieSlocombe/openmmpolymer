@@ -449,3 +449,94 @@ def test_the_strain_rate_is_printed_with_the_modulus(
     write_deformation(Path("run"))
     main(["--analyse", "run", "--no-figures"])
     assert "strain/ns" in capsys.readouterr().out
+
+
+def test_the_flat_relaxation_flags_reach_the_spec_a_scan_takes() -> None:
+    """The relax factory takes **kwargs, so the check above cannot see it."""
+    from openmmpolymer.__main__ import _RELAXATION, _relaxation_spec
+
+    parameters = inspect.signature(_relaxation_spec).parameters
+    for option in _RELAXATION:
+        assert option in parameters, option
+
+
+def test_the_relaxation_controls_reach_the_protocol() -> None:
+    """A flag that is parsed, ignored and never arrives is the failure this
+    whole table exists to prevent."""
+    from openmmpolymer.__main__ import _protocol_options, _relaxation_spec
+
+    arguments = build_parser().parse_args(
+        [
+            "[*]CC[*]",
+            "--protocol",
+            "relax",
+            "--step-strain",
+            "0.05",
+            "--relaxation-ps",
+            "500",
+            "--baseline-ps",
+            "50",
+            "--relax-replicas",
+            "2",
+            "--relax-mode",
+            "shear",
+            "--bins-per-decade",
+            "12",
+            "--linearity-strains",
+            "0.01,0.09",
+        ]
+    )
+    spec = _relaxation_spec(**_protocol_options(arguments, PROTOCOLS["relax"]))
+    assert spec.step_strain == 0.05
+    assert spec.relax_ps == 500.0
+    assert spec.baseline_ps == 50.0
+    assert spec.n_replicas == 2
+    assert spec.mode == "shear"
+    assert spec.bins_per_decade == 12
+    assert spec.linearity_strains == (0.01, 0.09)
+
+
+def test_analysing_a_relaxation_directory_reports_and_writes_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--analyse dispatches on what the directory recorded, not on a flag.
+
+    It also crosses the one seam where the scan and the reader differ: a scan
+    carries an overall verdict and a directory read back does not, and the
+    shared printer has to cope with both rather than assuming the richer one.
+    """
+    from .helpers import write_relaxation
+
+    stages: dict[str, Any] | None = None
+    for replica in range(3):
+        write_relaxation(
+            tmp_path,
+            stem=f"06_relax_r{replica}",
+            modulus_mpa=900.0,
+            tau_ps=150.0,
+            beta=0.45,
+            chunks=2,
+            merge=stages,
+        )
+        stages = json.loads((tmp_path / "manifest.json").read_text())["stages"]
+
+    assert main(["--analyse", str(tmp_path)]) == 0
+    captured = capsys.readouterr().out
+    assert "G(0)" in captured
+    # The planted parameters come back exactly, which is what makes this a
+    # test of the wiring rather than of the fit.
+    assert "beta = 0.450" in captured
+    assert "tau = 150 ps" in captured
+    assert (tmp_path / "analysis" / "relaxation.json").is_file()
+    assert (tmp_path / "analysis" / "relaxation.png").is_file()
+
+
+def test_a_directory_that_is_neither_quench_nor_deformation_nor_relaxation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The refusal names all three, so it says what would have been reported."""
+    (tmp_path / "manifest.json").write_text(
+        '{"protocol": "x", "seed": 1, "stages": {"05_npt": {"samples": {}}}}'
+    )
+    assert main(["--analyse", str(tmp_path)]) == 1
+    assert "quench, a deformation or a relaxation" in capsys.readouterr().out

@@ -519,3 +519,92 @@ def test_a_moduli_figure_survives_a_report_with_only_a_modulus_in_it(
     report = analyse_mechanics(tmp_path, strain_limit=0.05)
     axis = plot_moduli(report).axes[0]
     assert [text.get_text() for text in axis.get_xticklabels()] == ["E"]
+
+
+def _relaxation_curve(
+    *, modulus_mpa: float = 1000.0, equilibrium_mpa: float = 0.0, floor: float = 1.0
+) -> Any:
+    """A planted relaxation curve, for the figures to draw."""
+    from openmmpolymer.relaxation import RelaxationCurve
+
+    time_ps = np.geomspace(0.1, 1.0e4, 80)
+    modulus = equilibrium_mpa + modulus_mpa * np.exp(-((time_ps / 200.0) ** 0.5))
+    return RelaxationCurve(
+        stage="06_relax_r0_00",
+        mode="tensile",
+        bin_index=np.arange(time_ps.size),
+        time_ps=time_ps,
+        modulus_mpa=modulus,
+        standard_error_mpa=np.full(time_ps.size, 2.0),
+        n_samples=np.geomspace(1.0, 5000.0, time_ps.size),
+        step_strain=0.03,
+        strain_measure=0.089,
+        temperature_k=298.15,
+        poisson=0.5,
+        baseline_mpa=0.0,
+        noise_floor_mpa=floor,
+        n_replicas=4,
+    )
+
+
+def test_a_relaxation_figure_draws_the_decay_and_what_stands_behind_it() -> None:
+    """Two panels. The lower one is the point: the readings per bin fall to
+    one at the fast end, which is where the curve looks smoothest."""
+    from openmmpolymer.plots import plot_relaxation
+
+    figure = plot_relaxation(_relaxation_curve())
+    assert len(figure.axes) == 2
+    assert figure.axes[0].get_ylabel() == "|G(t)| (MPa)"
+    assert figure.axes[0].get_xscale() == "log"
+    assert figure.axes[0].get_yscale() == "log"
+    assert figure.axes[1].get_ylabel() == "Readings per bin"
+    assert "+0.030" in figure.axes[0].get_title()
+    assert "298 K" in figure.axes[0].get_title()
+
+
+def test_a_relaxation_figure_shades_the_floor_the_decay_vanishes_into() -> None:
+    """A decay that has run into its own baseline noise should look like one
+    rather than reading as a plateau."""
+    from openmmpolymer.plots import plot_relaxation
+
+    figure = plot_relaxation(_relaxation_curve(floor=5.0))
+    labels = [text.get_text() for text in figure.axes[0].get_legend().get_texts()]
+    assert any("below the baseline noise" in label for label in labels)
+
+
+def test_a_relaxation_figure_labels_both_fits_with_their_verdicts() -> None:
+    """An unresolved fit drawn without saying so is worse than no fit."""
+    from openmmpolymer.plots import plot_relaxation
+    from openmmpolymer.relaxation import fit_kww, fit_prony
+
+    curve = _relaxation_curve()
+    figure = plot_relaxation(curve, kww=fit_kww(curve), prony=fit_prony(curve))
+    labels = " ".join(
+        text.get_text() for text in figure.axes[0].get_legend().get_texts()
+    )
+    assert "KWW" in labels and "beta" in labels
+    assert "Prony" in labels and "G_inf" in labels
+
+
+def test_a_relaxation_figure_draws_the_replicas_behind_the_mean() -> None:
+    """The spread between them is the error bar, so it should be visible."""
+    from openmmpolymer.plots import plot_relaxation
+
+    curves = [_relaxation_curve(modulus_mpa=value) for value in (900.0, 1100.0)]
+    figure = plot_relaxation(_relaxation_curve(), replicas=curves)
+    assert len(figure.axes[0].get_lines()) >= 3
+
+
+def test_a_spectrum_figure_marks_what_lies_past_the_end_of_the_run() -> None:
+    """A weight on the slowest term is the fit saying the decay outlasted the
+    data, and the figure should not let that pass as a measurement."""
+    from openmmpolymer.plots import plot_relaxation_spectrum
+    from openmmpolymer.relaxation import fit_prony
+
+    figure = plot_relaxation_spectrum(fit_prony(_relaxation_curve()))
+    assert figure.axes[0].get_xlabel() == "Relaxation time (ps)"
+    assert figure.axes[0].get_xscale() == "log"
+    labels = " ".join(
+        text.get_text() for text in figure.axes[0].get_legend().get_texts()
+    )
+    assert "past the end of the run" in labels

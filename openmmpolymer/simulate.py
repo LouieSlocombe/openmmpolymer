@@ -22,6 +22,7 @@ import logging
 import math
 import time
 from collections.abc import Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,7 @@ import numpy as np
 import numpy.typing as npt
 
 from ._seeds import derive_seed, seed_random_stream
-from ._validation import require_integer, require_positive
+from ._validation import require_choice, require_integer, require_positive
 from .forcefield import PolymerForceField
 from .mdsystem import (
     BAROSTAT_TEMPERATURE_PARAMETER,
@@ -41,7 +42,7 @@ from .mdsystem import (
     make_barostat,
     select_platform,
 )
-from .reporters import TrajectoryOptions, reporting, steps_for
+from .reporters import TrajectoryOptions, reporting, rotate_existing, steps_for
 
 log = logging.getLogger(__name__)
 
@@ -2167,6 +2168,668 @@ def run_shear(
         temperature_k=temperature_k,
         mean_temperature_k=float(np.mean(samples["segment_mean_temperature_k"])),
         mean_density_g_cm3=samples["segment_density_g_cm3"][-1],
+        final_pdb=pdb_path,
+        csv=paths.csv,
+        samples=samples,
+    )
+
+
+# --------------------------------------------------------------------------
+# Stress relaxation
+# --------------------------------------------------------------------------
+
+#: The deformations a relaxation stage knows how to apply. Both measure the
+#: shear relaxation modulus ``G(t)``: a shear step reads it straight off the
+#: off-diagonal stress, and a tensile step reads it off the differential
+#: stress, which for an isotropic solid is exactly ``2 G (e_axial -
+#: e_lateral)`` with the Lame constant cancelling - see
+#: :func:`openmmpolymer.stress.deviatoric_strain`. Young's relaxation modulus
+#: is derived from it afterwards, with the material's own Poisson ratio.
+RELAX_MODES = ("tensile", "shear")
+
+#: How many standard errors the pre-strain deviatoric stress may sit from zero
+#: before the stage says so. An equilibrated isotropic cell has none; one that
+#: does is carrying a residual stress the measurement cannot undo.
+BASELINE_SIGMA_TOLERANCE = 4.0
+
+#: A floor under that, in bar, so a very quiet baseline does not warn about a
+#: difference of no consequence.
+BASELINE_FLOOR_BAR = 50.0
+
+
+def relax_bin_edges_ps(
+    first_sample_ps: float, total_ps: float, bins_per_decade: int
+) -> npt.NDArray[np.float64]:
+    """Return the logarithmic time grid a relaxation stage bins its stress into.
+
+    Derived from the settings and never from the data, and that is the whole
+    point of it. A relaxation modulus is read on a log time axis, so the
+    readings have to be pooled into log-spaced bins somewhere; doing it here,
+    from numbers every chunk and every replica were given, means they all land
+    on the same grid. Their curves can then be merged bin by bin and averaged
+    element by element. A grid fitted to whatever each chunk happened to
+    sample would turn both of those into a regridding problem.
+
+    The bins also do the averaging where it is needed. Early bins are narrow
+    and hold a reading or two, which keeps the fast part of the decay
+    resolved; late bins are wide and hold thousands, which is exactly where
+    the stress has decayed towards a noise floor that only averaging gets
+    through.
+
+    Args:
+        first_sample_ps: The earliest time a reading can land at, which is the
+            sampling cadence.
+        total_ps: The whole relaxation, not just this chunk of it.
+        bins_per_decade: Bins per decade of time.
+
+    Returns:
+        The ``n + 1`` bin edges, ascending.
+
+    Raises:
+        ValueError: The span is not positive, or *bins_per_decade* is not.
+    """
+    require_positive(first_sample_ps, None, name="first_sample_ps")
+    require_integer(bins_per_decade, minimum=1, name="bins_per_decade")
+    if total_ps <= first_sample_ps:
+        raise ValueError(
+            f"total_ps={total_ps} is not above first_sample_ps="
+            f"{first_sample_ps}, so there is no time axis to bin."
+        )
+    decades = math.log10(total_ps / first_sample_ps)
+    count = max(1, round(bins_per_decade * decades))
+    return np.geomspace(first_sample_ps, total_ps, count + 1)
+
+
+class _LogBins:
+    """Stress readings accumulated into fixed logarithmic time bins.
+
+    Sums rather than running means, and the sum of squares beside them,
+    because that is what merges. Two chunks of one relaxation can share a bin
+    at the boundary between them, and a count-weighted mean of their means
+    with a count-weighted mean of their mean-squares recovers exactly the
+    numbers one unbroken run would have written. A stored standard error does
+    not merge at all.
+    """
+
+    def __init__(self, edges_ps: npt.NDArray[np.float64]) -> None:
+        """Set up empty bins between *edges_ps*."""
+        self._edges = edges_ps
+        count = edges_ps.size - 1
+        self._n = np.zeros(count, dtype=np.int64)
+        self._sum = np.zeros(count, dtype=np.float64)
+        self._sum_sq = np.zeros(count, dtype=np.float64)
+        self._sum_time = np.zeros(count, dtype=np.float64)
+        self._diagonal = np.zeros((count, 3), dtype=np.float64)
+
+    def add(
+        self, time_ps: float, measure_bar: float, diagonal_bar: npt.NDArray[np.float64]
+    ) -> None:
+        """Add one reading, ignoring one that falls off either end of the grid.
+
+        The top edge is the exception, and it is closed rather than open. A
+        run ends exactly on it, and floating-point time accumulated a step at
+        a time lands a hair either side, so an open edge would drop the very
+        last reading of every stage - and the rule "every reading is in a bin"
+        is worth more than the bin boundary being uniformly half-open.
+        """
+        index = int(np.searchsorted(self._edges, time_ps, side="right")) - 1
+        if index == self._n.size and time_ps <= self._edges[-1] * (1.0 + 1.0e-9):
+            index -= 1
+        if index < 0 or index >= self._n.size:
+            return
+        self._n[index] += 1
+        self._sum[index] += measure_bar
+        self._sum_sq[index] += measure_bar * measure_bar
+        self._sum_time[index] += time_ps
+        self._diagonal[index] += diagonal_bar
+
+    @property
+    def populated(self) -> npt.NDArray[np.bool_]:
+        """Which bins got at least one reading."""
+        return self._n > 0
+
+    def samples(self) -> dict[str, list[float]]:
+        """The populated bins, as the lists a StageResult records.
+
+        Means rather than sums, because a mean is the number a reader wants
+        and the count is recorded beside it, so nothing is lost.
+        """
+        keep = self.populated
+        counts = self._n[keep].astype(np.float64)
+        recorded = {
+            # The mean time of the readings in the bin, not its geometric
+            # centre. They differ when a bin is not sampled uniformly across
+            # its width - which is every bin the sampling cadence changes
+            # inside, and every bin holding a single reading - and the mean
+            # stress belongs to the mean time whatever the cadence did.
+            "segment_relax_time_ps": self._sum_time[keep] / counts,
+            # The index is the merge key. Two chunks of one relaxation share
+            # a grid by construction, so adding them bin for bin is exact;
+            # matching float times would be the same thing done fragilely.
+            "segment_bin": np.flatnonzero(keep).astype(np.float64),
+            "segment_stress_bar": self._sum[keep] / counts,
+            "segment_stress_sq_bar2": self._sum_sq[keep] / counts,
+            "segment_samples": counts,
+        }
+        for axis, name in enumerate("xyz"):
+            recorded[f"segment_stress_{name}{name}_bar"] = (
+                self._diagonal[keep, axis] / counts
+            )
+        return {
+            key: [float(value) for value in values] for key, values in recorded.items()
+        }
+
+
+def _relax_measure(
+    stress: npt.NDArray[np.float64], mode: str, axis: int, plane: tuple[int, int]
+) -> float:
+    """The one stress component a relaxation stage is watching.
+
+    Tensile: the differential stress ``sigma_zz - (sigma_xx + sigma_yy) / 2``,
+    which is what filters the isotropic background out of the decay.
+    Shear: the off-diagonal component the step displaced.
+    """
+    from .stress import tensile_stress_bar
+
+    if mode == "tensile":
+        return tensile_stress_bar(stress, axis)
+    return float(stress[plane[0], plane[1]])
+
+
+def _strain_increment(
+    simulation: Any,
+    *,
+    mode: str,
+    axis: int,
+    plane: tuple[int, int],
+    increment: float,
+    poisson: float,
+) -> None:
+    """Strain the cell by one more increment, affinely, from where it is now.
+
+    Composes: applying this twice with half the strain each time leaves the
+    cell where applying it once with the whole strain would, which is what
+    lets a ramp be a loop. For the tensile case the three scale factors
+    multiply; for the shear case the tilts add, because the gradient axis is
+    the one the displacement is read off and the increment never touches it.
+    """
+    from .stress import affine_scale, affine_shear, shear_box_vectors
+
+    vectors = simulation.context.getState().getPeriodicBoxVectors()
+    if mode == "shear":
+        _apply_positions(
+            simulation,
+            affine_shear(_positions_nm(simulation), increment, plane),
+            shear_box_vectors(vectors, increment, plane),
+        )
+        return
+
+    # Lateral contraction by (1 + e) ** -nu: at nu = 0.5 the volume is
+    # preserved exactly, which is the incompressible limit a melt is usually
+    # deformed in. The parameter exists because a glass is nearer 0.35, and
+    # the differential stress this stage measures is deviatoric and so barely
+    # notices the hydrostatic part either choice leaves behind.
+    lateral = (1.0 + increment) ** -poisson
+    factors = [lateral, lateral, lateral]
+    factors[axis] = 1.0 + increment
+    scaled = [vector * factors[which] for which, vector in enumerate(vectors)]
+    _apply_positions(
+        simulation, affine_scale(_positions_nm(simulation), factors), scaled
+    )
+
+
+def _check_baseline(name: str, mean_bar: float, error_bar: float, samples: int) -> None:
+    """Say so when the cell was already carrying a deviatoric stress.
+
+    The differential stress cancels an isotropic background - which is the
+    whole reason a relaxation is read off it rather than off ``sigma_zz`` -
+    but it cannot cancel a deviatoric one, and a cell frozen at an NPT
+    snapshot can be carrying one. Everything downstream subtracts this mean,
+    so a large one is not fatal; it is a warning that the cell the modulus
+    belongs to was not the isotropic one it is supposed to be.
+
+    The mean pressure is deliberately not checked. Locking the box at an NPT
+    snapshot leaves it wherever that fluctuation happened to be, which is
+    expected and harmless.
+    """
+    if samples < 2:
+        return
+    limit = max(BASELINE_SIGMA_TOLERANCE * error_bar, BASELINE_FLOOR_BAR)
+    if abs(mean_bar) > limit:
+        log.warning(
+            "%s: before straining, the cell already carried a deviatoric "
+            "stress of %.1f +/- %.1f bar over %d readings. It is subtracted, "
+            "but a cell that is not isotropic to begin with is not the one "
+            "this measurement assumes.",
+            name,
+            mean_bar,
+            error_bar,
+            samples,
+        )
+
+
+def run_relax(
+    run: RunContext,
+    output_prefix: str | Path = "06_relax",
+    *,
+    temperature_k: float = 298.15,
+    mode: str = "tensile",
+    axis: int = 2,
+    plane: tuple[int, int] = (0, 2),
+    step_strain: float = 0.03,
+    poisson: float = 0.5,
+    ramp_ps: float = 0.0,
+    baseline_ps: float = 1000.0,
+    duration_ps: float = 10_000.0,
+    total_ps: float | None = None,
+    time_offset_ps: float = 0.0,
+    strain_applied: bool = False,
+    reference_box_nm: Sequence[float] | None = None,
+    sample_every_ps: float = 0.05,
+    late_sample_every_ps: float = 5.0,
+    late_after_ps: float = 200.0,
+    bins_per_decade: int = 20,
+    new_velocities: bool = False,
+    timestep_fs: float | None = None,
+    friction_ps: float = 1.0,
+    trajectory: TrajectoryOptions | str = "none",
+    report_interval_ps: float = 10.0,
+    write_raw: bool = True,
+    state_in: str | Path | None = None,
+) -> StageResult:
+    """Strain the cell once, hold it there, and watch the stress decay.
+
+    The measurement a relaxation modulus is defined by. Everything else here
+    deforms a cell and asks how hard it pushed back; this one deforms it once
+    and asks how long it keeps pushing. What comes out is the shear relaxation
+    modulus ``G(t)``, whichever step was applied, which is what a Prony series
+    or a stretched exponential is fitted to. The stage records the strain to
+    divide the stress by rather than the modulus itself, because turning one
+    into the other is arithmetic and belongs in
+    :mod:`openmmpolymer.relaxation` with the rest of it.
+
+    The box is locked for the whole production run and a barostat is attached
+    anyway, at ``frequency=0``. That is not a contradiction: the applied strain
+    *is* the measurement, so nothing may relax it away, but OpenMM reports a
+    pressure only through ``Barostat.computeCurrentPressure`` and refuses it
+    for a force that is not in the Context. A barostat that never moves the box
+    exists purely to be asked - the same trick :func:`run_shear` uses, and the
+    one ``make_barostat`` documents ``frequency=0`` for.
+
+    Before straining, the stage measures the stress it is about to strain from.
+    The differential stress filters out an isotropic background but not a
+    deviatoric one, and a cell frozen at an NPT snapshot can carry one. That
+    baseline is recorded rather than subtracted: subtraction is arithmetic over
+    recorded numbers, and that belongs in
+    :mod:`openmmpolymer.relaxation` with the rest of it.
+
+    Readings are pooled into logarithmic time bins as they are taken, so the
+    cost is bounded and the fast part of the decay keeps its resolution while
+    the slow part gets the heavy averaging it needs. The grid comes from the
+    settings and not from the data, so every replica and every resumed chunk
+    lands on the same bins - see :func:`relax_bin_edges_ps`.
+
+    Args:
+        run: The run context.
+        output_prefix: Stem for this stage's files.
+        temperature_k: The temperature to hold. Which side of the polymer's
+            glass transition this falls on decides what is being measured, and
+            nothing here knows which: below it the decay is local and fast,
+            above it the chains themselves have to move and a 10 ns window
+            sees the beginning of it at best.
+        mode: ``"tensile"`` or ``"shear"``. Both measure ``G(t)``; a shear
+            step does it without imposing a lateral contraction at all, which
+            above the glass transition is the cleaner deformation.
+        axis: The axis to stretch, for a tensile step.
+        plane: ``(driven, gradient)`` axes, for a shear step.
+        step_strain: The strain applied, all at once. Small enough to stay
+            inside the linear viscoelastic region, where the modulus does not
+            depend on it - which nothing here can check from one run, and
+            which ``linearity_strains`` on a
+            :class:`~openmmpolymer.viscoelastic.RelaxationSpec` exists to test.
+        poisson: The lateral contraction, as ``(1 + e) ** -poisson``. The
+            default of 0.5 preserves the volume exactly, which is the usual
+            assumption for a melt.
+        ramp_ps: Apply the strain over this long instead of instantaneously.
+            Zero by default, because an instantaneous step is what ``E(t)`` is
+            defined against; a short ramp trades a sharper time origin for a
+            gentler perturbation. The relaxation clock starts when the ramp
+            ends either way.
+        baseline_ps: Time held at the locked box before straining, to measure
+            what the cell was already carrying.
+        duration_ps: How much relaxation *this stage* runs.
+        total_ps: The whole relaxation the time grid spans, when this stage is
+            one chunk of a longer one. None means *duration_ps*.
+        time_offset_ps: Where this chunk starts on the relaxation clock. A
+            resumed chunk is handed this because a state file does not carry
+            it, and a chunk that called its own start time zero would fold the
+            late part of the decay back onto the early part.
+        strain_applied: This chunk opens an already-strained cell, so it
+            neither measures a baseline nor strains again.
+        reference_box_nm: The unstrained cell edges. None reads them from the
+            cell, which is right only when the strain has not been applied yet.
+        sample_every_ps: Time between stress readings, early on. Each reading
+            costs OpenMM about six energy evaluations, so this is the knob that
+            sets the stage's overhead.
+        late_sample_every_ps: Time between readings after *late_after_ps*. The
+            decay is slow by then and the bins are wide, so a dense cadence
+            buys very little.
+        late_after_ps: When to change down.
+        bins_per_decade: Logarithmic bins per decade of time.
+        new_velocities: Draw fresh velocities rather than inheriting them.
+            This is what makes replicas of one configuration independent.
+        timestep_fs: The integration timestep, or None for the longest safe one.
+        friction_ps: Langevin friction.
+        trajectory: Trajectory settings.
+        report_interval_ps: Time between state-data rows.
+        write_raw: Write every reading to ``<stem>_stress.csv`` beside the
+            binned curve, so it can be re-binned or analysed some other way
+            without running the whole thing again.
+        state_in: The previous stage's state.
+
+    Returns:
+        What the stage did, with the binned decay, the baseline and the
+        deformation recorded in its samples.
+
+    Raises:
+        SimulationError: The cell blew up, or the strain took an edge below
+            what the cutoff allows.
+        ValueError: The mode, the axes or one of the times is not usable.
+    """
+    from .stress import deviatoric_strain
+
+    require_choice(mode, RELAX_MODES, name="mode")
+    if axis not in (0, 1, 2):
+        raise ValueError(f"axis={axis!r} must be 0, 1 or 2.")
+    driven, gradient = plane
+    if driven == gradient or not {driven, gradient} <= {0, 1, 2}:
+        raise ValueError(f"plane={plane!r} must be two different axes of 0, 1, 2.")
+    require_positive(duration_ps, None, name="duration_ps")
+    require_positive(sample_every_ps, None, name="sample_every_ps")
+    require_positive(late_sample_every_ps, None, name="late_sample_every_ps")
+    require_positive(abs(step_strain), None, name="step_strain")
+    if baseline_ps < 0.0 or ramp_ps < 0.0 or time_offset_ps < 0.0:
+        raise ValueError(
+            f"baseline_ps={baseline_ps}, ramp_ps={ramp_ps} and "
+            f"time_offset_ps={time_offset_ps} must all be zero or more."
+        )
+
+    prefix = Path(output_prefix)
+    started = time.monotonic()
+    if timestep_fs is None:
+        timestep_fs = safe_timestep_fs(temperature_k, run.spec)
+    check_timestep(timestep_fs, temperature_k, run.spec)
+
+    # A shear step measures G directly: sigma_xz = G gamma. A tensile step
+    # measures it through the deviator, which is why the factor of two and
+    # the lateral strain are here and no assumption about the material is.
+    measure_strain = (
+        float(step_strain)
+        if mode == "shear"
+        else 2.0 * deviatoric_strain(step_strain, poisson)
+    )
+    span_ps = duration_ps if total_ps is None else float(total_ps)
+    edges = relax_bin_edges_ps(sample_every_ps, span_ps, bins_per_decade)
+    bins = _LogBins(edges)
+
+    # Anisotropic reports the diagonal, which is what a tensile step needs;
+    # only the flexible one reports shear. Neither moves anything at
+    # frequency=0 - they are here to be asked, not to hold a pressure.
+    simulation = _build_simulation(
+        run,
+        prefix.name,
+        temperature_k=temperature_k,
+        timestep_fs=timestep_fs,
+        friction_ps=friction_ps,
+        barostat="anisotropic" if mode == "tensile" else "flexible",
+        pressure_bar=1.0,
+        barostat_frequency=0,
+    )
+    _initialise(
+        run,
+        simulation,
+        prefix.name,
+        state_in,
+        temperature_k,
+        reuse_velocities=not new_velocities,
+    )
+    _check_molecules(prefix.name, simulation, run.box.n_molecules)
+    cutoff_nm = nonbonded_cutoff_nm(simulation.system)
+    reference = (
+        _box_lengths_nm(simulation)
+        if reference_box_nm is None
+        else np.asarray([float(value) for value in reference_box_nm], dtype=np.float64)
+    )
+    if reference.shape != (3,) or not np.all(reference > 0.0):
+        raise SimulationError(
+            f"reference_box_nm={reference.tolist()} is not three positive cell edges."
+        )
+
+    # Guarded rather than left to steps_for, which floors at one step: a
+    # baseline of zero or an instantaneous strain would otherwise each run a
+    # single step of dynamics, and the second of those puts the relaxation
+    # clock's origin one step after the strain it is supposed to start at.
+    skip = strain_applied
+    baseline_steps = (
+        0 if skip or baseline_ps <= 0.0 else steps_for(baseline_ps, timestep_fs)
+    )
+    ramp_steps = 0 if skip or ramp_ps <= 0.0 else steps_for(ramp_ps, timestep_fs)
+    production_steps = steps_for(duration_ps, timestep_fs)
+    total_steps = baseline_steps + ramp_steps + production_steps
+    log.info(
+        "%s: %s step of %+.4f%s, %.1f ps baseline then %.1f ps held at a "
+        "locked box from t = %.1f ps, at %.2f fs (%d steps), into %d log bins.",
+        prefix.name,
+        mode,
+        step_strain,
+        ""
+        if strain_applied
+        else f" on {'xyz'[axis] if mode == 'tensile' else ''.join('xyz'[i] for i in plane)}",
+        0.0 if strain_applied else baseline_ps,
+        duration_ps,
+        time_offset_ps,
+        timestep_fs,
+        total_steps,
+        edges.size - 1,
+    )
+    from .stress import stress_tensor_bar
+
+    instant_bar: float | None = None
+
+    def read() -> tuple[npt.NDArray[np.float64], float]:
+        """One reading: the diagonal, and the component being watched.
+
+        Finiteness is checked here rather than by reading the potential
+        energy separately, as the windowed stages do. A cell that has blown
+        up reports a non-finite stress, and the stress is already in hand, so
+        the check costs nothing. The off-diagonals an anisotropic barostat
+        leaves NaN are deliberately not looked at.
+        """
+        stress = stress_tensor_bar(simulation)
+        diagonal = np.asarray(
+            [stress[index, index] for index in range(3)], dtype=np.float64
+        )
+        measure = _relax_measure(stress, mode, axis, plane)
+        if not (bool(np.all(np.isfinite(diagonal))) and math.isfinite(measure)):
+            raise SimulationError(
+                f"{prefix.name}: the stress went to NaN. The step strain is "
+                "too large for this cell, or the timestep is too long for "
+                "this temperature. Lower step_strain, or ramp it in over "
+                "ramp_ps instead of applying it at once."
+            )
+        return diagonal, measure
+
+    raw_path = prefix.parent / f"{prefix.name}_stress.csv"
+    baseline_n = 0
+    baseline_sum = 0.0
+    baseline_sum_sq = 0.0
+    temperatures: list[float] = []
+    elapsed_ps = float(time_offset_ps)
+    ran_steps = 0
+
+    with ExitStack() as stack:
+        paths = stack.enter_context(
+            reporting(
+                simulation,
+                prefix,
+                total_steps=max(1, total_steps),
+                report_interval=steps_for(report_interval_ps, timestep_fs),
+                trajectory=trajectory,
+                trajectory_interval=_frame_interval(trajectory, timestep_fs),
+            )
+        )
+        raw = None
+        if write_raw:
+            rotate_existing(raw_path)
+            raw = stack.enter_context(raw_path.open("w"))
+            raw.write("time_ps,sigma_xx_bar,sigma_yy_bar,sigma_zz_bar,sigma_bar\n")
+
+        chunk = max(1, steps_for(sample_every_ps, timestep_fs))
+        remaining = baseline_steps
+        while remaining > 0:
+            taken = min(chunk, remaining)
+            simulation.step(taken)
+            remaining -= taken
+            ran_steps += taken
+            _, measure = read()
+            baseline_n += 1
+            baseline_sum += measure
+            baseline_sum_sq += measure * measure
+
+        baseline_mean = baseline_sum / baseline_n if baseline_n else 0.0
+        baseline_error = 0.0
+        if baseline_n > 1:
+            variance = max(0.0, baseline_sum_sq / baseline_n - baseline_mean**2)
+            baseline_error = math.sqrt(variance / baseline_n)
+        _check_baseline(prefix.name, baseline_mean, baseline_error, baseline_n)
+
+        if not strain_applied:
+            # Composed from increments so that a ramp and a step are the same
+            # code path. Engineering strain compounds, so a tensile increment
+            # is the root of one plus the total; a shear tilt simply adds.
+            increments = max(1, round(ramp_ps / sample_every_ps)) if ramp_ps > 0 else 1
+            each = (
+                step_strain / increments
+                if mode == "shear"
+                else (1.0 + step_strain) ** (1.0 / increments) - 1.0
+            )
+            per_increment = ramp_steps // increments
+            for _ in range(increments):
+                _strain_increment(
+                    simulation,
+                    mode=mode,
+                    axis=axis,
+                    plane=plane,
+                    increment=each,
+                    poisson=poisson,
+                )
+                if per_increment:
+                    simulation.step(per_increment)
+                    ran_steps += per_increment
+            _check_deformed_box(prefix.name, simulation, cutoff_nm, step_strain)
+            # The response before anything has moved: the affine part of the
+            # modulus, and the one point of the decay no amount of dynamics
+            # can give back, since every later reading is already relaxing.
+            # It has no time to be binned at, so it is recorded on its own.
+            _, instant_bar = read()
+
+        # The box is locked from here, so the density cannot change and is
+        # worth one reading rather than one per sample.
+        density = density_g_cm3(simulation, run.total_mass_g_mol)
+        locked = _box_lengths_nm(simulation)
+
+        remaining = production_steps
+        since_temperature = 0
+        rows = 0
+        while remaining > 0:
+            cadence = (
+                sample_every_ps if elapsed_ps < late_after_ps else late_sample_every_ps
+            )
+            taken = min(max(1, steps_for(cadence, timestep_fs)), remaining)
+            simulation.step(taken)
+            remaining -= taken
+            ran_steps += taken
+            elapsed_ps += taken * timestep_fs / 1000.0
+            diagonal, measure = read()
+            bins.add(elapsed_ps, measure, diagonal)
+            if raw is not None:
+                raw.write(
+                    f"{elapsed_ps:.8g},{diagonal[0]:.8g},{diagonal[1]:.8g},"
+                    f"{diagonal[2]:.8g},{measure:.8g}\n"
+                )
+                rows += 1
+                if rows % 1000 == 0:
+                    # Flushed as it goes: the run this matters for is the one
+                    # that gets killed, and a buffer is lost with the process.
+                    raw.flush()
+            since_temperature += 1
+            if since_temperature >= 50:
+                temperatures.append(temperature_k_of(simulation))
+                since_temperature = 0
+
+        if not temperatures:
+            temperatures.append(temperature_k_of(simulation))
+        moved = _box_lengths_nm(simulation)
+        if not np.allclose(moved, locked, rtol=0.0, atol=1.0e-9):
+            raise SimulationError(
+                f"{prefix.name}: the cell moved from {locked.round(6).tolist()} "
+                f"to {moved.round(6).tolist()} nm during the hold. The strain "
+                "is the measurement, so a box that relaxes is a barostat that "
+                "is not at frequency=0."
+            )
+        state_path, pdb_path = _save_final(simulation, prefix)
+
+    samples = bins.samples()
+    samples["segment_duration_ps"] = [float(duration_ps)]
+    # What the modulus is divided by. Recorded rather than left to be worked
+    # out downstream, because it is the one number that says what the stress
+    # means: the differential stress of an isotropic solid is exactly
+    # 2 G (e_axial - e_lateral), with the Lame constant cancelling, so
+    # dividing by this gives G whatever Poisson's ratio the step imposed and
+    # whatever the material's own turns out to be.
+    samples["relax_strain_measure"] = [measure_strain]
+    samples["relax_volume_ratio"] = [
+        float(np.prod(locked) / np.prod(reference)) if not strain_applied else math.nan
+    ]
+    samples["relax_window_ps"] = [float(time_offset_ps), float(elapsed_ps)]
+    samples["step_strain"] = [float(step_strain)]
+    samples["relax_ramp_ps"] = [float(ramp_ps)]
+    samples["reference_box_nm"] = [float(value) for value in reference]
+    # Which key is here says which deformation ran, the way a stage's kind is
+    # everywhere else read off what it recorded rather than off its name.
+    if mode == "shear":
+        samples["relax_plane"] = [float(driven), float(gradient)]
+    else:
+        samples["relax_axis"] = [float(axis)]
+        samples["relax_poisson"] = [float(poisson)]
+    if instant_bar is not None:
+        samples["instant_stress_bar"] = [instant_bar]
+    if baseline_n:
+        samples["baseline_stress_bar"] = [baseline_mean]
+        samples["baseline_stress_sq_bar2"] = [baseline_sum_sq / baseline_n]
+        samples["baseline_samples"] = [float(baseline_n)]
+
+    realised = float(np.mean(temperatures))
+    log.info(
+        "  %d of %d bins filled from %.4g to %.4g ps, ran at %.0f K, %.4f g/cm3%s.",
+        int(np.count_nonzero(bins.populated)),
+        edges.size - 1,
+        float(edges[0]),
+        float(edges[-1]),
+        realised,
+        density,
+        f", baseline {baseline_mean:+.1f} +/- {baseline_error:.1f} bar"
+        if baseline_n
+        else "",
+    )
+    return StageResult(
+        name=prefix.name,
+        steps=ran_steps,
+        wall_seconds=time.monotonic() - started,
+        final_state=state_path,
+        temperature_k=temperature_k,
+        mean_temperature_k=realised,
+        mean_density_g_cm3=density,
         final_pdb=pdb_path,
         csv=paths.csv,
         samples=samples,

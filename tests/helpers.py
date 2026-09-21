@@ -753,3 +753,85 @@ def _write_manifest(run_dir: Path, stages: dict[str, Any]) -> Path:
     record["stages"].update(stages)
     path.write_text(json.dumps(record, indent=2))
     return path
+
+
+def write_relaxation(
+    run_dir: Path,
+    *,
+    modulus_mpa: float = 1000.0,
+    tau_ps: float = 100.0,
+    beta: float = 0.5,
+    equilibrium_mpa: float = 0.0,
+    step_strain: float = 0.03,
+    strain_measure: float | None = None,
+    first_ps: float = 0.1,
+    total_ps: float = 1.0e4,
+    bins_per_decade: int = 20,
+    baseline_bar: float = 0.0,
+    samples_per_bin: float = 100.0,
+    stem: str = "06_relax_r0",
+    chunks: int = 1,
+    temperature_k: float = 298.15,
+    mode: str = "tensile",
+    poisson: float = 0.5,
+    merge: dict[str, Any] | None = None,
+) -> Path:
+    """Write a manifest holding an exact stretched-exponential relaxation.
+
+    ``G(t) = equilibrium + modulus exp[-(t/tau)^beta]`` planted on the real
+    logarithmic grid the stage would have used, so a correct reader recovers
+    it to machine precision and an assertion can be an equality rather than a
+    tolerance - the trick :func:`write_deformation` uses for a modulus.
+
+    Every bin is given zero scatter, so its standard error is zero and the
+    whole curve is inside any signal window. *chunks* splits the bins across
+    that many stages, which is what a resumed relaxation looks like on disk
+    and the only way to exercise the merge.
+    """
+    from openmmpolymer.elasticity import MPA_PER_BAR
+    from openmmpolymer.simulate import relax_bin_edges_ps
+    from openmmpolymer.stress import deviatoric_strain
+
+    if strain_measure is None:
+        strain_measure = (
+            step_strain
+            if mode == "shear"
+            else 2.0 * deviatoric_strain(step_strain, poisson)
+        )
+    edges = relax_bin_edges_ps(first_ps, total_ps, bins_per_decade)
+    centres = np.sqrt(edges[:-1] * edges[1:])
+    moduli = equilibrium_mpa + modulus_mpa * np.exp(-((centres / tau_ps) ** beta))
+    # The reader subtracts the baseline, scales to MPa and divides by the
+    # strain, so plant the stress that comes back out as exactly `moduli`.
+    stresses = moduli * strain_measure / MPA_PER_BAR + baseline_bar
+
+    stages = dict(merge or {})
+    groups = np.array_split(np.arange(centres.size), max(1, chunks))
+    for index, group in enumerate(groups):
+        samples: dict[str, Any] = {
+            "segment_bin": [float(value) for value in group],
+            "segment_relax_time_ps": [float(centres[value]) for value in group],
+            "segment_stress_bar": [float(stresses[value]) for value in group],
+            "segment_stress_sq_bar2": [float(stresses[value] ** 2) for value in group],
+            "segment_samples": [samples_per_bin] * len(group),
+            "relax_strain_measure": [float(strain_measure)],
+            "step_strain": [float(step_strain)],
+        }
+        if mode == "shear":
+            samples["relax_plane"] = [0.0, 2.0]
+        else:
+            samples["relax_axis"] = [2.0]
+            samples["relax_poisson"] = [float(poisson)]
+        if index == 0:
+            samples["baseline_stress_bar"] = [float(baseline_bar)]
+            samples["baseline_stress_sq_bar2"] = [float(baseline_bar) ** 2]
+            samples["baseline_samples"] = [samples_per_bin]
+            samples["instant_stress_bar"] = [
+                float((equilibrium_mpa + modulus_mpa) * strain_measure / MPA_PER_BAR)
+                + baseline_bar
+            ]
+        stages[f"{stem}_{index:02d}"] = {
+            "samples": samples,
+            "mean_temperature_k": temperature_k,
+        }
+    return _write_manifest(run_dir, stages)

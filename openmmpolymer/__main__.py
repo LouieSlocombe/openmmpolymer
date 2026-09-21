@@ -51,7 +51,8 @@ from .packing import (
     pack_box,
 )
 from .protocols import Protocol, melt_quench, run_protocol, standard_melt_equilibration
-from .simulate import prepare_run
+from .relaxation import relax_stages
+from .simulate import RELAX_MODES, prepare_run
 from .tg import (
     TgSpec,
     analyse_run,
@@ -67,6 +68,13 @@ from .timeseries import (
     quench_stages,
 )
 from .trajectory import AnalysisError
+from .viscoelastic import (
+    RelaxationSpec,
+    analyse_relaxation,
+    relaxation_scan,
+    run_relaxation_scan,
+    write_relaxation_report,
+)
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +141,63 @@ _MECHANICS = (
     "skip",
     "max_total_ns",
 )
+
+
+#: The step strain, and the pass that checks it was small enough.
+_RELAXATION = (
+    "temperature_k",
+    "pressure_bar",
+    "relax_mode",
+    "deform_axis",
+    "step_strain",
+    "baseline_ps",
+    "relaxation_ps",
+    "relax_replicas",
+    "sample_every_ps",
+    "bins_per_decade",
+    "relax_stage_ps",
+    "linearity_strains",
+    "max_total_ns",
+)
+
+
+def _relaxation_spec(
+    *,
+    temperature_k: float = 298.15,
+    pressure_bar: float = 1.0,
+    relax_mode: str = "tensile",
+    deform_axis: int = 2,
+    step_strain: float = 0.03,
+    baseline_ps: float = 1000.0,
+    relaxation_ps: float = 10_000.0,
+    relax_replicas: int = 4,
+    sample_every_ps: float = 0.05,
+    bins_per_decade: int = 20,
+    relax_stage_ps: float = 20_000.0,
+    linearity_strains: tuple[float, ...] | None = None,
+    max_total_ns: float | None = None,
+) -> RelaxationSpec:
+    """Turn the flat relaxation flags into the spec a scan takes."""
+    return RelaxationSpec(
+        temperature_k=temperature_k,
+        pressure_bar=pressure_bar,
+        mode=relax_mode,
+        axis=deform_axis,
+        step_strain=step_strain,
+        baseline_ps=baseline_ps,
+        relax_ps=relaxation_ps,
+        n_replicas=relax_replicas,
+        sample_every_ps=sample_every_ps,
+        bins_per_decade=bins_per_decade,
+        stage_ps=relax_stage_ps,
+        linearity_strains=linearity_strains,
+        max_total_ns=max_total_ns,
+    )
+
+
+def _relax_protocol(**options: Any) -> Protocol:
+    """The equilibration and one relaxation, so --dry-run can price it."""
+    return relaxation_scan(_relaxation_spec(**options))
 
 
 def _modulus_spec(
@@ -226,6 +291,7 @@ PROTOCOLS = {
     "melt-quench": ProtocolEntry(melt_quench, _TARGET + _COMMON + _QUENCH),
     "tg": ProtocolEntry(_tg_protocol, _COMMON + _QUENCH[1:] + _TG),
     "modulus": ProtocolEntry(_modulus_protocol, ("pressure_bar", *_MECHANICS)),
+    "relax": ProtocolEntry(_relax_protocol, _RELAXATION),
 }
 
 
@@ -497,6 +563,73 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("load", "bulk", "shear"),
         help="passes to leave out; the extension always runs",
     )
+    relaxation = parser.add_argument_group(
+        "relaxation",
+        "the step strain the relax protocol applies, and how the decay after "
+        "it is sampled",
+    )
+    relaxation.add_argument(
+        "--relax-mode",
+        default="tensile",
+        choices=RELAX_MODES,
+        help="whether the step is an extension or a shear; both measure G(t), "
+        "and a shear imposes no lateral contraction (default: %(default)s)",
+    )
+    relaxation.add_argument(
+        "--step-strain",
+        type=float,
+        default=0.03,
+        help="the strain applied all at once, then held (default: %(default)s)",
+    )
+    relaxation.add_argument(
+        "--baseline-ps",
+        type=float,
+        default=1000.0,
+        help="time at the locked box before straining; its scatter is the "
+        "floor the decay is read against (default: %(default)s)",
+    )
+    relaxation.add_argument(
+        "--relaxation-ps",
+        type=float,
+        default=10000.0,
+        help="how long the strain is held, per replica (default: %(default)s)",
+    )
+    relaxation.add_argument(
+        "--relax-replicas",
+        type=int,
+        default=4,
+        help="independent runs from the same cell with fresh velocities. The "
+        "first knob to turn: the early bins hold one reading each, so "
+        "averaging replicas is what makes the fast end of the curve mean "
+        "anything (default: %(default)s)",
+    )
+    relaxation.add_argument(
+        "--sample-every-ps",
+        type=float,
+        default=0.05,
+        help="time between stress readings early on (default: %(default)s)",
+    )
+    relaxation.add_argument(
+        "--bins-per-decade",
+        type=int,
+        default=20,
+        help="logarithmic time bins per decade (default: %(default)s)",
+    )
+    relaxation.add_argument(
+        "--relax-stage-ps",
+        type=float,
+        default=20000.0,
+        help="most relaxation one stage may hold before it is split for "
+        "resume (default: %(default)s)",
+    )
+    relaxation.add_argument(
+        "--linearity-strains",
+        type=_floats,
+        default=None,
+        help="comma-separated strains to repeat the whole measurement at, "
+        "e.g. 0.01,0.05; inside the linear region the moduli coincide, and "
+        "there is no other way to check from one strain alone",
+    )
     analysis = parser.add_argument_group(
         "analysis", "read a finished run directory instead of building one"
     )
@@ -700,6 +833,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_tg_scan(arguments, run, output, chain, options)
     if name == "modulus":
         return _run_modulus_scan(arguments, run, output, chain, options)
+    if name == "relax":
+        return _run_relaxation_scan(arguments, run, output, chain, options)
 
     summary = run_protocol(
         entry.factory(**options),
@@ -882,6 +1017,90 @@ def _consistency_line(check: Any) -> str:
     )
 
 
+def _run_relaxation_scan(
+    arguments: argparse.Namespace,
+    run: Any,
+    output: Path,
+    chain: Any,
+    options: dict[str, Any],
+) -> int:
+    """Strain the cell once, watch the stress decay, and say what it decayed to."""
+    result = run_relaxation_scan(
+        run,
+        output,
+        spec=_relaxation_spec(**options),
+        chain_backbone=chain.backbone,
+        atoms_per_chain=chain.n_atoms,
+    )
+    for line in _relaxation_lines(result):
+        print(line, flush=True)
+    return 0
+
+
+def _relaxation_lines(result: Any) -> list[str]:
+    """One line per fitted quantity, each carrying what qualifies it.
+
+    Takes either a :class:`~openmmpolymer.viscoelastic.RelaxationResult` from a
+    scan or a :class:`~openmmpolymer.viscoelastic.RelaxationReport` from
+    ``--analyse``. They carry the same measurements, and only the scan carries
+    an overall verdict: deciding whether a run resolved needs the replica
+    spread and the baseline weighed together, which is the driver's job and not
+    something reading a directory back should invent. So the verdict is asked
+    for rather than assumed, and left off when there is none.
+    """
+    if result.mean is None:
+        return ["relax: nothing was strained"]
+    mean = result.mean
+    spread = (
+        ""
+        if result.replica_spread_mpa is None
+        else f" +/- {result.replica_spread_mpa:.3g} over {len(result.curves)}"
+    )
+    resolved = getattr(result, "resolved", None)
+    lines = [
+        f"G(0) = {mean.initial_modulus_mpa:.4g} MPa{spread} at "
+        f"{mean.step_strain:+.3f} strain, {mean.temperature_k:.0f} K, over "
+        f"{mean.decades:.1f} decades"
+        f"{'' if resolved is not False else ' (not resolved)'}"
+    ]
+    if result.kww is not None:
+        lines.append(
+            f"KWW: beta = {result.kww.beta:.3f}, tau = {result.kww.tau_ps:.4g} ps, "
+            f"<tau> = {result.kww.mean_tau_ps:.4g} ps"
+            f"{'' if result.kww.resolved else ' (not resolved)'}"
+        )
+    if result.prony is not None:
+        lines.append(
+            f"Prony: G_inf = {result.prony.equilibrium_mpa:.4g} MPa over "
+            f"{result.prony.n_active} of {result.prony.n_terms} terms"
+            f"{'' if result.prony.plateau_reached else ' - still decaying'}"
+        )
+    if result.linearity is not None:
+        lines.append(
+            f"linearity: strains {[round(v, 4) for v in result.linearity.strains]} "
+            f"differ by {100.0 * result.linearity.gap:.0f}%"
+            f"{'' if result.linearity.linear else ' - outside the linear region'}"
+        )
+    return lines
+
+
+def _analyse_relaxation(arguments: argparse.Namespace, run_dir: Path) -> None:
+    """Report the relaxation modulus, and write it out."""
+    report = analyse_relaxation(run_dir)
+    for line in _relaxation_lines(report):
+        print(line, flush=True)
+    for note in report.notes:
+        print(f"note: {note}", flush=True)
+
+    files = write_relaxation_report(
+        report,
+        arguments.output_dir,
+        figures=not arguments.no_figures,
+        figure_format=cast(str, arguments.figure_format),
+    )
+    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
+
+
 def _has_stages(run_dir: Path, find: Any) -> bool:
     """Whether a reader finds anything of its kind in this directory.
 
@@ -913,10 +1132,11 @@ def _analyse(arguments: argparse.Namespace) -> int:
     deformed = any(
         _has_stages(first, find) for find in (deform_stages, load_stages, shear_stages)
     )
-    if not quenched and not deformed:
+    relaxed = _has_stages(first, relax_stages)
+    if not quenched and not deformed and not relaxed:
         print(
-            f"nothing in {first} was a quench or a deformation, so there is "
-            "nothing to report",
+            f"nothing in {first} was a quench, a deformation or a relaxation, "
+            "so there is nothing to report",
             flush=True,
         )
         return 1
@@ -925,6 +1145,8 @@ def _analyse(arguments: argparse.Namespace) -> int:
         _analyse_tg(arguments, directories)
     if deformed:
         _analyse_mechanics(arguments, first)
+    if relaxed:
+        _analyse_relaxation(arguments, first)
     return 0
 
 
