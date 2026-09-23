@@ -62,7 +62,7 @@ from .timeseries import (
 )
 
 if TYPE_CHECKING:
-    from .strength import BreakingStrength
+    from .strength import BreakingStrength, YieldStrength
 
 log = logging.getLogger(__name__)
 
@@ -665,6 +665,123 @@ def plot_breaking_strength(curve: StressStrain, result: BreakingStrength) -> Any
         f"Apparent tensile strength = {result.strength_mpa:.1f} MPa"
         if result.resolved and result.strength_mpa is not None
         else "Apparent tensile strength not resolved"
+    )
+    chunks = curve.stage.split(", ")
+    label = (
+        chunks[0] if len(chunks) == 1 else f"{chunks[0]} (+{len(chunks) - 1} chunks)"
+    )
+    axis.set_title(
+        f"{label}: {result.temperature_k:.0f} K, {rate}\n{verdict}",
+        fontsize=9,
+    )
+    axis.legend(fontsize=7, frameon=False)
+    return figure
+
+
+def plot_yield_strength(curve: StressStrain, result: YieldStrength) -> Any:
+    """Plot an offset yield construction on the nominal tensile response.
+
+    The fit window and the offset line show how the criterion was chosen.
+    A resolved intersection is interpolated between samples; its shaded
+    bracket shows the sampling interval, not a confidence interval. An
+    unresolved result is labelled without drawing a yield-strength marker.
+
+    Args:
+        curve: The stress-strain curve analysed for yield strength.
+        result: Its result from :func:`~openmmpolymer.strength.yield_strength`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axes = _figure(1, 1)
+    axis = axes[0]
+    axis.plot(
+        curve.strain,
+        result.nominal_stress_mpa,
+        marker="o",
+        markersize=3.5,
+        linewidth=0.9,
+        color=_DATA_COLOUR,
+        label="nominal tensile stress",
+    )
+    fit_span = np.asarray(
+        [result.fit_min_strain, result.fit_max_strain], dtype=np.float64
+    )
+    axis.axvspan(
+        *fit_span,
+        color=_REFERENCE_COLOUR,
+        alpha=0.12,
+        linewidth=0,
+        label="elastic fit window",
+    )
+    offset_label = f"{100.0 * result.offset_strain:g}% offset"
+    if (
+        result.modulus_mpa is not None
+        and result.intercept_mpa is not None
+        and math.isfinite(result.modulus_mpa)
+        and math.isfinite(result.intercept_mpa)
+    ):
+        axis.plot(
+            fit_span,
+            result.modulus_mpa * fit_span + result.intercept_mpa,
+            linewidth=1.0,
+            linestyle="--",
+            color=_REFERENCE_COLOUR,
+            label=(
+                f"elastic fit: E = {result.modulus_mpa:.1f} MPa"
+                f"{'' if result.fit_resolved else ' (unresolved)'}"
+            ),
+        )
+        span = np.asarray(
+            [float(curve.strain.min()), float(curve.strain.max())], dtype=np.float64
+        )
+        axis.plot(
+            span,
+            result.modulus_mpa * (span - result.offset_strain) + result.intercept_mpa,
+            linewidth=1.0,
+            linestyle="--",
+            color=_GUIDE_COLOUR,
+            label=f"{offset_label} line",
+        )
+    if result.resolved:
+        if result.yield_bracket is not None:
+            axis.axvspan(
+                *result.yield_bracket,
+                color=_GUIDE_COLOUR,
+                alpha=0.12,
+                linewidth=0,
+                label="yield strain bracket",
+            )
+        if result.yield_strain is not None and result.strength_mpa is not None:
+            axis.plot(
+                [result.yield_strain],
+                [result.strength_mpa],
+                marker="*",
+                markersize=10,
+                linestyle="none",
+                color=_GUIDE_COLOUR,
+                label="interpolated offset intersection",
+            )
+
+    # Extending the elastic line to the final strain can give stresses far
+    # above the measured response. Keep that extrapolation from setting the
+    # scale and hiding the curve whose intersection is being reported.
+    low = min(0.0, float(result.nominal_stress_mpa.min()))
+    high = max(0.0, float(result.nominal_stress_mpa.max()))
+    margin = max(high - low, 1.0) * 0.05
+    axis.set_ylim(low - margin, high + margin)
+    axis.axhline(0.0, color=_REFERENCE_COLOUR, linewidth=0.6)
+    axis.set_xlabel(f"Engineering strain along {'xyz'[curve.axis]}")
+    axis.set_ylabel("Nominal tensile stress (MPa)")
+    rate = (
+        "rate not recorded"
+        if result.strain_rate_per_ns is None
+        else f"{result.strain_rate_per_ns:.3g} strain/ns"
+    )
+    verdict = (
+        f"{offset_label} yield strength = {result.strength_mpa:.1f} MPa"
+        if result.resolved and result.strength_mpa is not None
+        else f"{offset_label} yield strength not resolved"
     )
     chunks = curve.stage.split(", ")
     label = (

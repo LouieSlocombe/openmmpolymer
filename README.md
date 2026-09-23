@@ -207,8 +207,9 @@ across them. The manifest is not touched.
 
 It works out what to report from what the directory recorded: a run that
 quenched gets a glass transition, a heating scan gets a melting report, a run
-that was deformed gets its elastic constants or breaking-strength report, and
-any run whose stages left coordinates gets its structure read back as well.
+that was deformed gets its elastic constants, yield-strength or breaking-strength
+report, and any run whose stages left coordinates gets its structure read back
+as well.
 
 ## Measuring a modulus
 
@@ -263,6 +264,84 @@ openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol modulus -t 298 -o run -v
 ```
 
 and `--skip bulk shear` if `E` and `nu` are all you want.
+
+## Calculating a yield strength
+
+`run_yield_scan` measures an **apparent offset yield strength** from a tensile
+stress-strain curve. It equilibrates the cell, then extends replicas from that
+same state with fresh velocities while the transverse dimensions relax at the
+specified pressure. The default criterion is a 0.2% offset proof stress. This
+is a configurable, operational definition; it is not a universal polymer yield
+criterion or a test of permanent deformation after unloading.
+
+```python
+from openmmpolymer import (
+    YieldSpec,
+    analyse_yield,
+    run_yield_scan,
+    write_yield_report,
+)
+
+report = run_yield_scan(
+    run,
+    "yield_run",
+    spec=YieldSpec(
+        temperature_k=298.15,
+        strain_increment=0.002,
+        max_strain=0.3,
+        relax_ps=50.0,
+        n_replicas=3,
+        offset_strain=0.002,
+        fit_min_strain=0.0,
+        fit_max_strain=0.02,
+    ),
+)
+print(report.strength_mpa, report.replica_spread_mpa, report.resolved)
+write_yield_report(report)
+# Reanalyse with the saved criterion, without running more dynamics:
+write_yield_report(analyse_yield("yield_run"))
+```
+
+The workflow uses engineering strain and nominal tensile stress. It subtracts
+the mean transverse stress from the axial stress and multiplies by the measured
+transverse area ratio `A / A0`, as in the breaking workflow below. It fits an
+initial elastic line `sigma = E * strain + intercept`, then finds the first
+crossing after that fit window with the parallel offset line
+`sigma = E * (strain - offset_strain) + intercept`. Linear interpolation within
+the sampled strain bracket gives the proof stress and yield strain.
+
+The elastic fit needs at least five points and must pass its fit-quality checks.
+Choose the fit window inside the material's initial linear response; a window
+that includes yielding cannot define its elastic slope reliably. A missing
+crossing, an invalid elastic fit or an incomplete replica leaves the pooled
+strength unresolved (`strength_mpa` is `None`). Reports retain each replica's
+curve, fit, crossing bracket and reasons for unresolved results. Figures show
+the initial elastic fit and offset line alongside nominal stress.
+
+```bash
+openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol yield -t 298 \
+  --yield-strain-increment 0.002 --yield-max-strain 0.3 \
+  --yield-relax-ps 50 --yield-replicas 3 \
+  --yield-offset-strain 0.002 --yield-fit-min-strain 0 \
+  --yield-fit-max-strain 0.02 -o yield_run -v
+openmmpolymer --analyse yield_run
+```
+
+`--yield-stage-ps` controls resumable chunk duration,
+`--yield-samples-per-step` controls stress sampling, and
+`--yield-trajectory-ps` optionally saves coordinates. Increments extend the
+current cell and compound; the maximum strain is relative to the initial cell.
+`--max-total-ns` limits the complete equilibration and replica schedule before
+the monomer is built. JSON and figures are written to `yield_run/analysis`;
+`--no-figures` writes only JSON. Automatic analysis recognises yield runs and
+uses their saved fit window and offset.
+
+Report the temperature, strain rate, offset and elastic fit window with the
+strength. The rapid rates, force field, chain length and periodic cell size can
+shift this apparent value relative to a macroscopic experiment. Replica spread
+reflects fresh velocities at one starting structure. For the distinction
+between an offset proof stress and a physical onset of yielding, see
+[Instron's offset yield strength definition](https://www.instron.com/en/resources/glossary/offset-yield-strength/).
 
 ## Calculating a breaking strength
 

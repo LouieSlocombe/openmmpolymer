@@ -176,6 +176,7 @@ from .plots import (
     plot_relaxation_spectrum,
     plot_state_data,
     plot_stress_strain,
+    plot_yield_strength,
 )
 from .protocols import (
     ChainDimensions,
@@ -228,7 +229,7 @@ from .simulate import (
     run_shear,
     safe_timestep_fs,
 )
-from .strength import BreakingStrength, breaking_strength
+from .strength import BreakingStrength, YieldStrength, breaking_strength, yield_strength
 from .stress import (
     StressError,
     deviatoric_strain,
@@ -311,6 +312,19 @@ from .viscoelastic import (
     relaxation_scan,
     run_relaxation_scan,
     write_relaxation_report,
+)
+from .yielding import (
+    YieldError,
+    YieldReport,
+    YieldSchedule,
+    YieldSpec,
+    analyse_yield,
+    run_yield_scan,
+    write_yield_report,
+    yield_protocol,
+    yield_scan,
+    yield_schedule,
+    yield_stages,
 )
 
 try:
@@ -406,6 +420,11 @@ __all__ = [
     "TmSpec",
     "TrajectoryOptions",
     "ViscoelasticError",
+    "YieldError",
+    "YieldReport",
+    "YieldSchedule",
+    "YieldSpec",
+    "YieldStrength",
     "__version__",
     "analyse_breaking",
     "analyse_mechanics",
@@ -413,6 +432,7 @@ __all__ = [
     "analyse_relaxation",
     "analyse_run",
     "analyse_structure",
+    "analyse_yield",
     "assemble_box",
     "assemble_chain",
     "assign_charges",
@@ -488,6 +508,7 @@ __all__ = [
     "plot_relaxation_spectrum",
     "plot_state_data",
     "plot_stress_strain",
+    "plot_yield_strength",
     "poisson_ratio",
     "prepare_box",
     "prepare_run",
@@ -529,6 +550,7 @@ __all__ = [
     "run_shear",
     "run_tg_scan",
     "run_tm_scan",
+    "run_yield_scan",
     "safe_timestep_fs",
     "select_platform",
     "shear_modulus",
@@ -550,5 +572,11 @@ __all__ = [
     "write_relaxation_report",
     "write_report",
     "write_structure_report",
+    "write_yield_report",
+    "yield_protocol",
+    "yield_scan",
+    "yield_schedule",
+    "yield_stages",
+    "yield_strength",
     "youngs_modulus",
 ]

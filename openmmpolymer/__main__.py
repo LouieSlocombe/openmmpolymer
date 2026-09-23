@@ -94,6 +94,15 @@ from .viscoelastic import (
     run_relaxation_scan,
     write_relaxation_report,
 )
+from .yielding import (
+    YieldError,
+    YieldSpec,
+    analyse_yield,
+    run_yield_scan,
+    write_yield_report,
+    yield_scan,
+    yield_stages,
+)
 
 log = logging.getLogger(__name__)
 
@@ -176,6 +185,25 @@ _BREAKING = (
     "breaking_trajectory_ps",
     "failure_fraction",
     "confirmation_steps",
+    "max_total_ns",
+)
+
+
+#: Finite extension and the elastic fit defining an offset proof stress.
+_YIELD = (
+    "temperature_k",
+    "pressure_bar",
+    "deform_axis",
+    "yield_strain_increment",
+    "yield_max_strain",
+    "yield_relax_ps",
+    "yield_replicas",
+    "yield_samples_per_step",
+    "yield_stage_ps",
+    "yield_trajectory_ps",
+    "yield_offset_strain",
+    "yield_fit_min_strain",
+    "yield_fit_max_strain",
     "max_total_ns",
 )
 
@@ -383,6 +411,55 @@ def _breaking_protocol(**options: Any) -> Protocol:
     return protocol
 
 
+def _yield_spec(
+    *,
+    temperature_k: float = 298.15,
+    pressure_bar: float = 1.0,
+    deform_axis: int = 2,
+    yield_strain_increment: float = 0.002,
+    yield_max_strain: float = 0.3,
+    yield_relax_ps: float = 50.0,
+    yield_replicas: int = 3,
+    yield_samples_per_step: int = 250,
+    yield_stage_ps: float = 1000.0,
+    yield_trajectory_ps: float | None = None,
+    yield_offset_strain: float = 0.002,
+    yield_fit_min_strain: float = 0.0,
+    yield_fit_max_strain: float = 0.02,
+    max_total_ns: float | None = None,
+) -> YieldSpec:
+    """Map the tensile and proof-stress controls onto the yield workflow."""
+    return YieldSpec(
+        temperature_k=temperature_k,
+        pressure_bar=pressure_bar,
+        axis=deform_axis,
+        strain_increment=yield_strain_increment,
+        max_strain=yield_max_strain,
+        relax_ps=yield_relax_ps,
+        n_replicas=yield_replicas,
+        samples_per_step=yield_samples_per_step,
+        stage_ps=yield_stage_ps,
+        trajectory_ps=yield_trajectory_ps,
+        offset_strain=yield_offset_strain,
+        fit_min_strain=yield_fit_min_strain,
+        fit_max_strain=yield_fit_max_strain,
+        max_total_ns=max_total_ns,
+    )
+
+
+def _yield_protocol(**options: Any) -> Protocol:
+    """Validate equilibration and every tensile replica before building a cell."""
+    spec = _yield_spec(**options)
+    protocol = yield_scan(spec)
+    duration_ns = protocol.total_duration_ps / 1000.0
+    if spec.max_total_ns is not None and duration_ns > spec.max_total_ns:
+        raise YieldError(
+            f"The yield scan is {duration_ns:.3g} ns, over the "
+            f"{spec.max_total_ns:g} ns budget. Shorten the scan or raise max_total_ns."
+        )
+    return protocol
+
+
 def _tg_spec(
     *,
     melt_temperature_k: float = 650.0,
@@ -424,6 +501,7 @@ PROTOCOLS = {
     "tm": ProtocolEntry(_tm_protocol, _TM),
     "modulus": ProtocolEntry(_modulus_protocol, ("pressure_bar", *_MECHANICS)),
     "breaking": ProtocolEntry(_breaking_protocol, _BREAKING),
+    "yield": ProtocolEntry(_yield_protocol, _YIELD),
     "relax": ProtocolEntry(_relax_protocol, _RELAXATION),
 }
 
@@ -445,7 +523,9 @@ class _ProtocolParser(argparse.ArgumentParser):
                 "step_k": 10.0,
                 "hold_ps": 1000.0,
             }
-        defaults["temperature"] = 298.15 if arguments.protocol == "breaking" else 450.0
+        defaults["temperature"] = (
+            298.15 if arguments.protocol in ("breaking", "yield") else 450.0
+        )
         for name, value in defaults.items():
             if getattr(arguments, name) is None:
                 setattr(arguments, name, value)
@@ -490,7 +570,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--temperature",
         type=float,
         default=None,
-        help="target temperature in kelvin (default: 298.15 for breaking, "
+        help="target temperature in kelvin (default: 298.15 for breaking and yield, "
         "450 for other protocols)",
     )
     parser.add_argument(
@@ -823,6 +903,75 @@ def build_parser() -> argparse.ArgumentParser:
         help="consecutive terminal holds needed to confirm the stress drop "
         "(default: %(default)s)",
     )
+    yielding = parser.add_argument_group(
+        "yield strength",
+        "finite tensile extension and the offset line defining its proof stress",
+    )
+    yielding.add_argument(
+        "--yield-strain-increment",
+        type=float,
+        default=0.002,
+        help="fractional extension of the current cell at each step "
+        "(default: %(default)s)",
+    )
+    yielding.add_argument(
+        "--yield-max-strain",
+        type=float,
+        default=0.3,
+        help="engineering strain to reach; 0.3 means 30%% (default: %(default)s)",
+    )
+    yielding.add_argument(
+        "--yield-relax-ps",
+        type=float,
+        default=50.0,
+        help="hold after each extension, in ps (default: %(default)s)",
+    )
+    yielding.add_argument(
+        "--yield-replicas",
+        type=int,
+        default=3,
+        help="extensions from the equilibrated cell with fresh velocities "
+        "(default: %(default)s)",
+    )
+    yielding.add_argument(
+        "--yield-samples-per-step",
+        type=int,
+        default=250,
+        help="stress readings per extension (default: %(default)s)",
+    )
+    yielding.add_argument(
+        "--yield-stage-ps",
+        type=float,
+        default=1000.0,
+        help="duration of each resumable extension chunk, in ps (default: %(default)s)",
+    )
+    yielding.add_argument(
+        "--yield-trajectory-ps",
+        type=float,
+        default=None,
+        help="save extension coordinates every this many ps; omitted by default",
+    )
+    yielding.add_argument(
+        "--yield-offset-strain",
+        type=float,
+        default=0.002,
+        help="strain offset for the proof-stress line; 0.002 means 0.2%% "
+        "(default: %(default)s)",
+    )
+    yielding.add_argument(
+        "--yield-fit-min-strain",
+        type=float,
+        default=0.0,
+        help="lower engineering strain for the initial elastic fit "
+        "(default: %(default)s)",
+    )
+    yielding.add_argument(
+        "--yield-fit-max-strain",
+        type=float,
+        default=0.02,
+        help="upper engineering strain for the initial elastic fit "
+        "(default: %(default)s)",
+    )
     relaxation = parser.add_argument_group(
         "relaxation",
         "the step strain the relax protocol applies, and how the decay after "
@@ -1105,6 +1254,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             _breaking_protocol(**_protocol_options(arguments, PROTOCOLS["breaking"]))
         except (ValueError, BreakingError) as error:
             parser.error(str(error))
+    if arguments.protocol == "yield":
+        try:
+            _yield_protocol(**_protocol_options(arguments, PROTOCOLS["yield"]))
+        except (ValueError, YieldError) as error:
+            parser.error(str(error))
 
     output = Path(cast("str | None", arguments.output_dir) or "run")
     output.mkdir(parents=True, exist_ok=True)
@@ -1190,6 +1344,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_modulus_scan(arguments, run, output, chain, options)
     if name == "breaking":
         return _run_breaking_scan(arguments, run, output, chain, options)
+    if name == "yield":
+        return _run_yield_scan(arguments, run, output, chain, options)
     if name == "relax":
         return _run_relaxation_scan(arguments, run, output, chain, options)
 
@@ -1571,6 +1727,78 @@ def _run_breaking_scan(
     return 0
 
 
+def _yield_lines(report: Any) -> list[str]:
+    """Print the proof stress together with its offset, temperature and rate."""
+    if report.strength_mpa is None or not report.resolved:
+        lines = ["yield: apparent offset yield strength not resolved"]
+    else:
+        spread = (
+            ""
+            if report.replica_spread_mpa is None
+            else f" +/- {report.replica_spread_mpa:.3g} over {len(report.replicas)} replicas"
+        )
+        lines = [
+            f"yield: apparent offset yield strength = "
+            f"{report.strength_mpa:.4g} MPa{spread}"
+        ]
+    for index, result in zip(report.replica_indices, report.replicas, strict=True):
+        rate = (
+            "unknown strain rate"
+            if result.strain_rate_per_ns is None
+            else f"{result.strain_rate_per_ns:.3g} strain/ns"
+        )
+        strength = (
+            f"{result.strength_mpa:.4g} MPa at strain {result.yield_strain:.4g}"
+            if result.resolved
+            and result.strength_mpa is not None
+            and result.yield_strain is not None
+            else "not resolved"
+        )
+        lines.append(
+            f"  replica {index}: {100.0 * result.offset_strain:g}% offset "
+            f"proof stress {strength}, {result.temperature_k:.0f} K, {rate}"
+        )
+        if result.modulus_mpa is not None:
+            lines.append(
+                f"    initial elastic slope {result.modulus_mpa:.4g} MPa "
+                f"over strain {result.fit_min_strain:g} to {result.fit_max_strain:g}"
+            )
+    return lines
+
+
+def _write_yield_result(arguments: argparse.Namespace, report: Any) -> None:
+    """Print and save the same proof-stress report after a run or a reread."""
+    for line in _yield_lines(report):
+        print(line, flush=True)
+    for note in report.notes:
+        print(f"note: {note}", flush=True)
+    files = write_yield_report(
+        report,
+        arguments.output_dir if arguments.analyse else None,
+        formats=() if arguments.no_figures else (cast(str, arguments.figure_format),),
+    )
+    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
+
+
+def _run_yield_scan(
+    arguments: argparse.Namespace,
+    run: Any,
+    output: Path,
+    chain: Any,
+    options: dict[str, Any],
+) -> int:
+    """Measure apparent offset yield strength and write its report."""
+    report = run_yield_scan(
+        run,
+        output,
+        spec=_yield_spec(**options),
+        chain_backbone=chain.backbone,
+        atoms_per_chain=chain.n_atoms,
+    )
+    _write_yield_result(arguments, report)
+    return 0
+
+
 def _run_relaxation_scan(
     arguments: argparse.Namespace,
     run: Any,
@@ -1681,12 +1909,13 @@ def _analyse(arguments: argparse.Namespace) -> int:
     quenched = _has_stages(first, quench_stages)
     heated = _has_stages(first, heating_stages)
     broken = _has_stages(first, breaking_stages)
+    yielded = _has_stages(first, yield_stages)
     deformed = any(
         _has_stages(first, find) for find in (deform_stages, load_stages, shear_stages)
     )
     relaxed = _has_stages(first, relax_stages)
     structured = not arguments.no_structure and _has_stages(first, structure_stages)
-    if not any((quenched, heated, broken, deformed, relaxed, structured)):
+    if not any((quenched, heated, broken, yielded, deformed, relaxed, structured)):
         print(
             f"nothing in {first} was a quench, a heating scan, a deformation or a relaxation, "
             "and no stage left coordinates to measure, so there is nothing to "
@@ -1701,7 +1930,9 @@ def _analyse(arguments: argparse.Namespace) -> int:
         _analyse_melting(arguments, first)
     if broken:
         _write_breaking_result(arguments, analyse_breaking(first))
-    if deformed and not broken:
+    if yielded:
+        _write_yield_result(arguments, analyse_yield(first))
+    if deformed and not (broken or yielded):
         _analyse_mechanics(arguments, first)
     if relaxed:
         _analyse_relaxation(arguments, first)
