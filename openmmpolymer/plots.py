@@ -62,6 +62,7 @@ from .timeseries import (
 )
 
 if TYPE_CHECKING:
+    from .strain_rate import StrainRateExtrapolation
     from .strength import BreakingStrength, ElongationAtBreak, YieldStrength
 
 log = logging.getLogger(__name__)
@@ -245,6 +246,99 @@ def _predicted(extrapolation: CoolingRateExtrapolation, rate_k_per_ns: Any) -> A
     return parameters["t0_k"] + parameters["b_k"] / (
         parameters["ln_r0"] - np.log(rate_k_per_ns)
     )
+
+
+def plot_strain_rate(extrapolation: StrainRateExtrapolation) -> Any:
+    """Plot measured Young's moduli and a finite-rate empirical estimate.
+
+    Error bars show one standard error. The unsampled interval between the
+    measurements and target is shaded, including when the target lies above
+    the sampled rates. The title retains the temperature, elastic fit window
+    and resolution verdict so that a long extrapolation stays visible.
+
+    Args:
+        extrapolation: A fit from
+            :func:`~openmmpolymer.strain_rate.strain_rate_extrapolation`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axes = _figure(1, 1)
+    axis = axes[0]
+    rates = extrapolation.strain_rate_per_ns
+    target = extrapolation.target_rate_per_ns
+    minimum = float(rates.min())
+    maximum = float(rates.max())
+    if target < minimum or target > maximum:
+        boundary = minimum if target < minimum else maximum
+        axis.axvspan(
+            min(target, boundary),
+            max(target, boundary),
+            color=_GUIDE_COLOUR,
+            alpha=0.15,
+            label="extrapolated interval",
+        )
+    span = np.geomspace(min(target, minimum), max(target, maximum), 200)
+    predicted = extrapolation.predict(span)
+    axis.plot(
+        span,
+        np.where(np.isfinite(predicted), predicted, np.nan),
+        linewidth=0.9,
+        linestyle="--",
+        color=_REFERENCE_COLOUR,
+        label=f"{extrapolation.form} fit",
+    )
+    axis.errorbar(
+        rates,
+        extrapolation.moduli_mpa,
+        yerr=extrapolation.standard_errors_mpa,
+        marker="o",
+        markersize=4.0,
+        linestyle="none",
+        elinewidth=0.9,
+        capsize=2,
+        color=_DATA_COLOUR,
+        label="measured (1 SE)",
+    )
+    if math.isfinite(extrapolation.modulus_mpa):
+        target_error = extrapolation.standard_error_mpa
+        has_error = math.isfinite(target_error)
+        error_label = "1 SE" if has_error else "SE unavailable"
+        axis.errorbar(
+            [target],
+            [extrapolation.modulus_mpa],
+            yerr=[target_error] if has_error else None,
+            marker="*",
+            markersize=9.0,
+            linestyle="none",
+            elinewidth=0.9,
+            capsize=2,
+            color=_GUIDE_COLOUR,
+            label=(
+                f"target = {extrapolation.modulus_mpa:.1f} MPa "
+                f"at {target:.3g} strain/ns ({error_label})"
+            ),
+        )
+    else:
+        axis.axvline(
+            target,
+            color=_GUIDE_COLOUR,
+            linewidth=0.9,
+            label=f"target estimate not finite at {target:.3g} strain/ns",
+        )
+    axis.set_xscale("log")
+    axis.set_xlabel("Strain rate (strain/ns)")
+    axis.set_ylabel("Young's modulus (MPa)")
+    verdict = "resolved" if extrapolation.resolved else "not resolved"
+    axis.set_title(
+        f"{extrapolation.temperature_k:.0f} K, "
+        f"elastic strain <= {extrapolation.strain_limit:g}\n"
+        f"{extrapolation.form}: {extrapolation.extrapolation_decades:.1f} "
+        f"decades extrapolated, {verdict}",
+        fontsize=9,
+    )
+    axis.legend(fontsize=7, frameon=False)
+    return figure
 
 
 def plot_conformation(series: ConformationSeries) -> Any:

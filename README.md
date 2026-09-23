@@ -265,6 +265,90 @@ openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol modulus -t 298 -o run -v
 
 and `--skip bulk shear` if `E` and `nu` are all you want.
 
+### Reducing strain-rate bias in Young's modulus
+
+Fast deformation leaves less time for stress to relax and can overestimate the
+modulus at a slower rate. Measure at least three distinct rates, keeping the
+temperature, strain increment, elastic fitting window and sample preparation
+fixed. `run_modulus_rate_scan` varies the relaxation time between increments;
+longer holds give a slower nominal rate, approximately
+`1000 * strain_increment / relax_ps` in strain/ns. The reported rate uses the
+final compounded strain divided by the total deformation time. Keep the strain
+increment small enough to remain in the initial linear response and use
+replicas to quantify stress noise. The scan equilibrates once, then branches
+each rate and replica from that common configuration. It runs extension passes
+only; the load, bulk and shear passes are skipped.
+
+```python
+from openmmpolymer import (
+    ModulusSpec,
+    analyse_modulus_rates,
+    run_modulus_rate_scan,
+    write_modulus_rate_report,
+)
+
+report = run_modulus_rate_scan(
+    run,
+    "modulus_rates",
+    relax_ps=(50.0, 200.0, 1000.0),
+    target_rate_per_ns=0.0002,
+    spec=ModulusSpec(temperature_k=298.15, max_strain=0.03),
+)
+write_modulus_rate_report(report)
+
+# Existing modulus runs can also be analysed together, without more dynamics.
+report = analyse_modulus_rates(
+    ["modulus_fast", "modulus_medium", "modulus_slow"],
+    target_rate_per_ns=0.0002,
+    strain_limit=0.015,
+)
+write_modulus_rate_report(report, output_dir="rate_analysis")
+```
+
+Without `output_dir`, the report writer puts `modulus_rates.json` and the
+figures in the first measured run's `analysis` directory (for a rate scan,
+`modulus_rates/rate_00/analysis`).
+
+For already fitted `ElasticModulus` results, use
+`strain_rate_extrapolation(fits, target_rate_per_ns=0.0002)`. The default
+`form="log_linear"` fits `E = E_ref + b * log10(rate / rate_ref)`;
+`form="power_law"` fits `E = E_ref * (rate / rate_ref)**b` as an alternative.
+Both are local empirical relations evaluated at a **positive, finite target
+rate**. Neither determines a zero-rate or equilibrium modulus. Logarithmic
+rate dependence has been observed in atomistic polyimide simulations, but
+the fastest deformations in that study also departed from it; inspect the
+measured trend before extending either fit. See
+[Nazarychev et al., Soft Matter (2016)](https://pubs.rsc.org/en/content/articlehtml/2016/sm/c6sm00230g).
+
+The results retain each measured modulus and its standard error, propagate
+measurement uncertainty and rate-fit scatter to the target estimate, and
+report `sensitivity_mpa_per_decade` at `reference_rate_per_ns`. This uncertainty
+does not include force-field bias, sample-history differences or the error of
+extending an empirical relation beyond its measured range. Compare both forms
+and add slower measurements when their predictions diverge. Temperature and
+elastic fitting window must match across fits. Unresolved input fits, poor
+rate fits or unsupported predictions remain unresolved; the default limit is
+two extrapolated decades. A conservative guard also refuses fits whose RMS
+residual exceeds 10% of the mean measured modulus or, in the fitted response
+scale, three times the RMS input error when any input errors are nonzero.
+A target many decades below molecular-dynamics rates is therefore an
+unresolved estimate, even when the fitted line is clean.
+`plot_strain_rate` shows the measured errors and target uncertainty, and shades
+the extrapolated interval.
+
+```bash
+openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol modulus -t 298 \
+  --modulus-relax-times 50,200,1000 --target-strain-rate 0.0002 \
+  -o modulus_rates -v
+openmmpolymer --analyse modulus_fast modulus_medium modulus_slow \
+  --protocol modulus --target-strain-rate 0.0002
+```
+
+Rates are in strain/ns: multiply a rate in s^-1 by `1e-9` before passing it.
+Choose a target near the slowest sampled rate to evaluate a controlled
+reduction in rate sensitivity; extending directly to a laboratory rate does
+not by itself remove kinetic stiffness.
+
 ## Calculating a yield strength
 
 `run_yield_scan` measures an **apparent offset yield strength** from a tensile
@@ -617,9 +701,11 @@ openmmpolymer --analyse run --no-structure
 | Plots | `plots` | A figure per result, returned rather than written |
 | Stress | `stress` | The pressure tensor of a running cell, and the strain applied to it |
 | Elasticity | `elasticity` | Stress-strain curves, and the four elastic constants read off them |
+| Strain rate | `strain_rate` | Young's modulus versus strain rate, local empirical fits and finite-rate extrapolation |
 | Relaxation | `relaxation` | `G(t)` from a step strain, and the Prony and KWW fits read off it |
 | Workflow | `tg` | The two-pass glass-transition scan, and reading a finished run back |
 | Workflow | `mechanical` | The extension, the load, bulk and shear passes, and the report |
+| Workflow | `modulus_rates` | Modulus scans at several relaxation times, shared analysis and rate reports |
 | Workflow | `breaking` | Finite tensile extension, nominal stress peaks and sustained stress drops, replicas and reporting |
 | Workflow | `elongation` | Percent engineering elongation at a confirmed terminal stress loss, replicas and reporting |
 | Workflow | `viscoelastic` | The step-strain scan, its replicas, and the report |

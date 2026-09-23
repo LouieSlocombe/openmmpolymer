@@ -55,11 +55,19 @@ from .mdsystem import (
     prepare_box,
 )
 from .mechanical import (
+    MechanicalError,
     ModulusSpec,
     analyse_mechanics,
     mechanical_scan,
     run_modulus_scan,
     write_mechanical_report,
+)
+from .modulus_rate_report import write_modulus_rate_report
+from .modulus_rates import (
+    ModulusRateReport,
+    analyse_modulus_rates,
+    run_modulus_rate_scan,
+    validate_modulus_rate_scan,
 )
 from .packing import (
     DEFAULT_PACKING_DENSITY,
@@ -873,6 +881,22 @@ def build_parser() -> argparse.ArgumentParser:
         "(default: %(default)s)",
     )
     mechanics.add_argument(
+        "--modulus-relax-times",
+        type=_floats,
+        default=None,
+        help="comma-separated hold times in ps for a Young's modulus rate scan; "
+        "at least three distinct values, e.g. 50,150,500. Requires --protocol "
+        "modulus and --target-strain-rate; runs extension replicas at each rate",
+    )
+    mechanics.add_argument(
+        "--target-strain-rate",
+        type=float,
+        default=None,
+        help="positive target rate in strain/ns for modulus extrapolation "
+        "(multiply a rate in s^-1 by 1e-9); also enables rate analysis of "
+        "--analyse directories or a saved modulus rate scan",
+    )
+    mechanics.add_argument(
         "--elastic-strain-limit",
         type=float,
         default=0.015,
@@ -1338,7 +1362,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
 
+    if arguments.modulus_relax_times is not None:
+        if arguments.analyse or arguments.protocol != "modulus":
+            parser.error("--modulus-relax-times requires a new --protocol modulus scan")
+        if arguments.target_strain_rate is None:
+            parser.error("--modulus-relax-times requires --target-strain-rate")
+    if arguments.target_strain_rate is not None:
+        if (
+            not math.isfinite(arguments.target_strain_rate)
+            or arguments.target_strain_rate <= 0.0
+        ):
+            parser.error("--target-strain-rate must be finite and positive (strain/ns)")
+        if not arguments.analyse and arguments.modulus_relax_times is None:
+            parser.error(
+                "--target-strain-rate requires --modulus-relax-times or --analyse"
+            )
     if arguments.analyse:
+        if arguments.target_strain_rate is not None:
+            try:
+                report = analyse_modulus_rates(
+                    arguments.analyse,
+                    target_rate_per_ns=arguments.target_strain_rate,
+                    strain_limit=arguments.elastic_strain_limit,
+                )
+            except (OSError, ValueError, AnalysisError) as error:
+                parser.error(str(error))
+            _write_modulus_rate_result(arguments, report)
+            return 0
+        if arguments.protocol == "modulus" and len(arguments.analyse) > 1:
+            parser.error(
+                "analysing multiple modulus rates requires --target-strain-rate"
+            )
         return _analyse(arguments)
     if arguments.protocol == "tm":
         if arguments.monomer is not None:
@@ -1396,6 +1450,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             _yield_protocol(**_protocol_options(arguments, PROTOCOLS["yield"]))
         except (ValueError, YieldError) as error:
             parser.error(str(error))
+    if arguments.modulus_relax_times is not None:
+        try:
+            plan = validate_modulus_rate_scan(
+                _modulus_spec(**_protocol_options(arguments, PROTOCOLS["modulus"])),
+                arguments.modulus_relax_times,
+                target_rate_per_ns=arguments.target_strain_rate,
+            )
+        except (ValueError, MechanicalError) as error:
+            parser.error(str(error))
+        print(
+            f"modulus rate scan: {len(plan.schedules)} rates, "
+            f"{plan.n_replicas} replicas each, {plan.total_ns:.3g} ns total "
+            "including equilibration",
+            flush=True,
+        )
 
     output = Path(cast("str | None", arguments.output_dir) or "run")
     output.mkdir(parents=True, exist_ok=True)
@@ -1728,6 +1797,18 @@ def _run_modulus_scan(
     options: dict[str, Any],
 ) -> int:
     """Measure the elastic constants, and say what qualifies each one."""
+    if arguments.modulus_relax_times is not None:
+        report = run_modulus_rate_scan(
+            run,
+            output,
+            relax_ps=arguments.modulus_relax_times,
+            target_rate_per_ns=arguments.target_strain_rate,
+            spec=_modulus_spec(**options),
+            chain_backbone=chain.backbone,
+            atoms_per_chain=chain.n_atoms,
+        )
+        _write_modulus_rate_result(arguments, report, output / "analysis")
+        return 0
     result = run_modulus_scan(
         run,
         output,
@@ -1739,6 +1820,44 @@ def _run_modulus_scan(
         print(line, flush=True)
     _print_chains(None)
     return 0
+
+
+def _write_modulus_rate_result(
+    arguments: argparse.Namespace,
+    report: ModulusRateReport,
+    output_dir: Path | None = None,
+) -> None:
+    """Keep each model's target, uncertainty and extrapolation distance visible."""
+    for fit in (report.log_linear, report.power_law):
+        print(
+            f"{fit.form}: E = {fit.modulus_mpa:.4g} +/- "
+            f"{fit.standard_error_mpa:.3g} MPa (fit SE) at "
+            f"{fit.target_rate_per_ns:.3g} strain/ns, {fit.temperature_k:.1f} K; "
+            f"{fit.sensitivity_mpa_per_decade:.3g} MPa per decade at "
+            f"{fit.reference_rate_per_ns:.3g} strain/ns; "
+            f"{fit.n_rates} measured rates, extrapolated "
+            f"{fit.extrapolation_decades:.2f} decades"
+            f"{'' if fit.resolved else ' (not resolved)'}",
+            flush=True,
+        )
+        for note in fit.notes:
+            print(f"note ({fit.form}): {note}", flush=True)
+    print(
+        "model difference at target: "
+        f"{abs(report.log_linear.modulus_mpa - report.power_law.modulus_mpa):.4g} MPa",
+        flush=True,
+    )
+    printed_notes = set(report.log_linear.notes) | set(report.power_law.notes)
+    for note in report.notes:
+        if note not in printed_notes:
+            print(f"note: {note}", flush=True)
+    files = write_modulus_rate_report(
+        report,
+        output_dir if output_dir is not None else arguments.output_dir,
+        figures=not arguments.no_figures,
+        figure_format=arguments.figure_format,
+    )
+    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
 
 
 def _modulus_lines(result: Any) -> list[str]:

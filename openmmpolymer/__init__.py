@@ -157,6 +157,14 @@ from .mechanical import (
     run_modulus_scan,
     write_mechanical_report,
 )
+from .modulus_rate_report import write_modulus_rate_report
+from .modulus_rates import (
+    ModulusRatePlan,
+    ModulusRateReport,
+    analyse_modulus_rates,
+    run_modulus_rate_scan,
+    validate_modulus_rate_scan,
+)
 from .packing import (
     DEFAULT_PACKING_DENSITY,
     DEFAULT_TOLERANCE_NM,
@@ -189,6 +197,7 @@ from .plots import (
     plot_relaxation,
     plot_relaxation_spectrum,
     plot_state_data,
+    plot_strain_rate,
     plot_stress_strain,
     plot_yield_strength,
 )
@@ -243,6 +252,7 @@ from .simulate import (
     run_shear,
     safe_timestep_fs,
 )
+from .strain_rate import StrainRateExtrapolation, strain_rate_extrapolation
 from .strength import (
     BreakingStrength,
     ElongationAtBreak,
@@ -398,6 +408,8 @@ __all__ = [
     "MeltEquilibration",
     "MeltingReport",
     "MeltingTransition",
+    "ModulusRatePlan",
+    "ModulusRateReport",
     "ModulusReport",
     "ModulusResult",
     "ModulusSchedule",
@@ -430,6 +442,7 @@ __all__ = [
     "StageFiles",
     "StageResult",
     "StateData",
+    "StrainRateExtrapolation",
     "StressError",
     "StressStrain",
     "StructureFactor",
@@ -456,6 +469,7 @@ __all__ = [
     "analyse_elongation",
     "analyse_mechanics",
     "analyse_melting",
+    "analyse_modulus_rates",
     "analyse_relaxation",
     "analyse_run",
     "analyse_structure",
@@ -540,6 +554,7 @@ __all__ = [
     "plot_relaxation",
     "plot_relaxation_spectrum",
     "plot_state_data",
+    "plot_strain_rate",
     "plot_stress_strain",
     "plot_yield_strength",
     "poisson_ratio",
@@ -571,6 +586,7 @@ __all__ = [
     "run_heat",
     "run_load",
     "run_minimise",
+    "run_modulus_rate_scan",
     "run_modulus_scan",
     "run_npt",
     "run_nvt",
@@ -592,6 +608,7 @@ __all__ = [
     "stage_files",
     "standard_melt_equilibration",
     "steps_for",
+    "strain_rate_extrapolation",
     "stress_strain",
     "stress_tensor_bar",
     "structure_factor",
@@ -600,10 +617,12 @@ __all__ = [
     "tg_coarse_scan",
     "tg_fine_scan",
     "trans_fraction",
+    "validate_modulus_rate_scan",
     "write_breaking_report",
     "write_elongation_report",
     "write_mechanical_report",
     "write_melting_report",
+    "write_modulus_rate_report",
     "write_relaxation_report",
     "write_report",
     "write_structure_report",
