@@ -25,6 +25,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+from .breaking import (
+    BreakingError,
+    BreakingSpec,
+    analyse_breaking,
+    breaking_scan,
+    breaking_stages,
+    run_breaking_scan,
+    write_breaking_report,
+)
 from .chain import ChainSpec, build_chain
 from .charges import CHARGE_METHODS, assign_charges
 from .elasticity import deform_stages, load_stages, shear_stages
@@ -149,6 +158,24 @@ _MECHANICS = (
     "bulk_pressures",
     "shear_strains",
     "skip",
+    "max_total_ns",
+)
+
+
+#: Finite extension and the sustained stress drop used to qualify its peak.
+_BREAKING = (
+    "temperature_k",
+    "pressure_bar",
+    "deform_axis",
+    "breaking_strain_increment",
+    "breaking_max_strain",
+    "breaking_relax_ps",
+    "breaking_replicas",
+    "breaking_samples_per_step",
+    "breaking_stage_ps",
+    "breaking_trajectory_ps",
+    "failure_fraction",
+    "confirmation_steps",
     "max_total_ns",
 )
 
@@ -309,6 +336,53 @@ def _modulus_protocol(**options: Any) -> Protocol:
     return mechanical_scan(_modulus_spec(**options))
 
 
+def _breaking_spec(
+    *,
+    temperature_k: float = 298.15,
+    pressure_bar: float = 1.0,
+    deform_axis: int = 2,
+    breaking_strain_increment: float = 0.01,
+    breaking_max_strain: float = 1.0,
+    breaking_relax_ps: float = 50.0,
+    breaking_replicas: int = 3,
+    breaking_samples_per_step: int = 250,
+    breaking_stage_ps: float = 1000.0,
+    breaking_trajectory_ps: float | None = None,
+    failure_fraction: float = 0.5,
+    confirmation_steps: int = 3,
+    max_total_ns: float | None = None,
+) -> BreakingSpec:
+    """Map the finite-extension controls onto the breaking workflow."""
+    return BreakingSpec(
+        temperature_k=temperature_k,
+        pressure_bar=pressure_bar,
+        axis=deform_axis,
+        strain_increment=breaking_strain_increment,
+        max_strain=breaking_max_strain,
+        relax_ps=breaking_relax_ps,
+        n_replicas=breaking_replicas,
+        samples_per_step=breaking_samples_per_step,
+        stage_ps=breaking_stage_ps,
+        trajectory_ps=breaking_trajectory_ps,
+        failure_fraction=failure_fraction,
+        confirmation_steps=confirmation_steps,
+        max_total_ns=max_total_ns,
+    )
+
+
+def _breaking_protocol(**options: Any) -> Protocol:
+    """Build the equilibration and every replica of the tensile ladder."""
+    spec = _breaking_spec(**options)
+    protocol = breaking_scan(spec)
+    duration_ns = protocol.total_duration_ps / 1000.0
+    if spec.max_total_ns is not None and duration_ns > spec.max_total_ns:
+        raise BreakingError(
+            f"The breaking scan is {duration_ns:.3g} ns, over the "
+            f"{spec.max_total_ns:g} ns budget. Shorten the scan or raise max_total_ns."
+        )
+    return protocol
+
+
 def _tg_spec(
     *,
     melt_temperature_k: float = 650.0,
@@ -349,12 +423,13 @@ PROTOCOLS = {
     "tg": ProtocolEntry(_tg_protocol, _COMMON + _QUENCH[1:] + _TG),
     "tm": ProtocolEntry(_tm_protocol, _TM),
     "modulus": ProtocolEntry(_modulus_protocol, ("pressure_bar", *_MECHANICS)),
+    "breaking": ProtocolEntry(_breaking_protocol, _BREAKING),
     "relax": ProtocolEntry(_relax_protocol, _RELAXATION),
 }
 
 
 class _ProtocolParser(argparse.ArgumentParser):
-    """Choose heating defaults only after the protocol has been parsed."""
+    """Choose protocol-specific defaults after parsing every explicit flag."""
 
     def parse_args(
         self,
@@ -370,6 +445,7 @@ class _ProtocolParser(argparse.ArgumentParser):
                 "step_k": 10.0,
                 "hold_ps": 1000.0,
             }
+        defaults["temperature"] = 298.15 if arguments.protocol == "breaking" else 450.0
         for name, value in defaults.items():
             if getattr(arguments, name) is None:
                 setattr(arguments, name, value)
@@ -413,8 +489,9 @@ def build_parser() -> argparse.ArgumentParser:
         "-t",
         "--temperature",
         type=float,
-        default=450.0,
-        help="target temperature in kelvin (default: %(default)s)",
+        default=None,
+        help="target temperature in kelvin (default: 298.15 for breaking, "
+        "450 for other protocols)",
     )
     parser.add_argument(
         "--melt-temperature",
@@ -683,6 +760,68 @@ def build_parser() -> argparse.ArgumentParser:
         default=(),
         choices=("load", "bulk", "shear"),
         help="passes to leave out; the extension always runs",
+    )
+    breaking = parser.add_argument_group(
+        "breaking strength",
+        "finite tensile extension and the stress drop that qualifies its peak",
+    )
+    breaking.add_argument(
+        "--breaking-strain-increment",
+        type=float,
+        default=0.01,
+        help="fractional extension of the current cell at each step "
+        "(default: %(default)s)",
+    )
+    breaking.add_argument(
+        "--breaking-max-strain",
+        type=float,
+        default=1.0,
+        help="engineering strain to reach; 1 means 100%% (default: %(default)s)",
+    )
+    breaking.add_argument(
+        "--breaking-relax-ps",
+        type=float,
+        default=50.0,
+        help="hold after each extension, in ps (default: %(default)s)",
+    )
+    breaking.add_argument(
+        "--breaking-replicas",
+        type=int,
+        default=3,
+        help="extensions from the equilibrated cell with fresh velocities "
+        "(default: %(default)s)",
+    )
+    breaking.add_argument(
+        "--breaking-samples-per-step",
+        type=int,
+        default=250,
+        help="stress readings per extension (default: %(default)s)",
+    )
+    breaking.add_argument(
+        "--breaking-stage-ps",
+        type=float,
+        default=1000.0,
+        help="duration of each resumable extension chunk, in ps (default: %(default)s)",
+    )
+    breaking.add_argument(
+        "--breaking-trajectory-ps",
+        type=float,
+        default=None,
+        help="save extension coordinates every this many ps; omitted by default",
+    )
+    breaking.add_argument(
+        "--failure-fraction",
+        type=float,
+        default=0.5,
+        help="fraction of peak nominal stress below which the terminal "
+        "drop must remain (default: %(default)s)",
+    )
+    breaking.add_argument(
+        "--confirmation-steps",
+        type=int,
+        default=3,
+        help="consecutive terminal holds needed to confirm the stress drop "
+        "(default: %(default)s)",
     )
     relaxation = parser.add_argument_group(
         "relaxation",
@@ -961,6 +1100,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--crystal-pdb, --system-xml and --state-in require --protocol tm")
     if arguments.monomer is None:
         parser.error("a monomer SMILES is required unless --analyse is given")
+    if arguments.protocol == "breaking":
+        try:
+            _breaking_protocol(**_protocol_options(arguments, PROTOCOLS["breaking"]))
+        except (ValueError, BreakingError) as error:
+            parser.error(str(error))
 
     output = Path(cast("str | None", arguments.output_dir) or "run")
     output.mkdir(parents=True, exist_ok=True)
@@ -1044,6 +1188,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_tg_scan(arguments, run, output, chain, options)
     if name == "modulus":
         return _run_modulus_scan(arguments, run, output, chain, options)
+    if name == "breaking":
+        return _run_breaking_scan(arguments, run, output, chain, options)
     if name == "relax":
         return _run_relaxation_scan(arguments, run, output, chain, options)
 
@@ -1359,6 +1505,72 @@ def _consistency_line(check: Any) -> str:
     )
 
 
+def _breaking_lines(report: Any) -> list[str]:
+    """Keep an unconfirmed peak distinct from an apparent tensile strength."""
+    if report.strength_mpa is None or not report.resolved:
+        lines = ["breaking: apparent tensile strength not resolved"]
+    else:
+        spread = (
+            ""
+            if report.replica_spread_mpa is None
+            else f" +/- {report.replica_spread_mpa:.3g} over {len(report.replicas)} replicas"
+        )
+        lines = [
+            f"breaking: apparent ultimate nominal tensile strength = "
+            f"{report.strength_mpa:.4g} MPa{spread}"
+        ]
+    for index, result in enumerate(report.replicas):
+        rate = (
+            "unknown strain rate"
+            if result.strain_rate_per_ns is None
+            else f"{result.strain_rate_per_ns:.3g} strain/ns"
+        )
+        lines.append(
+            f"  replica {index}: peak {result.peak_stress_mpa:.4g} MPa at "
+            f"strain {result.strain_at_peak:.4g}, {result.temperature_k:.0f} K, "
+            f"{rate}{'' if result.resolved else ' (not resolved)'}"
+        )
+        if result.failure_strain is not None:
+            lines.append(
+                f"    stress drop at strain {result.failure_strain:.4g}, "
+                f"stress {result.failure_stress_mpa:.4g} MPa"
+            )
+    return lines
+
+
+def _write_breaking_result(arguments: argparse.Namespace, report: Any) -> None:
+    """Print and save the same result for a run and a later analysis."""
+    for line in _breaking_lines(report):
+        print(line, flush=True)
+    for note in report.notes:
+        print(f"note: {note}", flush=True)
+    files = write_breaking_report(
+        report,
+        arguments.output_dir if arguments.analyse else None,
+        formats=() if arguments.no_figures else (cast(str, arguments.figure_format),),
+    )
+    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
+
+
+def _run_breaking_scan(
+    arguments: argparse.Namespace,
+    run: Any,
+    output: Path,
+    chain: Any,
+    options: dict[str, Any],
+) -> int:
+    """Measure the apparent tensile strength and write its report."""
+    report = run_breaking_scan(
+        run,
+        output,
+        spec=_breaking_spec(**options),
+        chain_backbone=chain.backbone,
+        atoms_per_chain=chain.n_atoms,
+    )
+    _write_breaking_result(arguments, report)
+    return 0
+
+
 def _run_relaxation_scan(
     arguments: argparse.Namespace,
     run: Any,
@@ -1468,12 +1680,13 @@ def _analyse(arguments: argparse.Namespace) -> int:
     first = directories[0]
     quenched = _has_stages(first, quench_stages)
     heated = _has_stages(first, heating_stages)
+    broken = _has_stages(first, breaking_stages)
     deformed = any(
         _has_stages(first, find) for find in (deform_stages, load_stages, shear_stages)
     )
     relaxed = _has_stages(first, relax_stages)
     structured = not arguments.no_structure and _has_stages(first, structure_stages)
-    if not quenched and not heated and not deformed and not relaxed and not structured:
+    if not any((quenched, heated, broken, deformed, relaxed, structured)):
         print(
             f"nothing in {first} was a quench, a heating scan, a deformation or a relaxation, "
             "and no stage left coordinates to measure, so there is nothing to "
@@ -1486,7 +1699,9 @@ def _analyse(arguments: argparse.Namespace) -> int:
         _analyse_tg(arguments, directories)
     if heated:
         _analyse_melting(arguments, first)
-    if deformed:
+    if broken:
+        _write_breaking_result(arguments, analyse_breaking(first))
+    if deformed and not broken:
         _analyse_mechanics(arguments, first)
     if relaxed:
         _analyse_relaxation(arguments, first)

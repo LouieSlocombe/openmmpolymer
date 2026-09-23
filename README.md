@@ -207,8 +207,8 @@ across them. The manifest is not touched.
 
 It works out what to report from what the directory recorded: a run that
 quenched gets a glass transition, a heating scan gets a melting report, a run
-that was deformed gets its elastic constants, and any run whose stages left
-coordinates gets its structure read back as well.
+that was deformed gets its elastic constants or breaking-strength report, and
+any run whose stages left coordinates gets its structure read back as well.
 
 ## Measuring a modulus
 
@@ -263,6 +263,85 @@ openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol modulus -t 298 -o run -v
 ```
 
 and `--skip bulk shear` if `E` and `nu` are all you want.
+
+## Calculating a breaking strength
+
+`run_breaking_scan` measures an **apparent ultimate nominal tensile strength**
+from a finite extension. It equilibrates the cell, then starts each tensile
+replica from that same state with fresh velocities. The extension proceeds in
+increments while the two transverse dimensions relax at the specified
+pressure. Chunks retain the unstrained reference box so an interrupted scan
+can resume without resetting its strain origin.
+
+```python
+from openmmpolymer import (
+    BreakingSpec,
+    analyse_breaking,
+    run_breaking_scan,
+    write_breaking_report,
+)
+
+report = run_breaking_scan(
+    run,
+    "breaking_run",
+    spec=BreakingSpec(
+        temperature_k=298.15,
+        strain_increment=0.01,
+        max_strain=1.0,
+        relax_ps=50.0,
+        n_replicas=3,
+        trajectory_ps=10.0,
+    ),
+)
+print(report.strength_mpa, report.replica_spread_mpa, report.resolved)
+write_breaking_report(report)
+# Reanalyse the recorded holds later, without rerunning dynamics:
+write_breaking_report(analyse_breaking("breaking_run"))
+```
+
+The recorded stress tensor uses the instantaneous cell. The workflow subtracts
+the mean transverse stress from the axial stress, then multiplies this
+differential true stress by the transverse area ratio `A / A0` to obtain
+nominal stress in MPa. It uses the recorded transverse dimensions; it does not
+assume constant volume. The reported strength is the **peak** nominal stress.
+The stress at the subsequent drop and its strain are reported separately.
+The conversion uses each hold's mean stress and final transverse area, so it
+approximates the mean force when that area fluctuates during the hold.
+
+A peak is confirmed only when the curve ends with a sustained drop below a
+specified fraction of that peak. The defaults require three consecutive
+terminal holds below half the peak. A curve that is still rising, recovers
+after a temporary dip, or does not reach that drop remains unresolved;
+`strength_mpa` is `None` and the observed peak remains available per replica.
+Incomplete replicas or stages also leave the pooled result unresolved. The
+threshold is an operational definition of loss of load-bearing capacity, not
+an observation of a crack.
+
+The supported force fields have [fixed harmonic bonds](https://docs.openmm.org/latest/userguide/theory/02_standard_forces.html#harmonicbondforce): this workflow does **not** model
+chemical bond scission or measure covalent fracture strength. A loss of stress
+can reflect chain sliding or separation. Interpret it alongside saved
+coordinates, and report the temperature, strain rate, force field, chain
+length and periodic cell size. These small periodic cells and rapid molecular
+dynamics strain rates can give strengths different from a macroscopic tensile
+test. The replica spread measures the variation from fresh velocities at one
+starting structure.
+
+```bash
+openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol breaking -t 298 \
+  --breaking-strain-increment 0.01 --breaking-max-strain 1.0 \
+  --breaking-relax-ps 50 --breaking-replicas 3 \
+  --failure-fraction 0.5 --confirmation-steps 3 \
+  --breaking-trajectory-ps 10 -o breaking_run -v
+openmmpolymer --analyse breaking_run
+```
+
+Strain increments compound: `0.01` extends the current cell by one percent,
+and `--breaking-max-strain 1.0` requests at least 100% engineering strain.
+`--breaking-stage-ps` controls the resumable chunk duration;
+`--breaking-samples-per-step` controls stress sampling. `--max-total-ns`
+limits the full equilibration and replica schedule. Reports contain the
+stress-strain curves, individual peaks and drop criteria, and any reasons the
+strength remained unresolved. Use `--no-figures` for a JSON-only report.
 
 ## Watching a stress relax
 
@@ -378,6 +457,7 @@ openmmpolymer --analyse run --no-structure
 | Relaxation | `relaxation` | `G(t)` from a step strain, and the Prony and KWW fits read off it |
 | Workflow | `tg` | The two-pass glass-transition scan, and reading a finished run back |
 | Workflow | `mechanical` | The extension, the load, bulk and shear passes, and the report |
+| Workflow | `breaking` | Finite tensile extension, nominal stress peaks and sustained stress drops, replicas and reporting |
 | Workflow | `viscoelastic` | The step-strain scan, its replicas, and the report |
 | Workflow | `structure` | Reading a finished run's `g(r)`, `S(q)`, chain dimensions, persistence length, displacement and end-to-end relaxation back, and the report |
 

@@ -41,6 +41,19 @@ where they matter.
 
 from importlib.metadata import PackageNotFoundError, version
 
+from .breaking import (
+    BreakingError,
+    BreakingReport,
+    BreakingSchedule,
+    BreakingSpec,
+    analyse_breaking,
+    breaking_protocol,
+    breaking_scan,
+    breaking_schedule,
+    breaking_stages,
+    run_breaking_scan,
+    write_breaking_report,
+)
 from .chain import (
     ChainError,
     ChainResult,
@@ -151,6 +164,7 @@ from .packing import (
     render_packmol_input,
 )
 from .plots import (
+    plot_breaking_strength,
     plot_conformation,
     plot_cooling_rate,
     plot_correlations,
@@ -214,6 +228,7 @@ from .simulate import (
     run_shear,
     safe_timestep_fs,
 )
+from .strength import BreakingStrength, breaking_strength
 from .stress import (
     StressError,
     deviatoric_strain,
@@ -313,6 +328,11 @@ __all__ = [
     "EXTRAPOLATION_FORMS",
     "RELAX_MODES",
     "AnalysisError",
+    "BreakingError",
+    "BreakingReport",
+    "BreakingSchedule",
+    "BreakingSpec",
+    "BreakingStrength",
     "BulkModulus",
     "ChainDimensions",
     "ChainError",
@@ -387,6 +407,7 @@ __all__ = [
     "TrajectoryOptions",
     "ViscoelasticError",
     "__version__",
+    "analyse_breaking",
     "analyse_mechanics",
     "analyse_melting",
     "analyse_relaxation",
@@ -399,6 +420,11 @@ __all__ = [
     "backbone_path",
     "barostat_kind",
     "box_edge_nm",
+    "breaking_protocol",
+    "breaking_scan",
+    "breaking_schedule",
+    "breaking_stages",
+    "breaking_strength",
     "build_chain",
     "build_polymer_forcefield",
     "build_system",
@@ -450,6 +476,7 @@ __all__ = [
     "packmol_version",
     "persistence_length",
     "platform_is_usable",
+    "plot_breaking_strength",
     "plot_conformation",
     "plot_cooling_rate",
     "plot_correlations",
@@ -483,6 +510,7 @@ __all__ = [
     "render_packmol_input",
     "replicate_topology",
     "run_anneal",
+    "run_breaking_scan",
     "run_compress",
     "run_deform",
     "run_heat",
@@ -516,6 +544,7 @@ __all__ = [
     "tg_coarse_scan",
     "tg_fine_scan",
     "trans_fraction",
+    "write_breaking_report",
     "write_mechanical_report",
     "write_melting_report",
     "write_relaxation_report",

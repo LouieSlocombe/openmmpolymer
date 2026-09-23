@@ -39,7 +39,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -60,6 +60,9 @@ from .timeseries import (
     QuenchCurve,
     StateData,
 )
+
+if TYPE_CHECKING:
+    from .strength import BreakingStrength
 
 log = logging.getLogger(__name__)
 
@@ -592,6 +595,86 @@ def plot_stress_strain(
     lateral.set_xlabel(f"Engineering strain along {'xyz'[curve.axis]}")
     lateral.set_ylabel("Mean transverse strain")
     lateral.legend(fontsize=7, frameon=False)
+    return figure
+
+
+def plot_breaking_strength(curve: StressStrain, result: BreakingStrength) -> Any:
+    """Plot the nominal tensile response, its peak and a resolved stress drop.
+
+    The nominal stress includes the measured change in lateral area. A
+    sampled maximum is always labelled as a sampled maximum; it is reported
+    as an apparent tensile strength only when the analysis resolved the
+    subsequent sustained loss of stress. The shaded failure bracket shows
+    the sampling interval, rather than suggesting a precise rupture strain.
+
+    Args:
+        curve: The stress-strain curve analysed for strength.
+        result: Its result from :func:`~openmmpolymer.strength.breaking_strength`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axes = _figure(1, 1)
+    axis = axes[0]
+    axis.plot(
+        curve.strain,
+        result.nominal_stress_mpa,
+        marker="o",
+        markersize=3.5,
+        linewidth=0.9,
+        color=_DATA_COLOUR,
+        label="nominal tensile stress",
+    )
+    axis.plot(
+        [result.strain_at_peak],
+        [result.peak_stress_mpa],
+        marker="*",
+        markersize=10,
+        linestyle="none",
+        color=_GUIDE_COLOUR,
+        label=f"sampled peak = {result.peak_stress_mpa:.1f} MPa",
+    )
+    if result.resolved:
+        if result.failure_bracket is not None:
+            axis.axvspan(
+                *result.failure_bracket,
+                color=_GUIDE_COLOUR,
+                alpha=0.12,
+                linewidth=0,
+                label="failure strain bracket",
+            )
+        if result.failure_strain is not None and result.failure_stress_mpa is not None:
+            axis.plot(
+                [result.failure_strain],
+                [result.failure_stress_mpa],
+                marker="D",
+                markersize=5,
+                linestyle="none",
+                color=_GUIDE_COLOUR,
+                label="sustained stress drop",
+            )
+    axis.axhline(0.0, color=_REFERENCE_COLOUR, linewidth=0.6)
+    axis.set_xlabel(f"Engineering strain along {'xyz'[curve.axis]}")
+    axis.set_ylabel("Nominal tensile stress (MPa)")
+    rate = (
+        "rate not recorded"
+        if result.strain_rate_per_ns is None
+        else f"{result.strain_rate_per_ns:.3g} strain/ns"
+    )
+    verdict = (
+        f"Apparent tensile strength = {result.strength_mpa:.1f} MPa"
+        if result.resolved and result.strength_mpa is not None
+        else "Apparent tensile strength not resolved"
+    )
+    chunks = curve.stage.split(", ")
+    label = (
+        chunks[0] if len(chunks) == 1 else f"{chunks[0]} (+{len(chunks) - 1} chunks)"
+    )
+    axis.set_title(
+        f"{label}: {result.temperature_k:.0f} K, {rate}\n{verdict}",
+        fontsize=9,
+    )
+    axis.legend(fontsize=7, frameon=False)
     return figure
 
 
