@@ -12,12 +12,17 @@ import json
 import math
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
-from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from ._rate_scan import (
+    state_digest,
+    validate_extrapolation_limit,
+    validate_hold_times,
+    write_workflow,
+)
 from ._validation import require_positive
 from .elasticity import (
     bulk_modulus,
@@ -119,8 +124,7 @@ def _property(name: str) -> RateProperty:
 def _analysis_options(target_rate: float, strain_limit: float, decades: float) -> None:
     require_positive(target_rate, None, name="target_rate")
     require_positive(strain_limit, None, name="strain_limit")
-    if not math.isfinite(decades) or decades < 0:
-        raise ValueError("max_extrapolation_decades must be finite and nonnegative.")
+    validate_extrapolation_limit(decades)
 
 
 def _rate_spec(spec: ModulusSpec, name: str, hold: float) -> ModulusSpec:
@@ -193,13 +197,7 @@ def validate_elastic_rate_scan(
     """Validate a selected property and price all rates before any output exists."""
     _property(property_name)
     _analysis_options(target_rate, spec.elastic_strain_limit, max_extrapolation_decades)
-    holds = tuple(
-        require_positive(h, None, name="hold_times_ps") for h in hold_times_ps
-    )
-    if len(holds) < 3 or any(
-        math.isclose(a, b, rel_tol=1e-8) for a, b in pairwise(sorted(holds))
-    ):
-        raise ValueError("hold_times_ps needs at least three distinct positive holds.")
+    holds = validate_hold_times(hold_times_ps)
     groups = tuple(
         tuple(
             _protocol(
@@ -236,13 +234,6 @@ def validate_elastic_rate_scan(
             f"over the {spec.max_total_ns:.3g} ns budget."
         )
     return plan
-
-
-def _save_workflow(directory: Path, record: dict[str, Any]) -> None:
-    path = directory / WORKFLOW_NAME
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
-    temporary.replace(path)
 
 
 def run_elastic_rate_scan(
@@ -314,10 +305,7 @@ def run_elastic_rate_scan(
         fingerprint = previous.get("start_state_sha256")
         if fingerprint is not None:
             source = Path(previous.get("start_state", ""))
-            if (
-                not source.is_file()
-                or hashlib.sha256(source.read_bytes()).hexdigest() != fingerprint
-            ):
+            if not source.is_file() or state_digest(source) != fingerprint:
                 raise MechanicalError(
                     "The common preparation state changed or is missing; "
                     "restore it or rerun with resume=False."
@@ -343,7 +331,7 @@ def run_elastic_rate_scan(
         "request": request,
         "run_dirs": names,
     }
-    _save_workflow(directory, record)
+    write_workflow(workflow, record)
     chains: dict[str, Any] = {
         "chain_backbone": chain_backbone,
         "atoms_per_chain": atoms_per_chain,
@@ -354,7 +342,7 @@ def run_elastic_rate_scan(
         plan.equilibration, run, settled_dir, resume=resume, **chains
     )
     start = _last_state(settled, settled_dir)
-    fingerprint = hashlib.sha256(Path(start).read_bytes()).hexdigest()
+    fingerprint = state_digest(start)
     if resume and previous.get("start_state_sha256", fingerprint) != fingerprint:
         raise MechanicalError(
             "The common preparation state changed; restore it or rerun with resume=False."
@@ -367,7 +355,7 @@ def run_elastic_rate_scan(
         reference_box_nm=origin,
         timestep_fs=timestep,
     )
-    _save_workflow(directory, record)
+    write_workflow(workflow, record)
     for i, (name, hold) in enumerate(zip(names, plan.hold_times_ps, strict=True)):
         rate_spec = _rate_spec(spec, property_name, hold)
         for replica in range(spec.n_replicas):

@@ -108,7 +108,8 @@ def test_npt_actually_moves_the_volume(argon_run: Any) -> None:
     """Adding a barostat to a System that already has a Context does nothing.
 
     This is the test for that: the stage builds its own Simulation precisely so
-    the barostat is there before the Context is.
+    the barostat is there before the Context is. Forty trial moves suffice;
+    sustained compression would shrink this tiny cell below twice its cutoff.
     """
     minimised = run_minimise(argon_run, "00_minimise")
     result = run_npt(
@@ -116,7 +117,7 @@ def test_npt_actually_moves_the_volume(argon_run: Any) -> None:
         "01_npt",
         temperature_k=120.0,
         pressure_bar=500.0,
-        duration_ps=4.0,
+        duration_ps=0.4,
         barostat_frequency=5,
         state_in=minimised.final_state,
     )
@@ -430,6 +431,69 @@ def test_the_ladder_helper_reproduces_the_one_a_quench_runs() -> None:
 def test_a_ladder_that_does_not_divide_evenly_still_reaches_the_bottom() -> None:
     """The floor is a temperature someone chose, not a rounding artefact."""
     assert quench_temperatures(100.0, 30.0, 90.0) == [100.0, 30.0]
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "step"),
+    [
+        (100.0, 100.0, 20.0),
+        (100.0, 200.0, 20.0),
+        (float("inf"), 100.0, 20.0),
+        (float("nan"), 100.0, 20.0),
+        (200.0, float("nan"), 20.0),
+        (200.0, float("-inf"), 20.0),
+        (200.0, 100.0, float("nan")),
+        (200.0, 100.0, float("inf")),
+        (200.0, 100.0, 0.0),
+        (200.0, 100.0, -1.0),
+        (200.0, 100.0, 1e-30),
+        (-2.0 + 2.0**-52, -3.0, 2.0**-52),
+    ],
+)
+def test_quench_ladder_rejects_invalid_arguments(
+    start: float, end: float, step: float
+) -> None:
+    """Invalid endpoints and steps must fail instead of hanging a quench."""
+    with pytest.raises(ValueError):
+        quench_temperatures(start, end, step)
+
+
+def test_quench_ladder_accepts_offsets_for_nominal_schedule_costs() -> None:
+    """A nominal fine schedule counts relative rungs before its window is known."""
+    assert quench_temperatures(10.0, -10.0, 5.0) == [10.0, 5.0, 0.0, -5.0, -10.0]
+
+
+@pytest.mark.parametrize("endpoint", ["t_start", "t_end"])
+@pytest.mark.parametrize("value", [0.0, -100.0, -1e100])
+def test_quench_rejects_nonpositive_physical_temperatures(
+    argon_run: Any, endpoint: str, value: float
+) -> None:
+    """Offset ladders are useful for cost estimates, but cannot run dynamics."""
+    options: dict[str, Any] = {endpoint: value}
+    with pytest.raises(ValueError):
+        run_quench(argon_run, **options)
+
+
+@pytest.mark.parametrize(
+    "temperatures",
+    [
+        [],
+        [100.0, 120.0],
+        [100.0, 100.0],
+        [float("nan")],
+        [float("inf")],
+        [0.0],
+        [-1.0],
+        [120.0, float("nan")],
+        [float("inf"), 120.0],
+    ],
+)
+def test_quench_rejects_an_invalid_explicit_ladder(
+    argon_run: Any, temperatures: list[float]
+) -> None:
+    """A one-window chunk needs the same valid temperatures as a full ladder."""
+    with pytest.raises(ValueError):
+        run_quench(argon_run, temperatures_k=temperatures)
 
 
 def test_heating_ladder_includes_both_endpoints() -> None:

@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 from matplotlib.figure import Figure
 
-from .modulus_rate_report import _json_value
+from ._reporting import json_value
 from .protocols import _write_atomically
 from .rate_dependence import RateExtrapolation, RateReport
 from .tg import ReportFiles
@@ -148,7 +148,7 @@ def write_rate_report(
     )
     path = directory / f"{name}_rates.json"
     _write_atomically(
-        path, json.dumps(_json_value(record), indent=2, allow_nan=False) + "\n"
+        path, json.dumps(json_value(record), indent=2, allow_nan=False) + "\n"
     )
     written: list[str] = []
     if figures:

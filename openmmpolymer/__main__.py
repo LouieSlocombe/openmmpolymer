@@ -93,6 +93,7 @@ from .relaxation import relax_stages
 from .simulate import RELAX_MODES, RunContext, prepare_run
 from .structure import analyse_structure, structure_stages, write_structure_report
 from .tg import (
+    ReportFiles,
     TgSpec,
     analyse_run,
     cooling_rate_series,
@@ -448,14 +449,9 @@ def _breaking_spec(
 def _breaking_protocol(**options: Any) -> Protocol:
     """Build the equilibration and every replica of the tensile ladder."""
     spec = _breaking_spec(**options)
-    protocol = breaking_scan(spec)
-    duration_ns = protocol.total_duration_ps / 1000.0
-    if spec.max_total_ns is not None and duration_ns > spec.max_total_ns:
-        raise BreakingError(
-            f"The breaking scan is {duration_ns:.3g} ns, over the "
-            f"{spec.max_total_ns:g} ns budget. Shorten the scan or raise max_total_ns."
-        )
-    return protocol
+    return _check_scan_budget(
+        breaking_scan(spec), spec.max_total_ns, "breaking", BreakingError
+    )
 
 
 def _elongation_spec(
@@ -495,14 +491,9 @@ def _elongation_spec(
 def _elongation_protocol(**options: Any) -> Protocol:
     """Build the equilibration and every replica of the tensile ladder."""
     spec = _elongation_spec(**options)
-    protocol = elongation_scan(spec)
-    duration_ns = protocol.total_duration_ps / 1000.0
-    if spec.max_total_ns is not None and duration_ns > spec.max_total_ns:
-        raise ElongationError(
-            f"The elongation scan is {duration_ns:.3g} ns, over the "
-            f"{spec.max_total_ns:g} ns budget. Shorten the scan or raise max_total_ns."
-        )
-    return protocol
+    return _check_scan_budget(
+        elongation_scan(spec), spec.max_total_ns, "elongation", ElongationError
+    )
 
 
 def _yield_spec(
@@ -544,12 +535,21 @@ def _yield_spec(
 def _yield_protocol(**options: Any) -> Protocol:
     """Validate equilibration and every tensile replica before building a cell."""
     spec = _yield_spec(**options)
-    protocol = yield_scan(spec)
+    return _check_scan_budget(yield_scan(spec), spec.max_total_ns, "yield", YieldError)
+
+
+def _check_scan_budget(
+    protocol: Protocol,
+    max_total_ns: float | None,
+    name: str,
+    error_type: type[Exception],
+) -> Protocol:
+    """Reject a tensile schedule that exceeds its budget before building a cell."""
     duration_ns = protocol.total_duration_ps / 1000.0
-    if spec.max_total_ns is not None and duration_ns > spec.max_total_ns:
-        raise YieldError(
-            f"The yield scan is {duration_ns:.3g} ns, over the "
-            f"{spec.max_total_ns:g} ns budget. Shorten the scan or raise max_total_ns."
+    if max_total_ns is not None and duration_ns > max_total_ns:
+        raise error_type(
+            f"The {name} scan is {duration_ns:.3g} ns, over the "
+            f"{max_total_ns:g} ns budget. Shorten the scan or raise max_total_ns."
         )
     return protocol
 
@@ -627,6 +627,59 @@ class _ProtocolParser(argparse.ArgumentParser):
             if getattr(arguments, name) is None:
                 setattr(arguments, name, value)
         return arguments
+
+
+def _add_tensile_arguments(
+    group: argparse._ArgumentGroup,
+    prefix: str,
+    defaults: BreakingSpec | ElongationSpec | YieldSpec,
+) -> None:
+    """Expose the common tensile controls using each workflow's own defaults."""
+    group.add_argument(
+        f"--{prefix}-strain-increment",
+        type=float,
+        default=defaults.strain_increment,
+        help="fractional extension of the current cell at each step "
+        "(default: %(default)s)",
+    )
+    group.add_argument(
+        f"--{prefix}-max-strain",
+        type=float,
+        default=defaults.max_strain,
+        help=f"engineering strain to reach; {defaults.max_strain:g} means "
+        f"{100 * defaults.max_strain:g}%% (default: %(default)s)",
+    )
+    group.add_argument(
+        f"--{prefix}-relax-ps",
+        type=float,
+        default=defaults.relax_ps,
+        help="hold after each extension, in ps (default: %(default)s)",
+    )
+    group.add_argument(
+        f"--{prefix}-replicas",
+        type=int,
+        default=defaults.n_replicas,
+        help="extensions from the equilibrated cell with fresh velocities "
+        "(default: %(default)s)",
+    )
+    group.add_argument(
+        f"--{prefix}-samples-per-step",
+        type=int,
+        default=defaults.samples_per_step,
+        help="stress readings per extension (default: %(default)s)",
+    )
+    group.add_argument(
+        f"--{prefix}-stage-ps",
+        type=float,
+        default=defaults.stage_ps,
+        help="duration of each resumable extension chunk, in ps (default: %(default)s)",
+    )
+    group.add_argument(
+        f"--{prefix}-trajectory-ps",
+        type=float,
+        default=defaults.trajectory_ps,
+        help="save extension coordinates every this many ps; omitted by default",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -993,98 +1046,12 @@ def build_parser() -> argparse.ArgumentParser:
         "breaking strength",
         "finite tensile extension and the stress drop that qualifies its peak",
     )
-    breaking.add_argument(
-        "--breaking-strain-increment",
-        type=float,
-        default=0.01,
-        help="fractional extension of the current cell at each step "
-        "(default: %(default)s)",
-    )
-    breaking.add_argument(
-        "--breaking-max-strain",
-        type=float,
-        default=1.0,
-        help="engineering strain to reach; 1 means 100%% (default: %(default)s)",
-    )
-    breaking.add_argument(
-        "--breaking-relax-ps",
-        type=float,
-        default=50.0,
-        help="hold after each extension, in ps (default: %(default)s)",
-    )
-    breaking.add_argument(
-        "--breaking-replicas",
-        type=int,
-        default=3,
-        help="extensions from the equilibrated cell with fresh velocities "
-        "(default: %(default)s)",
-    )
-    breaking.add_argument(
-        "--breaking-samples-per-step",
-        type=int,
-        default=250,
-        help="stress readings per extension (default: %(default)s)",
-    )
-    breaking.add_argument(
-        "--breaking-stage-ps",
-        type=float,
-        default=1000.0,
-        help="duration of each resumable extension chunk, in ps (default: %(default)s)",
-    )
-    breaking.add_argument(
-        "--breaking-trajectory-ps",
-        type=float,
-        default=None,
-        help="save extension coordinates every this many ps; omitted by default",
-    )
+    _add_tensile_arguments(breaking, "breaking", BreakingSpec())
     elongation = parser.add_argument_group(
         "elongation at break",
         "engineering strain at the onset of a confirmed terminal stress drop",
     )
-    elongation.add_argument(
-        "--elongation-strain-increment",
-        type=float,
-        default=0.01,
-        help="fractional extension of the current cell at each step "
-        "(default: %(default)s)",
-    )
-    elongation.add_argument(
-        "--elongation-max-strain",
-        type=float,
-        default=1.0,
-        help="engineering strain to reach; 1 means 100%% (default: %(default)s)",
-    )
-    elongation.add_argument(
-        "--elongation-relax-ps",
-        type=float,
-        default=50.0,
-        help="hold after each extension, in ps (default: %(default)s)",
-    )
-    elongation.add_argument(
-        "--elongation-replicas",
-        type=int,
-        default=3,
-        help="extensions from the equilibrated cell with fresh velocities "
-        "(default: %(default)s)",
-    )
-    elongation.add_argument(
-        "--elongation-samples-per-step",
-        type=int,
-        default=250,
-        help="stress readings per extension (default: %(default)s)",
-    )
-    elongation.add_argument(
-        "--elongation-stage-ps",
-        type=float,
-        default=1000.0,
-        help="duration of each resumable extension chunk, in ps (default: %(default)s)",
-    )
-    elongation.add_argument(
-        "--elongation-trajectory-ps",
-        type=float,
-        default=None,
-        help="save extension coordinates every this many ps; omitted by default",
-    )
+    _add_tensile_arguments(elongation, "elongation", ElongationSpec())
     failure = parser.add_argument_group(
         "tensile failure criterion",
         "shared stress-drop criterion for breaking strength and elongation at break",
@@ -1107,50 +1074,7 @@ def build_parser() -> argparse.ArgumentParser:
         "yield strength",
         "finite tensile extension and the offset line defining its proof stress",
     )
-    yielding.add_argument(
-        "--yield-strain-increment",
-        type=float,
-        default=0.002,
-        help="fractional extension of the current cell at each step "
-        "(default: %(default)s)",
-    )
-    yielding.add_argument(
-        "--yield-max-strain",
-        type=float,
-        default=0.3,
-        help="engineering strain to reach; 0.3 means 30%% (default: %(default)s)",
-    )
-    yielding.add_argument(
-        "--yield-relax-ps",
-        type=float,
-        default=50.0,
-        help="hold after each extension, in ps (default: %(default)s)",
-    )
-    yielding.add_argument(
-        "--yield-replicas",
-        type=int,
-        default=3,
-        help="extensions from the equilibrated cell with fresh velocities "
-        "(default: %(default)s)",
-    )
-    yielding.add_argument(
-        "--yield-samples-per-step",
-        type=int,
-        default=250,
-        help="stress readings per extension (default: %(default)s)",
-    )
-    yielding.add_argument(
-        "--yield-stage-ps",
-        type=float,
-        default=1000.0,
-        help="duration of each resumable extension chunk, in ps (default: %(default)s)",
-    )
-    yielding.add_argument(
-        "--yield-trajectory-ps",
-        type=float,
-        default=None,
-        help="save extension coordinates every this many ps; omitted by default",
-    )
+    _add_tensile_arguments(yielding, "yield", YieldSpec())
     yielding.add_argument(
         "--yield-offset-strain",
         type=float,
@@ -2215,6 +2139,12 @@ def _modulus_lines(result: Any) -> list[str]:
         f"strain/ns, {result.youngs.temperature_k:.0f} K"
         f"{'' if result.resolved else ' (not resolved)'}"
     )
+    return lines + _additional_modulus_lines(result)
+
+
+def _additional_modulus_lines(result: Any) -> list[str]:
+    """Format the elastic cross-checks shared by fresh scans and saved reports."""
+    lines: list[str] = []
     if result.poisson is not None:
         lines.append(
             f"nu = {result.poisson.ratio:.3f}"
@@ -2238,8 +2168,6 @@ def _modulus_lines(result: Any) -> list[str]:
 
 def _consistency_line(check: Any) -> str:
     """One line for the over-determination check."""
-    import math
-
     gaps = ", ".join(
         f"{name} {100.0 * gap:.0f}%"
         for name, gap in (("K", check.bulk_gap), ("G", check.shear_gap))
@@ -2291,18 +2219,30 @@ def _breaking_lines(report: Any) -> list[str]:
     return lines
 
 
-def _write_breaking_result(arguments: argparse.Namespace, report: Any) -> None:
-    """Print and save the same result for a run and a later analysis."""
-    for line in _breaking_lines(report):
+def _write_tensile_result(
+    arguments: argparse.Namespace,
+    report: Any,
+    lines: Sequence[str],
+    writer: Callable[..., ReportFiles],
+) -> None:
+    """Print and save a tensile report consistently after a scan or a reread."""
+    for line in lines:
         print(line, flush=True)
     for note in report.notes:
         print(f"note: {note}", flush=True)
-    files = write_breaking_report(
+    files = writer(
         report,
         arguments.output_dir if arguments.analyse else None,
         formats=() if arguments.no_figures else (cast(str, arguments.figure_format),),
     )
     print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
+
+
+def _write_breaking_result(arguments: argparse.Namespace, report: Any) -> None:
+    """Print and save the same result for a run and a later analysis."""
+    _write_tensile_result(
+        arguments, report, _breaking_lines(report), write_breaking_report
+    )
 
 
 def _run_breaking_scan(
@@ -2368,16 +2308,9 @@ def _elongation_lines(report: Any) -> list[str]:
 
 def _write_elongation_result(arguments: argparse.Namespace, report: Any) -> None:
     """Print and save the same result for a run and a later analysis."""
-    for line in _elongation_lines(report):
-        print(line, flush=True)
-    for note in report.notes:
-        print(f"note: {note}", flush=True)
-    files = write_elongation_report(
-        report,
-        arguments.output_dir if arguments.analyse else None,
-        formats=() if arguments.no_figures else (cast(str, arguments.figure_format),),
+    _write_tensile_result(
+        arguments, report, _elongation_lines(report), write_elongation_report
     )
-    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
 
 
 def _run_elongation_scan(
@@ -2440,16 +2373,7 @@ def _yield_lines(report: Any) -> list[str]:
 
 def _write_yield_result(arguments: argparse.Namespace, report: Any) -> None:
     """Print and save the same proof-stress report after a run or a reread."""
-    for line in _yield_lines(report):
-        print(line, flush=True)
-    for note in report.notes:
-        print(f"note: {note}", flush=True)
-    files = write_yield_report(
-        report,
-        arguments.output_dir if arguments.analyse else None,
-        formats=() if arguments.no_figures else (cast(str, arguments.figure_format),),
-    )
-    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
+    _write_tensile_result(arguments, report, _yield_lines(report), write_yield_report)
 
 
 def _run_yield_scan(
@@ -2800,27 +2724,8 @@ def _analyse_mechanics(arguments: argparse.Namespace, run_dir: Path) -> None:
             + ("" if report.youngs.resolved else " (not resolved)"),
             flush=True,
         )
-    if report.poisson is not None:
-        print(
-            f"nu = {report.poisson.ratio:.3f}"
-            f"{'' if report.poisson.resolved else ' (not resolved)'}",
-            flush=True,
-        )
-    for label, fit in (("K", report.bulk), ("G", report.shear)):
-        if fit is not None:
-            print(
-                f"{label} = {fit.modulus_mpa:.0f} MPa"
-                f"{'' if fit.resolved else ' (not resolved)'}",
-                flush=True,
-            )
-    if report.load_modulus is not None:
-        print(
-            f"constant-stress cross-check: "
-            f"E = {report.load_modulus.modulus_mpa:.0f} MPa",
-            flush=True,
-        )
-    if report.consistency is not None:
-        print(_consistency_line(report.consistency), flush=True)
+    for line in _additional_modulus_lines(report):
+        print(line, flush=True)
     for note in report.notes:
         print(f"note: {note}", flush=True)
 

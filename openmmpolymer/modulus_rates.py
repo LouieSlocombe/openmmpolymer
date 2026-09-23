@@ -11,12 +11,16 @@ import logging
 import math
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
-from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from ._rate_scan import (
+    validate_extrapolation_limit,
+    validate_hold_times,
+    write_workflow,
+)
 from ._validation import require_positive
 from .elasticity import ElasticModulus, StressStrain, youngs_modulus
 from .mechanical import (
@@ -76,8 +80,7 @@ def _analysis_options(
     target_rate_per_ns: float, max_extrapolation_decades: float
 ) -> None:
     require_positive(target_rate_per_ns, None, name="target_rate_per_ns")
-    if not math.isfinite(max_extrapolation_decades) or max_extrapolation_decades < 0:
-        raise ValueError("max_extrapolation_decades must be finite and nonnegative.")
+    validate_extrapolation_limit(max_extrapolation_decades)
 
 
 def validate_modulus_rate_scan(
@@ -94,13 +97,7 @@ def validate_modulus_rate_scan(
     are planned; load, bulk and shear settings in ``spec`` are not run.
     """
     _analysis_options(target_rate_per_ns, max_extrapolation_decades)
-    holds = tuple(require_positive(value, None, name="relax_ps") for value in relax_ps)
-    ordered = sorted(holds)
-    if len(holds) < 3 or any(
-        math.isclose(first, second, rel_tol=1.0e-8)
-        for first, second in pairwise(ordered)
-    ):
-        raise ValueError("relax_ps needs at least three distinct positive hold times.")
+    holds = validate_hold_times(relax_ps, name="relax_ps")
     schedules = tuple(deform_schedule(replace(spec, relax_ps=value)) for value in holds)
     plan = ModulusRatePlan(
         equilibration=equilibration_protocol(spec, **equilibration),
@@ -114,14 +111,6 @@ def validate_modulus_rate_scan(
             "Shorten holds, reduce replicas, or raise max_total_ns."
         )
     return plan
-
-
-def _save_workflow(directory: Path, record: dict[str, Any]) -> None:
-    """Keep the settings durable before the first resumable stage starts."""
-    path = directory / WORKFLOW_NAME
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
-    temporary.replace(path)
 
 
 def run_modulus_rate_scan(
@@ -192,7 +181,7 @@ def run_modulus_rate_scan(
         )
     directory.mkdir(parents=True, exist_ok=True)
     record: dict[str, Any] = {"request": request, "run_dirs": relative_dirs}
-    _save_workflow(directory, record)
+    write_workflow(workflow, record)
     log.info(
         "Modulus rate scan: %d rates, %d replicas per rate, %.3g ns in total.",
         len(plan.schedules),
@@ -216,7 +205,7 @@ def run_modulus_rate_scan(
         reference_box_nm=origin,
         timestep_fs=timestep_fs,
     )
-    _save_workflow(directory, record)
+    write_workflow(workflow, record)
     for rate_index, (name, schedule) in enumerate(
         zip(relative_dirs, plan.schedules, strict=True)
     ):

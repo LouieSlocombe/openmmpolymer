@@ -11,12 +11,12 @@ from pathlib import Path
 import numpy as np
 from matplotlib.figure import Figure
 
+from ._reporting import json_value
 from .convergence import (
     ConvergenceReport,
     RelaxationWindowConvergence,
     WindowConvergence,
 )
-from .modulus_rate_report import _json_value
 from .protocols import _write_atomically
 from .structural_convergence import StructuralWindowConvergence
 from .tg import ReportFiles
@@ -173,7 +173,7 @@ def write_convergence_report(
     )
     path = directory / "convergence.json"
     _write_atomically(
-        path, json.dumps(_json_value(record), indent=2, allow_nan=False) + "\n"
+        path, json.dumps(json_value(record), indent=2, allow_nan=False) + "\n"
     )
     written: list[str] = []
     if figures:

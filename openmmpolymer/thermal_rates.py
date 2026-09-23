@@ -14,18 +14,22 @@ import json
 import math
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
-from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from ._rate_scan import (
+    state_digest,
+    validate_extrapolation_limit,
+    validate_hold_times,
+    write_workflow,
+)
 from ._validation import require_integer, require_positive
 from .protocols import (
     Protocol,
     RunManifest,
     Stage,
-    _write_atomically,
     run_protocol,
 )
 from .rate_dependence import (
@@ -98,8 +102,7 @@ def _property(property_name: str) -> RateProperty:
 
 def _analysis_options(target_rate: float, max_extrapolation_decades: float) -> None:
     require_positive(target_rate, None, name="target_rate")
-    if not math.isfinite(max_extrapolation_decades) or max_extrapolation_decades < 0:
-        raise ValueError("max_extrapolation_decades must be finite and nonnegative.")
+    validate_extrapolation_limit(max_extrapolation_decades)
 
 
 def _thermal_protocol(
@@ -159,13 +162,7 @@ def validate_thermal_rate_scan(
     _property(property_name)
     _analysis_options(target_rate, max_extrapolation_decades)
     n_replicas = require_integer(n_replicas, name="n_replicas")
-    holds = tuple(
-        require_positive(value, None, name="hold_times_ps") for value in hold_times_ps
-    )
-    if len(holds) < 3 or any(
-        math.isclose(a, b, rel_tol=1e-8) for a, b in pairwise(sorted(holds))
-    ):
-        raise ValueError("hold_times_ps needs at least three distinct positive holds.")
+    holds = validate_hold_times(hold_times_ps)
     if property_name == "glass_transition":
         if not isinstance(spec, TgSpec):
             raise ValueError("glass_transition requires a TgSpec.")
@@ -203,16 +200,6 @@ def validate_thermal_rate_scan(
             f"replicas, over the {spec.max_total_ns:.3g} ns budget."
         )
     return plan
-
-
-def _digest(path: str | Path) -> str:
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
-def _save(directory: Path, record: dict[str, Any]) -> None:
-    _write_atomically(
-        directory / WORKFLOW_NAME, json.dumps(record, indent=2, allow_nan=False) + "\n"
-    )
 
 
 def _check_system(run: RunContext) -> None:
@@ -323,7 +310,7 @@ def run_thermal_rate_scan(
                 ).hexdigest(),
                 "box_nm": list(run.box.box_nm),
                 "seed": run.seed,
-                "state_sha256": None if state_in is None else _digest(state_in),
+                "state_sha256": None if state_in is None else state_digest(state_in),
                 "crystalline_supplied": crystalline
                 if property_name == "melting_temperature"
                 else None,
@@ -359,7 +346,7 @@ def run_thermal_rate_scan(
         record.update(
             {name: previous[name] for name in ("start_state", "start_state_sha256")}
         )
-    _save(directory, record)
+    write_workflow(workflow, record)
     chains: dict[str, Any] = {
         "chain_backbone": chain_backbone,
         "atoms_per_chain": atoms_per_chain,
@@ -376,12 +363,13 @@ def run_thermal_rate_scan(
     start = Path(settled.final_state)
     if not start.is_file():
         raise ThermalRateError("The common preparation did not save a final state.")
-    if resume and record.get("start_state_sha256", _digest(start)) != _digest(start):
+    fingerprint = state_digest(start)
+    if resume and record.get("start_state_sha256", fingerprint) != fingerprint:
         raise ThermalRateError(
             "The common preparation state changed; use a fresh directory."
         )
-    record.update(start_state=str(start), start_state_sha256=_digest(start))
-    _save(directory, record)
+    record.update(start_state=str(start), start_state_sha256=fingerprint)
+    write_workflow(workflow, record)
     for rate_index, protocol in enumerate(plan.protocols):
         for replica in range(n_replicas):
             run_protocol(

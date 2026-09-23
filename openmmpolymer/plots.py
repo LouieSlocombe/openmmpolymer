@@ -36,7 +36,6 @@ extrapolation whatever number it came back with.
 
 from __future__ import annotations
 
-import logging
 import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
@@ -62,10 +61,10 @@ from .timeseries import (
 )
 
 if TYPE_CHECKING:
+    import numpy.typing as npt
+
     from .strain_rate import StrainRateExtrapolation
     from .strength import BreakingStrength, ElongationAtBreak, YieldStrength
-
-log = logging.getLogger(__name__)
 
 #: Figure size in inches. Wide enough for a four-panel column to stay legible
 #: at a report's width.
@@ -708,17 +707,7 @@ def plot_breaking_strength(curve: StressStrain, result: BreakingStrength) -> Any
     Returns:
         A ``matplotlib.figure.Figure``.
     """
-    figure, axes = _figure(1, 1)
-    axis = axes[0]
-    axis.plot(
-        curve.strain,
-        result.nominal_stress_mpa,
-        marker="o",
-        markersize=3.5,
-        linewidth=0.9,
-        color=_DATA_COLOUR,
-        label="nominal tensile stress",
-    )
+    figure, axis = _nominal_stress_figure(curve.strain, result.nominal_stress_mpa)
     axis.plot(
         [result.strain_at_peak],
         [result.peak_stress_mpa],
@@ -750,24 +739,12 @@ def plot_breaking_strength(curve: StressStrain, result: BreakingStrength) -> Any
     axis.axhline(0.0, color=_REFERENCE_COLOUR, linewidth=0.6)
     axis.set_xlabel(f"Engineering strain along {'xyz'[curve.axis]}")
     axis.set_ylabel("Nominal tensile stress (MPa)")
-    rate = (
-        "rate not recorded"
-        if result.strain_rate_per_ns is None
-        else f"{result.strain_rate_per_ns:.3g} strain/ns"
-    )
     verdict = (
         f"Apparent tensile strength = {result.strength_mpa:.1f} MPa"
         if result.resolved and result.strength_mpa is not None
         else "Apparent tensile strength not resolved"
     )
-    chunks = curve.stage.split(", ")
-    label = (
-        chunks[0] if len(chunks) == 1 else f"{chunks[0]} (+{len(chunks) - 1} chunks)"
-    )
-    axis.set_title(
-        f"{label}: {result.temperature_k:.0f} K, {rate}\n{verdict}",
-        fontsize=9,
-    )
+    axis.set_title(_strength_title(curve, result, verdict), fontsize=9)
     axis.legend(fontsize=7, frameon=False)
     return figure
 
@@ -807,16 +784,8 @@ def plot_elongation_at_break(
             failure_fraction=failure_fraction,
             confirmation_steps=confirmation_steps,
         )
-    figure, axes = _figure(1, 1)
-    axis = axes[0]
-    axis.plot(
-        100.0 * curve.strain,
-        result.nominal_stress_mpa,
-        marker="o",
-        markersize=3.5,
-        linewidth=0.9,
-        color=_DATA_COLOUR,
-        label="nominal tensile stress",
+    figure, axis = _nominal_stress_figure(
+        100.0 * curve.strain, result.nominal_stress_mpa
     )
     axis.plot(
         [100.0 * result.strain_at_peak],
@@ -852,24 +821,12 @@ def plot_elongation_at_break(
     axis.axhline(0.0, color=_REFERENCE_COLOUR, linewidth=0.6)
     axis.set_xlabel(f"Engineering elongation along {'xyz'[curve.axis]} (%)")
     axis.set_ylabel("Nominal tensile stress (MPa)")
-    rate = (
-        "rate not recorded"
-        if result.strain_rate_per_ns is None
-        else f"{result.strain_rate_per_ns:.3g} strain/ns"
-    )
     verdict = (
         f"Apparent elongation at break = {result.elongation_percent:.1f}%"
         if result.resolved and result.elongation_percent is not None
         else "Apparent elongation at break not resolved"
     )
-    chunks = curve.stage.split(", ")
-    label = (
-        chunks[0] if len(chunks) == 1 else f"{chunks[0]} (+{len(chunks) - 1} chunks)"
-    )
-    axis.set_title(
-        f"{label}: {result.temperature_k:.0f} K, {rate}\n{verdict}",
-        fontsize=9,
-    )
+    axis.set_title(_strength_title(curve, result, verdict), fontsize=9)
     axis.legend(fontsize=7, frameon=False)
     return figure
 
@@ -889,17 +846,7 @@ def plot_yield_strength(curve: StressStrain, result: YieldStrength) -> Any:
     Returns:
         A ``matplotlib.figure.Figure``.
     """
-    figure, axes = _figure(1, 1)
-    axis = axes[0]
-    axis.plot(
-        curve.strain,
-        result.nominal_stress_mpa,
-        marker="o",
-        markersize=3.5,
-        linewidth=0.9,
-        color=_DATA_COLOUR,
-        label="nominal tensile stress",
-    )
+    figure, axis = _nominal_stress_figure(curve.strain, result.nominal_stress_mpa)
     fit_span = np.asarray(
         [result.fit_min_strain, result.fit_max_strain], dtype=np.float64
     )
@@ -969,26 +916,55 @@ def plot_yield_strength(curve: StressStrain, result: YieldStrength) -> Any:
     axis.axhline(0.0, color=_REFERENCE_COLOUR, linewidth=0.6)
     axis.set_xlabel(f"Engineering strain along {'xyz'[curve.axis]}")
     axis.set_ylabel("Nominal tensile stress (MPa)")
-    rate = (
-        "rate not recorded"
-        if result.strain_rate_per_ns is None
-        else f"{result.strain_rate_per_ns:.3g} strain/ns"
-    )
     verdict = (
         f"{offset_label} yield strength = {result.strength_mpa:.1f} MPa"
         if result.resolved and result.strength_mpa is not None
         else f"{offset_label} yield strength not resolved"
     )
-    chunks = curve.stage.split(", ")
-    label = (
-        chunks[0] if len(chunks) == 1 else f"{chunks[0]} (+{len(chunks) - 1} chunks)"
-    )
-    axis.set_title(
-        f"{label}: {result.temperature_k:.0f} K, {rate}\n{verdict}",
-        fontsize=9,
-    )
+    axis.set_title(_strength_title(curve, result, verdict), fontsize=9)
     axis.legend(fontsize=7, frameon=False)
     return figure
+
+
+def _nominal_stress_figure(
+    strain: npt.NDArray[np.float64], stress_mpa: npt.NDArray[np.float64]
+) -> tuple[Any, Any]:
+    """Start a tensile-strength figure with its measured nominal response."""
+    figure, axes = _figure(1, 1)
+    axis = axes[0]
+    axis.plot(
+        strain,
+        stress_mpa,
+        marker="o",
+        markersize=3.5,
+        linewidth=0.9,
+        color=_DATA_COLOUR,
+        label="nominal tensile stress",
+    )
+    return figure, axis
+
+
+def _strength_title(
+    curve: StressStrain,
+    result: BreakingStrength | ElongationAtBreak | YieldStrength,
+    verdict: str,
+) -> str:
+    """Keep the source, loading conditions and verdict with each strength plot."""
+    chunks = curve.stage.split(", ")
+    stage = chunks[0]
+    if len(chunks) > 1:
+        stage += f" (+{len(chunks) - 1} chunks)"
+    return (
+        f"{stage}: {result.temperature_k:.0f} K, "
+        f"{_strain_rate_label(result.strain_rate_per_ns)}\n{verdict}"
+    )
+
+
+def _strain_rate_label(rate_per_ns: float | None) -> str:
+    """Describe the measured rate, including when it was not recorded."""
+    return (
+        "rate not recorded" if rate_per_ns is None else f"{rate_per_ns:.3g} strain/ns"
+    )
 
 
 def plot_moduli(report: Any) -> Any:
@@ -1083,11 +1059,7 @@ def _stress_title(curve: StressStrain, fit: ElasticModulus | None) -> str:
     control = (
         "strain-controlled" if curve.controlled == "strain" else "stress-controlled"
     )
-    rate = (
-        "rate not recorded"
-        if curve.strain_rate_per_ns is None
-        else f"{curve.strain_rate_per_ns:.3g} strain/ns"
-    )
+    rate = _strain_rate_label(curve.strain_rate_per_ns)
     head = f"{curve.stage} - {control}, {rate}, {curve.temperature_k:.0f} K"
     if fit is None:
         return head

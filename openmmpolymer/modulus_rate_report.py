@@ -3,29 +3,13 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
 
-import numpy as np
-
+from ._reporting import json_value
 from .modulus_rates import ModulusRateReport
 from .protocols import _write_atomically
 from .tg import ReportFiles
-
-
-def _json_value(value: Any) -> Any:
-    """Use JSON null for an undefined diagnostic, retaining the resolved flag."""
-    if isinstance(value, np.ndarray):
-        return _json_value(value.tolist())
-    if isinstance(value, dict):
-        return {key: _json_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_value(item) for item in value]
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    return value
 
 
 def write_modulus_rate_report(
@@ -62,7 +46,7 @@ def write_modulus_rate_report(
     json_path = directory / "modulus_rates.json"
     _write_atomically(
         json_path,
-        json.dumps(_json_value(record), indent=2, allow_nan=False) + "\n",
+        json.dumps(json_value(record), indent=2, allow_nan=False) + "\n",
     )
     written: list[str] = []
     if figures:

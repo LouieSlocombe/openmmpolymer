@@ -34,7 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -986,16 +986,16 @@ def analyse_mechanics(
     # fitted as a bulk modulus is a confident number about nothing. Two
     # different measurements that record the same shape cannot be told apart
     # by their shape, so this asks for the stage this workflow wrote.
-    bulk = (
-        _optional(
+    manifest = RunManifest.load(directory)
+    stage_names = list(manifest.stages) if manifest is not None else []
+    if BULK_STEM in stage_names:
+        bulk = _optional(
             lambda: bulk_modulus(directory, BULK_STEM),
             notes,
             "No bulk-modulus pass to fit",
         )
-        if BULK_STEM in _manifest_stage_names(directory)
-        else None
-    )
-    if bulk is None and BULK_STEM not in _manifest_stage_names(directory):
+    else:
+        bulk = None
         notes.append(
             f"No bulk-modulus pass: {directory} has no {BULK_STEM} stage. A "
             "compression ladder run as part of equilibration is not one - it "
@@ -1025,7 +1025,7 @@ def analyse_mechanics(
     if not curves and bulk is None and shear is None and load is None:
         raise AnalysisError(
             f"Nothing in {directory} was a mechanical measurement. It "
-            f"records: {', '.join(_manifest_stage_names(directory)) or 'nothing'}."
+            f"records: {', '.join(stage_names) or 'nothing'}."
         )
 
     return ModulusReport(
@@ -1045,13 +1045,7 @@ def analyse_mechanics(
     )
 
 
-def _manifest_stage_names(run_dir: Path) -> list[str]:
-    """Every stage a manifest records, or nothing when there is no manifest."""
-    manifest = RunManifest.load(run_dir)
-    return list(manifest.stages) if manifest is not None else []
-
-
-def _optional(read: Any, notes: list[str], what: str) -> Any:
+def _optional[T](read: Callable[[], T], notes: list[str], what: str) -> T | None:
     """Run a reader, turning "there is nothing there" into a note.
 
     A skipped pass and a broken one look identical from the outside, so the

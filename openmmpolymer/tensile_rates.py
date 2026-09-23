@@ -11,20 +11,24 @@ import json
 import math
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
-from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from . import breaking, elongation, yielding
+from ._rate_scan import (
+    state_digest,
+    validate_extrapolation_limit,
+    validate_hold_times,
+    write_workflow,
+)
 from ._seeds import derive_seed
 from ._validation import require_positive
 from .mechanical import _equilibrated_box_nm
 from .protocols import (
     Protocol,
     RunManifest,
-    _write_atomically,
     run_protocol,
     standard_melt_equilibration,
 )
@@ -111,15 +115,8 @@ def validate_tensile_rate_scan(
     if type(spec) is not expected:
         raise ValueError(f"{property_name} requires {expected.__name__}.")
     require_positive(target_rate, None, name="target_rate")
-    if not math.isfinite(max_extrapolation_decades) or max_extrapolation_decades < 0:
-        raise ValueError("max_extrapolation_decades must be finite and nonnegative.")
-    holds = tuple(
-        require_positive(value, None, name="hold_times_ps") for value in hold_times_ps
-    )
-    if len(holds) < 3 or any(
-        math.isclose(a, b, rel_tol=1e-8) for a, b in pairwise(sorted(holds))
-    ):
-        raise ValueError("hold_times_ps needs at least three distinct positive holds.")
+    validate_extrapolation_limit(max_extrapolation_decades)
+    holds = validate_hold_times(hold_times_ps)
     specs = tuple(
         replace(
             spec, relax_ps=hold, stage_ps=max(spec.stage_ps, hold), max_total_ns=None
@@ -140,14 +137,6 @@ def validate_tensile_rate_scan(
             f"Tensile rate scan needs {cost:.3g} ns across all rates and replicas, above max_total_ns={spec.max_total_ns:g}."
         )
     return TensileRatePlan(property_name, settle, specs, cost)
-
-
-def _save(path: Path, record: dict[str, Any]) -> None:
-    _write_atomically(path, json.dumps(record, indent=2, allow_nan=False) + "\n")
-
-
-def _state_digest(path: str | Path) -> str:
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def _check_states(directory: Path) -> None:
@@ -232,7 +221,7 @@ def run_tensile_rate_scan(
             start_path = Path(previous["start_state"])
             if not start_path.is_file() or previous.get(
                 "start_state_sha256"
-            ) != _state_digest(start_path):
+            ) != state_digest(start_path):
                 raise ValueError(
                     "The common preparation state is missing, changed or lacks its fingerprint; "
                     "restore the original state or rerun with resume=False."
@@ -251,7 +240,7 @@ def run_tensile_rate_scan(
             if key in previous
         }
     )
-    _save(workflow, root_record)
+    write_workflow(workflow, root_record)
     chains: dict[str, Any] = {
         "chain_backbone": chain_backbone,
         "atoms_per_chain": atoms_per_chain,
@@ -263,7 +252,7 @@ def run_tensile_rate_scan(
     start = settled.final_state
     if not start or not Path(start).is_file():
         raise ValueError("Common equilibration did not leave a readable state.")
-    fingerprint = _state_digest(start)
+    fingerprint = state_digest(start)
     if previous.get("start_state_sha256", fingerprint) != fingerprint:
         raise ValueError(
             "The common preparation changed on resume; rerun with resume=False."
@@ -272,7 +261,7 @@ def run_tensile_rate_scan(
     root_record.update(
         start_state=start, start_state_sha256=fingerprint, reference_box_nm=origin
     )
-    _save(workflow, root_record)
+    write_workflow(workflow, root_record)
     timestep = safe_timestep_fs(selected.temperature_k, run.spec)
     for index, (name, rate_spec) in enumerate(zip(names, plan.specs, strict=True)):
         rate_dir = directory / name
@@ -286,7 +275,7 @@ def run_tensile_rate_scan(
             )
             for replica in range(rate_spec.n_replicas)
         )
-        _save(
+        write_workflow(
             rate_dir / module.WORKFLOW_NAME,
             {
                 "request": {

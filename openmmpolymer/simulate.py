@@ -31,7 +31,12 @@ import numpy as np
 import numpy.typing as npt
 
 from ._seeds import derive_seed, seed_random_stream
-from ._validation import require_choice, require_integer, require_positive
+from ._validation import (
+    require_choice,
+    require_finite,
+    require_integer,
+    require_positive,
+)
 from .forcefield import PolymerForceField
 from .mdsystem import (
     BAROSTAT_TEMPERATURE_PARAMETER,
@@ -739,21 +744,17 @@ def run_segments(
             set_temperature(simulation, segment.temperature_k, barostat)
             if barostat is not None:
                 set_pressure(simulation, segment.pressure_bar, barostat)
+            density, temperature, enthalpy = _sample_segment(
+                simulation,
+                steps,
+                run.total_mass_g_mol,
+                samples_per_segment,
+                pressure_bar=segment.pressure_bar if measure_enthalpy else None,
+            )
             if measure_enthalpy:
-                density, temperature, enthalpy = _sample_segment(
-                    simulation,
-                    steps,
-                    run.total_mass_g_mol,
-                    samples_per_segment,
-                    pressure_bar=segment.pressure_bar,
-                )
                 assert enthalpy is not None
                 samples["segment_enthalpy_kj_mol"].append(enthalpy)
                 samples["segment_pressure_bar"].append(segment.pressure_bar)
-            else:
-                density, temperature = _run_segment(
-                    simulation, steps, run.total_mass_g_mol, samples_per_segment
-                )
             samples["segment_temperature_k"].append(segment.temperature_k)
             samples["segment_density_g_cm3"].append(density)
             samples["segment_mean_temperature_k"].append(temperature)
@@ -788,23 +789,6 @@ def run_segments(
     )
 
 
-def _run_segment(
-    simulation: Any,
-    steps: int,
-    total_mass_g_mol: float,
-    samples_per_segment: int = _SAMPLES_PER_SEGMENT,
-) -> tuple[float, float]:
-    """Run one segment, returning its settled density and temperature.
-
-    Sampled in chunks and averaged over the second half, so a segment that
-    spends its first part relaxing does not drag its own average.
-    """
-    density, temperature, _ = _sample_segment(
-        simulation, steps, total_mass_g_mol, samples_per_segment
-    )
-    return density, temperature
-
-
 def _sample_segment(
     simulation: Any,
     steps: int,
@@ -813,7 +797,11 @@ def _sample_segment(
     *,
     pressure_bar: float | None = None,
 ) -> tuple[float, float, float | None]:
-    """Average density, temperature and optional enthalpy at the same times."""
+    """Average density, temperature and optional enthalpy at the same times.
+
+    Sampled in chunks and averaged over the second half, so a segment that
+    spends its first part relaxing does not drag its own average.
+    """
     from openmm import unit
 
     chunk = max(1, steps // samples_per_segment)
@@ -1192,6 +1180,8 @@ def quench_temperatures(t_start: float, t_end: float, step_k: float) -> list[flo
     splits it into resumable stages, and the stage that runs it - counts the
     same temperatures. A ladder that does not divide evenly still ends exactly
     at *t_end*, because the bottom of the curve is a point someone chose.
+    Finite offsets are accepted for estimating a nominal schedule; actual
+    quench temperatures are checked by :func:`run_quench`.
 
     Args:
         t_start: Where cooling starts.
@@ -1202,37 +1192,48 @@ def quench_temperatures(t_start: float, t_end: float, step_k: float) -> list[flo
         The temperatures, descending.
 
     Raises:
-        ValueError: The ramp does not descend, or the step is not positive.
+        ValueError: Endpoints are not finite, the step is not finite and
+            positive, the ramp does not descend, or the step cannot advance it.
     """
+    t_start = require_finite(t_start, None, name="t_start")
+    t_end = require_finite(t_end, None, name="t_end")
+    step_k = require_positive(step_k, None, name="step_k")
     if t_end >= t_start:
         raise ValueError(
             f"t_end={t_end} must be below t_start={t_start}: a quench cools."
         )
-    require_positive(step_k, None, name="step_k")
+    if t_start - step_k >= t_start:
+        raise ValueError("step_k is too small to advance the quench temperature.")
 
     temperatures: list[float] = []
     temperature = t_start
     while temperature > t_end + 1e-9:
         temperatures.append(temperature)
-        temperature -= step_k
+        next_temperature = temperature - step_k
+        if next_temperature >= temperature:
+            raise ValueError("step_k is too small to advance the quench temperature.")
+        temperature = next_temperature
     temperatures.append(t_end)
     return temperatures
 
 
-def _descending_ladder(temperatures_k: Sequence[float]) -> list[float]:
-    """Check a caller-supplied ladder is one a quench could run."""
-    ladder = [float(value) for value in temperatures_k]
+def _temperature_ladder(
+    temperatures_k: Sequence[float], *, ascending: bool
+) -> list[float]:
+    """Validate an explicit thermal ladder, including a one-window chunk."""
+    ladder = [
+        require_positive(value, None, name="temperatures_k") for value in temperatures_k
+    ]
     if not ladder:
-        raise ValueError(
-            "temperatures_k is empty, so there is nothing to hold. Give the "
-            "temperatures to visit, or leave it out and name t_start, t_end "
-            "and step_k instead."
-        )
-    for hotter, cooler in itertools.pairwise(ladder):
-        if cooler >= hotter:
+        raise ValueError("temperatures_k is empty, so there is nothing to hold.")
+    for first, second in itertools.pairwise(ladder):
+        out_of_order = second <= first if ascending else second >= first
+        if out_of_order:
+            action = "a heating scan warms" if ascending else "a quench cools"
+            direction = "ascend" if ascending else "descend"
             raise ValueError(
-                f"temperatures_k goes {hotter} -> {cooler}: a quench cools, so "
-                "the ladder has to descend."
+                f"temperatures_k goes {first} -> {second}: {action}, so "
+                f"the ladder has to {direction} strictly."
             )
     return ladder
 
@@ -1280,12 +1281,17 @@ def run_quench(
         densities they settled at.
 
     Raises:
-        ValueError: The ramp does not descend.
+        ValueError: The temperatures are not finite and positive, or the ramp
+            does not descend.
     """
     temperatures = (
-        quench_temperatures(t_start, t_end, step_k)
+        quench_temperatures(
+            require_positive(t_start, None, name="t_start"),
+            require_positive(t_end, None, name="t_end"),
+            step_k,
+        )
         if temperatures_k is None
-        else _descending_ladder(temperatures_k)
+        else _temperature_ladder(temperatures_k, ascending=False)
     )
 
     segments = [
@@ -1327,22 +1333,6 @@ def heating_temperatures(t_start: float, t_end: float, step_k: float) -> list[fl
         index += 1
     temperatures.append(t_end)
     return temperatures
-
-
-def _ascending_ladder(temperatures_k: Sequence[float]) -> list[float]:
-    """Validate an explicit heating ladder, including a one-window chunk."""
-    ladder = [
-        require_positive(value, None, name="temperatures_k") for value in temperatures_k
-    ]
-    if not ladder:
-        raise ValueError("temperatures_k is empty, so there is nothing to hold.")
-    for colder, hotter in itertools.pairwise(ladder):
-        if hotter <= colder:
-            raise ValueError(
-                f"temperatures_k goes {colder} -> {hotter}: a heating scan warms, "
-                "so the ladder has to ascend strictly."
-            )
-    return ladder
 
 
 def run_heat(
@@ -1388,7 +1378,7 @@ def run_heat(
     temperatures = (
         heating_temperatures(t_start, t_end, step_k)
         if temperatures_k is None
-        else _ascending_ladder(temperatures_k)
+        else _temperature_ladder(temperatures_k, ascending=True)
     )
     hold_ps = require_positive(hold_ps, None, name="hold_ps")
     pressure_bar = require_positive(pressure_bar, None, name="pressure_bar")
