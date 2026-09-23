@@ -37,6 +37,15 @@ from .breaking import (
 from .chain import ChainSpec, build_chain
 from .charges import CHARGE_METHODS, assign_charges
 from .elasticity import deform_stages, load_stages, shear_stages
+from .elongation import (
+    ElongationError,
+    ElongationSpec,
+    analyse_elongation,
+    elongation_scan,
+    elongation_stages,
+    run_elongation_scan,
+    write_elongation_report,
+)
 from .forcefield import BACKENDS, PolymerForceField, build_polymer_forcefield
 from .mdsystem import (
     PackedBox,
@@ -183,6 +192,24 @@ _BREAKING = (
     "breaking_samples_per_step",
     "breaking_stage_ps",
     "breaking_trajectory_ps",
+    "failure_fraction",
+    "confirmation_steps",
+    "max_total_ns",
+)
+
+
+#: Finite extension and the sustained stress drop defining apparent elongation at break.
+_ELONGATION = (
+    "temperature_k",
+    "pressure_bar",
+    "deform_axis",
+    "elongation_strain_increment",
+    "elongation_max_strain",
+    "elongation_relax_ps",
+    "elongation_replicas",
+    "elongation_samples_per_step",
+    "elongation_stage_ps",
+    "elongation_trajectory_ps",
     "failure_fraction",
     "confirmation_steps",
     "max_total_ns",
@@ -411,6 +438,53 @@ def _breaking_protocol(**options: Any) -> Protocol:
     return protocol
 
 
+def _elongation_spec(
+    *,
+    temperature_k: float = 298.15,
+    pressure_bar: float = 1.0,
+    deform_axis: int = 2,
+    elongation_strain_increment: float = 0.01,
+    elongation_max_strain: float = 1.0,
+    elongation_relax_ps: float = 50.0,
+    elongation_replicas: int = 3,
+    elongation_samples_per_step: int = 250,
+    elongation_stage_ps: float = 1000.0,
+    elongation_trajectory_ps: float | None = None,
+    failure_fraction: float = 0.5,
+    confirmation_steps: int = 3,
+    max_total_ns: float | None = None,
+) -> ElongationSpec:
+    """Map the finite-extension controls onto the elongation workflow."""
+    return ElongationSpec(
+        temperature_k=temperature_k,
+        pressure_bar=pressure_bar,
+        axis=deform_axis,
+        strain_increment=elongation_strain_increment,
+        max_strain=elongation_max_strain,
+        relax_ps=elongation_relax_ps,
+        n_replicas=elongation_replicas,
+        samples_per_step=elongation_samples_per_step,
+        stage_ps=elongation_stage_ps,
+        trajectory_ps=elongation_trajectory_ps,
+        failure_fraction=failure_fraction,
+        confirmation_steps=confirmation_steps,
+        max_total_ns=max_total_ns,
+    )
+
+
+def _elongation_protocol(**options: Any) -> Protocol:
+    """Build the equilibration and every replica of the tensile ladder."""
+    spec = _elongation_spec(**options)
+    protocol = elongation_scan(spec)
+    duration_ns = protocol.total_duration_ps / 1000.0
+    if spec.max_total_ns is not None and duration_ns > spec.max_total_ns:
+        raise ElongationError(
+            f"The elongation scan is {duration_ns:.3g} ns, over the "
+            f"{spec.max_total_ns:g} ns budget. Shorten the scan or raise max_total_ns."
+        )
+    return protocol
+
+
 def _yield_spec(
     *,
     temperature_k: float = 298.15,
@@ -501,6 +575,7 @@ PROTOCOLS = {
     "tm": ProtocolEntry(_tm_protocol, _TM),
     "modulus": ProtocolEntry(_modulus_protocol, ("pressure_bar", *_MECHANICS)),
     "breaking": ProtocolEntry(_breaking_protocol, _BREAKING),
+    "elongation": ProtocolEntry(_elongation_protocol, _ELONGATION),
     "yield": ProtocolEntry(_yield_protocol, _YIELD),
     "relax": ProtocolEntry(_relax_protocol, _RELAXATION),
 }
@@ -524,7 +599,9 @@ class _ProtocolParser(argparse.ArgumentParser):
                 "hold_ps": 1000.0,
             }
         defaults["temperature"] = (
-            298.15 if arguments.protocol in ("breaking", "yield") else 450.0
+            298.15
+            if arguments.protocol in ("breaking", "elongation", "yield")
+            else 450.0
         )
         for name, value in defaults.items():
             if getattr(arguments, name) is None:
@@ -570,7 +647,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--temperature",
         type=float,
         default=None,
-        help="target temperature in kelvin (default: 298.15 for breaking and yield, "
+        help="target temperature in kelvin (default: 298.15 for breaking, elongation "
+        "and yield, "
         "450 for other protocols)",
     )
     parser.add_argument(
@@ -889,14 +967,66 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="save extension coordinates every this many ps; omitted by default",
     )
-    breaking.add_argument(
+    elongation = parser.add_argument_group(
+        "elongation at break",
+        "engineering strain at the onset of a confirmed terminal stress drop",
+    )
+    elongation.add_argument(
+        "--elongation-strain-increment",
+        type=float,
+        default=0.01,
+        help="fractional extension of the current cell at each step "
+        "(default: %(default)s)",
+    )
+    elongation.add_argument(
+        "--elongation-max-strain",
+        type=float,
+        default=1.0,
+        help="engineering strain to reach; 1 means 100%% (default: %(default)s)",
+    )
+    elongation.add_argument(
+        "--elongation-relax-ps",
+        type=float,
+        default=50.0,
+        help="hold after each extension, in ps (default: %(default)s)",
+    )
+    elongation.add_argument(
+        "--elongation-replicas",
+        type=int,
+        default=3,
+        help="extensions from the equilibrated cell with fresh velocities "
+        "(default: %(default)s)",
+    )
+    elongation.add_argument(
+        "--elongation-samples-per-step",
+        type=int,
+        default=250,
+        help="stress readings per extension (default: %(default)s)",
+    )
+    elongation.add_argument(
+        "--elongation-stage-ps",
+        type=float,
+        default=1000.0,
+        help="duration of each resumable extension chunk, in ps (default: %(default)s)",
+    )
+    elongation.add_argument(
+        "--elongation-trajectory-ps",
+        type=float,
+        default=None,
+        help="save extension coordinates every this many ps; omitted by default",
+    )
+    failure = parser.add_argument_group(
+        "tensile failure criterion",
+        "shared stress-drop criterion for breaking strength and elongation at break",
+    )
+    failure.add_argument(
         "--failure-fraction",
         type=float,
         default=0.5,
         help="fraction of peak nominal stress below which the terminal "
         "drop must remain (default: %(default)s)",
     )
-    breaking.add_argument(
+    failure.add_argument(
         "--confirmation-steps",
         type=int,
         default=3,
@@ -1254,6 +1384,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             _breaking_protocol(**_protocol_options(arguments, PROTOCOLS["breaking"]))
         except (ValueError, BreakingError) as error:
             parser.error(str(error))
+    if arguments.protocol == "elongation":
+        try:
+            _elongation_protocol(
+                **_protocol_options(arguments, PROTOCOLS["elongation"])
+            )
+        except (ValueError, ElongationError) as error:
+            parser.error(str(error))
     if arguments.protocol == "yield":
         try:
             _yield_protocol(**_protocol_options(arguments, PROTOCOLS["yield"]))
@@ -1344,6 +1481,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_modulus_scan(arguments, run, output, chain, options)
     if name == "breaking":
         return _run_breaking_scan(arguments, run, output, chain, options)
+    if name == "elongation":
+        return _run_elongation_scan(arguments, run, output, chain, options)
     if name == "yield":
         return _run_yield_scan(arguments, run, output, chain, options)
     if name == "relax":
@@ -1727,6 +1866,81 @@ def _run_breaking_scan(
     return 0
 
 
+def _elongation_lines(report: Any) -> list[str]:
+    """Report the confirmed break strain separately from the stress maximum."""
+    if report.elongation_percent is None or not report.resolved:
+        lines = ["elongation: apparent elongation at break not resolved"]
+    else:
+        spread = (
+            ""
+            if report.replica_spread_percent is None
+            else f" +/- {report.replica_spread_percent:.3g} percentage points "
+            f"over {len(report.replicas)} replicas"
+        )
+        lines = [
+            f"elongation: apparent elongation at break = "
+            f"{report.elongation_percent:.4g}%{spread}"
+        ]
+    for index, result in zip(report.replica_indices, report.replicas, strict=True):
+        rate = (
+            "unknown strain rate"
+            if result.strain_rate_per_ns is None
+            else f"{result.strain_rate_per_ns:.3g} strain/ns"
+        )
+        elongation = (
+            f"{result.elongation_percent:.4g}% at engineering strain "
+            f"{result.strain_at_break:.4g}"
+            if result.resolved
+            and result.elongation_percent is not None
+            and result.strain_at_break is not None
+            else "not resolved"
+        )
+        lines.append(
+            f"  replica {index}: elongation at break {elongation}, "
+            f"{result.temperature_k:.0f} K, {rate}"
+        )
+        lines.append(
+            f"    peak {result.peak_stress_mpa:.4g} MPa at "
+            f"strain {result.strain_at_peak:.4g}"
+        )
+        if result.resolved and result.break_stress_mpa is not None:
+            lines.append(f"    stress at break {result.break_stress_mpa:.4g} MPa")
+    return lines
+
+
+def _write_elongation_result(arguments: argparse.Namespace, report: Any) -> None:
+    """Print and save the same result for a run and a later analysis."""
+    for line in _elongation_lines(report):
+        print(line, flush=True)
+    for note in report.notes:
+        print(f"note: {note}", flush=True)
+    files = write_elongation_report(
+        report,
+        arguments.output_dir if arguments.analyse else None,
+        formats=() if arguments.no_figures else (cast(str, arguments.figure_format),),
+    )
+    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
+
+
+def _run_elongation_scan(
+    arguments: argparse.Namespace,
+    run: Any,
+    output: Path,
+    chain: Any,
+    options: dict[str, Any],
+) -> int:
+    """Measure apparent elongation at break and write its report."""
+    report = run_elongation_scan(
+        run,
+        output,
+        spec=_elongation_spec(**options),
+        chain_backbone=chain.backbone,
+        atoms_per_chain=chain.n_atoms,
+    )
+    _write_elongation_result(arguments, report)
+    return 0
+
+
 def _yield_lines(report: Any) -> list[str]:
     """Print the proof stress together with its offset, temperature and rate."""
     if report.strength_mpa is None or not report.resolved:
@@ -1909,13 +2123,16 @@ def _analyse(arguments: argparse.Namespace) -> int:
     quenched = _has_stages(first, quench_stages)
     heated = _has_stages(first, heating_stages)
     broken = _has_stages(first, breaking_stages)
+    elongated = _has_stages(first, elongation_stages)
     yielded = _has_stages(first, yield_stages)
     deformed = any(
         _has_stages(first, find) for find in (deform_stages, load_stages, shear_stages)
     )
     relaxed = _has_stages(first, relax_stages)
     structured = not arguments.no_structure and _has_stages(first, structure_stages)
-    if not any((quenched, heated, broken, yielded, deformed, relaxed, structured)):
+    if not any(
+        (quenched, heated, broken, elongated, yielded, deformed, relaxed, structured)
+    ):
         print(
             f"nothing in {first} was a quench, a heating scan, a deformation or a relaxation, "
             "and no stage left coordinates to measure, so there is nothing to "
@@ -1930,9 +2147,11 @@ def _analyse(arguments: argparse.Namespace) -> int:
         _analyse_melting(arguments, first)
     if broken:
         _write_breaking_result(arguments, analyse_breaking(first))
+    if elongated:
+        _write_elongation_result(arguments, analyse_elongation(first))
     if yielded:
         _write_yield_result(arguments, analyse_yield(first))
-    if deformed and not (broken or yielded):
+    if deformed and not (broken or elongated or yielded):
         _analyse_mechanics(arguments, first)
     if relaxed:
         _analyse_relaxation(arguments, first)

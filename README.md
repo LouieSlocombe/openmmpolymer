@@ -207,9 +207,9 @@ across them. The manifest is not touched.
 
 It works out what to report from what the directory recorded: a run that
 quenched gets a glass transition, a heating scan gets a melting report, a run
-that was deformed gets its elastic constants, yield-strength or breaking-strength
-report, and any run whose stages left coordinates gets its structure read back
-as well.
+that was deformed gets its elastic constants, yield-strength, breaking-strength
+or elongation-at-break report, and any run whose stages left coordinates gets
+its structure read back as well.
 
 ## Measuring a modulus
 
@@ -422,6 +422,90 @@ limits the full equilibration and replica schedule. Reports contain the
 stress-strain curves, individual peaks and drop criteria, and any reasons the
 strength remained unresolved. Use `--no-figures` for a JSON-only report.
 
+## Calculating elongation at break
+
+`run_elongation_scan` measures **apparent engineering elongation at break** from
+the onset of a confirmed terminal loss of nominal tensile stress. It uses the
+same finite-extension schedule as the breaking-strength workflow: equilibrate
+the cell, start tensile replicas with fresh velocities, and relax the transverse
+dimensions at the specified pressure between strain increments.
+
+```python
+from openmmpolymer import (
+    ElongationSpec,
+    analyse_elongation,
+    run_elongation_scan,
+    write_elongation_report,
+)
+
+report = run_elongation_scan(
+    run,
+    "elongation_run",
+    spec=ElongationSpec(
+        temperature_k=298.15,
+        strain_increment=0.01,
+        max_strain=1.0,
+        relax_ps=50.0,
+        n_replicas=3,
+        failure_fraction=0.5,
+        confirmation_steps=3,
+        trajectory_ps=10.0,
+    ),
+)
+print(report.elongation_percent, report.replica_spread_percent, report.resolved)
+write_elongation_report(report)
+# Reanalyse recorded holds with the saved criterion, without more dynamics:
+write_elongation_report(analyse_elongation("elongation_run"))
+```
+
+The reported value is `100 * (L_break - L0) / L0`, where `L0` is the equilibrated
+axial cell length. This is percent engineering strain, with the original cell
+serving as the reference length. Experimental strain at break likewise uses
+the change in gauge length divided by its original length; see
+[Instron's explanation of strain at break](https://instron.com/en/resources/blog/2013/november/question-from-a-customer-on-how-to-report-strain-at-break/).
+The workflow's break criterion is operational: by default, the curve must end
+with at least three consecutive holds at or below half its peak nominal stress.
+Elongation is taken at the **first** hold in that confirmed terminal drop. It
+is distinct from the strain at ultimate tensile stress and from the last hold
+that confirms failure. The preceding hold and that first low-stress hold form
+the reported `break_bracket`; no interpolation is used. Smaller strain
+increments narrow this sampling interval.
+
+A rising curve, a temporary stress drop followed by recovery, an insufficient
+number of confirming holds, or a missing or incomplete replica leaves the
+pooled elongation unresolved (`elongation_percent` is `None`). The workflow
+does not substitute the maximum imposed strain for a missing break. Reports
+retain each replica's curve, sampled peak, break bracket and unresolved notes.
+Figures show nominal stress against percent elongation and mark the break
+onset separately from the peak. `replica_spread_percent` is a spread in
+percentage points from fresh velocities at one starting structure.
+
+```bash
+openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol elongation -t 298 \
+  --elongation-strain-increment 0.01 --elongation-max-strain 1.0 \
+  --elongation-relax-ps 50 --elongation-replicas 3 \
+  --failure-fraction 0.5 --confirmation-steps 3 \
+  --elongation-trajectory-ps 10 -o elongation_run -v
+openmmpolymer --analyse elongation_run
+```
+
+The strain options use fractions: `0.01` extends the current cell by one
+percent, and `--elongation-max-strain 1.0` requests at least 100% engineering
+strain relative to the initial cell. Increments compound.
+`--elongation-stage-ps` controls resumable chunks,
+`--elongation-samples-per-step` controls stress sampling, and
+`--max-total-ns` limits the full equilibration and replica schedule. Reports
+are written under `elongation_run/analysis`; `--no-figures` writes only JSON.
+Automatic analysis recognises elongation runs and restores their saved failure
+criterion.
+
+The supported force fields have fixed harmonic bonds, so this workflow cannot
+model covalent bond rupture. A stress loss can reflect chain sliding or
+separation. Inspect saved coordinates and report the temperature, strain rate,
+failure criterion, force field, chain length and periodic cell size alongside
+the result. Molecular dynamics rates and small periodic cells limit comparison
+with macroscopic elongation-at-break measurements.
+
 ## Watching a stress relax
 
 A modulus says how hard the cell pushes back. A *relaxation* modulus says how
@@ -537,6 +621,7 @@ openmmpolymer --analyse run --no-structure
 | Workflow | `tg` | The two-pass glass-transition scan, and reading a finished run back |
 | Workflow | `mechanical` | The extension, the load, bulk and shear passes, and the report |
 | Workflow | `breaking` | Finite tensile extension, nominal stress peaks and sustained stress drops, replicas and reporting |
+| Workflow | `elongation` | Percent engineering elongation at a confirmed terminal stress loss, replicas and reporting |
 | Workflow | `viscoelastic` | The step-strain scan, its replicas, and the report |
 | Workflow | `structure` | Reading a finished run's `g(r)`, `S(q)`, chain dimensions, persistence length, displacement and end-to-end relaxation back, and the report |
 

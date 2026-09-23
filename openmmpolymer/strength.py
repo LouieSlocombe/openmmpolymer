@@ -1,4 +1,4 @@
-"""Apparent tensile strengths from recorded strain-controlled deformation.
+"""Apparent tensile properties from recorded strain-controlled deformation.
 
 Yield uses the intersection with an offset elastic line; breaking strength
 requires a peak followed by sustained stress loss. These are criteria on
@@ -207,6 +207,94 @@ def breaking_strength(
         strain_rate_per_ns=curve.strain_rate_per_ns,
         nominal_stress_mpa=nominal,
         notes=tuple(notes),
+    )
+
+
+@dataclass(frozen=True)
+class ElongationAtBreak:
+    """Engineering elongation at the onset of confirmed terminal stress loss.
+
+    ``strain_at_break`` is the dimensionless engineering strain
+    ``(L - L0) / L0``; ``elongation_percent`` is 100 times that strain.
+    ``break_stress_mpa`` is nominal stress at the same sampled point, and
+    ``break_bracket`` bounds the threshold crossing between consecutive
+    sampled engineering strains. These four values are None when unresolved.
+
+    The peak stress, its strain, and the nominal-stress curve remain available
+    for diagnostics. The peak strain is generally earlier than the reported
+    break strain. Neither this operational stress-loss criterion nor the
+    sampling bracket establishes a molecular rupture event or its uncertainty.
+    """
+
+    strain_at_break: float | None
+    elongation_percent: float | None
+    break_stress_mpa: float | None
+    break_bracket: tuple[float, float] | None
+    peak_stress_mpa: float
+    strain_at_peak: float
+    resolved: bool
+    temperature_k: float
+    strain_rate_per_ns: float | None
+    nominal_stress_mpa: npt.NDArray[np.float64]
+    notes: tuple[str, ...]
+
+
+def elongation_at_break(
+    curve: StressStrain,
+    *,
+    failure_fraction: float = 0.5,
+    confirmation_steps: int = 3,
+) -> ElongationAtBreak:
+    """Calculate apparent elongation at break from a tensile deformation curve.
+
+    Use the same nominal-stress conversion and sustained terminal stress-loss
+    criterion as :func:`breaking_strength`. After a positive interior peak,
+    at least ``confirmation_steps`` final samples must remain at or below
+    ``failure_fraction`` of that peak. Report the engineering strain at the
+    first sample of this final interval, together with its percentage and
+    the preceding strain as a sampling bracket. No crossing is interpolated.
+
+    The peak strain and the last recorded strain are not substitutes for an
+    unresolved break strain. A plateau, recovery, boundary peak, or too few
+    confirmation samples leaves the break values None while retaining the
+    observed curve and peak. This is an apparent stress-loss criterion:
+    fixed-topology force fields cannot model covalent bond scission.
+
+    Args:
+        curve: Finite, strain-controlled tensile samples with strictly
+            increasing, nonnegative engineering strain.
+        failure_fraction: Fraction of peak nominal stress defining the loss,
+            strictly between zero and one.
+        confirmation_steps: At least two terminal samples below the threshold.
+
+    Raises:
+        ValueError: The curve or a numeric argument is invalid; see
+            :func:`breaking_strength` for the shared validation requirements.
+        TypeError: ``confirmation_steps`` is not an integer.
+    """
+    strength = breaking_strength(
+        curve,
+        failure_fraction=failure_fraction,
+        confirmation_steps=confirmation_steps,
+    )
+    strain_at_break = strength.failure_strain
+    elongation_percent = (
+        100.0 * strain_at_break if strain_at_break is not None else None
+    )
+    if elongation_percent is not None and not math.isfinite(elongation_percent):
+        raise ValueError("elongation_percent must remain finite.")
+    return ElongationAtBreak(
+        strain_at_break=strain_at_break,
+        elongation_percent=elongation_percent,
+        break_stress_mpa=strength.failure_stress_mpa,
+        break_bracket=strength.failure_bracket,
+        peak_stress_mpa=strength.peak_stress_mpa,
+        strain_at_peak=strength.strain_at_peak,
+        resolved=strength.resolved,
+        temperature_k=strength.temperature_k,
+        strain_rate_per_ns=strength.strain_rate_per_ns,
+        nominal_stress_mpa=strength.nominal_stress_mpa,
+        notes=strength.notes,
     )
 
 
