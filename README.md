@@ -349,6 +349,263 @@ Choose a target near the slowest sampled rate to evaluate a controlled
 reduction in rate sensitivity; extending directly to a laboratory rate does
 not by itself remove kinetic stiffness.
 
+### Rate sensitivity across measured properties
+
+The common `run_property_rate_scan`, `analyse_property_rates` and
+`write_rate_report` APIs extend the same measured-rate comparison to the
+other loading and thermal workflows. `RATE_PROPERTIES` records each quantity's
+units. The target rate must be positive and use the units in the last column;
+pressure ramps, heating and cooling are not strain rates.
+
+| `property_name` | Measured quantity | Value unit | Rate unit | Scan spec / CLI protocol |
+| --- | --- | --- | --- | --- |
+| `youngs_modulus` | Young's modulus from extension | MPa | strain/ns | `ModulusSpec` / `modulus` |
+| `poisson_ratio` | Transverse/axial strain ratio | dimensionless | strain/ns | `ModulusSpec` / `modulus` |
+| `shear_modulus` | Shear modulus | MPa | strain/ns | `ModulusSpec` / `modulus` |
+| `bulk_modulus` | Bulk modulus | MPa | bar/ns | `ModulusSpec` / `modulus` |
+| `load_modulus` | Young's modulus under applied stress | MPa | bar/ns | `ModulusSpec` / `modulus` |
+| `yield_strength` | Apparent offset yield strength | MPa | strain/ns | `YieldSpec` / `yield` |
+| `yield_strain` | Strain at the offset yield event | strain | strain/ns | `YieldSpec` / `yield` |
+| `breaking_strength` | Apparent ultimate tensile strength | MPa | strain/ns | `BreakingSpec` / `breaking` |
+| `elongation_at_break` | Apparent elongation at break | % | strain/ns | `ElongationSpec` / `elongation` |
+| `glass_transition` | Glass transition on cooling | K | K/ns | `TgSpec` / `tg` |
+| `melting_temperature` | Apparent melting on heating | K | K/ns | `TmSpec` / `tm` |
+
+Each new scan prepares one common starting state and branches every rate and
+replica from it, with fresh velocities and independent random streams. Only
+the requested measurement runs. The scan keeps the loading/temperature
+ladder, fitting criterion and preparation fixed while changing the hold per
+step. Settings are recorded before dynamics; changed requests are refused on
+resume. `validate_property_rate_scan` returns a plan with `total_ns`, counting
+the common preparation and every rate and replica. The spec's
+`max_total_ns` applies to that whole budget.
+
+```python
+from openmmpolymer import (
+    ModulusSpec,
+    analyse_property_rates,
+    run_property_rate_scan,
+    validate_property_rate_scan,
+    write_rate_report,
+)
+
+spec = ModulusSpec(temperature_k=298.15, n_replicas=3)
+plan = validate_property_rate_scan(
+    spec,
+    (100.0, 500.0, 2000.0),
+    property_name="bulk_modulus",
+    target_rate=10.0,  # bar/ns
+)
+print(plan.total_ns)
+report = run_property_rate_scan(
+    run,
+    "bulk_rates",
+    property_name="bulk_modulus",
+    hold_times_ps=(100.0, 500.0, 2000.0),
+    target_rate=10.0,
+    spec=spec,
+)
+write_rate_report(report, output_dir="bulk_rates/analysis")
+
+# A scan root expands to its recorded rate runs. Existing compatible runs
+# can instead be supplied as ["bulk_fast", "bulk_medium", "bulk_slow"].
+report = analyse_property_rates(
+    ["bulk_rates"],
+    property_name="bulk_modulus",
+    target_rate=10.0,
+)
+```
+
+The nominal pressure/stress and shear rates use total absolute distance along
+the imposed ladder divided by the time in all its holds. Reversing a pressure
+ladder therefore counts both branches, and the initial hold remains in the
+time denominator. Tensile rates retain the compounded engineering-strain
+convention above. Mechanical replica counts come from the relevant spec.
+
+For thermal scans, the hold determines `1000 * temperature_step_k / hold_ps`
+in K/ns. A Tg rate scan uses the fixed full ladder given by
+`melt_temperature_k`, `t_floor_k` and `coarse_step_k`; adaptive fine-window
+settings are unused. The existing two-pass `run_tg_scan`,
+`cooling_rate_series` and Tg log-linear/VFT analysis remain available.
+Thermal replica counts use the scan's `n_replicas` argument.
+
+```python
+from openmmpolymer import TgSpec, TmSpec
+
+tg = run_property_rate_scan(
+    run,
+    "tg_rates",
+    property_name="glass_transition",
+    hold_times_ps=(500.0, 1500.0, 5000.0),
+    target_rate=1.0,  # K/ns
+    spec=TgSpec(melt_temperature_k=650, t_floor_k=150, coarse_step_k=10),
+    n_replicas=3,
+)
+write_rate_report(tg, output_dir="tg_rates/analysis")
+
+# crystal_run must contain a prepared crystalline or semicrystalline cell.
+tm = run_property_rate_scan(
+    crystal_run,
+    "tm_rates",
+    property_name="melting_temperature",
+    hold_times_ps=(500.0, 1500.0, 5000.0),
+    target_rate=1.0,  # K/ns
+    spec=TmSpec(t_start_k=250, t_end_k=650, step_k=10),
+    n_replicas=3,
+    crystalline=True,
+)
+write_rate_report(tm, output_dir="tm_rates/analysis")
+
+elongation = analyse_property_rates(
+    ["elongation_fast", "elongation_medium", "elongation_slow"],
+    property_name="elongation_at_break",
+    target_rate=0.0002,  # strain/ns
+)
+if elongation.log_linear is not None:
+    print(elongation.log_linear.value)  # percentage, not fractional strain
+write_rate_report(elongation, output_dir="elongation_rate_analysis")
+```
+
+Tm preparation minimises and settles the supplied crystal at its starting
+temperature; it never substitutes a melt preparation. `crystalline=True`
+asserts the supplied structure's order, including an optional `state_in`.
+Common starting coordinates do not establish melt equilibration or independent
+crystal morphologies. Cooling-rate effects require material-specific validation
+when comparing with experiments, as illustrated by
+[the specific-volume/cooling-rate analysis of an epoxy network](https://pubs.acs.org/doi/abs/10.1021/acs.macromol.7b01303).
+Heating may superheat a crystal, so a fitted heating-rate correction cannot
+establish equilibrium melting; see
+[the molecular-dynamics study of superheating versus heating rate](https://journals.aps.org/prb/abstract/10.1103/PhysRevB.68.134206).
+Check crystalline-order loss in saved structures or trajectories as well.
+
+The shared analysis requires at least three distinct measured rates. It
+retains each observation, source and qualification, pools same-rate replicas,
+and attempts both `log_linear` and `power_law` fits. `value`, `standard_error`
+and `sensitivity_per_decade` use the property's value unit; the report records
+the reference and target rates, extrapolation distance, fit residuals and
+resolution status. Physical bounds and expected trends are property-specific;
+no universal monotonic correction is imposed on every quantity.
+
+Unknown single-history uncertainty stays unknown. Where available, input
+errors and excess rate-fit scatter propagate to the target, with
+between-replica standard deviation as a conservative floor. Tg's current
+single-history fit supplies no temperature standard error. A Tm bracket is
+the adjacent sampled-temperature interval, not an error bar; replicas provide
+temperature variability when their transitions differ. These errors do not
+cover force-field bias, shared morphology, model choice or experimental
+calibration. A missing yield or break event is retained as missing/censored
+and prevents an extrapolation from silently fitting only successful events.
+
+Unresolved observations, unknown uncertainty, poor fits, unsupported bounds
+or trends, excessive relative target uncertainty and extrapolations beyond
+`max_extrapolation_decades=2.0` remain unresolved. A model that cannot be fitted
+is `None`, with the reason retained. JSON writes missing/nonfinite fields as
+`null`, preserves Tm bracket notes and reports the disagreement between model
+predictions. Figures label the property's units and unknown errors. Files are
+`<property_name>_rates.json` plus one figure per available model; the default
+destination is the first measured run's `analysis` directory.
+
+```bash
+openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol modulus -t 298 \
+  --rate-property bulk_modulus --rate-hold-times 100,500,2000 \
+  --target-property-rate 10 -o bulk_rates
+openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol tg \
+  --rate-property glass_transition --rate-hold-times 500,1500,5000 \
+  --target-property-rate 1 -o tg_rates
+openmmpolymer --protocol tm --crystal-pdb crystal.pdb --system-xml system.xml \
+  --rate-property melting_temperature --rate-hold-times 500,1500,5000 \
+  --target-property-rate 1 -o tm_rates
+openmmpolymer --analyse elongation_fast elongation_medium elongation_slow \
+  --rate-property elongation_at_break --target-property-rate 0.0002
+```
+
+New scans require the matching protocol from the table. Saved-run analysis
+needs the property and target rate; it does not require a protocol selection.
+The older Young's-modulus API and `--modulus-relax-times` /
+`--target-strain-rate` options retain their existing behavior.
+
+### Observation-window convergence for other measures
+
+Quantities measured from a trajectory or a relaxation curve need an
+observation-window check as well. `analyse_convergence` compares estimates
+from increasing fractions of a saved run and writes a separate report; it
+does not reinterpret observation time as an imposed strain or thermal rate.
+
+| Measurement family | Checked quantities | Evidence required |
+| --- | --- | --- |
+| State-data time series | Density, temperature, potential energy | Stable prefix means and disjoint tail blocks; enough autocorrelation-adjusted samples |
+| Chain-dimension time series | Mean radius of gyration, mean squared end-to-end distance | The same sampling and stability checks |
+| Structural refits | Persistence length, characteristic ratio, ratio of squares | Stable refits and disjoint tail blocks; backbone correlation must decay for persistence length |
+| Chain dynamics | COM diffusion coefficient, end-to-end relaxation time | Stable refits; observed diffusive MSD or observed orientational decorrelation |
+| Pair and reciprocal structure | RDF peak position/height, S(q) peak position/height | Fixed grids and sampling policy; enough sampled frames and agreement of disjoint tail blocks |
+| Stress relaxation | Equilibrium modulus, KWW mean relaxation time, KWW and Prony viscosities | Stable decay refits and evidence that the relevant tail/plateau was observed |
+
+```python
+from openmmpolymer import analyse_convergence, write_convergence_report
+
+convergence = analyse_convergence(
+    "run",
+    stage="05_npt",
+    backbone=chain.backbone,
+    window_fractions=(0.25, 0.5, 0.75, 1.0),
+    relative_tolerance=0.1,
+    min_effective_samples=20,
+    discard_fraction=0.1,
+)
+write_convergence_report(convergence, output_dir="run/convergence_analysis")
+```
+
+For raw stationary observations, `time_window_convergence(time_ps, values,
+property_name="density", value_unit="g/cm^3")` supplies the same check.
+`relaxation_window_convergence(curve)` refits an existing `RelaxationCurve`.
+Relaxation is a physical decay, so its model parameters are checked through
+longer fitted windows rather than treating G(t) as a stationary trace.
+
+The structural report retains the complete RDF, S(q), backbone-correlation,
+MSD and end-to-end-correlation curves for each window. One RDF radius remains
+legal for every observed box, and the same histogram grids and global strides
+apply throughout. S(q) peak comparisons share a bin mask with sufficient
+wavevectors per frame. A changing bin population cannot silently change the
+set of allowed peak locations.
+
+Pair-distribution and structure-factor sampling defaults to the ordinary
+structural-report caps of 50 and 8 frames. Those caps can leave the window
+check unresolved, especially S(q). Increase sampling explicitly when the
+cost is acceptable:
+
+```python
+from openmmpolymer import open_run, structural_window_convergence
+
+ensemble = open_run("run", "05_npt")
+structure_windows = structural_window_convergence(
+    ensemble,
+    backbone=chain.backbone,
+    min_frames=20,
+    max_distribution_frames=None,
+    max_structure_factor_frames=None,
+)
+print(structure_windows.parameters["diffusion_coefficient_cm2_s"].resolved)
+```
+
+Structural refit differences and differences between overlapping windows are
+stability diagnostics, not standard errors or independent replicas. Inspect
+individual parameter verdicts: a trajectory can have stable pair structure
+without observing chain diffusion. A snapshot cannot establish convergence;
+repeated frozen coordinates or uniform translation alone also remain
+unresolved. An unobserved relaxation time, diffusive regime or backbone decay stays
+missing/censored. None of these window checks proves equilibrium or supplies
+a zero-rate correction.
+
+```bash
+openmmpolymer --analyse run --convergence --convergence-stage 05_npt \
+  --window-fractions .25,.5,.75,1 --convergence-tolerance .1 \
+  --min-effective-samples 20 --convergence-discard-fraction .1 \
+  -o convergence_analysis
+```
+
+`--structure-stage` can select the stage when `--convergence-stage` is omitted.
+The existing `--backbone`, `--stride` and `--no-figures` options also apply.
+
 ## Calculating a yield strength
 
 `run_yield_scan` measures an **apparent offset yield strength** from a tensile

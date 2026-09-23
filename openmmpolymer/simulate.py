@@ -604,6 +604,7 @@ def run_segments(
     waypoints: bool = False,
     samples_per_segment: int = _SAMPLES_PER_SEGMENT,
     measure_enthalpy: bool = False,
+    new_velocities: bool = False,
 ) -> StageResult:
     """Run a sequence of segments in one ensemble.
 
@@ -642,6 +643,9 @@ def run_segments(
             samples. Recorded as ``segment_enthalpy_kj_mol``, in OpenMM's
             molar energy units, with ``segment_pressure_bar``. This is not
             normalised by the number of chains or repeat units.
+        new_velocities: Draw fresh velocities at the first segment's
+            temperature, using the stage's deterministic random seed. This
+            permits independent replicas from one equilibrated configuration.
 
     Returns:
         What the stage did, including a density and a temperature per segment.
@@ -673,7 +677,14 @@ def run_segments(
         pressure_bar=first.pressure_bar,
         barostat_frequency=barostat_frequency,
     )
-    _initialise(run, simulation, prefix.name, state_in, first.temperature_k)
+    _initialise(
+        run,
+        simulation,
+        prefix.name,
+        state_in,
+        first.temperature_k,
+        reuse_velocities=not new_velocities,
+    )
 
     per_segment = [steps_for(segment.duration_ps, timestep_fs) for segment in segments]
     total_steps = sum(per_segment)
@@ -1708,6 +1719,7 @@ def run_deform(
     total_steps = steps_each * n_steps
     samples: dict[str, list[float]] = {
         "segment_strain": [],
+        "lateral_pressure_bar": [pressure_bar],
         "segment_stress_xx_bar": [],
         "segment_stress_yy_bar": [],
         "segment_stress_zz_bar": [],
@@ -2045,6 +2057,7 @@ def run_load(
     total_steps = steps_each * len(rungs)
     samples: dict[str, list[float]] = {
         "segment_applied_stress_bar": [],
+        "lateral_pressure_bar": [pressure_bar],
         "segment_box_x_nm": [],
         "segment_box_y_nm": [],
         "segment_box_z_nm": [],
@@ -2257,6 +2270,7 @@ def run_shear(
     total_steps = steps_each * len(ladder)
     samples: dict[str, list[float]] = {
         "segment_shear_strain": [],
+        "shear_plane": [float(driven), float(gradient)],
         "segment_shear_stress_bar": [],
         "segment_temperature_k": [],
         "segment_mean_temperature_k": [],

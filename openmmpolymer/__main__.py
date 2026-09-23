@@ -36,6 +36,8 @@ from .breaking import (
 )
 from .chain import ChainSpec, build_chain
 from .charges import CHARGE_METHODS, assign_charges
+from .convergence import DEFAULT_WINDOW_FRACTIONS, analyse_convergence
+from .convergence_report import write_convergence_report
 from .elasticity import deform_stages, load_stages, shear_stages
 from .elongation import (
     ElongationError,
@@ -76,7 +78,17 @@ from .packing import (
     distribute_conformers,
     pack_box,
 )
+from .property_rates import (
+    RATE_PROPERTIES,
+    RateScanSpec,
+    analyse_property_rates,
+    default_rate_spec,
+    run_property_rate_scan,
+    validate_property_rate_scan,
+)
 from .protocols import Protocol, melt_quench, run_protocol, standard_melt_equilibration
+from .rate_dependence import RateReport
+from .rate_reports import write_rate_report
 from .relaxation import relax_stages
 from .simulate import RELAX_MODES, RunContext, prepare_run
 from .structure import analyse_structure, structure_stages, write_structure_report
@@ -902,6 +914,40 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.015,
         help="strain the modulus is fitted up to (default: %(default)s)",
     )
+    rate_analysis = parser.add_argument_group(
+        "rate sensitivity",
+        "compare the same measurement at several imposed loading rates",
+    )
+    rate_analysis.add_argument(
+        "--rate-property",
+        choices=sorted(RATE_PROPERTIES),
+        default=None,
+        help="property to compare; a new scan must use its matching --protocol",
+    )
+    rate_analysis.add_argument(
+        "--rate-hold-times",
+        type=_floats,
+        default=None,
+        help="three or more distinct hold times in ps; varies rate while keeping the same ladder and preparation",
+    )
+    rate_analysis.add_argument(
+        "--target-property-rate",
+        type=float,
+        default=None,
+        help="positive target in the selected property's units: strain/ns, bar/ns, or K/ns",
+    )
+    rate_analysis.add_argument(
+        "--max-rate-extrapolation-decades",
+        type=float,
+        default=2.0,
+        help="largest extrapolation distance allowed to resolve (default: %(default)s); this is a reporting guard",
+    )
+    rate_analysis.add_argument(
+        "--thermal-rate-replicas",
+        type=_positive_int,
+        default=3,
+        help="independent velocity replicas per thermal rate (default: %(default)s)",
+    )
     mechanics.add_argument(
         "--replicas",
         type=int,
@@ -1209,6 +1255,44 @@ def build_parser() -> argparse.ArgumentParser:
         default="05_npt",
         help="the equilibration stage to check (default: %(default)s)",
     )
+    convergence = parser.add_argument_group(
+        "time-window convergence", "check estimates as the observation window grows"
+    )
+    convergence.add_argument(
+        "--convergence",
+        action="store_true",
+        help="analyse observation-window stability for one --analyse directory",
+    )
+    convergence.add_argument(
+        "--convergence-stage",
+        default=None,
+        metavar="STAGE",
+        help="saved stage to check (default: --structure-stage or the last available stage)",
+    )
+    convergence.add_argument(
+        "--window-fractions",
+        type=_floats,
+        default=DEFAULT_WINDOW_FRACTIONS,
+        help="increasing observed fractions ending at 1 (default: 0.25,0.5,0.75,1)",
+    )
+    convergence.add_argument(
+        "--convergence-tolerance",
+        type=float,
+        default=0.1,
+        help="maximum relative change to resolve window stability (default: %(default)s)",
+    )
+    convergence.add_argument(
+        "--min-effective-samples",
+        type=float,
+        default=20.0,
+        help="minimum autocorrelation-adjusted count for scalar time traces (default: %(default)s)",
+    )
+    convergence.add_argument(
+        "--convergence-discard-fraction",
+        type=float,
+        default=0.1,
+        help="initial fraction discarded from stationary time traces (default: %(default)s)",
+    )
     analysis.add_argument(
         "--no-melt-check",
         action="store_true",
@@ -1346,6 +1430,182 @@ def _rates(text: str) -> tuple[float, ...]:
     return rates
 
 
+_RATE_PROTOCOLS = {
+    "youngs_modulus": "modulus",
+    "poisson_ratio": "modulus",
+    "shear_modulus": "modulus",
+    "bulk_modulus": "modulus",
+    "load_modulus": "modulus",
+    "yield_strength": "yield",
+    "yield_strain": "yield",
+    "breaking_strength": "breaking",
+    "elongation_at_break": "elongation",
+    "glass_transition": "tg",
+    "melting_temperature": "tm",
+}
+_PROTOCOL_RATE_DEFAULTS = {
+    "modulus": "youngs_modulus",
+    "yield": "yield_strength",
+    "breaking": "breaking_strength",
+    "elongation": "elongation_at_break",
+    "tg": "glass_transition",
+    "tm": "melting_temperature",
+}
+
+
+def _property_rates_requested(arguments: argparse.Namespace) -> bool:
+    return any(
+        (
+            arguments.rate_property is not None,
+            arguments.rate_hold_times is not None,
+            arguments.target_property_rate is not None,
+            arguments.target_strain_rate is not None
+            and arguments.protocol in ("yield", "breaking", "elongation"),
+        )
+    )
+
+
+def _property_rate_request(
+    arguments: argparse.Namespace,
+) -> tuple[str, float, RateScanSpec]:
+    """Resolve a physical rate unit before allowing any build or dynamics."""
+    property_name = arguments.rate_property or _PROTOCOL_RATE_DEFAULTS.get(
+        arguments.protocol
+    )
+    if property_name is None:
+        raise ValueError(
+            "Choose --rate-property for rate analysis, or a measurement --protocol for a scan."
+        )
+    if arguments.modulus_relax_times is not None:
+        raise ValueError(
+            "Use --rate-hold-times with --rate-property; --modulus-relax-times belongs to the original Young's modulus interface."
+        )
+    if (
+        arguments.target_property_rate is not None
+        and arguments.target_strain_rate is not None
+    ):
+        raise ValueError(
+            "Specify one of --target-property-rate or --target-strain-rate."
+        )
+    target = arguments.target_property_rate
+    if target is None and arguments.target_strain_rate is not None:
+        if RATE_PROPERTIES[property_name].rate_unit != "strain/ns":
+            raise ValueError(
+                f"{property_name} uses {RATE_PROPERTIES[property_name].rate_unit}; use --target-property-rate."
+            )
+        target = arguments.target_strain_rate
+    if target is None or not math.isfinite(target) or target <= 0:
+        raise ValueError("A finite positive --target-property-rate is required.")
+    maximum = arguments.max_rate_extrapolation_decades
+    if not math.isfinite(maximum) or maximum < 0:
+        raise ValueError(
+            "--max-rate-extrapolation-decades must be finite and nonnegative."
+        )
+    protocol_name = _RATE_PROTOCOLS[property_name]
+    if arguments.analyse:
+        if arguments.rate_hold_times is not None:
+            raise ValueError(
+                "--rate-hold-times starts new dynamics and cannot be used with --analyse."
+            )
+        return property_name, float(target), default_rate_spec(property_name)
+    elif arguments.protocol != protocol_name or arguments.rate_hold_times is None:
+        raise ValueError(
+            f"{property_name} scans require --protocol {protocol_name} and --rate-hold-times."
+        )
+    factories: dict[str, Callable[..., RateScanSpec]] = {
+        "modulus": _modulus_spec,
+        "yield": _yield_spec,
+        "breaking": _breaking_spec,
+        "elongation": _elongation_spec,
+        "tg": _tg_spec,
+        "tm": _tm_spec,
+    }
+    spec = factories[protocol_name](
+        **_protocol_options(arguments, PROTOCOLS[protocol_name])
+    )
+    return property_name, float(target), spec
+
+
+def _write_property_rate_result(
+    arguments: argparse.Namespace, report: RateReport, output_dir: Path | None = None
+) -> None:
+    """A unit-aware headline for each model, including unavailable predictions."""
+    property = report.property
+    for form in ("log_linear", "power_law"):
+        fit = getattr(report, form)
+        if fit is None:
+            print(f"{property.label}, {form}: unavailable (not resolved)", flush=True)
+            continue
+        uncertainty = (
+            f"{fit.standard_error:.3g}"
+            if math.isfinite(fit.standard_error)
+            else "unknown"
+        )
+        print(
+            f"{property.label}, {form}: {fit.value:.5g} +/- {uncertainty} {property.value_unit} (fit SE) at "
+            f"{fit.target_rate:.4g} {property.rate_unit}; {fit.n_rates} rates, extrapolated {fit.extrapolation_decades:.2f} decades"
+            f"{'' if fit.resolved else ' (not resolved)'}",
+            flush=True,
+        )
+        for note in fit.notes:
+            print(f"note ({form}): {note}", flush=True)
+    if report.log_linear is not None and report.power_law is not None:
+        print(
+            f"model difference at target: {abs(report.log_linear.value - report.power_law.value):.4g} {property.value_unit}",
+            flush=True,
+        )
+    for note in report.notes:
+        print(f"note: {note}", flush=True)
+    files = write_rate_report(
+        report,
+        output_dir if output_dir is not None else arguments.output_dir,
+        figures=not arguments.no_figures,
+        figure_format=arguments.figure_format,
+    )
+    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
+
+
+def _analyse_convergence(arguments: argparse.Namespace) -> int:
+    report = analyse_convergence(
+        arguments.analyse[0],
+        stage=arguments.convergence_stage or arguments.structure_stage,
+        backbone=arguments.backbone,
+        stride=arguments.stride,
+        window_fractions=arguments.window_fractions,
+        relative_tolerance=arguments.convergence_tolerance,
+        min_effective_samples=arguments.min_effective_samples,
+        discard_fraction=arguments.convergence_discard_fraction,
+    )
+    print(f"observation-window convergence: stage {report.stage}", flush=True)
+    statuses: list[tuple[str, bool, Sequence[str]]] = [
+        (name, result.resolved, result.notes) for name, result in report.results.items()
+    ]
+    if report.relaxation is not None:
+        statuses.extend(
+            (name, result.resolved, result.notes)
+            for name, result in report.relaxation.metrics.items()
+        )
+    if report.structural is not None:
+        statuses.extend(
+            (name, parameter.resolved, parameter.notes)
+            for name, parameter in report.structural.parameters.items()
+        )
+    for name, resolved, notes in statuses:
+        print(f"{name}: {'resolved' if resolved else 'unresolved'}", flush=True)
+        for note in notes:
+            print(f"  {note}", flush=True)
+    for note in report.notes:
+        print(f"note: {note}", flush=True)
+    files = write_convergence_report(
+        report,
+        arguments.output_dir,
+        figures=not arguments.no_figures,
+        figure_format=arguments.figure_format,
+    )
+    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line interface.
 
@@ -1362,12 +1622,56 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
 
-    if arguments.modulus_relax_times is not None:
+    if arguments.convergence:
+        if not arguments.analyse or len(arguments.analyse) != 1:
+            parser.error("--convergence requires exactly one --analyse directory")
+        if (
+            _property_rates_requested(arguments)
+            or arguments.target_strain_rate is not None
+            or arguments.modulus_relax_times is not None
+        ):
+            parser.error("run --convergence separately from imposed-rate analysis")
+        try:
+            return _analyse_convergence(arguments)
+        except (OSError, ValueError, AnalysisError) as error:
+            parser.error(str(error))
+
+    property_request: tuple[str, float, RateScanSpec] | None = None
+    if _property_rates_requested(arguments):
+        try:
+            property_request = _property_rate_request(arguments)
+            property_name, target, rate_spec = property_request
+            if arguments.analyse:
+                report = analyse_property_rates(
+                    arguments.analyse,
+                    property_name=property_name,
+                    target_rate=target,
+                    strain_limit=arguments.elastic_strain_limit,
+                    max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
+                )
+                _write_property_rate_result(arguments, report)
+                return 0
+            plan = validate_property_rate_scan(
+                rate_spec,
+                arguments.rate_hold_times,
+                property_name=property_name,
+                target_rate=target,
+                n_replicas=arguments.thermal_rate_replicas,
+                max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
+            )
+            print(
+                f"{property_name} rate scan: {plan.total_ns:.3g} ns total including preparation and all replicas",
+                flush=True,
+            )
+        except (OSError, ValueError, TypeError, RuntimeError) as error:
+            parser.error(str(error))
+
+    if property_request is None and arguments.modulus_relax_times is not None:
         if arguments.analyse or arguments.protocol != "modulus":
             parser.error("--modulus-relax-times requires a new --protocol modulus scan")
         if arguments.target_strain_rate is None:
             parser.error("--modulus-relax-times requires --target-strain-rate")
-    if arguments.target_strain_rate is not None:
+    if property_request is None and arguments.target_strain_rate is not None:
         if (
             not math.isfinite(arguments.target_strain_rate)
             or arguments.target_strain_rate <= 0.0
@@ -1380,14 +1684,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.analyse:
         if arguments.target_strain_rate is not None:
             try:
-                report = analyse_modulus_rates(
+                modulus_report = analyse_modulus_rates(
                     arguments.analyse,
                     target_rate_per_ns=arguments.target_strain_rate,
                     strain_limit=arguments.elastic_strain_limit,
                 )
             except (OSError, ValueError, AnalysisError) as error:
                 parser.error(str(error))
-            _write_modulus_rate_result(arguments, report)
+            _write_modulus_rate_result(arguments, modulus_report)
             return 0
         if arguments.protocol == "modulus" and len(arguments.analyse) > 1:
             parser.error(
@@ -1402,7 +1706,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             tm_spec = _tm_spec(**_protocol_options(arguments, PROTOCOLS["tm"]))
             # Validate the complete scan before reading coordinates or creating files.
-            melting_scan(tm_spec)
+            if property_request is None:
+                melting_scan(tm_spec)
             crystal_run = _prepared_crystal(arguments)
         except (OSError, ValueError, TmError) as error:
             parser.error(str(error))
@@ -1410,6 +1715,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 "dry run: crystal and heating schedule validated; no dynamics",
                 flush=True,
+            )
+            return 0
+        if property_request is not None:
+            property_name, target, rate_spec = property_request
+            report = run_property_rate_scan(
+                crystal_run,
+                Path(arguments.output_dir or "run"),
+                property_name=property_name,
+                target_rate=target,
+                spec=rate_spec,
+                hold_times_ps=arguments.rate_hold_times,
+                n_replicas=arguments.thermal_rate_replicas,
+                max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
+                state_in=arguments.state_in,
+                crystalline=True,
+            )
+            _write_property_rate_result(
+                arguments, report, Path(arguments.output_dir or "run") / "analysis"
             )
             return 0
         result = run_tm_scan(
@@ -1433,19 +1756,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--crystal-pdb, --system-xml and --state-in require --protocol tm")
     if arguments.monomer is None:
         parser.error("a monomer SMILES is required unless --analyse is given")
-    if arguments.protocol == "breaking":
+    if property_request is None and arguments.protocol == "breaking":
         try:
             _breaking_protocol(**_protocol_options(arguments, PROTOCOLS["breaking"]))
         except (ValueError, BreakingError) as error:
             parser.error(str(error))
-    if arguments.protocol == "elongation":
+    if property_request is None and arguments.protocol == "elongation":
         try:
             _elongation_protocol(
                 **_protocol_options(arguments, PROTOCOLS["elongation"])
             )
         except (ValueError, ElongationError) as error:
             parser.error(str(error))
-    if arguments.protocol == "yield":
+    if property_request is None and arguments.protocol == "yield":
         try:
             _yield_protocol(**_protocol_options(arguments, PROTOCOLS["yield"]))
         except (ValueError, YieldError) as error:
@@ -1541,6 +1864,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         platform=cast("str | None", arguments.platform),
         seed=int(arguments.seed),
     )
+    if property_request is not None:
+        property_name, target, rate_spec = property_request
+        report = run_property_rate_scan(
+            run,
+            output,
+            property_name=property_name,
+            target_rate=target,
+            spec=rate_spec,
+            hold_times_ps=arguments.rate_hold_times,
+            n_replicas=arguments.thermal_rate_replicas,
+            max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
+            chain_backbone=chain.backbone,
+            atoms_per_chain=chain.n_atoms,
+        )
+        _write_property_rate_result(arguments, report, output / "analysis")
+        return 0
     name = cast(str, arguments.protocol)
     entry = PROTOCOLS[name]
     options = _protocol_options(arguments, entry)
