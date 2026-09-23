@@ -12,7 +12,8 @@ the run be picked up again after the queue kills it.
 
 ## Installation
 
-Python 3.12 or newer, with the dependencies from conda-forge:
+Python 3.12 or newer and OpenMM 8.3.1 or newer, with the dependencies from
+conda-forge:
 
 ```bash
 conda env create -f build_tools/environment.yml
@@ -27,6 +28,13 @@ openmmpolymer` on its own will not give you a working install.
 
 The plotting helpers build a `matplotlib.figure.Figure` directly and never
 touch `pyplot`, so they need no display and no backend.
+
+OpenMM 8.3.0 has a kinetic-pressure calculation bug and is not supported.
+CI exercises the pressure and system adapters against 8.3.1 as well as the
+current environment. Flexible-cell stress uses `computeStressTensor` when
+available, with a consistent-strain finite-difference implementation on older
+supported releases. Older isotropic and anisotropic barostats support only
+rigid molecular scaling; requesting unavailable atomic scaling is an error.
 
 ## A polyethylene melt
 
@@ -84,6 +92,30 @@ openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE -t 450 -o run -v
 ```
 
 Run it again and it picks up from the last stage that finished.
+
+Resume checks the serialized System, topology, initial coordinates, seed,
+settings and stage inputs before reusing results. Missing or changed upstream
+states invalidate their dependent stages. The CLI also records the effective
+request and dependency versions in `build_request.json` before preparing the
+cell, so changed inputs cannot overwrite an existing run's build assets.
+Use a new output directory for a different simulation. Legacy manifests remain
+readable, but cannot be resumed without provenance; the Python API can
+explicitly rerun them with `resume=False`.
+
+End caps and chain dimensions can be specified for other polymers. For example,
+an acid-terminated PLA chain needs an explicit hydroxyl cap on its carbonyl end:
+
+```bash
+openmmpolymer '[*]OC(C)C(=O)[*]' -n 20 -c 40 -r PLA \
+  --tail-cap '[*]O' --charge-method nagl --dry-run -o pla-build
+```
+
+`--head-cap` and `--tail-cap` each accept a fragment with one `[*]`. Set
+`--characteristic-ratio` to a material-appropriate C-infinity for chain growth
+and every subsequent dimension check. Structure analysis reuses the recorded
+value unless an explicit override is supplied. The build default, 7.0, is for
+polyethylene; the PLA example above demonstrates end-cap construction and does
+not calibrate PLA chain statistics.
 
 ## Finding a glass transition
 
@@ -264,6 +296,19 @@ openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol modulus -t 298 -o run -v
 ```
 
 and `--skip bulk shear` if `E` and `nu` are all you want.
+
+The bulk fit reports `standard_error_mpa`, `relative_standard_error`,
+`residual_log_volume` and `half_disagreement`. A resolved fit needs distinct
+pressure levels, a positive modulus, relative fit uncertainty below 25%,
+approximately linear response and acceptable compression/decompression
+hysteresis. This uncertainty describes the fitted ladder; replica and
+preparation variability remain separate checks.
+
+Shear samples now record `stress_estimator_version`. Older shear and shear
+relaxation results used box-entry derivatives that are not the physical stress
+in a tilted cell. Their analysis is refused, including mixtures of old and new
+chunks; rerun those measurements with the corrected estimator. Reanalysing
+their saved stress values cannot repair them.
 
 ### Reducing strain-rate bias in Young's modulus
 
@@ -1030,11 +1075,12 @@ asked for — `npt_trajectory` on the protocol, `npt_trajectory_ps` on a `TgSpec
 `unchecked` says which half was missing, because a verdict with half its
 evidence absent is not a pass.
 
-**The manifest does not know the backbone.** The backbone atom indices come
+**Record the backbone with the run.** The backbone atom indices come
 from the attachment points the caps consumed when the chain was built, and
 nothing downstream can recover them from the structure alone. The workflow
 drivers record them as `chain_backbone` in their own `*_workflow.json`; a plain
-protocol run records them nowhere. So `analyse_structure` looks for a backbone
+protocol run given `chain_backbone` records them in `manifest.chains.backbone`
+alongside the final dimensions. `analyse_structure` looks for a backbone
 in that order — given, recorded by a workflow, recorded in the manifest — and
 failing all three infers one from the bond graph as the longest shortest path
 through one chain's heavy atoms. For a linear polymer that is the backbone,
@@ -1158,6 +1204,27 @@ keeps going. Per-atom scaling is therefore refused while constraints are on.
 so handing it charges makes it say so on every run. It matters only if the
 polymer gets virtual sites — `PolymerForceField.virtual_site_residues` is where
 to look.
+
+**CHARMM cache entries include the parameter streams.** Both stream order and
+file contents are fingerprinted. Editing a stream in place or replacing it
+invalidates the entry; a missing stream is an error even if a previous result
+was cached.
+
+## Reference benchmarks
+
+[The polyethylene benchmark](benchmarks/README.md) builds independent C44H90
+melts, runs their preparation and NPT measurement, and compares density with
+the published specific volumes in Lee, Frank and Yoon,
+[Polymers 12 (2020), Table 2](https://doi.org/10.3390/polym12051059).
+The checked-in reference records conditions, sources and a fixed comparison
+tolerance. Reports include replica variation, density settling and chain
+decorrelation; insufficient sampling cannot pass the comparison.
+
+The reference uses a united-atom model, while this benchmark uses all-atom
+OpenFF. Agreement is a cross-model check, not experimental validation of every
+property. A short `--smoke` run tests the actual chemistry-to-analysis pipeline
+and always reports `smoke_only`. The full comparison requires long simulations;
+see the benchmark documentation for commands and the scope of recorded results.
 
 ## Development
 

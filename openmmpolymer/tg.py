@@ -49,6 +49,7 @@ from .protocols import (
     Stage,
     run_protocol,
     standard_melt_equilibration,
+    validate_run_inputs,
 )
 from .reporters import TrajectoryOptions
 from .simulate import RunContext, quench_temperatures, safe_timestep_fs
@@ -957,11 +958,13 @@ def _approach(
         ladder,
         [nominal_fine_schedule(spec, hold_ps=hold) for hold in holds],
         spec,
-        RunManifest.load(directory),
+        RunManifest.load(directory) if resume else None,
     )
 
     request = _request(spec, tg_approx_k)
-    record = _check_request(directory, request)
+    record = _check_request(directory, request) if resume else {}
+    if resume:
+        validate_run_inputs(run, directory)
     record["request"] = request
     _save_workflow(directory, record)
 
@@ -1265,8 +1268,10 @@ def run_tg_scan(
         expected_characteristic_ratio=expected_characteristic_ratio,
         equilibration=equilibration,
     )
+    # The coarse pass already reset a forced rerun's manifest. The fine pass
+    # must preserve it, including the waypoint it starts from.
     summary, curve, transition, schedule = _run_fine(
-        run, directory, approach, spec, resume=resume
+        run, directory, approach, spec, resume=True
     )
     coarse = approach.approximate
     temperature = (
@@ -1373,7 +1378,7 @@ def cooling_rate_series(
             spec,
             hold_ps=hold_ps,
             stem=f"{FINE_STEM}_{_rate_label(float(rate))}",
-            resume=resume,
+            resume=True,
         )
         transitions.append(transition)
     return tuple(transitions)

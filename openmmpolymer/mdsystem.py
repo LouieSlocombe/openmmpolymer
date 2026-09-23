@@ -599,7 +599,18 @@ def make_barostat(
             axes[2],
             frequency,
         )
-    barostat.setScaleMoleculesAsRigid(scale_molecules_as_rigid)
+    # OpenMM 8.3's isotropic/anisotropic barostats always translate whole
+    # molecules; only newer releases expose an atomic-scaling switch for them.
+    set_rigid = getattr(barostat, "setScaleMoleculesAsRigid", None)
+    if callable(set_rigid):
+        set_rigid(scale_molecules_as_rigid)
+    elif not scale_molecules_as_rigid:
+        raise SystemAssemblyError(
+            f"This OpenMM version cannot use scale_molecules_as_rigid=False "
+            f"with a {kind} barostat. Use rigid molecular scaling, select a "
+            "flexible barostat, or upgrade OpenMM to a release exposing "
+            "setScaleMoleculesAsRigid for this barostat."
+        )
     seed_random_stream(barostat, seed)
     return barostat
 

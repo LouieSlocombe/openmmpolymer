@@ -1,19 +1,18 @@
 """The stress tensor of a running cell, and the strain that is applied to it.
 
-OpenMM's ``State`` carries energies, forces, positions, velocities and the box,
-and no virial, so for a long time getting a stress out of it meant
-differencing the potential energy against a box strain by hand. OpenMM 8.3
-added ``Barostat.computeCurrentPressure``, which does exactly that in C++ and
-on whichever platform the Context is running on, so this module is an adapter
-rather than an implementation.
+OpenMM 8.3 added ``Barostat.computeCurrentPressure``. Its flexible-barostat
+implementation differentiates individual box entries, which is not a physical
+stress in a tilted cell. In particular, a zero tilt can incorrectly imply zero
+potential shear stress. A Cauchy stress instead differentiates energy under
+the same infinitesimal deformation of positions and every box vector.
 
-Being the barostat's own estimator matters for more than speed. It uses the
-barostat's molecule grouping and the barostat's virial convention - molecular
-when ``getScaleMoleculesAsRigid()`` is true, atomic when it is not - so the
-pressure reported here is by construction the pressure the barostat is
-equilibrating towards, rather than a second number that happens to use the
-same convention. When the two disagree, something is wrong with the run, and
-that is a check worth having.
+For a flexible barostat we use ``computeStressTensor`` where available, and
+otherwise evaluate that consistent-strain derivative here. Both paths retain
+the barostat's molecular convention: translate geometric molecular centres
+rigidly and use centre-of-mass kinetic energy, or deform individual atoms when
+``getScaleMoleculesAsRigid()`` is false. The isotropic and anisotropic readouts
+use the pressure API directly. OpenMM 8.3.1 is the minimum supported release:
+8.3.0's native kinetic pressure has an upstream mass-weighting bug.
 
 Which barostat is attached decides what can be read. An anisotropic barostat
 reports the three diagonal components, and reports all three even when one
@@ -34,6 +33,7 @@ standard error does not support it.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -46,6 +46,10 @@ log = logging.getLogger(__name__)
 #: diagonal; only the flexible one gives shear.
 TENSOR_BAROSTATS = ("anisotropic", "flexible")
 
+#: Recorded in shear stage samples so analysis can reject legacy box-entry
+#: derivatives, which cannot be corrected from averaged stress data alone.
+STRESS_ESTIMATOR_VERSION = 1.0
+
 #: Where the flexible barostat's six numbers belong in a symmetric 3x3, in the
 #: order OpenMM returns them: (XX, YY, ZZ, XY, XZ, YZ).
 _FLEXIBLE_ORDER = ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))
@@ -53,6 +57,130 @@ _FLEXIBLE_ORDER = ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))
 
 class StressError(RuntimeError):
     """A stress could not be read, or a strain could not be applied."""
+
+
+def _require_pressure_api(barostat: Any) -> None:
+    """Give a useful failure for an old OpenMM installed with --no-deps."""
+    from openmm import version
+
+    release = re.match(r"(\d+)\.(\d+)\.(\d+)", version.version)
+    unsupported = release is not None and tuple(map(int, release.groups())) < (8, 3, 1)
+    if unsupported or not callable(getattr(barostat, "computeCurrentPressure", None)):
+        raise StressError(
+            "Stress measurement requires OpenMM >= 8.3.1: earlier releases "
+            "lack computeCurrentPressure or contain a kinetic-pressure bug. "
+            "Upgrade OpenMM in this environment."
+        )
+
+
+def _current_pressure_bar(barostat: Any, context: Any) -> Any:
+    """8.3 returns bare bar values; newer wrappers attach a pressure unit."""
+    from openmm import unit
+
+    value = barostat.computeCurrentPressure(context)
+    return value.value_in_unit(unit.bar) if unit.is_quantity(value) else value
+
+
+def _strain_pressure_tensor_bar(
+    simulation: Any, barostat: Any
+) -> npt.NDArray[np.float64]:
+    """Consistent-strain pressure for releases without computeStressTensor.
+
+    Use the same 1e-3 central difference as OpenMM's native stress estimator.
+    It is large enough to resolve energy changes in mixed precision. No
+    integration or constraint projection occurs, and positions and the box
+    are restored even if an energy evaluation fails. The integration force
+    groups and the molecular kinetic convention match the native estimator.
+    """
+    from openmm import unit
+
+    context = simulation.context
+    state = context.getState(getPositions=True, getVelocities=True)
+    positions = np.asarray(
+        state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+    )
+    box = np.asarray(
+        state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer)
+    )
+    velocities = np.asarray(
+        state.getVelocities(asNumpy=True).value_in_unit(
+            unit.nanometer / unit.picosecond
+        )
+    )
+    masses = np.asarray(
+        [
+            simulation.system.getParticleMass(i).value_in_unit(unit.dalton)
+            for i in range(simulation.system.getNumParticles())
+        ]
+    )
+    rigid = barostat.getScaleMoleculesAsRigid()
+    groups = (
+        molecule_groups(simulation)
+        if rigid
+        else tuple(np.asarray([i]) for i in range(len(masses)))
+    )
+    centres = np.empty_like(positions)
+    kinetic = np.zeros((3, 3), dtype=np.float64)
+    for group in groups:
+        centres[group] = positions[group].mean(axis=0)
+        mass = float(masses[group].sum())
+        if mass > 0.0:
+            momentum = (masses[group, None] * velocities[group]).sum(axis=0)
+            kinetic += np.outer(momentum, momentum) / mass
+
+    volume = float(np.linalg.det(box))
+    force_groups = simulation.integrator.getIntegrationForceGroups()
+    delta = 1.0e-3
+    tensor = np.empty((3, 3), dtype=np.float64)
+    try:
+        for row, column in _FLEXIBLE_ORDER:
+            energies = []
+            for strain in (delta, -delta):
+                strained_box = box.copy()
+                strained_box[:, row] += strain * box[:, column]
+                # A physically equivalent reduced lattice is required by OpenMM.
+                strained_box[2] -= strained_box[1] * round(
+                    strained_box[2, 1] / strained_box[1, 1]
+                )
+                strained_box[2] -= strained_box[0] * round(
+                    strained_box[2, 0] / strained_box[0, 0]
+                )
+                strained_box[1] -= strained_box[0] * round(
+                    strained_box[1, 0] / strained_box[0, 0]
+                )
+                displaced = positions.copy()
+                displaced[:, row] += strain * centres[:, column]
+                context.setPeriodicBoxVectors(*(strained_box * unit.nanometer))
+                context.setPositions(displaced * unit.nanometer)
+                energy = context.getState(
+                    getEnergy=True, groups=force_groups
+                ).getPotentialEnergy()
+                energies.append(energy.value_in_unit(unit.kilojoule_per_mole))
+            derivative = (energies[0] - energies[1]) / (2.0 * delta)
+            value = (kinetic[row, column] - derivative) / volume * 16.605390671738468
+            tensor[row, column] = tensor[column, row] = value
+    finally:
+        context.setPeriodicBoxVectors(*state.getPeriodicBoxVectors())
+        context.setPositions(state.getPositions())
+    return tensor
+
+
+def _flexible_pressure_tensor_bar(
+    simulation: Any, barostat: Any
+) -> npt.NDArray[np.float64]:
+    """Read Cauchy stress, never the flexible box-entry pressure derivative."""
+    from openmm import unit
+
+    if not callable(getattr(barostat, "computeStressTensor", None)):
+        return _strain_pressure_tensor_bar(simulation, barostat)
+    # OpenMM returns tensile stress; this function's public convention is pressure.
+    numbers = barostat.computeStressTensor(simulation.context, True).value_in_unit(
+        unit.bar
+    )
+    tensor = np.empty((3, 3), dtype=np.float64)
+    for value, (row, column) in zip(numbers, _FLEXIBLE_ORDER, strict=True):
+        tensor[row, column] = tensor[column, row] = -float(value)
+    return tensor
 
 
 def find_barostat(simulation: Any) -> tuple[str, Any]:
@@ -95,14 +223,16 @@ def pressure_bar(simulation: Any) -> float:
         The pressure in bar. Instantaneously very noisy - see the module
         docstring.
     """
-    from openmm import unit
-
     kind, barostat = find_barostat(simulation)
-    value = barostat.computeCurrentPressure(simulation.context)
+    _require_pressure_api(barostat)
+    if kind == "flexible":
+        return float(
+            np.trace(_flexible_pressure_tensor_bar(simulation, barostat)) / 3.0
+        )
+    value = _current_pressure_bar(barostat, simulation.context)
     if kind == "isotropic":
-        return float(value.value_in_unit(unit.bar))
-    numbers = value.value_in_unit(unit.bar)
-    return float(np.mean([numbers[axis] for axis in range(3)]))
+        return float(value)
+    return float(np.mean([value[axis] for axis in range(3)]))
 
 
 def pressure_tensor_bar(simulation: Any) -> npt.NDArray[np.float64]:
@@ -126,9 +256,8 @@ def pressure_tensor_bar(simulation: Any) -> npt.NDArray[np.float64]:
             reports a single number and cannot say how it is distributed over
             the axes.
     """
-    from openmm import unit
-
     kind, barostat = find_barostat(simulation)
+    _require_pressure_api(barostat)
     if kind == "isotropic":
         raise StressError(
             "An isotropic barostat reports one pressure, not a tensor, so "
@@ -137,17 +266,12 @@ def pressure_tensor_bar(simulation: Any) -> npt.NDArray[np.float64]:
             'barostat="anisotropic" for the diagonal.'
         )
 
+    if kind == "flexible":
+        return _flexible_pressure_tensor_bar(simulation, barostat)
     tensor = np.full((3, 3), np.nan, dtype=np.float64)
-    numbers = barostat.computeCurrentPressure(simulation.context).value_in_unit(
-        unit.bar
-    )
-    if kind == "anisotropic":
-        for axis in range(3):
-            tensor[axis, axis] = float(numbers[axis])
-        return tensor
-
-    for value, (row, column) in zip(numbers, _FLEXIBLE_ORDER, strict=True):
-        tensor[row, column] = tensor[column, row] = float(value)
+    numbers = _current_pressure_bar(barostat, simulation.context)
+    for axis in range(3):
+        tensor[axis, axis] = float(numbers[axis])
     return tensor
 
 

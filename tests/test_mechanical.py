@@ -224,15 +224,20 @@ def test_the_cost_is_reported_before_anything_runs(
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("initial_resume", [True, False])
 def test_the_whole_scan_runs_and_then_resumes_without_repeating_itself(
     argon_scan_run: Any,
+    initial_resume: bool,
 ) -> None:
     """The load-bearing one: every pass, the branching, and resume."""
-    first = run_modulus_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
+    first = run_modulus_scan(
+        argon_scan_run, "run", spec=QUICK, resume=initial_resume, **QUICK_EQUILIBRATION
+    )
     manifest = json.loads(Path("run/manifest.json").read_text())
     for stem in (LOAD_STEM, BULK_STEM, SHEAR_STEM):
         assert stem in manifest["stages"]
     assert len(first.replicas) == 2
+    assert "05_npt" in manifest["stages"]
     assert first.replica_spread_mpa is not None
 
     before = Path("run/manifest.json").read_bytes()
@@ -496,6 +501,10 @@ def test_the_report_writes_a_record_and_its_figures(tmp_path: Path) -> None:
     assert record["youngs"]["modulus_mpa"] == pytest.approx(2000.0)
     assert record["poisson"]["ratio"] == pytest.approx(0.35)
     assert record["bulk"]["modulus_mpa"] == pytest.approx(2222.0)
+    assert record["bulk"]["standard_error_mpa"] == pytest.approx(0.0, abs=1e-8)
+    assert record["bulk"]["relative_standard_error"] == pytest.approx(0.0, abs=1e-8)
+    assert record["bulk"]["residual_log_volume"] == pytest.approx(0.0, abs=1e-8)
+    assert record["bulk"]["half_disagreement"] == pytest.approx(0.0, abs=1e-8)
     assert record["shear"]["modulus_mpa"] == pytest.approx(741.0)
     assert record["consistency"]["bulk_gap"] < MAX_CONSISTENCY_GAP
     assert record["consistency"]["consistent"]

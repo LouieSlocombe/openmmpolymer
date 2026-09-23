@@ -232,25 +232,8 @@ def test_new_cli_scan_reaches_rate_workflow_with_chain_provenance(
         pdb_paths=["chain.pdb"],
         backbone=(0, 1, 2),
     )
-    box = SimpleNamespace(
-        n_molecules=30,
-        topology=SimpleNamespace(getNumAtoms=lambda: 120),
-        positions_nm=[],
-    )
     prepared = object()
-    substitutes = {
-        "build_chain": chain,
-        "check_target_density": 5.0,
-        "build_polymer_forcefield": SimpleNamespace(forcefield_xml="field.xml"),
-        "distribute_conformers": [],
-        "pack_box": SimpleNamespace(packed_pdb="packed.pdb", box_nm=(5, 5, 5)),
-        "assemble_box": box,
-        "check_packing": None,
-        "prepare_box": box,
-        "prepare_run": prepared,
-    }
-    for name, value in substitutes.items():
-        monkeypatch.setattr(cli, name, lambda *args, _value=value, **kwargs: _value)
+    monkeypatch.setattr(cli, "_prepare_cli_melt", lambda *args: (chain, prepared))
     received: dict[str, Any] = {}
 
     def scan(run: Any, output_dir: Path, **kwargs: Any) -> RateReport:
@@ -266,6 +249,8 @@ def test_new_cli_scan_reaches_rate_workflow_with_chain_provenance(
                 "[*]CC[*]",
                 "--charge-method",
                 "none",
+                "--characteristic-ratio",
+                "5.5",
                 "--protocol",
                 cli._RATE_PROTOCOLS[property_name],
                 "--rate-property",
@@ -283,6 +268,7 @@ def test_new_cli_scan_reaches_rate_workflow_with_chain_provenance(
     )
     assert received["chain_backbone"] == (0, 1, 2)
     assert received["atoms_per_chain"] == 4
+    assert received["expected_characteristic_ratio"] == 5.5
     assert received["hold_times_ps"] == (50, 150, 500)
     assert received["target_rate"] == 0.1
     assert (tmp_path / "output/analysis" / f"{property_name}_rates.json").is_file()

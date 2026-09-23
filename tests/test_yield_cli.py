@@ -214,6 +214,7 @@ def test_the_scan_passes_chain_metadata_and_writes_into_its_analysis_directory(
     arguments = cli.build_parser().parse_args(
         ["[*]CC[*]", "--protocol", "yield", "-o", "tensile", "--figure-format", "svg"]
     )
+    arguments.characteristic_ratio = 5.5
     report = _report()
     calls: list[Any] = []
 
@@ -234,6 +235,11 @@ def test_the_scan_passes_chain_metadata_and_writes_into_its_analysis_directory(
     assert calls[0] == (
         "context",
         Path("tensile"),
-        {"spec": YieldSpec(), "chain_backbone": (0, 1), "atoms_per_chain": 20},
+        {
+            "spec": YieldSpec(),
+            "chain_backbone": (0, 1),
+            "atoms_per_chain": 20,
+            "expected_characteristic_ratio": 5.5,
+        },
     )
     assert calls[1] == (report, None, ("svg",))

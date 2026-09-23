@@ -17,15 +17,16 @@ interpretation is left to whoever reads it.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
 import os
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -48,6 +49,7 @@ from .simulate import (
     run_pushoff,
     run_quench,
     run_relax,
+    run_segments,
     run_shear,
 )
 
@@ -152,12 +154,24 @@ def _stage_options(stage: Stage) -> dict[str, Any]:
     actually uses.
     """
     parameters = inspect.signature(STAGE_RUNNERS[stage.kind]).parameters
+    forwarded = (
+        inspect.signature(run_segments).parameters
+        if any(
+            item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+        )
+        else {}
+    )
     defaults = {
         name: parameter.default
-        for name, parameter in parameters.items()
+        for name, parameter in {**forwarded, **parameters}.items()
         if parameter.default is not inspect.Parameter.empty
     }
-    return {**defaults, **stage.options}
+    options = {**defaults, **stage.options}
+    if stage.kind == "heat":
+        options["measure_enthalpy"] = True
+    if stage.kind == "production":
+        options["barostat"] = None if options["pressure_bar"] is None else "isotropic"
+    return options
 
 
 def _stage_duration_ps(stage: Stage) -> float:
@@ -477,6 +491,9 @@ class RunManifest:
             the whole package indexes by, so analysis of a finished run should
             be able to read it rather than infer it. None for a manifest
             written before this was recorded.
+        provenance: Versioned fingerprints of the original cell and each
+            stage's request and state dependencies. Legacy manifests without
+            this remain readable for analysis, but cannot safely be resumed.
     """
 
     protocol: str
@@ -486,6 +503,7 @@ class RunManifest:
     stages: dict[str, dict[str, Any]] = field(default_factory=dict)
     chains: dict[str, Any] | None = None
     box: dict[str, Any] | None = None
+    provenance: dict[str, Any] | None = None
 
     def save(self, run_dir: str | Path) -> str:
         """Write the manifest into *run_dir*, atomically."""
@@ -522,6 +540,269 @@ def _versions() -> dict[str, str]:
     except ImportError:  # pragma: no cover - forcefill is a hard dependency
         pass
     return versions
+
+
+def _canonical(value: Any) -> Any:
+    """Represent scientific inputs consistently in memory and in JSON."""
+    if is_dataclass(value) and not isinstance(value, type):
+        return _canonical(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _canonical(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list, np.ndarray)):
+        return [_canonical(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    # Fail closed for unsupported objects and nonfinite settings, rather than
+    # giving unrelated inputs the same uninformative string representation.
+    json.dumps(value, allow_nan=False)
+    return value
+
+
+def _digest(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _file_digest(path: str | Path) -> str:
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _run_identity(run: RunContext) -> dict[str, Any]:
+    """Fingerprint the actual cell and Hamiltonian, not just build settings."""
+    topology = run.box.topology
+    # Reporters update topology box vectors to the final cell. The immutable
+    # initial vectors used by dynamics are already in system_xml and box_nm.
+    description = {
+        "atoms": [
+            [
+                atom.name,
+                None if atom.element is None else atom.element.atomic_number,
+                atom.residue.index,
+                atom.residue.name,
+                atom.residue.chain.index,
+            ]
+            for atom in topology.atoms()
+        ],
+        "bonds": [
+            [bond[0].index, bond[1].index, str(bond.type), bond.order]
+            for bond in topology.bonds()
+        ],
+    }
+    positions = np.asarray(run.box.positions_nm, dtype="<f8")
+    return cast(
+        "dict[str, Any]",
+        _canonical(
+            {
+                "seed": run.seed,
+                "system": asdict(run.spec),
+                "system_sha256": _digest(run.system_xml.encode()),
+                "topology_sha256": _digest(
+                    json.dumps(description, sort_keys=True, allow_nan=False).encode()
+                ),
+                "positions_sha256": _digest(positions.tobytes()),
+                "positions_shape": positions.shape,
+                "box_nm": run.box.box_nm,
+                "n_molecules": run.box.n_molecules,
+                "total_mass_g_mol": run.total_mass_g_mol,
+                "precision": run.precision,
+            }
+        ),
+    )
+
+
+def _state_source(state: str | Path | None, manifest: RunManifest) -> dict[str, Any]:
+    if state is None:
+        return {"packed": True}
+    path = Path(state).resolve()
+    for name, recorded in manifest.stages.items():
+        if Path(recorded["final_state"]).resolve() == path:
+            return {"stage": name, "artifact": "final_state"}
+        for index, waypoint in enumerate(recorded.get("waypoints", ())):
+            if Path(waypoint).resolve() == path:
+                return {"stage": name, "artifact": index}
+    return {"external_state_sha256": _file_digest(path)}
+
+
+def _source_path(source: dict[str, Any], manifest: RunManifest) -> str | None:
+    parent = manifest.stages.get(source.get("stage", ""))
+    if parent is None:
+        return None
+    artifact = source["artifact"]
+    if artifact == "final_state":
+        return str(parent["final_state"])
+    waypoints = parent.get("waypoints", ())
+    return str(waypoints[artifact]) if artifact < len(waypoints) else None
+
+
+def _validate_identity(manifest: RunManifest, identity: dict[str, Any]) -> None:
+    if manifest.provenance is None:
+        raise ProtocolError(
+            "Cannot safely resume a legacy manifest without input provenance. "
+            "Use a fresh run directory or rerun with resume=False."
+        )
+    if (
+        manifest.provenance.get("version") != 1
+        or manifest.provenance.get("run") != identity
+    ):
+        raise ProtocolError(
+            "Cannot resume: starting inputs changed (system, seed, coordinates, "
+            "topology or settings). Use a fresh run directory or rerun with resume=False."
+        )
+
+
+def validate_run_inputs(run: RunContext, run_dir: str | Path) -> None:
+    """Read-only input check for workflows that save metadata before stages."""
+    manifest = RunManifest.load(run_dir)
+    if manifest is not None:
+        _validate_identity(manifest, _run_identity(run))
+
+
+def _prepare_manifest(
+    protocol: Protocol,
+    run: RunContext,
+    directory: Path,
+    *,
+    resume: bool,
+    state_in: str | Path | None,
+) -> RunManifest:
+    """Validate all requested stages before modifying any run artifacts.
+
+    Stage dependencies support prefix extensions and independent branches in
+    one manifest. Invalidating a parent also invalidates every descendant,
+    including branches absent from the current protocol invocation.
+    """
+    identity = _run_identity(run)
+    manifest = RunManifest.load(directory) if resume else None
+    if manifest is not None:
+        _validate_identity(manifest, identity)
+        if manifest.protocol != protocol.name:
+            raise ProtocolError(
+                "Cannot resume: protocol changed. Use a fresh run directory "
+                "or rerun with resume=False."
+            )
+    else:
+        manifest = RunManifest(
+            protocol=protocol.name,
+            seed=run.seed,
+            versions=_versions(),
+            system=asdict(run.spec),
+            box={
+                "n_molecules": run.box.n_molecules,
+                "atoms_per_chain": run.box.topology.getNumAtoms()
+                // run.box.n_molecules,
+                "box_nm": list(run.box.box_nm),
+            },
+            provenance={"version": 1, "run": identity, "stages": {}},
+        )
+    assert manifest.provenance is not None
+    recorded_inputs = manifest.provenance["stages"]
+    requested: dict[str, Any] = {}
+    source = _state_source(state_in, manifest)
+    for stage in protocol.stages:
+        options = _stage_options(stage)
+        options.pop("state_in", None)
+        options.pop("output_prefix", None)
+        signature = {
+            "kind": stage.kind,
+            "options": _canonical(options),
+            "input": source,
+        }
+        previous = recorded_inputs.get(stage.name)
+        if previous is not None and previous["request"] != signature:
+            raise ProtocolError(
+                f"Cannot resume stage {stage.name!r}: its settings or starting "
+                "state changed. Use a fresh run directory or rerun with resume=False."
+            )
+        requested[stage.name] = {"request": signature}
+        source = {"stage": stage.name, "artifact": "final_state"}
+
+    invalid: set[str] = set()
+    for name, recorded in manifest.stages.items():
+        provenance = recorded_inputs.get(name)
+        final = Path(recorded.get("final_state", ""))
+        if (
+            provenance is None
+            or not final.is_file()
+            or provenance.get("output_sha256") != _file_digest(final)
+        ):
+            invalid.add(name)
+            continue
+        parent = provenance["request"]["input"]
+        if "stage" in parent:
+            path = _source_path(parent, manifest)
+            if (
+                path is None
+                or not Path(path).is_file()
+                or provenance.get("input_sha256") != _file_digest(path)
+            ):
+                invalid.add(name)
+                # A consumed waypoint is an upstream output too. Recreate
+                # its producer instead of accepting the altered waypoint as
+                # a fresh input to an otherwise unchanged branch.
+                invalid.add(parent["stage"])
+    while True:
+        descendants = {
+            name
+            for name, item in recorded_inputs.items()
+            if item["request"]["input"].get("stage") in invalid
+        }
+        if descendants <= invalid:
+            break
+        invalid.update(descendants)
+    initial_parent = requested[protocol.stages[0].name]["request"]["input"].get("stage")
+    if initial_parent in invalid:
+        raise ProtocolError(
+            f"Cannot start from stale stage {initial_parent!r}. Rerun the upstream "
+            "preparation protocol first, so this branch uses a verified state."
+        )
+    for name in invalid:
+        manifest.stages.pop(name, None)
+        recorded_inputs.pop(name, None)
+    if invalid:
+        manifest.chains = None
+        log.info("Invalidated stages with stale upstream states: %s", sorted(invalid))
+    for name, item in requested.items():
+        recorded_inputs.setdefault(name, item)
+    return manifest
+
+
+BUILD_REQUEST_NAME = "build_request.json"
+
+
+def check_build_request(run_dir: str | Path, request: dict[str, Any]) -> None:
+    """Check CLI inputs before rebuilding assets in an existing run directory.
+
+    Callers pass all chemistry, packing, force-field and simulation arguments;
+    output locations and presentation-only arguments should be omitted.
+    """
+    directory = Path(run_dir)
+    path = directory / BUILD_REQUEST_NAME
+    if path.is_file():
+        if json.loads(path.read_text()) != _canonical(request):
+            raise ProtocolError(
+                "Build or simulation inputs changed; use a fresh output directory "
+                "to preserve the existing run and its build artifacts."
+            )
+    elif directory.exists() and (
+        (directory / "build").exists() or any(directory.rglob(MANIFEST_NAME))
+    ):
+        raise ProtocolError(
+            "Existing build or run artifacts lack input provenance; use a fresh "
+            "output directory to preserve them."
+        )
+
+
+def record_build_request(run_dir: str | Path, request: dict[str, Any]) -> None:
+    """Record a checked CLI request atomically, before build work starts."""
+    check_build_request(run_dir, request)
+    directory = Path(run_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    _write_atomically(
+        directory / BUILD_REQUEST_NAME,
+        json.dumps(_canonical(request), indent=2, allow_nan=False) + "\n",
+    )
 
 
 @dataclass(frozen=True)
@@ -566,8 +847,9 @@ def run_protocol(
         protocol: What to run.
         run: The run context.
         run_dir: Where everything is written.
-        resume: Skip stages the manifest records as complete and whose state
-            is still on disk. Turn this off to force a rerun.
+        resume: Skip completed stages only when their inputs and saved states
+            still match. Missing or modified states invalidate their downstream
+            stages too. Turn this off to force a rerun with changed inputs.
         state_in: A state to start the first stage from, instead of the packed
             coordinates.
         chain_backbone: Backbone atom indices within one chain, from
@@ -581,23 +863,18 @@ def run_protocol(
         What the run did.
 
     Raises:
-        ProtocolError: A stage failed.
+        ProtocolError: A stage failed, inputs changed, or a legacy manifest
+            lacks the provenance needed to resume safely.
     """
     directory = Path(run_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-
-    manifest = (RunManifest.load(directory) if resume else None) or RunManifest(
-        protocol=protocol.name, seed=run.seed
+    manifest = _prepare_manifest(
+        protocol, run, directory, resume=resume, state_in=state_in
     )
-    manifest.protocol = protocol.name
-    manifest.seed = run.seed
-    manifest.versions = _versions()
-    manifest.system = asdict(run.spec)
-    manifest.box = {
-        "n_molecules": run.box.n_molecules,
-        "atoms_per_chain": run.box.topology.getNumAtoms() // run.box.n_molecules,
-        "box_nm": list(run.box.box_nm),
-    }
+    directory.mkdir(parents=True, exist_ok=True)
+    # Persist invalidations before any runner can overwrite an upstream file.
+    # An interruption must never leave old descendants marked complete.
+    manifest.save(directory)
+    assert manifest.provenance is not None
 
     results: list[StageResult] = []
     skipped: list[str] = []
@@ -613,7 +890,10 @@ def run_protocol(
             continue
 
         log.info("Running %s (%s).", stage.name, stage.kind)
+        manifest.chains = None
         runner = STAGE_RUNNERS[stage.kind]
+        provenance = manifest.provenance["stages"][stage.name]
+        provenance["input_sha256"] = None if state is None else _file_digest(state)
         try:
             result = runner(
                 run,
@@ -632,6 +912,7 @@ def run_protocol(
         results.append(result)
         state = result.final_state
         manifest.stages[stage.name] = asdict(result)
+        provenance["output_sha256"] = _file_digest(result.final_state)
         # Saved after every stage, not at the end: the point of the manifest is
         # to survive whatever stops the run.
         manifest.save(directory)

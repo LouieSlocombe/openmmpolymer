@@ -216,6 +216,30 @@ def test_every_rate_and_replica_branches_from_one_equilibrated_state(
     assert len(report.fits) == 3
 
 
+def test_changed_hamiltonian_is_rejected_before_workflow_metadata_is_overwritten(
+    tmp_path: Path, fake_dynamics: list[dict[str, Any]], argon_run: Any
+) -> None:
+    from openmmpolymer.protocols import ProtocolError, Stage
+    from openmmpolymer.protocols import run_protocol as real_run_protocol
+
+    run_modulus_rate_scan(
+        argon_run, tmp_path, spec=SPEC, relax_ps=HOLDS, target_rate_per_ns=0.001
+    )
+    # Record real input provenance without running the expensive rate scan.
+    real_run_protocol(
+        Protocol("initial", (Stage("00_minimise", "minimise"),)),
+        argon_run,
+        tmp_path / "equilibration",
+    )
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    changed = replace(argon_run, system_xml=argon_run.system_xml + "\n")
+    with pytest.raises(ProtocolError, match="starting inputs changed"):
+        run_modulus_rate_scan(
+            changed, tmp_path, spec=SPEC, relax_ps=HOLDS, target_rate_per_ns=0.001
+        )
+    assert {path: path.read_bytes() for path in before} == before
+
+
 @pytest.mark.parametrize(
     "changed", [{"relax_ps": (50.0, 200.0, 500.0)}, {"npt_ps": 50.0}]
 )

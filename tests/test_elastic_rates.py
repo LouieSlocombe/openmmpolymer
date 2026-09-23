@@ -120,13 +120,11 @@ def test_recovers_property_log_law_and_retains_units(tmp_path: Path, name: str) 
     assert len(report.observations) == 3
     assert report.property.rate_unit == ("strain/ns" if target == 0.001 else "bar/ns")
     if name == "bulk_modulus":
-        assert all(o.standard_error is None for o in report.observations)
-        assert not report.log_linear.resolved
-    else:
-        assert report.log_linear.resolved
+        assert all(o.standard_error is not None for o in report.observations)
+    assert report.log_linear.resolved
 
 
-def test_bulk_replicas_supply_uncertainty_without_fabricating_single_fit_error(
+def test_bulk_replicas_supply_uncertainty_beyond_the_single_fit_error(
     tmp_path: Path,
 ) -> None:
     report = analyse_elastic_rates(
@@ -136,11 +134,33 @@ def test_bulk_replicas_supply_uncertainty_without_fabricating_single_fit_error(
     )
     assert report.log_linear is not None
     assert report.log_linear.resolved
-    assert all(o.standard_error is None for o in report.observations)
+    assert all(o.standard_error is not None for o in report.observations)
     assert report.log_linear.standard_errors == pytest.approx(
         [np.std([0, 5], ddof=1)] * 3
     )
     assert report.log_linear.n_rates == 3
+
+
+def test_bulk_rate_observations_carry_fit_uncertainty_and_reject_noise(
+    tmp_path: Path,
+) -> None:
+    directories = _series(tmp_path, "bulk_modulus")
+    for directory in directories:
+        path = directory / "manifest.json"
+        record = json.loads(path.read_text())
+        samples = next(iter(record["stages"].values()))["samples"]
+        density = np.asarray(samples["segment_density_g_cm3"])
+        samples["segment_density_g_cm3"] = (
+            density * np.exp([0.0, -0.4, 0.4, 0.0, 0.4, -0.4, 0.0])
+        ).tolist()
+        path.write_text(json.dumps(record))
+    report = analyse_elastic_rates(
+        directories, property_name="bulk_modulus", target_rate=10.0
+    )
+    assert all(o.standard_error is not None for o in report.observations)
+    assert all(not o.resolved for o in report.observations)
+    assert report.log_linear is not None
+    assert not report.log_linear.resolved
 
 
 @pytest.mark.parametrize("name", ("shear_modulus", "bulk_modulus", "load_modulus"))

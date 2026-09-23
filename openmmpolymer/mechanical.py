@@ -735,7 +735,7 @@ def run_modulus_scan(
     directory = Path(run_dir)
     directory.mkdir(parents=True, exist_ok=True)
     request = _request(spec)
-    record = _check_request(directory, request)
+    record = _check_request(directory, request) if resume else {}
 
     settle = equilibration_protocol(spec, **equilibration)
     schedule = deform_schedule(spec)
@@ -773,7 +773,9 @@ def run_modulus_scan(
             ),
             run,
             directory,
-            resume=resume,
+            # Preparation already reset a forced rerun's manifest. Keep all
+            # newly completed preparation and replica stages from here on.
+            resume=True,
             state_in=start_state,
             **chains,
         )
@@ -783,7 +785,7 @@ def run_modulus_scan(
             Protocol(name=PROTOCOL_NAME, stages=(stage,)),
             run,
             directory,
-            resume=resume,
+            resume=True,
             state_in=start_state,
             **chains,
         )
@@ -1144,6 +1146,10 @@ def _bulk_record(fit: BulkModulus) -> dict[str, Any]:
     return {
         "stage": fit.stage,
         "modulus_mpa": fit.modulus_mpa,
+        "standard_error_mpa": fit.standard_error_mpa,
+        "relative_standard_error": fit.relative_standard_error,
+        "residual_log_volume": fit.residual_log_volume,
+        "half_disagreement": fit.half_disagreement,
         "compression_mpa": fit.compression_mpa,
         "decompression_mpa": fit.decompression_mpa,
         "hysteresis": fit.hysteresis,

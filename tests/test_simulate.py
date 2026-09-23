@@ -965,6 +965,24 @@ def test_a_shear_past_the_reduced_form_is_refused_before_the_ladder_runs(
         )
 
 
+def test_a_shear_records_the_corrected_stress_estimator(argon_run: Any) -> None:
+    """Analysis must distinguish new physical stresses from old box derivatives."""
+    from openmmpolymer.stress import STRESS_ESTIMATOR_VERSION
+
+    minimised = run_minimise(argon_run, "min", temperature_k=120.0)
+    result = run_shear(
+        argon_run,
+        "shear",
+        temperature_k=120.0,
+        strains=(0.01, 0.02),
+        duration_ps_each=0.1,
+        samples_per_step=2,
+        state_in=minimised.final_state,
+    )
+    assert result.samples["stress_estimator_version"] == [STRESS_ESTIMATOR_VERSION]
+    assert np.isfinite(result.samples["segment_shear_stress_bar"]).all()
+
+
 def test_a_deformation_records_a_reference_cell_and_an_axis(
     argon_run: Any,
 ) -> None:

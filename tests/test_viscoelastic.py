@@ -425,6 +425,7 @@ def test_a_shear_step_records_its_plane_and_a_tensile_one_its_axis(
     tensile = run_relax(argon_run, "t", mode="tensile", step_strain=0.02, **common)
     assert "relax_plane" in shear.samples and "relax_axis" not in shear.samples
     assert "relax_axis" in tensile.samples and "relax_plane" not in tensile.samples
+    assert shear.samples["stress_estimator_version"] == [1.0]
     # A shear step measures G directly, so it divides by the strain itself.
     assert shear.samples["relax_strain_measure"][0] == pytest.approx(0.02)
 
@@ -538,7 +539,7 @@ def test_a_relaxation_run_through_the_protocol_reads_back(argon_run: Any) -> Non
 
 
 @pytest.fixture
-def scanned_argon(argon_run: Any) -> Any:
+def scanned_argon(argon_run: Any, request: pytest.FixtureRequest) -> Any:
     """A whole relaxation scan over argon, equilibration and all.
 
     Deliberately the smallest thing that exercises the driver end to end: two
@@ -565,6 +566,7 @@ def scanned_argon(argon_run: Any) -> Any:
         argon_run,
         "run",
         spec=spec,
+        resume=getattr(request, "param", True),
         melt_temperature_k=150.0,
         nvt_ps=0.5,
         compress_ps_each=0.2,
@@ -576,6 +578,7 @@ def scanned_argon(argon_run: Any) -> Any:
     )
 
 
+@pytest.mark.parametrize("scanned_argon", [True, False], indirect=True)
 def test_a_whole_scan_runs_and_reports(scanned_argon: Any) -> None:
     """Every replica branches from the equilibrated cell, and the record says
     which one."""

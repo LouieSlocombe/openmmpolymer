@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+import sys
+import tarfile
 import tomllib
 from importlib.metadata import version
 from pathlib import Path
@@ -94,6 +98,19 @@ def test_the_python_floor_matches_forcefills(project: dict[str, object]) -> None
     assert project["project"]["requires-python"] == ">=3.12"  # type: ignore[index]
 
 
+def test_openmm_floor_matches_pressure_api_and_minimum_ci(
+    project: dict[str, object],
+) -> None:
+    """8.3.1 fixes the first pressure API's kinetic bug; require that patch."""
+    dependencies = project["project"]["dependencies"]  # type: ignore[index]
+    assert "openmm>=8.3.1" in dependencies
+    environment = (PYPROJECT.parent / "build_tools" / "environment.yml").read_text()
+    assert "- openmm>=8.3.1\n" in environment
+    workflow = (PYPROJECT.parent / ".github" / "workflows" / "ci.yml").read_text()
+    assert "openmm==8.3.1" in workflow
+    assert "tests/test_stress.py" in workflow
+
+
 def test_every_pytest_marker_is_registered(project: dict[str, object]) -> None:
     """--strict-markers is on, so an unregistered marker is a collection error."""
     configured = project["tool"]["pytest"]["ini_options"]["markers"]  # type: ignore[index]
@@ -133,3 +150,58 @@ def test_the_conda_environment_covers_the_hard_dependencies() -> None:
     # packmol comes from ambertools; asking for it separately makes the
     # environment unsolvable, because conda-forge's builds of it pin numpy < 2.
     assert "\n  - packmol" not in text
+
+
+def test_source_distribution_contains_the_documented_reference_workflow(
+    tmp_path: Path,
+) -> None:
+    """Inspect a real archive: a manifest that looks right can still omit inputs."""
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in (
+        "openmmpolymer",
+        "tests",
+        "benchmarks",
+        "build_tools",
+        ".github",
+        "pyproject.toml",
+        "MANIFEST.in",
+        "README.md",
+        "LICENSE",
+    ):
+        original = PYPROJECT.parent / name
+        if original.is_dir():
+            shutil.copytree(
+                original,
+                source / name,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+        else:
+            shutil.copy2(original, source / name)
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from setuptools.build_meta import build_sdist; build_sdist('dist')",
+        ],
+        cwd=source,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    with tarfile.open(next((source / "dist").glob("*.tar.gz"))) as archive:
+        members = {name.split("/", 1)[1] for name in archive.getnames() if "/" in name}
+    assert {
+        "benchmarks/__init__.py",
+        "benchmarks/pe_melt.py",
+        "benchmarks/polyethylene.json",
+        "benchmarks/README.md",
+        "build_tools/environment.yml",
+        "tests/__init__.py",
+        "tests/helpers.py",
+        "tests/conftest.py",
+        ".github/workflows/ci.yml",
+        "openmmpolymer/py.typed",
+        "MANIFEST.in",
+    } <= members

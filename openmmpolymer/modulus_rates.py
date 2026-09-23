@@ -38,7 +38,7 @@ from .mechanical import (
     deform_schedule,
     equilibration_protocol,
 )
-from .protocols import Protocol, run_protocol
+from .protocols import Protocol, run_protocol, validate_run_inputs
 from .simulate import RunContext, safe_timestep_fs
 from .strain_rate import StrainRateExtrapolation, strain_rate_extrapolation
 from .trajectory import AnalysisError
@@ -179,6 +179,8 @@ def run_modulus_rate_scan(
             f"{directory} already contains runs without a rate workflow record; "
             "their settings cannot be verified. Use a fresh directory."
         )
+    if resume:
+        validate_run_inputs(run, directory / "equilibration")
     directory.mkdir(parents=True, exist_ok=True)
     record: dict[str, Any] = {"request": request, "run_dirs": relative_dirs}
     write_workflow(workflow, record)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,9 @@ from openmmpolymer.protocols import (
     Stage,
     _stage_duration_ps,
     chain_dimensions,
+    check_build_request,
     melt_quench,
+    record_build_request,
     run_protocol,
     standard_melt_equilibration,
 )
@@ -168,6 +171,20 @@ def test_a_resumed_run_carries_on_from_where_it_stopped(argon_run: Any) -> None:
     assert [result.name for result in resumed.results] == ["02_npt"]
 
 
+def test_explicit_forwarded_defaults_match_the_original_request(argon_run: Any) -> None:
+    run_protocol(QUICK, argon_run, "run")
+    explicit = replace(
+        QUICK.stages[1],
+        options={**QUICK.stages[1].options, "barostat_frequency": 25},
+    )
+    resumed = run_protocol(
+        replace(QUICK, stages=(QUICK.stages[0], explicit, QUICK.stages[2])),
+        argon_run,
+        "run",
+    )
+    assert resumed.results == ()
+
+
 def test_resume_can_be_turned_off(argon_run: Any) -> None:
     """Forcing a rerun has to be possible, or a changed setting is stuck."""
     run_protocol(QUICK, argon_run, "run")
@@ -181,7 +198,202 @@ def test_a_stage_whose_state_has_gone_is_run_again(argon_run: Any) -> None:
     run_protocol(QUICK, argon_run, "run")
     Path("run/01_nvt.state.xml").unlink()
     resumed = run_protocol(QUICK, argon_run, "run")
-    assert "01_nvt" in [result.name for result in resumed.results]
+    assert resumed.skipped == ("00_minimise",)
+    assert [result.name for result in resumed.results] == ["01_nvt", "02_npt"]
+
+
+def _saved_artifacts(directory: Path) -> dict[str, bytes]:
+    return {
+        str(path): path.read_bytes() for path in directory.rglob("*") if path.is_file()
+    }
+
+
+@pytest.mark.parametrize(
+    "option,value", [("temperature_k", 120.0), ("duration_ps", 3.0)]
+)
+def test_changed_stage_settings_are_rejected_without_overwriting_artifacts(
+    argon_run: Any, option: str, value: float
+) -> None:
+    run_protocol(QUICK, argon_run, "run")
+    before = _saved_artifacts(Path("run"))
+    changed = replace(
+        QUICK.stages[1], options={**QUICK.stages[1].options, option: value}
+    )
+    protocol = replace(QUICK, stages=(QUICK.stages[0], changed, QUICK.stages[2]))
+    with pytest.raises(ProtocolError, match="settings or starting state changed"):
+        run_protocol(protocol, argon_run, "run")
+    assert _saved_artifacts(Path("run")) == before
+
+
+@pytest.mark.parametrize(
+    "change", ["seed", "spec", "system", "positions", "topology", "box"]
+)
+def test_changed_initial_inputs_are_rejected_without_overwriting_the_manifest(
+    argon_run: Any, change: str
+) -> None:
+    import openmm as mm
+
+    protocol = Protocol("initial", (QUICK.stages[0],))
+    run_protocol(protocol, argon_run, "run")
+    before = _saved_artifacts(Path("run"))
+    if change == "seed":
+        argon_run = replace(argon_run, seed=99)
+    elif change == "spec":
+        argon_run = replace(
+            argon_run, spec=replace(argon_run.spec, nonbonded_cutoff_nm=0.8)
+        )
+    elif change == "system":
+        system = mm.XmlSerializer.deserialize(argon_run.system_xml)
+        system.setParticleMass(0, 41.0)
+        argon_run = replace(argon_run, system_xml=mm.XmlSerializer.serialize(system))
+    elif change == "positions":
+        positions = argon_run.box.positions_nm.copy()
+        positions[0, 0] += 0.01
+        argon_run = replace(
+            argon_run, box=replace(argon_run.box, positions_nm=positions)
+        )
+    elif change == "topology":
+        next(argon_run.box.topology.atoms()).name = "different"
+    else:
+        argon_run = replace(
+            argon_run, box=replace(argon_run.box, box_nm=(2.5, 2.4, 2.4))
+        )
+    with pytest.raises(ProtocolError, match="starting inputs changed"):
+        run_protocol(protocol, argon_run, "run")
+    assert _saved_artifacts(Path("run")) == before
+
+
+def test_changing_protocol_name_or_stage_order_cannot_reuse_old_results(
+    argon_run: Any,
+) -> None:
+    run_protocol(QUICK, argon_run, "run")
+    before = _saved_artifacts(Path("run"))
+    for changed in (
+        replace(QUICK, name="other"),
+        replace(QUICK, stages=tuple(reversed(QUICK.stages))),
+    ):
+        with pytest.raises(ProtocolError, match="Cannot resume"):
+            run_protocol(changed, argon_run, "run")
+        assert _saved_artifacts(Path("run")) == before
+
+
+def test_external_starting_state_is_checked_by_content(argon_run: Any) -> None:
+    initial = run_protocol(
+        Protocol("prepare", (QUICK.stages[0],)), argon_run, "prepare"
+    )
+    protocol = Protocol("branch", (QUICK.stages[1],))
+    run_protocol(protocol, argon_run, "branch", state_in=initial.final_state)
+    before = _saved_artifacts(Path("branch"))
+    path = Path(initial.final_state)
+    path.write_text(path.read_text() + "\n")
+    with pytest.raises(ProtocolError, match="starting state changed"):
+        run_protocol(protocol, argon_run, "branch", state_in=initial.final_state)
+    assert _saved_artifacts(Path("branch")) == before
+
+
+def test_altered_completed_state_reruns_its_descendants(argon_run: Any) -> None:
+    run_protocol(QUICK, argon_run, "run")
+    path = Path("run/01_nvt.state.xml")
+    path.write_text(path.read_text() + "\n")
+    resumed = run_protocol(QUICK, argon_run, "run")
+    assert resumed.skipped == ("00_minimise",)
+    assert [result.name for result in resumed.results] == ["01_nvt", "02_npt"]
+
+
+def test_separate_branches_resume_and_upstream_reruns_invalidate_all_branches(
+    argon_run: Any,
+) -> None:
+    prepare = Protocol("quick", QUICK.stages[:2])
+    initial = run_protocol(prepare, argon_run, "run")
+    branches = [
+        Protocol("quick", (replace(QUICK.stages[2], name=name),))
+        for name in ("branch_a", "branch_b")
+    ]
+    for protocol in branches:
+        run_protocol(protocol, argon_run, "run", state_in=initial.final_state)
+    for protocol in branches:
+        resumed = run_protocol(protocol, argon_run, "run", state_in=initial.final_state)
+        assert resumed.skipped == (protocol.stages[0].name,)
+    Path(initial.final_state).unlink()
+    repaired = run_protocol(prepare, argon_run, "run")
+    manifest = RunManifest.load("run")
+    assert manifest is not None
+    assert set(manifest.stages) == {"00_minimise", "01_nvt"}
+    for protocol in branches:
+        resumed = run_protocol(
+            protocol, argon_run, "run", state_in=repaired.final_state
+        )
+        assert resumed.skipped == ()
+
+
+def test_branch_only_resume_cannot_start_from_an_invalidated_parent(
+    argon_run: Any,
+) -> None:
+    prepare = Protocol("quick", QUICK.stages[:2])
+    initial = run_protocol(prepare, argon_run, "run")
+    branch = Protocol("quick", QUICK.stages[2:])
+    run_protocol(branch, argon_run, "run", state_in=initial.final_state)
+    path = Path(initial.final_state)
+    path.write_text(path.read_text() + "\n")
+    before = _saved_artifacts(Path("run"))
+    with pytest.raises(ProtocolError, match="upstream preparation"):
+        run_protocol(branch, argon_run, "run", state_in=initial.final_state)
+    assert _saved_artifacts(Path("run")) == before
+
+
+def test_invalidated_descendants_stay_invalid_when_upstream_rerun_fails(
+    argon_run: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from functools import wraps
+
+    run_protocol(QUICK, argon_run, "run")
+    Path("run/01_nvt.state.xml").unlink()
+
+    @wraps(STAGE_RUNNERS["nvt"])
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("interrupted")
+
+    monkeypatch.setitem(STAGE_RUNNERS, "nvt", fail)
+    with pytest.raises(ProtocolError, match="interrupted"):
+        run_protocol(QUICK, argon_run, "run")
+    manifest = RunManifest.load("run")
+    assert manifest is not None
+    assert set(manifest.stages) == {"00_minimise"}
+
+
+def test_legacy_manifest_is_readable_but_requires_explicit_rerun(
+    argon_run: Any,
+) -> None:
+    run_protocol(QUICK, argon_run, "run")
+    path = Path("run/manifest.json")
+    data = json.loads(path.read_text())
+    data.pop("provenance")
+    path.write_text(json.dumps(data))
+    before = _saved_artifacts(Path("run"))
+    assert RunManifest.load("run") is not None
+    with pytest.raises(ProtocolError, match="legacy manifest"):
+        run_protocol(QUICK, argon_run, "run")
+    assert _saved_artifacts(Path("run")) == before
+    assert run_protocol(QUICK, argon_run, "run", resume=False).skipped == ()
+
+
+def test_build_request_guards_assets_before_cli_rebuilds(tmp_path: Path) -> None:
+    request = {"monomer": "[*]CC[*]", "caps": ("H", "H"), "seed": 7}
+    record_build_request(tmp_path, request)
+    (tmp_path / "build").mkdir()
+    asset = tmp_path / "build/chain.pdb"
+    asset.write_text("original build")
+    check_build_request(tmp_path, {**request, "caps": ["H", "H"]})
+    before = _saved_artifacts(tmp_path)
+    with pytest.raises(ProtocolError, match="inputs changed"):
+        record_build_request(tmp_path, {**request, "seed": 8})
+    assert _saved_artifacts(tmp_path) == before
+
+
+def test_build_request_rejects_unverified_existing_artifacts(tmp_path: Path) -> None:
+    (tmp_path / "build").mkdir()
+    with pytest.raises(ProtocolError, match="lack input provenance"):
+        check_build_request(tmp_path, {"seed": 7})
 
 
 def test_a_failing_stage_leaves_the_manifest_behind(argon_run: Any) -> None:
@@ -298,8 +510,7 @@ def test_the_manifest_records_what_was_in_the_cell(argon_run: Any) -> None:
 def test_a_manifest_written_before_the_cell_was_recorded_still_loads(
     tmp_path: Path,
 ) -> None:
-    """RunManifest.load passes every key through as a keyword argument, so a
-    new field has to be optional or every run already on disk stops resuming."""
+    """New provenance fields must not prevent analysis of old manifests."""
     (tmp_path / "manifest.json").write_text(
         json.dumps(
             {

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -106,6 +109,100 @@ def test_the_cache_key_is_stable_across_calls(charged_chain: Any) -> None:
     assert cache_key(charged_chain.sdf_paths[0], options) == cache_key(
         charged_chain.sdf_paths[0], options
     )
+
+
+@pytest.fixture
+def recorded_charmm_builds(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
+    """Record stream loading without running an unrelated parameterisation."""
+    builds: list[tuple[str, ...]] = []
+
+    def build(ligands: dict[str, Any], output: str, **kwargs: Any) -> Any:
+        streams = next(iter(ligands.values())).charmm_files
+        contents = tuple(Path(path).read_text() for path in streams)
+        builds.append(contents)
+        Path(output).write_text("\n".join(contents))
+        return SimpleNamespace(forcefield_xml=output)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "forcefill",
+        SimpleNamespace(
+            __version__="test",
+            LigandSpec=lambda **kwargs: SimpleNamespace(**kwargs),
+            build_ligand_xml=build,
+            residue_templates_with_virtual_sites=lambda path: (),
+        ),
+    )
+    monkeypatch.setattr(
+        "openmmpolymer.forcefield._molecule_fingerprint", lambda path: ("CC", (0.0,))
+    )
+    return builds
+
+
+def test_charmm_cache_tracks_stream_contents_paths_and_order(
+    tmp_path: Path, recorded_charmm_builds: list[tuple[str, ...]]
+) -> None:
+    """An in-place edit must not silently retain the previous parameters."""
+    first, second = tmp_path / "first.str", tmp_path / "second.str"
+    first.write_text("parameters A")
+    second.write_text("parameters B")
+    options: dict[str, Any] = {
+        "backend": "charmm",
+        "cache_dir": tmp_path / "cache",
+        "charmm_files": [first, second],
+    }
+
+    def build() -> PolymerForceField:
+        return build_polymer_forcefield(
+            "chain.sdf", tmp_path / "polymer.xml", **options
+        )
+
+    assert not build().cached
+    assert build().cached
+    first.write_text("parameters A edited")
+    edited = build()
+    assert not edited.cached
+    assert (
+        Path(edited.forcefield_xml).read_text() == "parameters A edited\nparameters B"
+    )
+    assert build().cached
+    options["charmm_files"] = [second, first]
+    assert not build().cached
+    options["charmm_files"] = [second]
+    assert not build().cached
+    options["charmm_files"] = [first]
+    assert not build().cached
+    assert len(recorded_charmm_builds) == 5
+    records = [
+        json.loads(path.read_text()) for path in (tmp_path / "cache").glob("*.json")
+    ]
+    assert any(
+        record["charmm_files"]
+        == [
+            {
+                "path": str(first),
+                "sha256": hashlib.sha256(first.read_bytes()).hexdigest(),
+            }
+        ]
+        for record in records
+    )
+
+
+def test_charmm_cache_does_not_hide_a_missing_parameter_stream(
+    tmp_path: Path, recorded_charmm_builds: list[tuple[str, ...]]
+) -> None:
+    stream = tmp_path / "parameters.str"
+    stream.write_text("parameters")
+    options: dict[str, Any] = {
+        "backend": "charmm",
+        "cache_dir": tmp_path / "cache",
+        "charmm_files": [stream],
+    }
+    build_polymer_forcefield("chain.sdf", tmp_path / "polymer.xml", **options)
+    stream.unlink()
+    with pytest.raises(ForceFieldError, match="Cannot read CHARMM parameter stream"):
+        build_polymer_forcefield("chain.sdf", tmp_path / "polymer.xml", **options)
+    assert len(recorded_charmm_builds) == 1
 
 
 @pytest.mark.forcefield

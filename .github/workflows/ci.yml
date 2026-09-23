@@ -90,6 +90,36 @@ jobs:
           name: coverage-py${{ matrix.python }}
           path: coverage.xml
 
+  minimum-openmm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OPENMM_CPU_THREADS: "1"
+      MPLCONFIGDIR: /tmp/openmmpolymer-mpl
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      # This pressure/strain contract needs no parameterisation backend. Test
+      # the actual API floor separately from the latest conda-forge stack.
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install the minimum OpenMM and test dependencies
+        run: >
+          python -m pip install "openmm==8.3.1" numpy rdkit matplotlib
+          pytest pytest-cov "setuptools>=84.0.0"
+
+      - name: Install the package without the force-field stack
+        run: python -m pip install -e . --no-deps
+
+      - name: Test the pressure and system APIs at the declared minimum
+        run: >
+          python -m pytest tests/test_stress.py tests/test_mdsystem.py
+          tests/test_simulate.py tests/test_package_metadata.py --no-cov
+
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30

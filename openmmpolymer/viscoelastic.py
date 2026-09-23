@@ -747,7 +747,7 @@ def run_relaxation_scan(
     directory = Path(run_dir)
     directory.mkdir(parents=True, exist_ok=True)
     request = _request(spec)
-    record = _check_request(directory, request)
+    record = _check_request(directory, request) if resume else {}
 
     settle = equilibration_protocol(spec, **equilibration)
     schedule = relax_schedule(spec)
@@ -783,7 +783,8 @@ def run_relaxation_scan(
                 ),
                 run,
                 directory,
-                resume=resume,
+                # Only preparation resets the manifest for a forced rerun.
+                resume=True,
                 state_in=start_state,
                 **chains,
             )

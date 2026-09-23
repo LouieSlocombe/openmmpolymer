@@ -18,11 +18,16 @@ accepts, and a test checks those names against the factories themselves.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
+import shutil
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from contextlib import ExitStack
+from dataclasses import asdict, dataclass, replace
+from importlib.metadata import version
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, cast
 
 from .breaking import (
@@ -34,7 +39,7 @@ from .breaking import (
     run_breaking_scan,
     write_breaking_report,
 )
-from .chain import ChainSpec, build_chain
+from .chain import ChainResult, ChainSpec, build_chain
 from .charges import CHARGE_METHODS, assign_charges
 from .convergence import DEFAULT_WINDOW_FRACTIONS, analyse_convergence
 from .convergence_report import write_convergence_report
@@ -86,7 +91,18 @@ from .property_rates import (
     run_property_rate_scan,
     validate_property_rate_scan,
 )
-from .protocols import Protocol, melt_quench, run_protocol, standard_melt_equilibration
+from .protocols import (
+    Protocol,
+    ProtocolError,
+    _file_digest,
+    _run_identity,
+    _write_atomically,
+    melt_quench,
+    record_build_request,
+    run_protocol,
+    standard_melt_equilibration,
+    validate_run_inputs,
+)
 from .rate_dependence import RateReport
 from .rate_reports import write_rate_report
 from .relaxation import relax_stages
@@ -716,6 +732,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="residue name, at most three characters (default: %(default)s)",
     )
     parser.add_argument(
+        "--head-cap",
+        help="head end-cap SMILES with one [*] attachment point",
+    )
+    parser.add_argument(
+        "--tail-cap",
+        help="tail end-cap SMILES with one [*] attachment point, e.g. '[*]O' for PLA",
+    )
+    parser.add_argument(
+        "--characteristic-ratio",
+        type=_positive_float,
+        help="polymer C-infinity used for chain growth and dimension checks "
+        "(default: 7.0 for building; recorded value for analysis)",
+    )
+    parser.add_argument(
         "-t",
         "--temperature",
         type=float,
@@ -1323,6 +1353,26 @@ def _ints(text: str) -> tuple[int, ...]:
     return values
 
 
+def _positive_float(text: str) -> float:
+    """An explicitly finite, positive numeric command-line value."""
+    try:
+        value = float(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive finite number") from error
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return value
+
+
+def _build_characteristic_ratio(arguments: argparse.Namespace) -> float:
+    """Keep the polyethylene build default separate from recorded analysis values."""
+    return (
+        7.0
+        if arguments.characteristic_ratio is None
+        else float(arguments.characteristic_ratio)
+    )
+
+
 def _positive_int(text: str) -> int:
     """Parse a count that has to be at least one, at the front door."""
     try:
@@ -1530,6 +1580,169 @@ def _analyse_convergence(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _build_cli_melt(
+    arguments: argparse.Namespace, build_dir: Path, cache_dir: Path
+) -> tuple[ChainResult, RunContext]:
+    """Prepare and validate a physical cell without starting dynamics."""
+    n_chains = int(arguments.chains)
+    n_conformers = min(int(arguments.conformers or n_chains), n_chains)
+    chain = build_chain(
+        ChainSpec(
+            monomer_smiles=cast(str, arguments.monomer),
+            degree_of_polymerization=int(arguments.degree_of_polymerization),
+            residue_name=cast(str, arguments.residue_name),
+            tacticity=cast(str, arguments.tacticity),
+            head_cap=cast("str | None", arguments.head_cap),
+            tail_cap=cast("str | None", arguments.tail_cap),
+            characteristic_ratio=_build_characteristic_ratio(arguments),
+            seed=int(arguments.seed),
+        ),
+        "chain",
+        n_conformers=n_conformers,
+        output_dir=build_dir,
+    )
+    print(
+        f"chain: {chain.n_atoms} atoms, {chain.molar_mass_g_mol:.1f} g/mol, "
+        f"{chain.embedder} embedder",
+        flush=True,
+    )
+
+    spec = SystemSpec()
+    edge = check_target_density(
+        [n_chains],
+        [chain.molar_mass_g_mol],
+        float(arguments.target_density),
+        spec,
+    )
+    print(
+        f"cell: {edge:.2f} nm at {arguments.target_density} g/cm3 once compressed",
+        flush=True,
+    )
+
+    if arguments.charge_method != "none":
+        assign_charges(chain.sdf_paths[0], cast(str, arguments.charge_method))
+    forcefield = build_polymer_forcefield(
+        chain.sdf_paths[0],
+        build_dir / "polymer_ff.xml",
+        residue_name=cast(str, arguments.residue_name),
+        backend=cast(str, arguments.backend),
+        cache_dir=cache_dir,
+        workdir=build_dir / "forcefill",
+    )
+    print(f"force field: {forcefield.forcefield_xml}", flush=True)
+
+    components = distribute_conformers(list(chain.pdb_paths), n_chains)
+    packed = pack_box(
+        components,
+        box_edge_nm(
+            [n_chains], [chain.molar_mass_g_mol], float(arguments.pack_density)
+        ),
+        build_dir / "packed.pdb",
+        seed=int(arguments.seed),
+        workdir=build_dir,
+    )
+    box = assemble_box(components, packed.packed_pdb, packed.box_nm)
+    check_packing(box.topology, box.positions_nm)
+    print(
+        f"packed: {box.n_molecules} chains, {box.topology.getNumAtoms()} atoms",
+        flush=True,
+    )
+
+    run = prepare_run(
+        prepare_box(box, forcefield),
+        forcefield,
+        spec,
+        platform=cast("str | None", arguments.platform),
+        seed=int(arguments.seed),
+    )
+    return chain, run
+
+
+def _prepare_cli_melt(
+    arguments: argparse.Namespace, output: Path
+) -> tuple[ChainResult, RunContext]:
+    """Stage repeat preparations so failed validation cannot alter old assets."""
+    build = output / "build"
+    record_path = build / "inputs.json"
+    previous = json.loads(record_path.read_text()) if record_path.is_file() else None
+    if previous is not None:
+        for name, digest in previous["artifacts"].items():
+            path = build / name
+            if not path.is_file() or _file_digest(path) != digest:
+                raise ProtocolError(
+                    f"Existing build artifact {name!r} changed or is missing. "
+                    "Restore it or use a fresh output directory."
+                )
+    repeated = build.exists()
+    with ExitStack() as stack:
+        if repeated:
+            temporary = Path(
+                stack.enter_context(
+                    TemporaryDirectory(prefix=".build-check-", dir=output)
+                )
+            )
+            working = temporary / "build"
+            cache = temporary / "cache"
+            if (output / "cache").is_dir():
+                shutil.copytree(output / "cache", cache)
+        else:
+            working = build
+            cache = output / "cache"
+        chain, run = _build_cli_melt(arguments, working, cache)
+        inputs = {
+            "run": _run_identity(run),
+            "chain": {
+                key: value
+                for key, value in asdict(chain).items()
+                if key not in {"sdf_paths", "pdb_paths"}
+            },
+        }
+        # JSON normalization makes tuple-valued chain metadata comparable.
+        inputs = json.loads(json.dumps(inputs, allow_nan=False))
+        if repeated and (previous is None or previous["inputs"] != inputs):
+            raise ProtocolError(
+                "Prepared chemistry, force field or packed coordinates changed, "
+                "or the existing build lacks verified inputs. The original build "
+                "was preserved; use a fresh output directory."
+            )
+        for directory in (output, output / "equilibration"):
+            validate_run_inputs(run, directory)
+        if not repeated:
+            artifacts = [
+                *chain.sdf_paths,
+                *chain.pdb_paths,
+                run.forcefield.forcefield_xml,
+                str(working / "packed.pdb"),
+            ]
+            record = {
+                "inputs": inputs,
+                "artifacts": {
+                    str(
+                        Path(path).resolve().relative_to(working.resolve())
+                    ): _file_digest(path)
+                    for path in artifacts
+                },
+            }
+            _write_atomically(record_path, json.dumps(record, indent=2) + "\n")
+        else:
+            # Everything needed for dynamics is now in memory. Returned file
+            # references point at the verified persistent originals.
+            chain = replace(
+                chain,
+                sdf_paths=tuple(
+                    str(build / Path(path).name) for path in chain.sdf_paths
+                ),
+                pdb_paths=tuple(
+                    str(build / Path(path).name) for path in chain.pdb_paths
+                ),
+            )
+            run.forcefield = replace(
+                run.forcefield,
+                forcefield_xml=str(build / Path(run.forcefield.forcefield_xml).name),
+            )
+        return chain, run
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line interface.
 
@@ -1714,80 +1927,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     output = Path(cast("str | None", arguments.output_dir) or "run")
-    output.mkdir(parents=True, exist_ok=True)
     n_chains = int(arguments.chains)
     n_conformers = min(int(arguments.conformers or n_chains), n_chains)
+    # Guard the preparation too: rebuilding into a completed run can overwrite
+    # its chemistry before the dynamics runner has a chance to reject resume.
+    request = {
+        key: value
+        for key, value in vars(arguments).items()
+        if key
+        not in {
+            "output_dir",
+            "platform",
+            "dry_run",
+            "verbose",
+            "no_figures",
+            "figure_format",
+            "max_total_ns",
+        }
+    }
+    request["conformers"] = n_conformers
+    request["characteristic_ratio"] = _build_characteristic_ratio(arguments)
+    request["runtime_versions"] = {
+        package: version(package)
+        for package in ("openmm", "rdkit", "forcefill", "openff-toolkit", "numpy")
+    }
+    try:
+        record_build_request(output, request)
+    except ProtocolError as error:
+        parser.error(str(error))
+    output.mkdir(parents=True, exist_ok=True)
 
-    chain = build_chain(
-        ChainSpec(
-            monomer_smiles=cast(str, arguments.monomer),
-            degree_of_polymerization=int(arguments.degree_of_polymerization),
-            residue_name=cast(str, arguments.residue_name),
-            tacticity=cast(str, arguments.tacticity),
-            seed=int(arguments.seed),
-        ),
-        "chain",
-        n_conformers=n_conformers,
-        output_dir=output / "build",
-    )
-    print(
-        f"chain: {chain.n_atoms} atoms, {chain.molar_mass_g_mol:.1f} g/mol, "
-        f"{chain.embedder} embedder",
-        flush=True,
-    )
-
-    spec = SystemSpec()
-    edge = check_target_density(
-        [n_chains],
-        [chain.molar_mass_g_mol],
-        float(arguments.target_density),
-        spec,
-    )
-    print(
-        f"cell: {edge:.2f} nm at {arguments.target_density} g/cm3 once compressed",
-        flush=True,
-    )
-
-    if arguments.charge_method != "none":
-        assign_charges(chain.sdf_paths[0], cast(str, arguments.charge_method))
-    forcefield = build_polymer_forcefield(
-        chain.sdf_paths[0],
-        output / "build" / "polymer_ff.xml",
-        residue_name=cast(str, arguments.residue_name),
-        backend=cast(str, arguments.backend),
-        cache_dir=output / "cache",
-        workdir=output / "build" / "forcefill",
-    )
-    print(f"force field: {forcefield.forcefield_xml}", flush=True)
-
-    components = distribute_conformers(list(chain.pdb_paths), n_chains)
-    packed = pack_box(
-        components,
-        box_edge_nm(
-            [n_chains], [chain.molar_mass_g_mol], float(arguments.pack_density)
-        ),
-        output / "build" / "packed.pdb",
-        seed=int(arguments.seed),
-        workdir=output / "build",
-    )
-    box = assemble_box(components, packed.packed_pdb, packed.box_nm)
-    check_packing(box.topology, box.positions_nm)
-    print(
-        f"packed: {box.n_molecules} chains, {box.topology.getNumAtoms()} atoms",
-        flush=True,
-    )
-
+    try:
+        chain, run = _prepare_cli_melt(arguments, output)
+    except ProtocolError as error:
+        parser.error(str(error))
     if arguments.dry_run:
         print("dry run: stopping before dynamics", flush=True)
         return 0
 
-    run = prepare_run(
-        prepare_box(box, forcefield),
-        forcefield,
-        spec,
-        platform=cast("str | None", arguments.platform),
-        seed=int(arguments.seed),
-    )
     if property_request is not None:
         property_name, target, rate_spec = property_request
         report = run_property_rate_scan(
@@ -1801,6 +1978,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
             chain_backbone=chain.backbone,
             atoms_per_chain=chain.n_atoms,
+            expected_characteristic_ratio=_build_characteristic_ratio(arguments),
         )
         _write_property_rate_result(arguments, report, output / "analysis")
         return 0
@@ -1826,7 +2004,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output,
         chain_backbone=chain.backbone,
         atoms_per_chain=chain.n_atoms,
-        expected_characteristic_ratio=7.0,
+        expected_characteristic_ratio=_build_characteristic_ratio(arguments),
     )
     print(
         f"{summary.protocol}: {len(summary.results)} stages in "
@@ -2001,6 +2179,7 @@ def _run_tg_scan(
         "tg_approx_k": arguments.tg_approx,
         "chain_backbone": chain.backbone,
         "atoms_per_chain": chain.n_atoms,
+        "expected_characteristic_ratio": _build_characteristic_ratio(arguments),
     }
     rates = cast("tuple[float, ...] | None", arguments.cooling_rates)
     if rates is None:
@@ -2069,6 +2248,7 @@ def _run_modulus_scan(
             spec=_modulus_spec(**options),
             chain_backbone=chain.backbone,
             atoms_per_chain=chain.n_atoms,
+            expected_characteristic_ratio=_build_characteristic_ratio(arguments),
         )
         _write_modulus_rate_result(arguments, report, output / "analysis")
         return 0
@@ -2078,6 +2258,7 @@ def _run_modulus_scan(
         spec=_modulus_spec(**options),
         chain_backbone=chain.backbone,
         atoms_per_chain=chain.n_atoms,
+        expected_characteristic_ratio=_build_characteristic_ratio(arguments),
     )
     for line in _modulus_lines(result):
         print(line, flush=True)
@@ -2153,7 +2334,8 @@ def _additional_modulus_lines(result: Any) -> list[str]:
     for label, fit in (("K", result.bulk), ("G", result.shear)):
         if fit is not None:
             lines.append(
-                f"{label} = {fit.modulus_mpa:.0f} MPa"
+                f"{label} = {fit.modulus_mpa:.0f} +/- "
+                f"{fit.standard_error_mpa:.2g} MPa (fit SE)"
                 f"{'' if fit.resolved else ' (not resolved)'}"
             )
     if result.load_modulus is not None:
@@ -2259,6 +2441,7 @@ def _run_breaking_scan(
         spec=_breaking_spec(**options),
         chain_backbone=chain.backbone,
         atoms_per_chain=chain.n_atoms,
+        expected_characteristic_ratio=_build_characteristic_ratio(arguments),
     )
     _write_breaking_result(arguments, report)
     return 0
@@ -2327,6 +2510,7 @@ def _run_elongation_scan(
         spec=_elongation_spec(**options),
         chain_backbone=chain.backbone,
         atoms_per_chain=chain.n_atoms,
+        expected_characteristic_ratio=_build_characteristic_ratio(arguments),
     )
     _write_elongation_result(arguments, report)
     return 0
@@ -2390,6 +2574,7 @@ def _run_yield_scan(
         spec=_yield_spec(**options),
         chain_backbone=chain.backbone,
         atoms_per_chain=chain.n_atoms,
+        expected_characteristic_ratio=_build_characteristic_ratio(arguments),
     )
     _write_yield_result(arguments, report)
     return 0
@@ -2409,6 +2594,7 @@ def _run_relaxation_scan(
         spec=_relaxation_spec(**options),
         chain_backbone=chain.backbone,
         atoms_per_chain=chain.n_atoms,
+        expected_characteristic_ratio=_build_characteristic_ratio(arguments),
     )
     for line in _relaxation_lines(result):
         print(line, flush=True)
@@ -2577,6 +2763,7 @@ def _analyse_structure(arguments: argparse.Namespace, run_dir: Path) -> None:
         run_dir,
         stage=arguments.structure_stage,
         backbone=arguments.backbone,
+        expected_characteristic_ratio=arguments.characteristic_ratio,
         stride=int(arguments.stride),
     )
     for line in _structure_lines(report):

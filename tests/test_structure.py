@@ -165,6 +165,21 @@ def test_a_backbone_given_is_the_backbone_used(tmp_path: Path) -> None:
     assert report.backbone_file is None
 
 
+@pytest.mark.parametrize("override", [None, 7.0])
+def test_analysis_uses_saved_polymer_dimensions_unless_overridden(
+    tmp_path: Path, override: float | None
+) -> None:
+    write_polymer_snapshot(tmp_path)
+    path = tmp_path / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["chains"] = {"expected_characteristic_ratio": 5.5}
+    path.write_text(json.dumps(manifest))
+    report = analyse_structure(tmp_path, expected_characteristic_ratio=override)
+    assert report.conformation is not None
+    expected = 5.5 if override is None else override
+    assert report.conformation.mean.expected_characteristic_ratio == expected
+
+
 def test_a_workflow_record_supplies_the_backbone(tmp_path: Path) -> None:
     """The scans write chain_backbone beside the manifest; it is read back."""
     write_polymer_snapshot(tmp_path)

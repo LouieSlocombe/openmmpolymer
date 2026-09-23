@@ -222,8 +222,16 @@ class BulkModulus:
             measurement.
         n_points: Points in the whole fit.
         temperature_k: The temperature it was held at.
-        resolved: A positive modulus, enough points, and a hysteresis below
-            :data:`MAX_BULK_HYSTERESIS`.
+        resolved: A positive modulus, enough points at at least three distinct
+            pressures, a supported linear slope, and acceptable hysteresis.
+        standard_error_mpa: First-order propagation of the fitted log-volume
+            slope's standard error through ``K = -0.1 / slope``. This measures
+            ladder-fit uncertainty, not independent-replica or equilibration
+            uncertainty. It is unreliable for an unresolved slope near zero.
+        residual_log_volume: Root-mean-square residual in log volume.
+        half_disagreement: Relative disagreement of slopes in the lower and
+            upper pressure ranges, averaging repeated pressures first. Zero
+            when fewer than four distinct pressures cannot support this check.
     """
 
     stage: str
@@ -236,6 +244,16 @@ class BulkModulus:
     n_points: int
     temperature_k: float
     resolved: bool
+    standard_error_mpa: float = math.inf
+    residual_log_volume: float = math.nan
+    half_disagreement: float = math.inf
+
+    @property
+    def relative_standard_error(self) -> float:
+        """The propagated standard error as a fraction of the modulus."""
+        if not math.isfinite(self.modulus_mpa) or abs(self.modulus_mpa) < _TINY:
+            return math.inf
+        return abs(self.standard_error_mpa / self.modulus_mpa)
 
 
 @dataclass(frozen=True)
@@ -407,6 +425,22 @@ def _gather(
         if mean is not None:
             temperatures.append(float(mean))
     return merged, float(np.mean(temperatures)) if temperatures else math.nan
+
+
+def _require_stress_estimator(
+    samples: dict[str, list[float]], names: Sequence[str]
+) -> None:
+    """Require a current stress estimator tag on every gathered shear stage."""
+    from .stress import STRESS_ESTIMATOR_VERSION
+
+    versions = samples.get("stress_estimator_version", [])
+    if len(versions) != len(names) or any(
+        version != STRESS_ESTIMATOR_VERSION for version in versions
+    ):
+        raise AnalysisError(
+            "Shear stress has an obsolete or unidentified estimator version; "
+            "rerun the shear stages with the current stress estimator."
+        )
 
 
 def _strain_rate_per_ns(
@@ -751,7 +785,9 @@ def bulk_modulus(
         min_points: Fewest rungs a fit may rest on.
 
     Returns:
-        The fit.
+        The fit, with the log-volume slope uncertainty propagated to the
+        modulus. Repeated replicas are still needed to assess variability
+        between independently prepared cells.
 
     Raises:
         AnalysisError: There is nothing there to read.
@@ -762,24 +798,38 @@ def bulk_modulus(
         else ((stage,) if isinstance(stage, str) else tuple(stage))
     )
     samples, temperature = _gather(run_dir, names)
-    pressure = np.asarray(samples["segment_pressure_bar"], dtype=np.float64)
-    density = np.asarray(samples["segment_density_g_cm3"], dtype=np.float64)
-    if density.size != pressure.size or np.any(density <= 0.0):
+    pressure = np.asarray(samples.get("segment_pressure_bar", []), dtype=np.float64)
+    density = np.asarray(samples.get("segment_density_g_cm3", []), dtype=np.float64)
+    if (
+        pressure.size == 0
+        or density.size != pressure.size
+        or not np.all(np.isfinite(pressure))
+        or not np.all(np.isfinite(density))
+        or np.any(density <= 0.0)
+    ):
         raise AnalysisError(
             f"{', '.join(names)} recorded {pressure.size} pressures and "
-            f"{density.size} usable densities, which cannot be paired."
+            f"{density.size} densities; paired finite pressures and positive "
+            "finite densities are required."
         )
     # Volume in arbitrary units: only d(ln V)/dP is used, so the constant
     # of proportionality between 1/density and volume drops out.
     log_volume = -np.log(density)
 
-    def fit(mask: npt.NDArray[np.bool_]) -> float | None:
-        if int(mask.sum()) < 2:
-            return None
-        (slope, _), _ = _fit_line(pressure[mask], log_volume[mask])
-        if abs(slope) < _TINY:
-            return None
-        return float(-1.0 / slope * MPA_PER_BAR)
+    def fit(mask: npt.NDArray[np.bool_]) -> tuple[float | None, float, float]:
+        x, y = pressure[mask], log_volume[mask]
+        if x.size < 2 or np.ptp(x) < _TINY:
+            return None, math.inf, math.nan
+        # Centering protects the slope fit when absolute pressure dwarfs the
+        # ladder's pressure increments.
+        x = x - x.mean()
+        (slope, _), residual_sum = _fit_line(x, y)
+        residual = math.sqrt(max(residual_sum, 0.0) / x.size)
+        if not math.isfinite(slope) or abs(slope) < _TINY:
+            return None, math.inf, residual
+        modulus = -MPA_PER_BAR / slope
+        error = MPA_PER_BAR * _slope_error(x, y, residual_sum) / slope**2
+        return float(modulus), float(error), residual
 
     everything = np.ones(pressure.size, dtype=np.bool_)
     peak = int(np.argmax(pressure))
@@ -788,18 +838,39 @@ def bulk_modulus(
     falling = np.zeros(pressure.size, dtype=np.bool_)
     falling[peak:] = True
 
-    modulus = fit(everything)
-    up = fit(rising) if peak >= 1 else None
-    down = fit(falling) if peak <= pressure.size - 2 else None
+    modulus, error, residual = fit(everything)
+    up = fit(rising)[0] if peak >= 1 else None
+    down = fit(falling)[0] if peak <= pressure.size - 2 else None
     hysteresis = math.nan
     if up is not None and down is not None and abs(up) > _TINY:
         hysteresis = abs(down - up) / abs(up)
 
+    unique_pressure = np.unique(pressure)
+    mean_log_volume = np.asarray(
+        [log_volume[pressure == value].mean() for value in unique_pressure],
+        dtype=np.float64,
+    )
+    disagreement = (
+        math.inf
+        if modulus is None
+        else _half_disagreement(
+            unique_pressure, mean_log_volume, -MPA_PER_BAR / modulus
+        )
+    )
+    has_return = 0 < peak < pressure.size - 1
+
     resolved = bool(
         modulus is not None
+        and math.isfinite(modulus)
         and modulus > 0.0
         and pressure.size >= min_points
-        and (math.isnan(hysteresis) or hysteresis <= MAX_BULK_HYSTERESIS)
+        and unique_pressure.size >= 3
+        and error < MAX_RELATIVE_STANDARD_ERROR * modulus
+        and disagreement <= MAX_HALF_SLOPE_DISAGREEMENT
+        and (
+            not has_return
+            or (math.isfinite(hysteresis) and hysteresis <= MAX_BULK_HYSTERESIS)
+        )
     )
     return BulkModulus(
         stage=", ".join(names),
@@ -812,6 +883,9 @@ def bulk_modulus(
         n_points=int(pressure.size),
         temperature_k=temperature,
         resolved=resolved,
+        standard_error_mpa=error,
+        residual_log_volume=residual,
+        half_disagreement=disagreement,
     )
 
 
@@ -834,7 +908,8 @@ def shear_modulus(
         rather than a failure to measure one.
 
     Raises:
-        AnalysisError: There is nothing there to read.
+        AnalysisError: There is nothing there to read, or the stress was
+            recorded with an obsolete or unidentified estimator.
     """
     names = (
         shear_stages(run_dir)
@@ -842,6 +917,7 @@ def shear_modulus(
         else ((stage,) if isinstance(stage, str) else tuple(stage))
     )
     samples, temperature = _gather(run_dir, names)
+    _require_stress_estimator(samples, names)
     strain = np.asarray(samples["segment_shear_strain"], dtype=np.float64)
     stress = (
         np.asarray(samples["segment_shear_stress_bar"], dtype=np.float64) * MPA_PER_BAR

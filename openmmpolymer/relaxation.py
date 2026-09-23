@@ -66,7 +66,12 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 
-from .elasticity import MPA_PER_BAR, _gather, _stages_holding
+from .elasticity import (
+    MPA_PER_BAR,
+    _gather,
+    _require_stress_estimator,
+    _stages_holding,
+)
 from .trajectory import AnalysisError
 
 log = logging.getLogger(__name__)
@@ -478,6 +483,8 @@ def relaxation_curve(
         else ((stage,) if isinstance(stage, str) else tuple(stage))
     )
     samples, temperature = _gather(run_dir, names)
+    if "relax_plane" in samples:
+        _require_stress_estimator(samples, names)
     if "segment_bin" not in samples:
         raise AnalysisError(
             f"{', '.join(names)} recorded no relaxation bins, so nothing "

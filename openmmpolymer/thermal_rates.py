@@ -31,6 +31,7 @@ from .protocols import (
     RunManifest,
     Stage,
     run_protocol,
+    validate_run_inputs,
 )
 from .rate_dependence import (
     RateObservation,
@@ -335,6 +336,8 @@ def run_thermal_rate_scan(
         raise ThermalRateError(
             "Existing runs lack the thermal rate workflow record; use a fresh directory."
         )
+    if resume:
+        validate_run_inputs(run, directory / "equilibration")
     directory.mkdir(parents=True, exist_ok=True)
     record = {
         "request": request,

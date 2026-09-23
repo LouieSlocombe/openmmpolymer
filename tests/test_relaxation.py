@@ -16,6 +16,7 @@ run - where the honest answer is to refuse.
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
@@ -98,6 +99,18 @@ def test_the_planted_decay_comes_back_exactly(tmp_path: Path) -> None:
     curve = relaxation_curve(tmp_path)
     expected = 800.0 * np.exp(-((curve.time_ps / 50.0) ** 0.6))
     assert np.allclose(curve.modulus_mpa, expected, rtol=0.0, atol=1e-9)
+
+
+def test_a_legacy_shear_chunk_cannot_be_combined_with_corrected_stress(
+    tmp_path: Path,
+) -> None:
+    path = write_relaxation(tmp_path, mode="shear", chunks=2)
+    manifest = json.loads(path.read_text())
+    first = next(iter(manifest["stages"].values()))
+    first["samples"].pop("stress_estimator_version")
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(AnalysisError, match=r"[Ss]tress|[Ss]hear"):
+        relaxation_curve(tmp_path)
 
 
 def test_chunks_of_one_relaxation_merge_into_the_curve_one_run_would_give(

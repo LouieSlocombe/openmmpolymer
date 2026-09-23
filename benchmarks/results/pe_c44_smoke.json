@@ -1,0 +1,146 @@
+{
+  "case_id": "pe-c44-melt-density",
+  "smoke": true,
+  "packing_density_g_cm3": 0.1,
+  "temperature_k": 400,
+  "pressure_bar": 1.01325,
+  "case_sha256": "859f9777f0362203f53d5364ee23bd96293413b98c678e91885f49998f01b54c",
+  "charge_method": "gasteiger",
+  "smirnoff_forcefield": "openff-2.2.1",
+  "protocol": {
+    "name": "pe_density_smoke",
+    "stages": [
+      {
+        "name": "00_minimise",
+        "kind": "minimise",
+        "options": {
+          "max_iterations": 500
+        }
+      },
+      {
+        "name": "01_pushoff",
+        "kind": "pushoff",
+        "options": {
+          "duration_ps": 0.03
+        }
+      },
+      {
+        "name": "02_nvt",
+        "kind": "nvt",
+        "options": {
+          "temperature_k": 400,
+          "duration_ps": 0.1,
+          "timestep_fs": 0.5,
+          "friction_ps": 10.0
+        }
+      },
+      {
+        "name": "03_compress",
+        "kind": "compress",
+        "options": {
+          "temperature_k": 400,
+          "duration_ps_each": 0.05,
+          "pressures_bar": [
+            1.01325,
+            100.0,
+            1.01325
+          ],
+          "timestep_fs": 0.5
+        }
+      },
+      {
+        "name": "06_measure",
+        "kind": "npt",
+        "options": {
+          "temperature_k": 400,
+          "pressure_bar": 1.01325,
+          "duration_ps": 0.5,
+          "timestep_fs": 0.5,
+          "report_interval_ps": 0.05,
+          "trajectory": [
+            "xtc",
+            0.05,
+            false
+          ]
+        }
+      }
+    ]
+  },
+  "system": {
+    "nonbonded_cutoff_nm": 1.2,
+    "switch_distance_nm": null,
+    "constraints": "hbonds",
+    "rigid_water": true,
+    "hydrogen_mass_amu": null,
+    "ewald_error_tolerance": 0.0005,
+    "use_dispersion_correction": true,
+    "remove_cm_motion": true,
+    "scale_molecules_as_rigid": true,
+    "minimum_box_factor": 2.5
+  },
+  "requested_platform": "CPU",
+  "versions": {
+    "openmmpolymer": "0.1.0",
+    "openmm": "8.6.1",
+    "forcefill": "1.0.0",
+    "rdkit": "2026.3.1",
+    "numpy": "2.5.3",
+    "openff-toolkit": "0.19.0"
+  },
+  "reference": {
+    "doi": "10.3390/polym12051059",
+    "url": "https://www.mdpi.com/2073-4360/12/5/1059",
+    "citation": "Lee, Frank and Yoon, Polymers 12 (2020), 1059, Table 2",
+    "kind": "published united-atom simulation, not experiment",
+    "molecule": "C44H90",
+    "specific_volume_cm3_g": {
+      "350": 1.232,
+      "400": 1.269
+    },
+    "relative_density_tolerance": 0.1,
+    "relative_temperature_tolerance": 0.02,
+    "tolerance_basis": "Project comparison tolerance across different force fields; not a published uncertainty.",
+    "pressure_note": "This benchmark uses 1 atm. The cited table does not specify the bulk NPT pressure.",
+    "density_g_cm3": 0.7880220646178093,
+    "temperature_k": 400
+  },
+  "replicas": [
+    {
+      "seed": 11,
+      "n_atoms": 4020,
+      "n_chains": 30,
+      "frames": 10,
+      "density_g_cm3": 0.10410450684461917,
+      "temperature_k": 346.16160853156214,
+      "density_equilibration": {
+        "start_index": 0,
+        "start_ps": 0.05000000000000004,
+        "n_samples": 10,
+        "n_independent_samples": 4.060493240048585,
+        "correlation_time_ps": 0.036568874819013074,
+        "relative_standard_error": 0.005992374888477142,
+        "relative_drift": 0.03459089966613789,
+        "equilibrated": false
+      },
+      "chains_decorrelated": false,
+      "end_to_end_correlation_final": 0.9988190951231636,
+      "end_to_end_relaxation_time_ps": null,
+      "end_to_end_max_lag_ps": 0.20000000298023224,
+      "manifest": "seed_11/manifest.json"
+    }
+  ],
+  "comparison": {
+    "density_g_cm3": 0.10410450684461917,
+    "replica_standard_error_g_cm3": null,
+    "reference_density_g_cm3": 0.7880220646178093,
+    "accepted_density_range_g_cm3": [
+      0.7092198581560284,
+      0.8668242710795904
+    ],
+    "relative_difference": -0.8678913808141783,
+    "all_replicas_within_range": false,
+    "all_replicas_at_target_temperature": false,
+    "sampling_sufficient": false,
+    "status": "smoke_only"
+  }
+}

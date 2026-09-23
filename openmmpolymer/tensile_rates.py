@@ -31,6 +31,7 @@ from .protocols import (
     RunManifest,
     run_protocol,
     standard_melt_equilibration,
+    validate_run_inputs,
 )
 from .rate_dependence import (
     RateObservation,
@@ -231,6 +232,8 @@ def run_tensile_rate_scan(
                 "Recorded tensile branches lack the common preparation fingerprint; "
                 "rerun with resume=False."
             )
+    if resume:
+        validate_run_inputs(run, directory / "equilibration")
     directory.mkdir(parents=True, exist_ok=True)
     root_record = {"request": request, "run_dirs": names}
     root_record.update(

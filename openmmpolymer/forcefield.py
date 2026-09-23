@@ -160,7 +160,9 @@ def build_polymer_forcefield(
         backend: One of :data:`BACKENDS`.
         base_forcefield: The files the result is loaded beside.
         smirnoff_forcefield: SMIRNOFF release, for ``backend="smirnoff"``.
-        charmm_files: CGenFF stream files, for ``backend="charmm"``.
+        charmm_files: CGenFF stream files, in loading order, for
+            ``backend="charmm"``. Their contents are included in the cache key,
+            so editing a stream invalidates parameters built from it.
         cache_dir: Where built force fields are kept. Parameterising a long
             chain is minutes; nothing about it depends on the run, so a cache
             hit is the difference between iterating and waiting.
@@ -192,6 +194,20 @@ def build_polymer_forcefield(
         "residue_name": residue_name,
         "forcefill": getattr(forcefill, "__version__", "unknown"),
     }
+    if backend == "charmm":
+        # Stream order matters: a later parameter definition can override an
+        # earlier one. Paths alone would reuse stale XML after an in-place edit.
+        streams = []
+        for stream in charmm_files:
+            path = Path(stream)
+            try:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError as error:
+                raise ForceFieldError(
+                    f"Cannot read CHARMM parameter stream {path}: {error}"
+                ) from error
+            streams.append({"path": str(path), "sha256": digest})
+        options["charmm_files"] = streams
     _warn_if_uncharged(source, backend)
     cached_path = _cache_lookup(cache_dir, source, options)
     if cached_path is not None:

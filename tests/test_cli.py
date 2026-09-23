@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -45,6 +46,225 @@ def test_the_monomer_is_the_one_required_argument() -> None:
     assert arguments.monomer == "[*]CC[*]"
     assert arguments.degree_of_polymerization == 20
     assert arguments.chains == 30
+
+
+def test_cli_passes_polyester_caps_and_polymer_dimensions_to_the_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supported polyester must be constructible through the CLI as well."""
+    from openmmpolymer import __main__ as cli
+    from openmmpolymer.chain import ChainSpec, assemble_chain
+
+    class BuildReached(Exception):
+        pass
+
+    def build(spec: ChainSpec, *args: Any, **kwargs: Any) -> Any:
+        assert spec.head_cap == "[*][H]"
+        assert spec.tail_cap == "[*]O"
+        assert spec.characteristic_ratio == 5.5
+        assert assemble_chain(spec).GetNumAtoms() > 0
+        raise BuildReached
+
+    monkeypatch.setattr(cli, "build_chain", build)
+    with pytest.raises(BuildReached):
+        main(
+            [
+                "[*]OC(C)C(=O)[*]",
+                "-n",
+                "3",
+                "--head-cap",
+                "[*][H]",
+                "--tail-cap",
+                "[*]O",
+                "--characteristic-ratio",
+                "5.5",
+                "--dry-run",
+            ]
+        )
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "bad"])
+def test_invalid_characteristic_ratio_is_rejected_by_the_parser(value: str) -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["[*]CC[*]", "--characteristic-ratio", value])
+
+
+def test_default_build_ratio_and_request_identity_remain_seven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openmmpolymer import __main__ as cli
+    from openmmpolymer.chain import ChainSpec
+
+    class BuildReached(Exception):
+        pass
+
+    def build(spec: ChainSpec, *args: Any, **kwargs: Any) -> Any:
+        assert spec.characteristic_ratio == 7.0
+        raise BuildReached
+
+    def request(output: Path, options: dict[str, Any]) -> None:
+        assert options["characteristic_ratio"] == 7.0
+
+    monkeypatch.setattr(cli, "build_chain", build)
+    monkeypatch.setattr(cli, "record_build_request", request)
+    with pytest.raises(BuildReached):
+        main(["[*]CC[*]", "--dry-run"])
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [["--seed", "7"], ["--temperature", "500"], ["--tail-cap", "[*]O"]],
+)
+def test_changed_cli_request_is_refused_before_overwriting_build_assets(
+    changed: list[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from openmmpolymer import __main__ as cli
+
+    class BuildReached(Exception):
+        pass
+
+    def build(*args: Any, **kwargs: Any) -> Any:
+        raise BuildReached
+
+    monkeypatch.setattr(cli, "build_chain", build)
+    arguments = ["[*]CC[*]", "-o", str(tmp_path / "run")]
+    with pytest.raises(BuildReached):
+        main(arguments)
+    artifact = tmp_path / "run" / "build" / "polymer_ff.xml"
+    artifact.parent.mkdir()
+    artifact.write_text("existing parameters")
+    with pytest.raises(SystemExit, match="2"):
+        main([*arguments, *changed])
+    assert artifact.read_text() == "existing parameters"
+    # Presentation, device selection and switching from build-only to dynamics
+    # do not change the prepared physical system.
+    with pytest.raises(BuildReached):
+        main([*arguments, "--platform", "CPU", "--dry-run", "-v"])
+
+
+@pytest.fixture
+def staged_cli_build(monkeypatch: pytest.MonkeyPatch, argon_run: Any) -> dict[str, Any]:
+    """Real input fingerprints with inexpensive stand-ins for chemistry tools."""
+    from openmmpolymer import __main__ as cli
+    from openmmpolymer.chain import ChainResult
+
+    control: dict[str, Any] = {"system_suffix": "", "fail": False, "paths": []}
+
+    def build(arguments: Any, build_dir: Path, cache_dir: Path) -> Any:
+        del arguments, cache_dir
+        control["paths"].append(build_dir)
+        build_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("chain_0.sdf", "chain_0.pdb", "polymer_ff.xml", "packed.pdb"):
+            (build_dir / name).write_text(f"prepared artifact {len(control['paths'])}")
+        if control["fail"]:
+            raise RuntimeError("preparation failed")
+        chain = ChainResult(
+            sdf_paths=(str(build_dir / "chain_0.sdf"),),
+            pdb_paths=(str(build_dir / "chain_0.pdb"),),
+            smiles="[Ar]",
+            n_atoms=1,
+            molar_mass_g_mol=39.948,
+        )
+        run = replace(
+            argon_run,
+            system_xml=argon_run.system_xml + control["system_suffix"],
+            forcefield=replace(
+                argon_run.forcefield, forcefield_xml=str(build_dir / "polymer_ff.xml")
+            ),
+        )
+        return chain, run
+
+    monkeypatch.setattr(cli, "_build_cli_melt", build)
+    return control
+
+
+def _cli_artifacts() -> dict[str, bytes]:
+    return {
+        str(path): path.read_bytes()
+        for path in Path("run").rglob("*")
+        if path.is_file()
+    }
+
+
+def test_repeated_cli_preparation_preserves_original_build_files(
+    staged_cli_build: dict[str, Any],
+) -> None:
+    assert main(["[*]CC[*]", "--dry-run"]) == 0
+    before = _cli_artifacts()
+    assert main(["[*]CC[*]", "--dry-run", "--platform", "CPU"]) == 0
+    assert _cli_artifacts() == before
+    assert staged_cli_build["paths"][0] == Path("run/build")
+    assert staged_cli_build["paths"][1] != Path("run/build")
+    assert not staged_cli_build["paths"][1].exists()
+
+
+@pytest.mark.parametrize("failure", ["different_system", "build_error"])
+def test_failed_cli_repreparation_cannot_overwrite_existing_assets(
+    staged_cli_build: dict[str, Any], failure: str
+) -> None:
+    assert main(["[*]CC[*]", "--dry-run"]) == 0
+    before = _cli_artifacts()
+    if failure == "different_system":
+        staged_cli_build["system_suffix"] = "\n"
+        expected: type[BaseException] = SystemExit
+    else:
+        staged_cli_build["fail"] = True
+        expected = RuntimeError
+    with pytest.raises(expected):
+        main(["[*]CC[*]", "--dry-run"])
+    assert _cli_artifacts() == before
+    assert not list(Path("run").glob(".build-check-*"))
+
+
+def test_cli_dry_run_can_continue_to_dynamics_using_verified_build_files(
+    staged_cli_build: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openmmpolymer import __main__ as cli
+
+    class DynamicsReached(Exception):
+        pass
+
+    def dynamics(protocol: Any, run: Any, *args: Any, **kwargs: Any) -> Any:
+        assert Path(run.forcefield.forcefield_xml) == Path("run/build/polymer_ff.xml")
+        assert Path(run.forcefield.forcefield_xml).is_file()
+        raise DynamicsReached
+
+    assert main(["[*]CC[*]", "--dry-run"]) == 0
+    before = _cli_artifacts()
+    monkeypatch.setattr(cli, "run_protocol", dynamics)
+    with pytest.raises(DynamicsReached):
+        main(["[*]CC[*]"])
+    assert _cli_artifacts() == before
+
+
+@pytest.mark.parametrize("manifest_dir", ["run", "run/equilibration"])
+def test_cli_checks_actual_inputs_against_existing_workflow_manifests(
+    staged_cli_build: dict[str, Any], argon_run: Any, manifest_dir: str
+) -> None:
+    from openmmpolymer.protocols import Protocol, Stage, run_protocol
+
+    assert main(["[*]CC[*]", "--dry-run"]) == 0
+    run_protocol(
+        Protocol("other", (Stage("00_minimise", "minimise"),)),
+        replace(argon_run, seed=99),
+        manifest_dir,
+    )
+    before = _cli_artifacts()
+    with pytest.raises(SystemExit):
+        main(["[*]CC[*]", "--dry-run"])
+    assert _cli_artifacts() == before
+
+
+def test_cli_refuses_a_modified_original_forcefield_before_rebuilding(
+    staged_cli_build: dict[str, Any],
+) -> None:
+    assert main(["[*]CC[*]", "--dry-run"]) == 0
+    Path("run/build/polymer_ff.xml").write_text("modified original")
+    before = _cli_artifacts()
+    with pytest.raises(SystemExit):
+        main(["[*]CC[*]", "--dry-run"])
+    assert len(staged_cli_build["paths"]) == 1
+    assert _cli_artifacts() == before
 
 
 def test_the_parser_rejects_a_protocol_it_cannot_run() -> None:
@@ -598,6 +818,8 @@ def test_a_tg_run_hands_the_flat_flags_to_the_scan_as_a_spec(
             "50",
             "--check-melt",
             "4",
+            "--characteristic-ratio",
+            "5.5",
         ]
     )
     entry = PROTOCOLS["tg"]
@@ -612,6 +834,7 @@ def test_a_tg_run_hands_the_flat_flags_to_the_scan_as_a_spec(
     assert spec.coarse_step_k == pytest.approx(20.0)
     assert spec.window_k == pytest.approx(50.0)
     assert spec.npt_trajectory_ps == pytest.approx(4.0)
+    assert seen["expected_characteristic_ratio"] == 5.5
     assert "Tg = 418 K" in capsys.readouterr().out
 
 
@@ -883,6 +1106,25 @@ def test_analyse_reports_structure_when_a_stage_left_coordinates(
     assert "chains: <R^2>" in captured
     assert "rod-like" in captured
     assert Path("run/analysis/structure.json").is_file()
+
+
+@pytest.mark.parametrize("override", [None, "7.0"])
+def test_structure_analysis_preserves_saved_ratio_and_accepts_explicit_override(
+    override: str | None,
+) -> None:
+    write_polymer_snapshot(Path("run"))
+    manifest_path = Path("run/manifest.json")
+    manifest = json.loads(manifest_path.read_text())
+    manifest["chains"] = {"expected_characteristic_ratio": 5.5}
+    manifest_path.write_text(json.dumps(manifest))
+    arguments = ["--analyse", "run", "--no-figures"]
+    if override is not None:
+        arguments.extend(["--characteristic-ratio", override])
+    assert main(arguments) == 0
+    record = json.loads(Path("run/analysis/structure.json").read_text())
+    assert record["conformation"]["mean"]["expected_characteristic_ratio"] == (
+        5.5 if override is None else float(override)
+    )
 
 
 def test_the_structure_flags_are_parsed() -> None:

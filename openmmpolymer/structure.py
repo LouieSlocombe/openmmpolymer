@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ._validation import require_integer
+from ._validation import require_integer, require_positive
 from .conformation import (
     ConformationSeries,
     EndToEndRelaxation,
@@ -447,7 +447,7 @@ def analyse_structure(
     stage: str | None = None,
     backbone: Sequence[int] | None = None,
     infer_backbone: bool = True,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float | None = None,
     stride: int = 1,
     heavy_atoms_only: bool = True,
     q_max_per_nm: float = 40.0,
@@ -474,8 +474,9 @@ def analyse_structure(
             the run recorded.
         infer_backbone: When nothing was given or recorded, infer the backbone
             from the bond graph with :func:`infer_backbone`.
-        expected_characteristic_ratio: The polymer's C-infinity, for the
-            chain dimensions.
+        expected_characteristic_ratio: The polymer's C-infinity, overriding
+            the value saved in the manifest. If neither is available, use
+            the polyethylene default of 7.0.
         stride: Measure every *stride*-th frame. The pair distribution and the
             structure factor are further capped at
             :data:`MAX_DISTRIBUTION_FRAMES` and
@@ -500,6 +501,18 @@ def analyse_structure(
     ensemble = open_run(directory, files.stage)
     manifest = RunManifest.load(directory)
     notes: list[str] = []
+    if expected_characteristic_ratio is None:
+        recorded = (
+            manifest.chains
+            if manifest is not None and isinstance(manifest.chains, dict)
+            else {}
+        )
+        expected_characteristic_ratio = recorded.get(
+            "expected_characteristic_ratio", 7.0
+        )
+    expected_characteristic_ratio = require_positive(
+        expected_characteristic_ratio, None, name="expected_characteristic_ratio"
+    )
 
     if ensemble.is_snapshot:
         if stage_source == "last_snapshot":

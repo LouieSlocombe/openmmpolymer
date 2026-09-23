@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "id": "pe-c44-melt-density",
+  "monomer_smiles": "[*]CC[*]",
+  "degree_of_polymerization": 22,
+  "chains": 30,
+  "packing_density_g_cm3": 0.3,
+  "smoke_packing_density_g_cm3": 0.1,
+  "pressure_bar": 1.01325,
+  "characteristic_ratio": 7.0,
+  "smirnoff_forcefield": "openff-2.2.1",
+  "charge_method": "nagl",
+  "seeds": [11, 29, 47],
+  "production_ps": 10000.0,
+  "design_note": "Thirty all-atom C44H90 chains, three independent seeds and 10 ns production per replica are project choices, not a reproduction of the published united-atom system. A completed run is accepted only after density stationarity, chain decorrelation and reference-comparison checks.",
+  "reference": {
+    "doi": "10.3390/polym12051059",
+    "url": "https://www.mdpi.com/2073-4360/12/5/1059",
+    "citation": "Lee, Frank and Yoon, Polymers 12 (2020), 1059, Table 2",
+    "kind": "published united-atom simulation, not experiment",
+    "molecule": "C44H90",
+    "specific_volume_cm3_g": {"350": 1.232, "400": 1.269},
+    "relative_density_tolerance": 0.1,
+    "relative_temperature_tolerance": 0.02,
+    "tolerance_basis": "Project comparison tolerance across different force fields; not a published uncertainty.",
+    "pressure_note": "This benchmark uses 1 atm. The cited table does not specify the bulk NPT pressure."
+  }
+}

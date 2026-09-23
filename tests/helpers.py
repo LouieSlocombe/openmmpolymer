@@ -721,9 +721,12 @@ def write_shear(
     merge: dict[str, Any] | None = None,
 ) -> Path:
     """Write a manifest holding an exactly linear shear ladder."""
+    from openmmpolymer.stress import STRESS_ESTIMATOR_VERSION
+
     stages = dict(merge or {})
     stages[stage] = {
         "samples": {
+            "stress_estimator_version": [float(STRESS_ESTIMATOR_VERSION)],
             "segment_shear_strain": list(strains),
             "segment_shear_stress_bar": [
                 modulus_mpa * value / 0.1 for value in strains
@@ -791,7 +794,7 @@ def write_relaxation(
     """
     from openmmpolymer.elasticity import MPA_PER_BAR
     from openmmpolymer.simulate import relax_bin_edges_ps
-    from openmmpolymer.stress import deviatoric_strain
+    from openmmpolymer.stress import STRESS_ESTIMATOR_VERSION, deviatoric_strain
 
     if strain_measure is None:
         strain_measure = (
@@ -819,6 +822,7 @@ def write_relaxation(
             "step_strain": [float(step_strain)],
         }
         if mode == "shear":
+            samples["stress_estimator_version"] = [float(STRESS_ESTIMATOR_VERSION)]
             samples["relax_plane"] = [0.0, 2.0]
         else:
             samples["relax_axis"] = [2.0]

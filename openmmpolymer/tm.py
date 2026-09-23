@@ -27,6 +27,7 @@ from .protocols import (
     Stage,
     _write_atomically,
     run_protocol,
+    validate_run_inputs,
 )
 from .reporters import TrajectoryOptions
 from .simulate import RunContext, heating_temperatures, safe_timestep_fs
@@ -607,6 +608,8 @@ def run_tm_scan(
             raise TmError(
                 "Melting settings or starting inputs changed; use a new run directory."
             )
+    if resume:
+        validate_run_inputs(run, directory)
     directory.mkdir(parents=True, exist_ok=True)
     _write_atomically(
         path,

@@ -1,0 +1,6 @@
+# Keep the documented installation and reference workflow usable from an sdist.
+include build_tools/environment.yml
+recursive-include benchmarks *.py *.json *.md
+# setuptools includes test_*.py by default; include their fixtures and helpers too.
+recursive-include tests *.py
+include .github/workflows/ci.yml

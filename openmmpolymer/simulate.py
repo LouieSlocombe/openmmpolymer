@@ -2213,7 +2213,7 @@ def run_shear(
             reduced form allows.
         ValueError: The plane or the strain ladder is not usable.
     """
-    from .stress import affine_shear, shear_box_vectors
+    from .stress import STRESS_ESTIMATOR_VERSION, affine_shear, shear_box_vectors
 
     driven, gradient = plane
     if driven == gradient or not {driven, gradient} <= {0, 1, 2}:
@@ -2261,6 +2261,7 @@ def run_shear(
     samples: dict[str, list[float]] = {
         "segment_shear_strain": [],
         "shear_plane": [float(driven), float(gradient)],
+        "stress_estimator_version": [STRESS_ESTIMATOR_VERSION],
         "segment_shear_stress_bar": [],
         "segment_temperature_k": [],
         "segment_mean_temperature_k": [],
@@ -2957,6 +2958,9 @@ def run_relax(
     # everywhere else read off what it recorded rather than off its name.
     if mode == "shear":
         samples["relax_plane"] = [float(driven), float(gradient)]
+        from .stress import STRESS_ESTIMATOR_VERSION
+
+        samples["stress_estimator_version"] = [STRESS_ESTIMATOR_VERSION]
     else:
         samples["relax_axis"] = [float(axis)]
         samples["relax_poisson"] = [float(poisson)]

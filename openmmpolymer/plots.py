@@ -1001,6 +1001,8 @@ def plot_moduli(report: Any) -> Any:
         labels.append(label)
         values.append(float(fit.modulus_mpa))
         resolved.append(bool(fit.resolved))
+        if label == "K" and math.isfinite(fit.standard_error_mpa):
+            error = fit.standard_error_mpa
         errors.append(0.0 if error is None else float(error))
 
     positions = np.arange(len(labels), dtype=np.float64)

@@ -13,6 +13,7 @@ be tested is that the flag says so.
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
@@ -81,7 +82,123 @@ def test_a_bulk_ladder_gives_back_its_modulus_and_no_hysteresis(
     assert fit.compression_mpa == pytest.approx(1500.0)
     assert fit.decompression_mpa == pytest.approx(1500.0)
     assert fit.hysteresis == pytest.approx(0.0, abs=1e-9)
+    assert fit.standard_error_mpa == pytest.approx(0.0, abs=1e-9)
+    assert fit.relative_standard_error == pytest.approx(0.0, abs=1e-12)
+    assert fit.residual_log_volume == pytest.approx(0.0, abs=1e-12)
+    assert fit.half_disagreement == pytest.approx(0.0, abs=1e-9)
     assert fit.resolved
+
+
+def _write_bulk_samples(
+    directory: Path, pressures: list[float], densities: list[float]
+) -> None:
+    path = write_bulk(directory)
+    record = json.loads(path.read_text())
+    samples = record["stages"]["08_bulk"]["samples"]
+    samples["segment_pressure_bar"] = pressures
+    samples["segment_density_g_cm3"] = densities
+    path.write_text(json.dumps(record))
+
+
+def test_bulk_uncertainty_rejects_a_reversible_noisy_ladder(tmp_path: Path) -> None:
+    """Retracing a noisy curve does not make its slope well determined."""
+    pressure = np.asarray([1.0, 11.0, 21.0, 31.0, 21.0, 11.0, 1.0])
+    noise = np.asarray([0.0, -0.04, 0.04, 0.0, 0.04, -0.04, 0.0])
+    log_density = 0.0001 * pressure + noise
+    _write_bulk_samples(tmp_path, pressure.tolist(), np.exp(log_density).tolist())
+    fit = bulk_modulus(tmp_path)
+    # Calculate the slope and uncertainty independently of the shared fitter.
+    centered = pressure - pressure.mean()
+    slope = float(centered @ (log_density - log_density.mean()) / (centered @ centered))
+    residuals = log_density - log_density.mean() - slope * centered
+    slope_error = math.sqrt(
+        float(residuals @ residuals) / (pressure.size - 2) / float(centered @ centered)
+    )
+    assert fit.standard_error_mpa == pytest.approx(0.1 * slope_error / slope**2)
+    assert fit.relative_standard_error == pytest.approx(slope_error / abs(slope))
+    assert fit.relative_standard_error > 1.0
+    assert fit.hysteresis == pytest.approx(0.0, abs=1e-12)
+    assert not fit.resolved
+
+
+def test_bulk_checks_linearity_across_pressure_ranges(tmp_path: Path) -> None:
+    """Smooth curvature has small fit uncertainty and no branch hysteresis."""
+    pressure = np.asarray([1.0, 11.0, 21.0, 31.0, 21.0, 11.0, 1.0])
+    log_density = 0.0001 * pressure + 0.00001 * pressure**2
+    _write_bulk_samples(tmp_path, pressure.tolist(), np.exp(log_density).tolist())
+    fit = bulk_modulus(tmp_path)
+    assert fit.relative_standard_error < 0.25
+    assert fit.hysteresis == pytest.approx(0.0, abs=1e-12)
+    assert fit.half_disagreement > 0.5
+    assert not fit.resolved
+
+
+def test_bulk_resolves_a_well_supported_noisy_slope(tmp_path: Path) -> None:
+    pressure = np.asarray([1.0, 11.0, 21.0, 31.0, 21.0, 11.0, 1.0])
+    noise = np.asarray([0.0, -1.0, 1.0, 0.0, 1.0, -1.0, 0.0]) * 1e-6
+    _write_bulk_samples(
+        tmp_path, pressure.tolist(), np.exp(0.0001 * pressure + noise).tolist()
+    )
+    fit = bulk_modulus(tmp_path)
+    assert fit.resolved
+    assert 0.0 < fit.relative_standard_error < 0.25
+    assert fit.modulus_mpa == pytest.approx(1000.0, rel=0.001)
+
+
+@pytest.mark.parametrize(
+    "pressure", ([1.0] * 4, [1.0, 11.0, 1.0, 11.0], [1.0], [1.0, 11.0])
+)
+def test_bulk_needs_distinct_pressures_and_residual_degrees_of_freedom(
+    tmp_path: Path, pressure: list[float]
+) -> None:
+    density = np.exp(0.0001 * np.asarray(pressure))
+    _write_bulk_samples(tmp_path, pressure, density.tolist())
+    fit = bulk_modulus(tmp_path, min_points=2)
+    assert not fit.resolved
+    if len(set(pressure)) == 1:
+        assert math.isnan(fit.modulus_mpa)
+        assert math.isinf(fit.relative_standard_error)
+    if len(pressure) <= 2:
+        assert math.isinf(fit.standard_error_mpa)
+
+
+@pytest.mark.parametrize("slope", (0.0, -0.0001))
+def test_bulk_refuses_zero_or_negative_compressibility(
+    tmp_path: Path, slope: float
+) -> None:
+    pressure = [1.0, 11.0, 21.0, 31.0]
+    _write_bulk_samples(
+        tmp_path, pressure, np.exp(slope * np.asarray(pressure)).tolist()
+    )
+    assert not bulk_modulus(tmp_path).resolved
+
+
+@pytest.mark.parametrize(
+    ("pressure", "density"),
+    (
+        ([], []),
+        ([1.0, 2.0], [0.9]),
+        ([1.0, math.nan], [0.9, 1.0]),
+        ([1.0, math.inf], [0.9, 1.0]),
+        ([1.0, 2.0], [0.9, math.nan]),
+        ([1.0, 2.0], [0.9, math.inf]),
+        ([1.0, 2.0], [0.9, 0.0]),
+        ([1.0, 2.0], [0.9, -1.0]),
+    ),
+)
+def test_bulk_rejects_unpaired_or_nonfinite_data(
+    tmp_path: Path, pressure: list[float], density: list[float]
+) -> None:
+    _write_bulk_samples(tmp_path, pressure, density)
+    with pytest.raises(AnalysisError, match="paired finite pressures"):
+        bulk_modulus(tmp_path, "08_bulk")
+
+
+def test_a_one_way_bulk_ladder_can_resolve(tmp_path: Path) -> None:
+    write_bulk(tmp_path, pressures_bar=[1.0, 11.0, 21.0, 31.0])
+    fit = bulk_modulus(tmp_path)
+    assert fit.resolved
+    assert math.isnan(fit.hysteresis)
 
 
 def test_a_shear_ladder_gives_back_its_modulus(tmp_path: Path) -> None:
@@ -90,6 +207,32 @@ def test_a_shear_ladder_gives_back_its_modulus(tmp_path: Path) -> None:
     fit = shear_modulus(tmp_path)
     assert fit.modulus_mpa == pytest.approx(700.0)
     assert fit.resolved
+
+
+@pytest.mark.parametrize("version", (None, 0.0, 2.0))
+def test_shear_refuses_obsolete_or_unidentified_stress(
+    tmp_path: Path, version: float | None
+) -> None:
+    path = write_shear(tmp_path)
+    record = json.loads(path.read_text())
+    samples = record["stages"]["09_shear"]["samples"]
+    if version is None:
+        samples.pop("stress_estimator_version")
+    else:
+        samples["stress_estimator_version"] = [version]
+    path.write_text(json.dumps(record))
+    with pytest.raises(AnalysisError, match="estimator version"):
+        shear_modulus(tmp_path)
+
+
+def test_shear_refuses_mixed_legacy_and_current_chunks(tmp_path: Path) -> None:
+    write_shear(tmp_path, stage="09_shear_00")
+    path = write_shear(tmp_path, stage="09_shear_01")
+    record = json.loads(path.read_text())
+    record["stages"]["09_shear_01"]["samples"].pop("stress_estimator_version")
+    path.write_text(json.dumps(record))
+    with pytest.raises(AnalysisError, match="estimator version"):
+        shear_modulus(tmp_path)
 
 
 def test_a_constant_stress_curve_measures_strain_against_its_own_zero(

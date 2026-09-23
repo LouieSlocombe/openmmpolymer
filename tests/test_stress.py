@@ -36,9 +36,22 @@ from openmmpolymer.stress import (
     tensile_stress_bar,
 )
 
-from .helpers import ideal_gas_system, rigid_rotor_system
+from .helpers import argon_system, ideal_gas_system, rigid_rotor_system
 
 BOLTZMANN_KJ_PER_K = 0.00831446261815324
+
+
+@pytest.fixture(params=[False, True], ids=["preferred", "openmm83-fallback"])
+def stress_backend(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise the stable-release fallback even when a newer API is installed."""
+    import openmm as mm
+
+    if request.param:
+        monkeypatch.delattr(
+            mm.MonteCarloFlexibleBarostat, "computeStressTensor", raising=False
+        )
 
 
 def _simulation(
@@ -91,7 +104,9 @@ def test_the_kinetic_pressure_of_a_force_free_gas_is_exact() -> None:
     assert np.diag(pressure_tensor_bar(simulation)) == pytest.approx(expected)
 
 
-def test_a_rigid_rotor_gas_pins_the_molecular_virial() -> None:
+@pytest.mark.usefixtures("stress_backend")
+@pytest.mark.parametrize("kind", ["anisotropic", "flexible"])
+def test_a_rigid_rotor_gas_pins_the_molecular_virial(kind: str) -> None:
     """The one test that can tell the two virial conventions apart.
 
     With no interactions the exact pressure is N_molecules kT / V: a rotor
@@ -105,7 +120,7 @@ def test_a_rigid_rotor_gas_pins_the_molecular_virial() -> None:
 
     n_molecules, box_nm, temperature = 200, 4.0, 300.0
     system, topology, positions = rigid_rotor_system(n_molecules, box_nm)
-    simulation = _simulation(system, topology, positions, "anisotropic")
+    simulation = _simulation(system, topology, positions, kind)
     simulation.context.applyConstraints(1.0e-10)
     simulation.context.setVelocitiesToTemperature(temperature * unit.kelvin, 5)
     simulation.context.applyVelocityConstraints(1.0e-10)
@@ -194,6 +209,203 @@ def test_the_flexible_shear_component_matches_the_kinetic_sum() -> None:
             * 16.605390666
         )
         assert tensor[first, second] == pytest.approx(expected)
+
+
+@pytest.mark.usefixtures("stress_backend")
+def test_interacting_triclinic_stress_is_a_consistent_strain_derivative() -> None:
+    """Nonzero potential shear and tilted diagonals detect box-entry derivatives.
+
+    Independently deform every position and box vector, with a much smaller
+    difference step than the production estimator. A finite kinetic term
+    also pins the sign, units and component ordering of the complete tensor.
+    """
+    from openmm import unit
+
+    system, topology, positions = argon_system(64, 2.4)
+    simulation = _simulation(system, topology, positions, "flexible")
+    deformation = np.array([[1.0, 0.07, 0.1], [0.0, 1.0, -0.04], [0.0, 0.0, 1.0]])
+    positions = positions @ deformation.T
+    box = 2.4 * deformation.T
+    context = simulation.context
+    context.setPeriodicBoxVectors(*(box * unit.nanometer))
+    context.setPositions(positions * unit.nanometer)
+    velocities = np.random.default_rng(17).normal(0.0, 0.2, (64, 3))
+    context.setVelocities(velocities * unit.nanometer / unit.picosecond)
+    measured = stress_tensor_bar(simulation)
+    assert pressure_bar(simulation) == pytest.approx(-np.trace(measured) / 3.0)
+    kinetic = 39.948 * velocities.T @ velocities
+    expected = np.empty((3, 3))
+    delta = 1.0e-5
+    try:
+        for row, column in ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2)):
+            energies = []
+            for sign in (-1, 1):
+                strain = np.eye(3)
+                strain[row, column] += sign * delta
+                context.setPeriodicBoxVectors(*((box @ strain.T) * unit.nanometer))
+                context.setPositions((positions @ strain.T) * unit.nanometer)
+                energies.append(
+                    context.getState(getEnergy=True)
+                    .getPotentialEnergy()
+                    .value_in_unit(unit.kilojoule_per_mole)
+                )
+            virial = (energies[1] - energies[0]) / (2 * delta)
+            value = (
+                (virial - kinetic[row, column])
+                / np.linalg.det(box)
+                * 16.605390671738468
+            )
+            expected[row, column] = expected[column, row] = value
+    finally:
+        context.setPeriodicBoxVectors(*(box * unit.nanometer))
+        context.setPositions(positions * unit.nanometer)
+    assert measured == pytest.approx(expected, rel=3.0e-4, abs=1.0e-5)
+
+
+@pytest.mark.usefixtures("stress_backend")
+@pytest.mark.parametrize("rigid", [False, True])
+@pytest.mark.parametrize("include_bond", [False, True])
+def test_flexible_stress_preserves_molecular_convention_and_force_groups(
+    rigid: bool, include_bond: bool
+) -> None:
+    """An unequal-mass bonded dimer separates molecular and atomic virials."""
+    import openmm as mm
+    from openmm import unit
+
+    system, topology, positions = ideal_gas_system(2, 3.0)
+    positions[:] = [[0.4, 0.5, 0.6], [0.6, 0.6, 0.9]]
+    system.setParticleMass(0, 12.0)
+    system.setParticleMass(1, 3.0)
+    bond = mm.HarmonicBondForce()
+    bond.addBond(0, 1, 0.2, 200.0)
+    bond.setForceGroup(1)
+    system.addForce(bond)
+    simulation = _simulation(
+        system, topology, positions, "flexible", scale_molecules_as_rigid=rigid
+    )
+    simulation.integrator.setIntegrationForceGroups(-1 if include_bond else 1)
+    velocities = np.array([[0.2, 0.3, -0.1], [-0.1, 0.4, 0.2]])
+    simulation.context.setVelocities(velocities * unit.nanometer / unit.picosecond)
+    masses = np.array([12.0, 3.0])
+    if rigid:
+        momentum = (velocities * masses[:, None]).sum(axis=0)
+        expected = -np.outer(momentum, momentum) / masses.sum()
+    else:
+        expected = -(velocities * masses[:, None]).T @ velocities
+        if include_bond:
+            distance = positions[1] - positions[0]
+            length = np.linalg.norm(distance)
+            expected += 200.0 * (length - 0.2) / length * np.outer(distance, distance)
+    expected *= 16.605390671738468 / 3.0**3
+    assert stress_tensor_bar(simulation) == pytest.approx(
+        expected, rel=2.0e-5, abs=1.0e-7
+    )
+
+
+@pytest.mark.usefixtures("stress_backend")
+def test_flexible_stress_preserves_context_state() -> None:
+    """A measurement must leave subsequent dynamics at the same state."""
+    from openmm import unit
+
+    system, topology, positions = argon_system(64, 2.4)
+    simulation = _simulation(system, topology, positions, "flexible")
+    context = simulation.context
+    context.setVelocitiesToTemperature(250.0, 19)
+    simulation.step(4)
+    before = context.getState(
+        getPositions=True, getVelocities=True, getEnergy=True, getParameters=True
+    )
+    stress_tensor_bar(simulation)
+    after = context.getState(
+        getPositions=True, getVelocities=True, getEnergy=True, getParameters=True
+    )
+    assert after.getPositions(asNumpy=True).value_in_unit(
+        unit.nanometer
+    ) == pytest.approx(
+        before.getPositions(asNumpy=True).value_in_unit(unit.nanometer), abs=1.0e-13
+    )
+    assert after.getVelocities(asNumpy=True).value_in_unit(
+        unit.nanometer / unit.picosecond
+    ) == pytest.approx(
+        before.getVelocities(asNumpy=True).value_in_unit(
+            unit.nanometer / unit.picosecond
+        ),
+        abs=1.0e-13,
+    )
+    assert after.getPeriodicBoxVectors(asNumpy=True).value_in_unit(
+        unit.nanometer
+    ) == pytest.approx(
+        before.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer),
+        abs=1.0e-13,
+    )
+    assert after.getTime() == before.getTime()
+    assert after.getStepCount() == before.getStepCount()
+    assert dict(after.getParameters()) == dict(before.getParameters())
+    assert after.getPotentialEnergy().value_in_unit(
+        unit.kilojoule_per_mole
+    ) == pytest.approx(
+        before.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole), abs=1.0e-10
+    )
+
+
+def test_fallback_restores_positions_and_box_on_energy_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception during either side of a derivative must not strain the run."""
+    import openmm as mm
+    from openmm import unit
+
+    monkeypatch.delattr(
+        mm.MonteCarloFlexibleBarostat, "computeStressTensor", raising=False
+    )
+    system, topology, positions = argon_system(64, 2.4)
+    simulation = _simulation(system, topology, positions, "flexible")
+    context = simulation.context
+    before = context.getState(getPositions=True)
+    original = context.getState
+
+    def failing_energy(**kwargs: Any) -> Any:
+        if kwargs.get("getEnergy"):
+            raise RuntimeError("energy failed")
+        return original(**kwargs)
+
+    monkeypatch.setattr(context, "getState", failing_energy)
+    with pytest.raises(RuntimeError, match="energy failed"):
+        stress_tensor_bar(simulation)
+    after = context.getState(getPositions=True)
+    assert np.array_equal(
+        after.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+        before.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+    )
+    assert np.array_equal(
+        after.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer),
+        before.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer),
+    )
+
+
+@pytest.mark.parametrize("reader", [pressure_bar, pressure_tensor_bar])
+def test_old_openmm_is_an_actionable_error(
+    monkeypatch: pytest.MonkeyPatch, reader: Any
+) -> None:
+    """An unsupported install should not surface a bare AttributeError."""
+    import openmm as mm
+
+    system, topology, positions = ideal_gas_system(8, 3.0)
+    simulation = _simulation(system, topology, positions, "anisotropic")
+    monkeypatch.delattr(mm.MonteCarloAnisotropicBarostat, "computeCurrentPressure")
+    with pytest.raises(StressError, match=r"OpenMM >= 8.3.1.*Upgrade"):
+        reader(simulation)
+
+
+def test_openmm830_pressure_bug_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Having a pressure method is insufficient on the first, buggy release."""
+    from openmm import version
+
+    system, topology, positions = ideal_gas_system(8, 3.0)
+    simulation = _simulation(system, topology, positions, "isotropic")
+    monkeypatch.setattr(version, "version", "8.3.0.dev-1ce5d91")
+    with pytest.raises(StressError, match="kinetic-pressure bug"):
+        pressure_bar(simulation)
 
 
 def test_stress_is_minus_pressure_so_tension_is_positive() -> None:

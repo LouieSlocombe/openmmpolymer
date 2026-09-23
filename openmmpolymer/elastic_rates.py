@@ -44,7 +44,7 @@ from .mechanical import (
     equilibration_protocol,
     extra_stages,
 )
-from .protocols import Protocol, Stage, run_protocol
+from .protocols import Protocol, Stage, run_protocol, validate_run_inputs
 from .rate_dependence import (
     RateObservation,
     RateProperty,
@@ -325,6 +325,8 @@ def run_elastic_rate_scan(
                     f"{directory / name} has completed stages with missing states; "
                     "restore them or rerun with resume=False."
                 )
+    if resume:
+        validate_run_inputs(run, directory / "equilibration")
     directory.mkdir(parents=True, exist_ok=True)
     record: dict[str, Any] = {
         **(previous if resume else {}),
@@ -665,9 +667,14 @@ def _observations(
                 )
             elif name == "bulk_modulus":
                 bulk = bulk_modulus(directory, group)
-                value, error, resolved = bulk.modulus_mpa, None, bulk.resolved
+                value, error, resolved = (
+                    bulk.modulus_mpa,
+                    bulk.standard_error_mpa,
+                    bulk.resolved,
+                )
                 notes.append(
-                    "Bulk ladder fit has no within-replica standard error; uncertainty needs repeated replicas."
+                    "Bulk standard error propagates the log-volume slope fit; "
+                    "independent replicas are needed to assess preparation variability."
                 )
             else:
                 load = youngs_modulus(

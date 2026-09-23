@@ -334,7 +334,26 @@ def test_make_barostat_is_seeded_and_rigid_by_default() -> None:
     """A seed of zero would make OpenMM choose its own and lose the run."""
     barostat = make_barostat("isotropic", 300.0, 1.0, 25, 4242)
     assert barostat.getRandomNumberSeed() == 4242
-    assert barostat.getScaleMoleculesAsRigid() is True
+    # 8.3's isotropic barostat is always rigid, with no configurable switch.
+    assert getattr(barostat, "getScaleMoleculesAsRigid", lambda: True)() is True
+
+
+@pytest.mark.parametrize("kind", ["isotropic", "anisotropic"])
+def test_older_barostat_defaults_to_rigid_and_refuses_atomic_scaling(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """A missing optional API must neither break defaults nor silently change physics."""
+    import openmm as mm
+
+    cls = (
+        mm.MonteCarloBarostat
+        if kind == "isotropic"
+        else mm.MonteCarloAnisotropicBarostat
+    )
+    monkeypatch.delattr(cls, "setScaleMoleculesAsRigid", raising=False)
+    assert make_barostat(kind, 300.0, 1.0, 25, 4242).getRandomNumberSeed() == 4242
+    with pytest.raises(SystemAssemblyError, match="scale_molecules_as_rigid=False"):
+        make_barostat(kind, 300.0, 1.0, 25, 4242, scale_molecules_as_rigid=False)
 
 
 def test_make_barostat_refuses_a_zero_seed() -> None:

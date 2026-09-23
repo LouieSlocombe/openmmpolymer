@@ -236,8 +236,10 @@ def test_the_refusal_names_the_ways_out(argon_scan_run: Any) -> None:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("initial_resume", [True, False])
 def test_the_whole_scan_runs_and_then_resumes_without_repeating_itself(
     argon_scan_run: Any,
+    initial_resume: bool,
 ) -> None:
     """The load-bearing one: both passes, the waypoint between them, resume."""
     result = run_tg_scan(
@@ -245,6 +247,7 @@ def test_the_whole_scan_runs_and_then_resumes_without_repeating_itself(
         "run",
         spec=QUICK,
         tg_approx_k=120.0,
+        resume=initial_resume,
         **QUICK_EQUILIBRATION,
     )
 

@@ -31,6 +31,7 @@ from .protocols import (
     _write_atomically,
     run_protocol,
     standard_melt_equilibration,
+    validate_run_inputs,
 )
 from .reporters import TrajectoryOptions
 from .simulate import RunContext, safe_timestep_fs
@@ -335,6 +336,8 @@ def run_breaking_scan(
         "steps_per_replica": breaking_schedule(spec).n_steps,
         "timestep_fs": timestep,
     }
+    if resume:
+        validate_run_inputs(run, directory)
     directory.mkdir(parents=True, exist_ok=True)
     _write_atomically(directory / WORKFLOW_NAME, json.dumps(record, indent=2) + "\n")
     log.info(
