@@ -12,7 +12,7 @@ the run be picked up again after the queue kills it.
 
 ## Installation
 
-Python 3.12 or newer and OpenMM 8.3.1 or newer, with the dependencies from
+Python 3.12 or newer and OpenMM 8.6.1 or newer, with the dependencies from
 conda-forge:
 
 ```bash
@@ -29,12 +29,9 @@ openmmpolymer` on its own will not give you a working install.
 The plotting helpers build a `matplotlib.figure.Figure` directly and never
 touch `pyplot`, so they need no display and no backend.
 
-OpenMM 8.3.0 has a kinetic-pressure calculation bug and is not supported.
-CI exercises the pressure and system adapters against 8.3.1 as well as the
+CI exercises the pressure and system adapters against 8.6.1 as well as the
 current environment. Flexible-cell stress uses `computeStressTensor` when
-available, with a consistent-strain finite-difference implementation on older
-supported releases. Older isotropic and anisotropic barostats support only
-rigid molecular scaling; requesting unavailable atomic scaling is an error.
+available, with a consistent-strain finite-difference fallback.
 
 ## A polyethylene melt
 

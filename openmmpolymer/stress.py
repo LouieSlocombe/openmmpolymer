@@ -11,8 +11,7 @@ otherwise evaluate that consistent-strain derivative here. Both paths retain
 the barostat's molecular convention: translate geometric molecular centres
 rigidly and use centre-of-mass kinetic energy, or deform individual atoms when
 ``getScaleMoleculesAsRigid()`` is false. The isotropic and anisotropic readouts
-use the pressure API directly. OpenMM 8.3.1 is the minimum supported release:
-8.3.0's native kinetic pressure has an upstream mass-weighting bug.
+use the pressure API directly. OpenMM 8.6.1 is the minimum supported release.
 
 Which barostat is attached decides what can be read. An anisotropic barostat
 reports the three diagonal components, and reports all three even when one
@@ -64,11 +63,11 @@ def _require_pressure_api(barostat: Any) -> None:
     from openmm import version
 
     release = re.match(r"(\d+)\.(\d+)\.(\d+)", version.version)
-    unsupported = release is not None and tuple(map(int, release.groups())) < (8, 3, 1)
+    unsupported = release is not None and tuple(map(int, release.groups())) < (8, 6, 1)
     if unsupported or not callable(getattr(barostat, "computeCurrentPressure", None)):
         raise StressError(
-            "Stress measurement requires OpenMM >= 8.3.1: earlier releases "
-            "lack computeCurrentPressure or contain a kinetic-pressure bug. "
+            "Stress measurement requires OpenMM >= 8.6.1 with "
+            "computeCurrentPressure available. "
             "Upgrade OpenMM in this environment."
         )
 

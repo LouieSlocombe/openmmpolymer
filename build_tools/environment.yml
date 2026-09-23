@@ -18,7 +18,7 @@ dependencies:
   - python>=3.12
   - pip
   - numpy>=2
-  - openmm>=8.3.1
+  - openmm>=8.6.1
   - rdkit
   - parmed
   # Supplies antechamber/parmchk2 for forcefill's gaff backend, and - this is

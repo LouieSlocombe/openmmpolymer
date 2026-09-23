@@ -393,19 +393,23 @@ def test_old_openmm_is_an_actionable_error(
     system, topology, positions = ideal_gas_system(8, 3.0)
     simulation = _simulation(system, topology, positions, "anisotropic")
     monkeypatch.delattr(mm.MonteCarloAnisotropicBarostat, "computeCurrentPressure")
-    with pytest.raises(StressError, match=r"OpenMM >= 8.3.1.*Upgrade"):
+    with pytest.raises(StressError, match=r"OpenMM >= 8.6.1.*Upgrade"):
         reader(simulation)
 
 
-def test_openmm830_pressure_bug_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Having a pressure method is insufficient on the first, buggy release."""
+@pytest.mark.parametrize("release", ["8.3.0.dev-1ce5d91", "8.3.1", "8.5.2", "8.6.0"])
+@pytest.mark.parametrize("reader", [pressure_bar, pressure_tensor_bar])
+def test_openmm_below_supported_floor_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, release: str, reader: Any
+) -> None:
+    """Having a pressure method does not make an older release supported."""
     from openmm import version
 
     system, topology, positions = ideal_gas_system(8, 3.0)
-    simulation = _simulation(system, topology, positions, "isotropic")
-    monkeypatch.setattr(version, "version", "8.3.0.dev-1ce5d91")
-    with pytest.raises(StressError, match="kinetic-pressure bug"):
-        pressure_bar(simulation)
+    simulation = _simulation(system, topology, positions, "anisotropic")
+    monkeypatch.setattr(version, "version", release)
+    with pytest.raises(StressError, match=r"OpenMM >= 8.6.1.*Upgrade"):
+        reader(simulation)
 
 
 def test_stress_is_minus_pressure_so_tension_is_positive() -> None:

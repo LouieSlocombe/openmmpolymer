@@ -35,8 +35,7 @@ classifiers = [
 # install; build_tools/environment.yml will.
 dependencies = [
   "numpy>=2.5.3",
-  # Pressure APIs arrived in 8.3; 8.3.1 fixes their kinetic mass-weighting bug.
-  "openmm>=8.3.1",
+  "openmm>=8.6.1",
   "rdkit",
   "forcefill>=1.0",
   "openff-toolkit>=0.16",

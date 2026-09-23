@@ -98,16 +98,16 @@ def test_the_python_floor_matches_forcefills(project: dict[str, object]) -> None
     assert project["project"]["requires-python"] == ">=3.12"  # type: ignore[index]
 
 
-def test_openmm_floor_matches_pressure_api_and_minimum_ci(
+def test_openmm_floor_matches_environment_and_minimum_ci(
     project: dict[str, object],
 ) -> None:
-    """8.3.1 fixes the first pressure API's kinetic bug; require that patch."""
+    """Installation routes and minimum-version CI use the same supported release."""
     dependencies = project["project"]["dependencies"]  # type: ignore[index]
-    assert "openmm>=8.3.1" in dependencies
+    assert "openmm>=8.6.1" in dependencies
     environment = (PYPROJECT.parent / "build_tools" / "environment.yml").read_text()
-    assert "- openmm>=8.3.1\n" in environment
+    assert "- openmm>=8.6.1\n" in environment
     workflow = (PYPROJECT.parent / ".github" / "workflows" / "ci.yml").read_text()
-    assert "openmm==8.3.1" in workflow
+    assert "openmm==8.6.1" in workflow
     assert "tests/test_stress.py" in workflow
 
 
