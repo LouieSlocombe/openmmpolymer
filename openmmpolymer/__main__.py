@@ -5,11 +5,9 @@ SMILES to an equilibrated cell, and every stage of it wants the same handful of
 facts. Anything more selective is better done from Python, where the four
 layers - chain, force field, packing, protocol - are separately callable.
 
-There is one exception, and it is ``--analyse``. Reading a finished run
-directory back is a different verb over a different input: it needs no monomer,
-none of the build flags apply to it, and "do it from Python" was the wrong
-answer for the one thing every run ends in. So the monomer is required unless
-that flag is given, which is the whole of the dispatch this command has.
+``--analyse`` reads a finished run without rebuilding it. ``--protocol tm``
+heats an explicitly supplied crystal and serialized System: packing an
+amorphous melt from a monomer cannot provide a crystalline melting point.
 
 The flags a protocol accepts are a table rather than a chain of conditionals,
 because the alternative failed quietly: a flag that no factory took was parsed,
@@ -22,7 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -30,8 +28,9 @@ from typing import Any, cast
 from .chain import ChainSpec, build_chain
 from .charges import CHARGE_METHODS, assign_charges
 from .elasticity import deform_stages, load_stages, shear_stages
-from .forcefield import BACKENDS, build_polymer_forcefield
+from .forcefield import BACKENDS, PolymerForceField, build_polymer_forcefield
 from .mdsystem import (
+    PackedBox,
     SystemSpec,
     assemble_box,
     check_target_density,
@@ -53,7 +52,7 @@ from .packing import (
 )
 from .protocols import Protocol, melt_quench, run_protocol, standard_melt_equilibration
 from .relaxation import relax_stages
-from .simulate import RELAX_MODES, prepare_run
+from .simulate import RELAX_MODES, RunContext, prepare_run
 from .structure import analyse_structure, structure_stages, write_structure_report
 from .tg import (
     TgSpec,
@@ -68,6 +67,15 @@ from .timeseries import (
     EXTRAPOLATION_FORMS,
     cooling_rate_extrapolation,
     quench_stages,
+)
+from .tm import (
+    TmError,
+    TmSpec,
+    analyse_melting,
+    heating_stages,
+    melting_scan,
+    run_tm_scan,
+    write_melting_report,
 )
 from .trajectory import AnalysisError
 from .viscoelastic import (
@@ -161,6 +169,53 @@ _RELAXATION = (
     "linearity_strains",
     "max_total_ns",
 )
+
+
+_TM = (
+    *_QUENCH,
+    "pressure_bar",
+    "tm_equilibration_ps",
+    "tm_stage_ps",
+    "tm_trajectory_ps",
+    "tm_barostat",
+    "min_points_per_branch",
+    "max_total_ns",
+)
+
+
+def _tm_spec(
+    *,
+    t_start: float = 250.0,
+    t_end: float = 650.0,
+    step_k: float = 10.0,
+    hold_ps: float = 1000.0,
+    pressure_bar: float = 1.0,
+    tm_equilibration_ps: float = 1000.0,
+    tm_stage_ps: float = 10_000.0,
+    tm_trajectory_ps: float | None = None,
+    tm_barostat: str = "anisotropic",
+    min_points_per_branch: int = 3,
+    max_total_ns: float | None = None,
+) -> TmSpec:
+    """Map the heating controls onto a crystalline melting scan."""
+    return TmSpec(
+        t_start_k=t_start,
+        t_end_k=t_end,
+        step_k=step_k,
+        hold_ps=hold_ps,
+        pressure_bar=pressure_bar,
+        equilibration_ps=tm_equilibration_ps,
+        stage_ps=tm_stage_ps,
+        trajectory_ps=tm_trajectory_ps,
+        barostat=tm_barostat,
+        min_points_per_branch=min_points_per_branch,
+        max_total_ns=max_total_ns,
+    )
+
+
+def _tm_protocol(**options: Any) -> Protocol:
+    """The complete heating ladder, including crystal equilibration."""
+    return melting_scan(_tm_spec(**options))
 
 
 def _relaxation_spec(
@@ -292,14 +347,38 @@ PROTOCOLS = {
     "equilibrate": ProtocolEntry(standard_melt_equilibration, _TARGET + _COMMON),
     "melt-quench": ProtocolEntry(melt_quench, _TARGET + _COMMON + _QUENCH),
     "tg": ProtocolEntry(_tg_protocol, _COMMON + _QUENCH[1:] + _TG),
+    "tm": ProtocolEntry(_tm_protocol, _TM),
     "modulus": ProtocolEntry(_modulus_protocol, ("pressure_bar", *_MECHANICS)),
     "relax": ProtocolEntry(_relax_protocol, _RELAXATION),
 }
 
 
+class _ProtocolParser(argparse.ArgumentParser):
+    """Choose heating defaults only after the protocol has been parsed."""
+
+    def parse_args(
+        self,
+        args: Iterable[str] | None = None,
+        namespace: Any = None,
+    ) -> Any:
+        arguments = super().parse_args(args, namespace)
+        defaults = {"t_end": 200.0, "step_k": 20.0, "hold_ps": 200.0}
+        if arguments.protocol == "tm":
+            defaults = {
+                "t_start": 250.0,
+                "t_end": 650.0,
+                "step_k": 10.0,
+                "hold_ps": 1000.0,
+            }
+        for name, value in defaults.items():
+            if getattr(arguments, name) is None:
+                setattr(arguments, name, value)
+        return arguments
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the command-line argument parser."""
-    parser = argparse.ArgumentParser(
+    parser = _ProtocolParser(
         prog="openmmpolymer",
         description="Build, pack and equilibrate an all-atom polymer melt.",
     )
@@ -308,7 +387,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         help="monomer SMILES with two [*] attachment points, e.g. '[*]CC[*]'. "
-        "Required unless --analyse is given",
+        "Required unless --analyse or --protocol tm is given",
     )
     parser.add_argument(
         "-n",
@@ -381,32 +460,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="what to run (default: %(default)s)",
     )
     quench = parser.add_argument_group(
-        "cooling",
-        "the ladder a quenching protocol walks; tg adds a second, finer pass",
+        "temperature ladder",
+        "cooling for melt-quench/tg, heating from a crystal for tm",
     )
     quench.add_argument(
         "--t-start",
         type=float,
         default=None,
-        help="temperature cooling starts from (default: the melt temperature)",
+        help="starting temperature (default: melt temperature; tm: 250 K)",
     )
     quench.add_argument(
         "--t-end",
         type=float,
-        default=200.0,
-        help="temperature cooling stops at (default: %(default)s)",
+        default=None,
+        help="ending temperature (default: 200 K; tm: 650 K)",
     )
     quench.add_argument(
         "--step-k",
         type=float,
-        default=20.0,
-        help="temperature drop per step (default: %(default)s)",
+        default=None,
+        help="temperature change per step (default: 20 K; tm: 10 K)",
     )
     quench.add_argument(
         "--hold-ps",
         type=float,
-        default=200.0,
-        help="time held at each temperature (default: %(default)s)",
+        default=None,
+        help="time held at each temperature (default: 200 ps; tm: 1000 ps)",
     )
     quench.add_argument(
         "--fine-step-k",
@@ -444,7 +523,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-total-ns",
         type=float,
         default=None,
-        help="refuse to start a tg or modulus scan longer than this",
+        help="refuse to start a scan longer than this",
     )
     quench.add_argument(
         "--check-melt",
@@ -456,6 +535,46 @@ def build_parser() -> argparse.ArgumentParser:
         "can be shown to have relaxed (default interval 10 ps). This is "
         "frames of the whole cell - tens of megabytes - and without it the "
         "chain half of that check has nothing to read",
+    )
+    melting = parser.add_argument_group(
+        "melting",
+        "tm requires a prepared crystalline or semicrystalline periodic cell",
+    )
+    melting.add_argument(
+        "--crystal-pdb",
+        help="crystalline starting PDB, with periodic box and System atom order",
+    )
+    melting.add_argument(
+        "--system-xml",
+        help="serialized OpenMM System for --crystal-pdb, without a thermostat or barostat",
+    )
+    melting.add_argument(
+        "--state-in",
+        help="optional serialized OpenMM State for the same crystalline cell",
+    )
+    melting.add_argument(
+        "--tm-equilibration-ps",
+        type=float,
+        default=1000.0,
+        help="equilibrate the crystal at --t-start for this long (default: %(default)s)",
+    )
+    melting.add_argument(
+        "--tm-stage-ps",
+        type=float,
+        default=10_000.0,
+        help="maximum heating stage duration in ps (default: %(default)s)",
+    )
+    melting.add_argument(
+        "--tm-trajectory-ps",
+        type=float,
+        default=None,
+        help="optional trajectory interval in ps, to inspect loss of crystal order",
+    )
+    melting.add_argument(
+        "--tm-barostat",
+        choices=("isotropic", "anisotropic"),
+        default="anisotropic",
+        help="pressure control for the crystal and heating (default: %(default)s)",
     )
     parser.add_argument(
         "--tacticity",
@@ -803,6 +922,43 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if arguments.analyse:
         return _analyse(arguments)
+    if arguments.protocol == "tm":
+        if arguments.monomer is not None:
+            parser.error("tm starts from --crystal-pdb, not a monomer SMILES")
+        if arguments.crystal_pdb is None or arguments.system_xml is None:
+            parser.error("tm requires both --crystal-pdb and --system-xml")
+        try:
+            tm_spec = _tm_spec(**_protocol_options(arguments, PROTOCOLS["tm"]))
+            # Validate the complete scan before reading coordinates or creating files.
+            melting_scan(tm_spec)
+            crystal_run = _prepared_crystal(arguments)
+        except (OSError, ValueError, TmError) as error:
+            parser.error(str(error))
+        if arguments.dry_run:
+            print(
+                "dry run: crystal and heating schedule validated; no dynamics",
+                flush=True,
+            )
+            return 0
+        result = run_tm_scan(
+            crystal_run,
+            Path(arguments.output_dir or "run"),
+            spec=tm_spec,
+            state_in=arguments.state_in,
+            crystalline=True,
+        )
+        print(_melting_line(result), flush=True)
+        for note in result.report.notes:
+            print(f"note: {note}", flush=True)
+        files = write_melting_report(
+            result.report,
+            figures=not arguments.no_figures,
+            figure_format=cast(str, arguments.figure_format),
+        )
+        print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
+        return 0
+    if any((arguments.crystal_pdb, arguments.system_xml, arguments.state_in)):
+        parser.error("--crystal-pdb, --system-xml and --state-in require --protocol tm")
     if arguments.monomer is None:
         parser.error("a monomer SMILES is required unless --analyse is given")
 
@@ -906,6 +1062,137 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     _print_chains(summary.chains)
     return 0
+
+
+def _prepared_crystal(arguments: argparse.Namespace) -> RunContext:
+    """Load a crystal without repacking it or rebuilding its force field."""
+    import numpy as np
+    import openmm as mm
+    from openmm import app, unit
+
+    try:
+        pdb = app.PDBFile(arguments.crystal_pdb)
+        system = mm.XmlSerializer.deserialize(Path(arguments.system_xml).read_text())
+    except Exception as error:
+        raise ValueError(
+            f"Could not read the prepared crystal and System: {error}"
+        ) from error
+    if not isinstance(system, mm.System):
+        raise ValueError("--system-xml must contain a serialized OpenMM System")
+    if system.getNumParticles() != pdb.topology.getNumAtoms():
+        raise ValueError("Crystal PDB and System must contain the same number of atoms")
+    if any("Barostat" in type(force).__name__ for force in system.getForces()):
+        raise ValueError("The supplied System must not contain a barostat")
+    if any(isinstance(force, mm.AndersenThermostat) for force in system.getForces()):
+        raise ValueError(
+            "The supplied System must not contain an Andersen thermostat; "
+            "the heating scan controls temperature with its Langevin integrator"
+        )
+    if not system.usesPeriodicBoundaryConditions():
+        raise ValueError("The supplied System must use periodic boundary conditions")
+    vectors = pdb.topology.getPeriodicBoxVectors()
+    if vectors is None:
+        raise ValueError("Crystal PDB must contain periodic box vectors (CRYST1)")
+    matrix = np.asarray(vectors.value_in_unit(unit.nanometer), dtype=float)
+    if not np.all(np.isfinite(matrix)) or np.linalg.det(matrix) <= 0:
+        raise ValueError("Crystal PDB must have finite, positive-volume box vectors")
+    positions = np.asarray(pdb.positions.value_in_unit(unit.nanometer), dtype=float)
+    if not np.all(np.isfinite(positions)):
+        raise ValueError("Crystal PDB coordinates must be finite")
+    system.setDefaultPeriodicBoxVectors(*vectors)
+    if arguments.state_in is not None:
+        try:
+            state = mm.XmlSerializer.deserialize(Path(arguments.state_in).read_text())
+            if not isinstance(state, mm.State):
+                raise ValueError("--state-in must contain a serialized OpenMM State")
+            saved_positions = np.asarray(
+                state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+                dtype=float,
+            )
+            saved_vectors = np.asarray(
+                state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer),
+                dtype=float,
+            )
+        except Exception as error:
+            raise ValueError(
+                f"Could not read the crystalline starting State: {error}"
+            ) from error
+        if saved_positions.shape != positions.shape or not np.all(
+            np.isfinite(saved_positions)
+        ):
+            raise ValueError(
+                "Starting State must have finite positions for every crystal atom"
+            )
+        if not np.all(np.isfinite(saved_vectors)) or np.linalg.det(saved_vectors) <= 0:
+            raise ValueError(
+                "Starting State must have finite, positive-volume box vectors"
+            )
+    box = PackedBox(
+        topology=pdb.topology,
+        positions_nm=positions,
+        box_nm=cast(
+            tuple[float, float, float],
+            tuple(float(value) for value in np.linalg.norm(matrix, axis=1)),
+        ),
+        n_molecules=_crystal_molecule_count(pdb.topology),
+    )
+    # The supplied System owns its parameters. This descriptor is provenance,
+    # never passed to app.ForceField; masses and constraints are left untouched.
+    forcefield = PolymerForceField(
+        forcefield_xml=str(Path(arguments.system_xml).resolve()),
+        base_forcefield=(),
+        residue_name="",
+        backend="prepared-system",
+    )
+    return prepare_run(
+        box,
+        forcefield,
+        SystemSpec(constraints="none", hydrogen_mass_amu=None),
+        platform=arguments.platform,
+        seed=arguments.seed,
+        system=system,
+    )
+
+
+def _crystal_molecule_count(topology: Any) -> int:
+    """Count bonded components and validate the molecule layout used by reports."""
+    n_atoms = topology.getNumAtoms()
+    if n_atoms == 0:
+        raise ValueError("Crystal PDB must contain atoms")
+    neighbours: list[list[int]] = [[] for _ in range(n_atoms)]
+    for left, right in topology.bonds():
+        neighbours[left.index].append(right.index)
+        neighbours[right.index].append(left.index)
+    visited: set[int] = set()
+    components: list[list[int]] = []
+    for start in range(n_atoms):
+        if start in visited:
+            continue
+        visited.add(start)
+        pending = [start]
+        component = []
+        while pending:
+            atom = pending.pop()
+            component.append(atom)
+            for neighbour in neighbours[atom]:
+                if neighbour not in visited:
+                    visited.add(neighbour)
+                    pending.append(neighbour)
+        components.append(component)
+    if any(len(component) != len(components[0]) for component in components):
+        raise ValueError(
+            "Crystal PDB must contain molecules with equal atom counts; "
+            "check its bonds/CONECT records against the System"
+        )
+    if any(
+        max(component) - min(component) + 1 != len(component)
+        for component in components
+    ):
+        raise ValueError(
+            "Crystal PDB molecules must occupy contiguous atom blocks; "
+            "reorder both the PDB and System consistently"
+        )
+    return len(components)
 
 
 def _protocol_options(
@@ -1159,17 +1446,13 @@ def _analyse_relaxation(arguments: argparse.Namespace, run_dir: Path) -> None:
 def _has_stages(run_dir: Path, find: Any) -> bool:
     """Whether a reader finds anything of its kind in this directory.
 
-    The readers raise rather than return empty, which is the right shape for
-    a caller that asked for one thing and consistent with
-    :func:`~openmmpolymer.timeseries.quench_stages`. Here the question really
-    is "is there any", so the refusal is caught once, in the one place that
-    is asking rather than telling.
+    Readers can return an empty collection or raise when none are found.
+    Both mean that this report does not apply to the directory.
     """
     try:
-        find(run_dir)
+        return bool(find(run_dir))
     except AnalysisError:
         return False
-    return True
 
 
 def _analyse(arguments: argparse.Namespace) -> int:
@@ -1184,14 +1467,15 @@ def _analyse(arguments: argparse.Namespace) -> int:
     directories = [Path(name) for name in arguments.analyse]
     first = directories[0]
     quenched = _has_stages(first, quench_stages)
+    heated = _has_stages(first, heating_stages)
     deformed = any(
         _has_stages(first, find) for find in (deform_stages, load_stages, shear_stages)
     )
     relaxed = _has_stages(first, relax_stages)
     structured = not arguments.no_structure and _has_stages(first, structure_stages)
-    if not quenched and not deformed and not relaxed and not structured:
+    if not quenched and not heated and not deformed and not relaxed and not structured:
         print(
-            f"nothing in {first} was a quench, a deformation or a relaxation, "
+            f"nothing in {first} was a quench, a heating scan, a deformation or a relaxation, "
             "and no stage left coordinates to measure, so there is nothing to "
             "report",
             flush=True,
@@ -1200,6 +1484,8 @@ def _analyse(arguments: argparse.Namespace) -> int:
 
     if quenched:
         _analyse_tg(arguments, directories)
+    if heated:
+        _analyse_melting(arguments, first)
     if deformed:
         _analyse_mechanics(arguments, first)
     if relaxed:
@@ -1207,6 +1493,35 @@ def _analyse(arguments: argparse.Namespace) -> int:
     if structured:
         _analyse_structure(arguments, first)
     return 0
+
+
+def _melting_line(result: Any) -> str:
+    """Report the finite heating bracket without implying equilibrium Tm."""
+    transition = getattr(result, "transition", result)
+    if not transition.resolved or transition.temperature_k is None:
+        return "tm: no clear melting transition (not resolved)"
+    low, high = transition.bracket_k
+    return (
+        f"tm: apparent Tm = {transition.temperature_k:g} K "
+        f"(heating bracket {low:g}-{high:g} K)"
+    )
+
+
+def _analyse_melting(arguments: argparse.Namespace, run_dir: Path) -> None:
+    """Read the density and enthalpy discontinuity of a recorded heating scan."""
+    report = analyse_melting(
+        run_dir, min_points_per_branch=int(arguments.min_points_per_branch)
+    )
+    print(_melting_line(report), flush=True)
+    for note in report.notes:
+        print(f"note: {note}", flush=True)
+    files = write_melting_report(
+        report,
+        arguments.output_dir,
+        figures=not arguments.no_figures,
+        figure_format=cast(str, arguments.figure_format),
+    )
+    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
 
 
 def _analyse_structure(arguments: argparse.Namespace, run_dir: Path) -> None:

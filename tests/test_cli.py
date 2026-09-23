@@ -17,6 +17,7 @@ from openmmpolymer.__main__ import (
     _modulus_spec,
     _protocol_options,
     _tg_spec,
+    _tm_spec,
     build_parser,
     main,
 )
@@ -196,6 +197,325 @@ def test_building_a_melt_still_needs_a_monomer() -> None:
     """The one required argument, unless the other mode was asked for."""
     with pytest.raises(SystemExit):
         main([])
+
+
+def test_melting_and_cooling_keep_their_own_defaults() -> None:
+    """Adding heating must not reverse any existing cooling command."""
+    parser = build_parser()
+    cooling = parser.parse_args(["[*]CC[*]", "--protocol", "melt-quench"])
+    heating = parser.parse_args(["--protocol", "tm"])
+    assert (cooling.t_start, cooling.t_end, cooling.step_k, cooling.hold_ps) == (
+        None,
+        200.0,
+        20.0,
+        200.0,
+    )
+    assert (heating.t_start, heating.t_end, heating.step_k, heating.hold_ps) == (
+        250.0,
+        650.0,
+        10.0,
+        1000.0,
+    )
+    for option in PROTOCOLS["tm"].options:
+        assert option in inspect.signature(_tm_spec).parameters
+    explicit = parser.parse_args(
+        [
+            "--t-start",
+            "100",
+            "--t-end",
+            "200",
+            "--step-k",
+            "5",
+            "--hold-ps",
+            "10",
+            "--protocol",
+            "tm",
+        ]
+    )
+    spec = _tm_spec(**_protocol_options(explicit, PROTOCOLS["tm"]))
+    assert (spec.t_start_k, spec.t_end_k, spec.step_k, spec.hold_ps) == (
+        100,
+        200,
+        5,
+        10,
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--protocol", "tm"],
+        ["--protocol", "tm", "--crystal-pdb", "crystal.pdb"],
+        [
+            "[*]CC[*]",
+            "--protocol",
+            "tm",
+            "--crystal-pdb",
+            "crystal.pdb",
+            "--system-xml",
+            "system.xml",
+        ],
+        ["[*]CC[*]", "--crystal-pdb", "crystal.pdb"],
+    ],
+)
+def test_melting_requires_a_prepared_crystal_before_creating_files(
+    argv: list[str], tmp_path: Path
+) -> None:
+    with pytest.raises(SystemExit):
+        main([*argv, "-o", str(tmp_path / "output")])
+    assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize(
+    "controls",
+    [
+        ["--t-start", "500", "--t-end", "300"],
+        ["--step-k", "0"],
+        ["--hold-ps", "-1"],
+        ["--max-total-ns", "0.001"],
+    ],
+)
+def test_melting_rejects_invalid_schedules_before_reading_the_crystal(
+    controls: list[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import openmmpolymer.__main__ as cli
+
+    def unexpected_read(arguments: Any) -> Any:
+        raise AssertionError("The schedule should fail before the crystal is read")
+
+    monkeypatch.setattr(cli, "_prepared_crystal", unexpected_read)
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--protocol",
+                "tm",
+                "--crystal-pdb",
+                "crystal.pdb",
+                "--system-xml",
+                "system.xml",
+                "-o",
+                str(tmp_path / "output"),
+                *controls,
+            ]
+        )
+    assert not (tmp_path / "output").exists()
+
+
+def _crystal_files(argon_box: tuple[Any, Any], directory: Path) -> list[str]:
+    """Write a prepared periodic cell and exactly its serialized System."""
+    import openmm as mm
+    from openmm import app
+
+    box, system = argon_box
+    pdb = directory / "crystal.pdb"
+    xml = directory / "system.xml"
+    with pdb.open("w") as stream:
+        app.PDBFile.writeFile(box.topology, box.positions, stream)
+    xml.write_text(mm.XmlSerializer.serialize(system))
+    return ["--crystal-pdb", str(pdb), "--system-xml", str(xml)]
+
+
+def test_melting_dry_run_validates_prepared_inputs_without_building(
+    argon_box: tuple[Any, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = _crystal_files(argon_box, tmp_path)
+    output = tmp_path / "output"
+    assert main(["--protocol", "tm", *args, "--dry-run", "-o", str(output)]) == 0
+    assert "crystal and heating schedule validated" in capsys.readouterr().out
+    assert not output.exists()
+
+
+def test_melting_dry_run_accepts_a_matching_crystalline_state(
+    argon_box: tuple[Any, Any], tmp_path: Path
+) -> None:
+    import openmm as mm
+
+    box, system = argon_box
+    args = _crystal_files(argon_box, tmp_path)
+    integrator = mm.VerletIntegrator(0.001)
+    context = mm.Context(system, integrator, mm.Platform.getPlatformByName("Reference"))
+    context.setPositions(box.positions)
+    context.setVelocitiesToTemperature(250.0, 1)
+    state = tmp_path / "crystal-state.xml"
+    state.write_text(
+        mm.XmlSerializer.serialize(
+            context.getState(getPositions=True, getVelocities=True)
+        )
+    )
+    assert main(["--protocol", "tm", *args, "--state-in", str(state), "--dry-run"]) == 0
+
+
+@pytest.mark.parametrize(
+    "invalid", ["atom_count", "barostat", "thermostat", "box", "periodicity", "state"]
+)
+def test_prepared_crystal_inputs_are_checked_before_the_scan(
+    invalid: str, argon_box: tuple[Any, Any], tmp_path: Path
+) -> None:
+    import openmm as mm
+
+    box, system = argon_box
+    if invalid == "atom_count":
+        system.addParticle(1.0)
+    elif invalid == "barostat":
+        system.addForce(mm.MonteCarloBarostat(1.0, 300.0))
+    elif invalid == "thermostat":
+        system.addForce(mm.AndersenThermostat(300.0, 1.0))
+    elif invalid == "periodicity":
+        system.getForce(0).setNonbondedMethod(mm.NonbondedForce.NoCutoff)
+    args = _crystal_files((box, system), tmp_path)
+    if invalid == "box":
+        pdb = tmp_path / "crystal.pdb"
+        pdb.write_text(
+            "\n".join(
+                line
+                for line in pdb.read_text().splitlines()
+                if not line.startswith("CRYST1")
+            )
+        )
+    elif invalid == "state":
+        args.extend(["--state-in", str(tmp_path / "missing-state.xml")])
+    with pytest.raises(SystemExit):
+        main(["--protocol", "tm", *args, "--dry-run", "-o", str(tmp_path / "output")])
+    assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_crystal_molecule_layout_must_match_the_reporters_assumptions(
+    interleaved: bool,
+    argon_box: tuple[Any, Any],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    box, _ = argon_box
+    atoms = list(box.topology.atoms())
+    if interleaved:
+        pairs = [
+            (0, 2),
+            (1, 3),
+            *[(index, index + 1) for index in range(4, len(atoms), 2)],
+        ]
+    else:
+        pairs = [(0, 1)]
+    for left, right in pairs:
+        box.topology.addBond(atoms[left], atoms[right])
+    args = _crystal_files(argon_box, tmp_path)
+    with pytest.raises(SystemExit):
+        main(["--protocol", "tm", *args, "--dry-run"])
+    message = "contiguous atom blocks" if interleaved else "equal atom counts"
+    assert message in capsys.readouterr().err
+    assert not (tmp_path / "run").exists()
+
+
+def test_melting_cli_dispatches_the_prepared_cell_and_explicit_schedule(
+    argon_box: tuple[Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import openmmpolymer.__main__ as cli
+
+    seen: dict[str, Any] = {}
+    report = SimpleNamespace(notes=("Finite heating rate; inspect crystalline order.",))
+
+    def scan(run: Any, output: Path, **kwargs: Any) -> Any:
+        seen.update(kwargs, run=run, output=output)
+        return SimpleNamespace(
+            temperature_k=415.0, bracket_k=(410.0, 420.0), resolved=True, report=report
+        )
+
+    def write(actual: Any, **kwargs: Any) -> Any:
+        assert actual is report
+        assert kwargs["figures"] is False
+        return SimpleNamespace(json=tmp_path / "output/analysis/tm.json", figures=())
+
+    monkeypatch.setattr(cli, "run_tm_scan", scan)
+    monkeypatch.setattr(cli, "write_melting_report", write)
+    args = _crystal_files(argon_box, tmp_path)
+    assert (
+        main(
+            [
+                "--protocol",
+                "tm",
+                *args,
+                "--t-start",
+                "280",
+                "--t-end",
+                "500",
+                "--step-k",
+                "20",
+                "--hold-ps",
+                "50",
+                "--tm-equilibration-ps",
+                "10",
+                "--tm-stage-ps",
+                "100",
+                "--no-figures",
+                "-o",
+                str(tmp_path / "output"),
+            ]
+        )
+        == 0
+    )
+    assert seen["crystalline"] is True
+    assert seen["state_in"] is None
+    assert seen["spec"].t_start_k == 280
+    assert seen["spec"].t_end_k == 500
+    assert seen["spec"].hold_ps == 50
+    assert seen["run"].box.topology.getNumAtoms() == argon_box[0].topology.getNumAtoms()
+    assert seen["run"].box.n_molecules == 64
+    assert seen["run"].spec.constraints == "none"
+    assert "apparent Tm = 415 K (heating bracket 410-420 K)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("resolved", [True, False])
+def test_analyse_dispatches_melting_and_reports_unresolved_results(
+    resolved: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import openmmpolymer.__main__ as cli
+    from openmmpolymer.tm import heating_stages
+
+    transition = SimpleNamespace(
+        temperature_k=415.0 if resolved else None,
+        bracket_k=(410.0, 420.0) if resolved else None,
+        resolved=resolved,
+    )
+    report = SimpleNamespace(transition=transition, notes=("Finite heating scan.",))
+    monkeypatch.setattr(cli, "_has_stages", lambda path, find: find is heating_stages)
+
+    def analyse(run_dir: Path, **kwargs: Any) -> Any:
+        assert run_dir == tmp_path
+        assert kwargs["min_points_per_branch"] == 4
+        return report
+
+    def write(actual: Any, output: Any, **kwargs: Any) -> Any:
+        assert actual is report
+        assert output == str(tmp_path / "reports")
+        assert kwargs["figures"] is False
+        return SimpleNamespace(json=tmp_path / "reports/tm.json", figures=())
+
+    monkeypatch.setattr(cli, "analyse_melting", analyse)
+    monkeypatch.setattr(cli, "write_melting_report", write)
+    assert (
+        main(
+            [
+                "--analyse",
+                str(tmp_path),
+                "--no-figures",
+                "--min-points-per-branch",
+                "4",
+                "-o",
+                str(tmp_path / "reports"),
+            ]
+        )
+        == 0
+    )
+    printed = capsys.readouterr().out
+    assert (
+        "apparent Tm = 415 K" if resolved else "no clear melting transition"
+    ) in printed
 
 
 def test_the_analysis_mode_reports_a_transition_and_writes_a_report(
@@ -532,16 +852,16 @@ def test_analysing_a_relaxation_directory_reports_and_writes_it(
     assert (tmp_path / "analysis" / "relaxation.png").is_file()
 
 
-def test_a_directory_that_is_none_of_the_four_kinds_is_refused(
+def test_a_directory_that_is_none_of_the_reported_kinds_is_refused(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The refusal names all four, so it says what would have been reported."""
+    """The refusal names all report kinds, including heating scans."""
     (tmp_path / "manifest.json").write_text(
         '{"protocol": "x", "seed": 1, "stages": {"05_npt": {"samples": {}}}}'
     )
     assert main(["--analyse", str(tmp_path)]) == 1
     captured = capsys.readouterr().out
-    assert "quench, a deformation or a relaxation" in captured
+    assert "quench, a heating scan, a deformation or a relaxation" in captured
     assert "coordinates" in captured
 
 

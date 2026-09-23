@@ -131,6 +131,67 @@ From the command line:
 openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol tg --check-melt -o run -v
 ```
 
+## Estimating a melting temperature
+
+Melting needs a crystalline or semicrystalline starting cell. The ordinary
+monomer-to-melt workflow produces an amorphous cell, so it cannot supply that
+starting point. Prepare and check the crystal separately, with a force field
+appropriate for its solid phase, then use `run_tm_scan` to equilibrate it below
+the expected melting range and heat it through a temperature ladder at fixed
+pressure.
+
+```python
+from openmmpolymer import TmSpec, analyse_melting, run_tm_scan, write_melting_report
+
+# crystal_run is a prepared RunContext for your crystalline periodic cell.
+result = run_tm_scan(
+    crystal_run,
+    "melting",
+    crystalline=True,
+    spec=TmSpec(t_start_k=250.0, t_end_k=650.0, step_k=10.0, hold_ps=1000.0),
+)
+print(result.temperature_k, result.bracket_k, result.resolved)
+write_melting_report(analyse_melting("melting"))
+```
+
+`crystalline=True` is your declaration about the starting structure, not an
+automatic crystallinity check. The scan looks for a coincident upward jump in
+specific volume and enthalpy. Smooth thermal expansion, a glass-transition
+slope change, or conflicting signals leave the result unresolved. The reported
+temperature is the midpoint of a sampled heating bracket; this is an apparent
+melting temperature at that heating rate, not an equilibrium melting point.
+Superheating, cell size, crystal morphology and the force field can shift it.
+Inspect the loss of crystalline order, repeat with longer holds and smaller
+steps, and use independent starting configurations to assess that uncertainty.
+`trajectory_ps` can save coordinates for that inspection.
+
+The CLI takes the prepared PDB and an OpenMM `XmlSerializer` System file in
+exactly the same atom order. The PDB must include its periodic box (`CRYST1`),
+and the System must be periodic and contain no thermostat or barostat. The scan
+supplies its own temperature and pressure controls. This is a serialized System,
+not a force-field XML template. Parameterisation and packing are skipped.
+The PDB must include molecular bonds (`CONECT` records where needed) consistent
+with the System: bonded connected components define the molecules, independently
+of PDB chain identifiers. Molecules must have equal atom counts and occupy
+contiguous atom blocks, as required by the structural reports. Mixed molecule
+sizes and interleaved atom ordering are rejected.
+
+```bash
+openmmpolymer --protocol tm --crystal-pdb crystal.pdb --system-xml system.xml \
+  --t-start 250 --t-end 650 --step-k 10 --hold-ps 1000 \
+  --tm-trajectory-ps 10 --max-total-ns 50 -o melting
+openmmpolymer --analyse melting
+```
+
+`--state-in crystal-state.xml` can supply positions, velocities and box vectors
+from the same prepared crystal instead of starting at the PDB coordinates.
+`--dry-run` checks the inputs and schedule without running dynamics. The
+default pressure control is anisotropic so the crystal's three box lengths can
+relax independently; `--tm-barostat isotropic` holds their ratios fixed. Heating
+is split into resumable stages (`--tm-stage-ps`), and rerunning the same command
+resumes completed work. Reports and figures go to `melting/analysis/tm.json`
+and its neighbouring image files.
+
 ## Reading a finished run
 
 ```bash
@@ -145,8 +206,8 @@ the figures. Give it several run directories to pool a cooling-rate series
 across them. The manifest is not touched.
 
 It works out what to report from what the directory recorded: a run that
-quenched gets a glass transition, a run that was deformed gets its elastic
-constants, a run that did both gets both, and any run whose stages left
+quenched gets a glass transition, a heating scan gets a melting report, a run
+that was deformed gets its elastic constants, and any run whose stages left
 coordinates gets its structure read back as well.
 
 ## Measuring a modulus

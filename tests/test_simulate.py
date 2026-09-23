@@ -9,6 +9,7 @@ milliseconds.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -20,11 +21,13 @@ from openmmpolymer.simulate import (
     SimulationError,
     StageResult,
     density_g_cm3,
+    heating_temperatures,
     prepare_run,
     quench_temperatures,
     run_anneal,
     run_compress,
     run_deform,
+    run_heat,
     run_minimise,
     run_npt,
     run_nvt,
@@ -427,6 +430,140 @@ def test_the_ladder_helper_reproduces_the_one_a_quench_runs() -> None:
 def test_a_ladder_that_does_not_divide_evenly_still_reaches_the_bottom() -> None:
     """The floor is a temperature someone chose, not a rounding artefact."""
     assert quench_temperatures(100.0, 30.0, 90.0) == [100.0, 30.0]
+
+
+def test_heating_ladder_includes_both_endpoints() -> None:
+    """The cost and stage must agree even when the final interval is short."""
+    assert heating_temperatures(100.0, 175.0, 30.0) == [100.0, 130.0, 160.0, 175.0]
+    assert heating_temperatures(100.0, 110.0, 30.0) == [100.0, 110.0]
+    assert heating_temperatures(100.0, 160.0, 30.0) == [100.0, 130.0, 160.0]
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "step"),
+    [
+        (100.0, 100.0, 20.0),
+        (200.0, 100.0, 20.0),
+        (0.0, 100.0, 20.0),
+        (100.0, float("inf"), 20.0),
+        (float("nan"), 200.0, 20.0),
+        (100.0, 200.0, float("nan")),
+        (100.0, 200.0, 0.0),
+        (100.0, 200.0, 1e-30),
+    ],
+)
+def test_heating_ladder_rejects_invalid_arguments(
+    start: float, end: float, step: float
+) -> None:
+    """Nonfinite or nonprogressing input must fail before entering dynamics."""
+    with pytest.raises(ValueError):
+        heating_temperatures(start, end, step)
+
+
+@pytest.mark.parametrize(
+    "temperatures",
+    [[], [120.0, 100.0], [100.0, 100.0], [100.0, float("nan")], [0.0, 100.0]],
+)
+def test_heat_rejects_an_invalid_explicit_ladder(
+    argon_run: Any, temperatures: list[float]
+) -> None:
+    """An explicit chunk has the same finite, positive, ascending rules."""
+    with pytest.raises(ValueError):
+        run_heat(argon_run, temperatures_k=temperatures)
+
+
+@pytest.mark.parametrize("option", ["hold_ps", "pressure_bar"])
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_heat_rejects_invalid_holds_and_pressures(
+    argon_run: Any, option: str, value: float
+) -> None:
+    """Fail before a context or any output is created."""
+    options: dict[str, Any] = {option: value}
+    with pytest.raises(ValueError, match=option):
+        run_heat(argon_run, **options)
+
+
+def test_heat_uses_the_hot_endpoint_to_validate_timestep(argon_run: Any) -> None:
+    """A cool start does not make a large step safe at the hot end."""
+    with pytest.raises(ValueError, match="too long for 900 K"):
+        run_heat(argon_run, t_start=100.0, t_end=900.0, timestep_fs=2.0)
+
+
+def test_heat_records_density_enthalpy_and_anisotropic_pressure(argon_run: Any) -> None:
+    """The CPU integration exercises the complete heating and state path."""
+    import openmm as mm
+
+    minimised = run_minimise(argon_run, "00_minimise")
+    result = run_heat(
+        argon_run,
+        "01_heat",
+        temperatures_k=[90.0, 120.0, 150.0],
+        hold_ps=0.4,
+        pressure_bar=2.0,
+        barostat_frequency=5,
+        waypoints=True,
+        state_in=minimised.final_state,
+    )
+    assert result.samples["segment_temperature_k"] == [90.0, 120.0, 150.0]
+    assert result.samples["segment_pressure_bar"] == [2.0, 2.0, 2.0]
+    assert result.samples["segment_duration_ps"] == [0.4, 0.4, 0.4]
+    assert len(result.samples["segment_enthalpy_kj_mol"]) == 3
+    assert np.isfinite(result.samples["segment_enthalpy_kj_mol"]).all()
+    assert np.all(np.asarray(result.samples["segment_density_g_cm3"]) > 0.0)
+    assert len(result.waypoints) == 3
+    saved = mm.XmlSerializer.deserialize(Path(result.final_state).read_text())
+    assert saved.getParameters()["MonteCarloPressureX"] == pytest.approx(2.0)
+    assert saved.getParameters()["MonteCarloPressureY"] == pytest.approx(2.0)
+    assert saved.getParameters()["MonteCarloPressureZ"] == pytest.approx(2.0)
+    resumed = run_heat(
+        argon_run,
+        "02_heat",
+        temperatures_k=[180.0],
+        hold_ps=0.1,
+        state_in=result.final_state,
+    )
+    assert resumed.samples["segment_temperature_k"] == [180.0]
+    assert len(resumed.samples["segment_enthalpy_kj_mol"]) == 1
+
+
+def test_enthalpy_includes_kinetic_energy_and_pv_over_retained_samples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The transient is discarded for every observable at the same times."""
+    from openmm import unit
+
+    import openmmpolymer.simulate as simulate
+
+    simulation = SimpleNamespace(index=-1)
+
+    def step(steps: int) -> None:
+        assert steps == 1
+        simulation.index += 1
+
+    def state(**kwargs: Any) -> Any:
+        index = simulation.index
+        return SimpleNamespace(
+            getPotentialEnergy=lambda: (
+                [1000, 500, 20, 40][index] * unit.kilojoule_per_mole
+            ),
+            getKineticEnergy=lambda: [1000, 500, 3, 4][index] * unit.kilojoule_per_mole,
+            getPeriodicBoxVolume=lambda: [1000, 500, 5, 7][index] * unit.nanometer**3,
+        )
+
+    simulation.step = step
+    simulation.context = SimpleNamespace(getState=state)
+    monkeypatch.setattr(
+        simulate, "density_g_cm3", lambda sim, mass: float(sim.index + 1)
+    )
+    monkeypatch.setattr(
+        simulate, "temperature_k_of", lambda sim: 100.0 * (sim.index + 1)
+    )
+    density, temperature, enthalpy = simulate._sample_segment(
+        simulation, 4, 1.0, 4, pressure_bar=2.0
+    )
+    assert density == pytest.approx(3.5)
+    assert temperature == pytest.approx(350.0)
+    assert enthalpy == pytest.approx(33.5 + 12.0 * 0.0602214076)
 
 
 def test_a_quench_can_be_given_its_temperatures_outright(argon_run: Any) -> None:

@@ -24,7 +24,12 @@ from openmmpolymer.protocols import (
     standard_melt_equilibration,
 )
 from openmmpolymer.reporters import TrajectoryOptions
-from openmmpolymer.simulate import DEFAULT_COMPRESSION_BAR, quench_temperatures
+from openmmpolymer.simulate import (
+    DEFAULT_COMPRESSION_BAR,
+    heating_temperatures,
+    quench_temperatures,
+    run_heat,
+)
 
 #: A protocol short enough to run in a test but shaped like a real one.
 QUICK = Protocol(
@@ -321,6 +326,52 @@ def test_the_total_duration_counts_the_quench_it_used_to_omit() -> None:
     assert quench.total_duration_ps == pytest.approx(
         equilibration.total_duration_ps + ladder_ps
     )
+
+
+def test_heat_is_registered_and_its_endpoint_ladder_duration_is_counted() -> None:
+    """Both explicitly chunked and generated ladders count every hold."""
+    assert STAGE_RUNNERS["heat"] is run_heat
+    default = Protocol("heat", (Stage("01_heat", "heat"),))
+    assert default.total_duration_ps == pytest.approx(
+        200.0 * len(heating_temperatures(200.0, 600.0, 20.0))
+    )
+    custom = Stage(
+        "01_heat",
+        "heat",
+        {"t_start": 100.0, "t_end": 175.0, "step_k": 30.0, "hold_ps": 10.0},
+    )
+    assert _stage_duration_ps(custom) == pytest.approx(40.0)
+    chunk = Stage("02_heat", "heat", {"temperatures_k": [200.0], "hold_ps": 10.0})
+    assert _stage_duration_ps(chunk) == pytest.approx(10.0)
+
+
+def test_heating_samples_are_retained_in_a_resumable_manifest(
+    argon_run: Any, tmp_path: Path
+) -> None:
+    """Protocol execution persists the signals needed by melting analysis."""
+    protocol = Protocol(
+        "heat",
+        (
+            Stage("00_minimise", "minimise"),
+            Stage(
+                "01_heat",
+                "heat",
+                {"temperatures_k": [100.0, 120.0], "hold_ps": 0.2},
+            ),
+        ),
+    )
+    run_protocol(protocol, argon_run, tmp_path)
+    manifest = RunManifest.load(tmp_path)
+    assert manifest is not None
+    samples = manifest.stages["01_heat"]["samples"]
+    assert samples["segment_temperature_k"] == [100.0, 120.0]
+    assert len(samples["segment_enthalpy_kj_mol"]) == 2
+    assert samples["segment_pressure_bar"] == [1.0, 1.0]
+    resumed = run_protocol(protocol, argon_run, tmp_path, resume=True)
+    assert resumed.skipped == ("00_minimise", "01_heat")
+    reloaded = RunManifest.load(tmp_path)
+    assert reloaded is not None
+    assert reloaded.stages["01_heat"]["samples"] == samples
 
 
 def test_the_total_duration_counts_an_anneal_and_a_compression_too() -> None:

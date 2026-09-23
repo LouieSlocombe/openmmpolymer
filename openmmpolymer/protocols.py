@@ -34,10 +34,12 @@ from .reporters import TrajectoryOptions
 from .simulate import (
     RunContext,
     StageResult,
+    heating_temperatures,
     quench_temperatures,
     run_anneal,
     run_compress,
     run_deform,
+    run_heat,
     run_load,
     run_minimise,
     run_npt,
@@ -62,6 +64,7 @@ STAGE_RUNNERS: dict[str, Callable[..., StageResult]] = {
     "compress": run_compress,
     "anneal": run_anneal,
     "quench": run_quench,
+    "heat": run_heat,
     "production": run_production,
     "deform": run_deform,
     "load": run_load,
@@ -160,6 +163,15 @@ def _stage_options(stage: Stage) -> dict[str, Any]:
 def _stage_duration_ps(stage: Stage) -> float:
     """How much dynamics one stage asks for, from the options it was given."""
     options = _stage_options(stage)
+    if stage.kind == "heat":
+        ladder = options.get("temperatures_k")
+        if ladder is None:
+            ladder = heating_temperatures(
+                float(options["t_start"]),
+                float(options["t_end"]),
+                float(options["step_k"]),
+            )
+        return float(options["hold_ps"]) * len(ladder)
     if stage.kind == "quench":
         ladder = options.get("temperatures_k") or quench_temperatures(
             float(options["t_start"]),

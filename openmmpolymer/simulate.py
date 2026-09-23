@@ -68,6 +68,9 @@ MAX_FORCE_AFTER_MINIMISATION = 1.0e5
 #: Grams per mole in a gram, for the density arithmetic.
 _AVOGADRO = 6.02214076e23
 
+#: One bar nm³, in the molar energy units OpenMM uses for a full cell.
+_BAR_NM3_TO_KJ_MOL = 0.0602214076
+
 
 class SimulationError(RuntimeError):
     """A stage could not run, or produced something unphysical."""
@@ -600,6 +603,7 @@ def run_segments(
     state_in: str | Path | None = None,
     waypoints: bool = False,
     samples_per_segment: int = _SAMPLES_PER_SEGMENT,
+    measure_enthalpy: bool = False,
 ) -> StageResult:
     """Run a sequence of segments in one ensemble.
 
@@ -633,6 +637,11 @@ def run_segments(
             half of them, so this sets how many readings that mean rests on -
             the default of ten leaves five, which is thin for a segment whose
             whole purpose is a low-noise point on a curve.
+        measure_enthalpy: Also average the full cell's potential plus kinetic
+            energy and external-pressure volume work over the same retained
+            samples. Recorded as ``segment_enthalpy_kj_mol``, in OpenMM's
+            molar energy units, with ``segment_pressure_bar``. This is not
+            normalised by the number of chains or repeat units.
 
     Returns:
         What the stage did, including a density and a temperature per segment.
@@ -691,6 +700,9 @@ def run_segments(
         # reported as unknown.
         "segment_duration_ps": [],
     }
+    if measure_enthalpy:
+        samples["segment_enthalpy_kj_mol"] = []
+        samples["segment_pressure_bar"] = []
     waypoint_paths: list[str] = []
     log.info(
         "%s: %d segments, %.1f ps at %.1f fs (%d steps)%s.",
@@ -716,9 +728,21 @@ def run_segments(
             set_temperature(simulation, segment.temperature_k, barostat)
             if barostat is not None:
                 set_pressure(simulation, segment.pressure_bar, barostat)
-            density, temperature = _run_segment(
-                simulation, steps, run.total_mass_g_mol, samples_per_segment
-            )
+            if measure_enthalpy:
+                density, temperature, enthalpy = _sample_segment(
+                    simulation,
+                    steps,
+                    run.total_mass_g_mol,
+                    samples_per_segment,
+                    pressure_bar=segment.pressure_bar,
+                )
+                assert enthalpy is not None
+                samples["segment_enthalpy_kj_mol"].append(enthalpy)
+                samples["segment_pressure_bar"].append(segment.pressure_bar)
+            else:
+                density, temperature = _run_segment(
+                    simulation, steps, run.total_mass_g_mol, samples_per_segment
+                )
             samples["segment_temperature_k"].append(segment.temperature_k)
             samples["segment_density_g_cm3"].append(density)
             samples["segment_mean_temperature_k"].append(temperature)
@@ -764,20 +788,33 @@ def _run_segment(
     Sampled in chunks and averaged over the second half, so a segment that
     spends its first part relaxing does not drag its own average.
     """
+    density, temperature, _ = _sample_segment(
+        simulation, steps, total_mass_g_mol, samples_per_segment
+    )
+    return density, temperature
+
+
+def _sample_segment(
+    simulation: Any,
+    steps: int,
+    total_mass_g_mol: float,
+    samples_per_segment: int,
+    *,
+    pressure_bar: float | None = None,
+) -> tuple[float, float, float | None]:
+    """Average density, temperature and optional enthalpy at the same times."""
     from openmm import unit
 
     chunk = max(1, steps // samples_per_segment)
     densities: list[float] = []
     temperatures: list[float] = []
+    enthalpies: list[float] = []
     remaining = steps
     while remaining > 0:
         simulation.step(min(chunk, remaining))
         remaining -= chunk
-        energy = (
-            simulation.context.getState(getEnergy=True)
-            .getPotentialEnergy()
-            .value_in_unit(unit.kilojoule_per_mole)
-        )
+        state = simulation.context.getState(getEnergy=True)
+        energy = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
         if not np.isfinite(energy):
             raise SimulationError(
                 "The potential energy went to NaN. The timestep is too long "
@@ -786,9 +823,20 @@ def _run_segment(
             )
         densities.append(density_g_cm3(simulation, total_mass_g_mol))
         temperatures.append(temperature_k_of(simulation))
+        if pressure_bar is not None:
+            kinetic = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
+            volume = state.getPeriodicBoxVolume().value_in_unit(unit.nanometer**3)
+            enthalpy = energy + kinetic + pressure_bar * volume * _BAR_NM3_TO_KJ_MOL
+            if not np.isfinite(enthalpy):
+                raise SimulationError("The cell's enthalpy is not finite.")
+            enthalpies.append(float(enthalpy))
 
     half = max(1, len(densities) // 2)
-    return float(np.mean(densities[-half:])), float(np.mean(temperatures[-half:]))
+    return (
+        float(np.mean(densities[-half:])),
+        float(np.mean(temperatures[-half:])),
+        float(np.mean(enthalpies[-half:])) if enthalpies else None,
+    )
 
 
 #: How far a stage's realised temperature may sit from the one it asked for.
@@ -1233,6 +1281,112 @@ def run_quench(
         Segment(value, hold_ps, pressure_bar, label=f"{value:.0f} K")
         for value in temperatures
     ]
+    return run_segments(
+        run,
+        Path(output_prefix).name,
+        segments,
+        output_prefix,
+        barostat=barostat,
+        **kwargs,
+    )
+
+
+def heating_temperatures(t_start: float, t_end: float, step_k: float) -> list[float]:
+    """Return ascending heating temperatures, always including both endpoints.
+
+    All arguments must be finite and positive, and ``t_end`` must exceed
+    ``t_start``. The final interval may be shorter than ``step_k``.
+    """
+    t_start = require_positive(t_start, None, name="t_start")
+    t_end = require_positive(t_end, None, name="t_end")
+    step_k = require_positive(step_k, None, name="step_k")
+    if t_end <= t_start:
+        raise ValueError(
+            f"t_end={t_end} must exceed t_start={t_start}: a heating scan warms."
+        )
+    if t_start + step_k <= t_start:
+        raise ValueError("step_k is too small to advance the heating temperature.")
+    temperatures = [t_start]
+    index = 1
+    while True:
+        temperature = t_start + index * step_k
+        if temperature >= t_end or math.isclose(temperature, t_end, rel_tol=1e-12):
+            break
+        temperatures.append(temperature)
+        index += 1
+    temperatures.append(t_end)
+    return temperatures
+
+
+def _ascending_ladder(temperatures_k: Sequence[float]) -> list[float]:
+    """Validate an explicit heating ladder, including a one-window chunk."""
+    ladder = [
+        require_positive(value, None, name="temperatures_k") for value in temperatures_k
+    ]
+    if not ladder:
+        raise ValueError("temperatures_k is empty, so there is nothing to hold.")
+    for colder, hotter in itertools.pairwise(ladder):
+        if hotter <= colder:
+            raise ValueError(
+                f"temperatures_k goes {colder} -> {hotter}: a heating scan warms, "
+                "so the ladder has to ascend strictly."
+            )
+    return ladder
+
+
+def run_heat(
+    run: RunContext,
+    output_prefix: str | Path = "02_heat",
+    *,
+    t_start: float = 200.0,
+    t_end: float = 600.0,
+    step_k: float = 20.0,
+    hold_ps: float = 200.0,
+    pressure_bar: float = 1.0,
+    barostat: str = "anisotropic",
+    temperatures_k: Sequence[float] | None = None,
+    **kwargs: Any,
+) -> StageResult:
+    """Heat a prepared solid, recording settled density and full-cell enthalpy.
+
+    Start from a crystalline or semicrystalline cell whose melting behaviour
+    is to be measured. Heating an amorphous packed melt cannot establish its
+    melting temperature. A finite-rate heating transition can be superheated
+    and is an apparent melting temperature, not an equilibrium estimate.
+
+    Args:
+        run: The run context for the prepared solid.
+        output_prefix: Stem for this stage's files.
+        t_start: Starting temperature, in kelvin.
+        t_end: Final temperature, in kelvin.
+        step_k: Temperature increment; both endpoints are visited.
+        hold_ps: Dynamics at each temperature, in picoseconds.
+        pressure_bar: Positive external pressure held throughout.
+        barostat: NPT barostat; anisotropic by default so a crystal's axes
+            can relax independently.
+        temperatures_k: Explicit, strictly ascending temperatures, replacing
+            the endpoint ladder. A one-temperature chunk is valid.
+        **kwargs: Passed to :func:`run_segments`, including ``state_in``,
+            ``waypoints``, and ``samples_per_segment``.
+
+    Returns:
+        Temperatures, densities and enthalpies in ``samples``. Enthalpy is
+        ``E_potential + E_kinetic + P V`` for the whole simulated cell in
+        OpenMM kJ/mol units, averaged over the second half of each hold.
+    """
+    temperatures = (
+        heating_temperatures(t_start, t_end, step_k)
+        if temperatures_k is None
+        else _ascending_ladder(temperatures_k)
+    )
+    hold_ps = require_positive(hold_ps, None, name="hold_ps")
+    pressure_bar = require_positive(pressure_bar, None, name="pressure_bar")
+    require_choice(barostat, ("isotropic", "anisotropic", "flexible"), name="barostat")
+    segments = [
+        Segment(value, hold_ps, pressure_bar, label=f"{value:.0f} K")
+        for value in temperatures
+    ]
+    kwargs["measure_enthalpy"] = True
     return run_segments(
         run,
         Path(output_prefix).name,
