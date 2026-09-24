@@ -28,8 +28,6 @@ import numpy as np
 import pytest
 
 from openmmpolymer.elasticity import MAX_CONSISTENCY_GAP
-from openmmpolymer.forcefield import PolymerForceField
-from openmmpolymer.mdsystem import PackedBox
 from openmmpolymer.mechanical import (
     BULK_STEM,
     DEFORM_STEM,
@@ -46,10 +44,14 @@ from openmmpolymer.mechanical import (
     run_modulus_scan,
     write_mechanical_report,
 )
-from openmmpolymer.simulate import prepare_run
 from openmmpolymer.trajectory import AnalysisError
 
-from .helpers import argon_system, write_bulk, write_deformation, write_shear
+from .helpers import (
+    QUICK_EQUILIBRATION,
+    write_bulk,
+    write_deformation,
+    write_shear,
+)
 
 #: Settings that put the whole scan inside a couple of seconds on argon. The
 #: cell has no elastic constants worth the name, so nothing here asserts one.
@@ -69,38 +71,6 @@ QUICK = ModulusSpec(
     shear_strains=(0.005, 0.010, 0.015),
     shear_ps_each=0.3,
 )
-
-#: The equilibration, shortened to match, and gentle for the same reason
-#: the Tg tests are: a kilobar squeezes a small argon cell past its cutoff.
-QUICK_EQUILIBRATION: dict[str, Any] = {
-    "nvt_ps": 0.2,
-    "compress_ps_each": 0.2,
-    "npt_ps": 0.3,
-    "anneal_cycles": 1,
-    "anneal_window_ps": 0.1,
-    "anneal_hold_ps": 0.1,
-    "compress_pressures_bar": (1.0, 20.0, 1.0),
-}
-
-
-@pytest.fixture
-def argon_scan_run() -> Any:
-    """An argon cell big enough to survive an NPT equilibration and a strain."""
-    system, topology, positions = argon_system(216, 2.8)
-    box = PackedBox(
-        topology=topology,
-        positions_nm=positions,
-        box_nm=(2.8, 2.8, 2.8),
-        n_molecules=216,
-    )
-    return prepare_run(
-        box,
-        PolymerForceField("unused.xml", (), "AR", "smirnoff"),
-        platform="CPU",
-        seed=11,
-        system=system,
-    )
-
 
 # --------------------------------------------------------------------------
 # Schedules and what a scan costs

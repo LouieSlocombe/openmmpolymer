@@ -11,10 +11,7 @@ import numpy as np
 import pytest
 
 import openmmpolymer.yielding as yielding
-from openmmpolymer.forcefield import PolymerForceField
-from openmmpolymer.mdsystem import PackedBox
 from openmmpolymer.protocols import RunManifest, standard_melt_equilibration
-from openmmpolymer.simulate import prepare_run
 from openmmpolymer.trajectory import AnalysisError
 from openmmpolymer.yielding import (
     DEFORM_STEM,
@@ -30,7 +27,7 @@ from openmmpolymer.yielding import (
     yield_stages,
 )
 
-from .helpers import argon_system, write_deformation
+from .helpers import QUICK_EQUILIBRATION, write_deformation
 
 QUICK = YieldSpec(
     temperature_k=120.0,
@@ -41,29 +38,7 @@ QUICK = YieldSpec(
     stage_ps=0.2,
     fit_max_strain=0.0125,
 )
-QUICK_EQUILIBRATION: dict[str, Any] = {
-    "nvt_ps": 0.2,
-    "compress_ps_each": 0.2,
-    "npt_ps": 0.3,
-    "anneal_cycles": 1,
-    "anneal_window_ps": 0.1,
-    "anneal_hold_ps": 0.1,
-    "compress_pressures_bar": (1.0, 20.0, 1.0),
-}
 PLANTED = replace(QUICK, temperature_k=298.15, relax_ps=1.0, stage_ps=4.0)
-
-
-@pytest.fixture
-def argon_yield_run() -> Any:
-    """A periodic argon cell supplies a cheap real engine integration test."""
-    system, topology, positions = argon_system(216, 2.8)
-    return prepare_run(
-        PackedBox(topology, positions, (2.8, 2.8, 2.8), 216),
-        PolymerForceField("unused.xml", (), "AR", "smirnoff"),
-        platform="CPU",
-        seed=11,
-        system=system,
-    )
 
 
 def _plant(directory: Path, *, spec: YieldSpec = PLANTED) -> None:
@@ -331,10 +306,10 @@ def test_report_writes_strict_json_and_per_replica_figures(tmp_path: Path) -> No
     assert all(Path(path).stat().st_size > 0 for path in files.figures)
 
 
-def test_budget_refuses_before_creating_output(argon_yield_run: Any) -> None:
+def test_budget_refuses_before_creating_output(argon_scan_run: Any) -> None:
     with pytest.raises(YieldError, match="max_total_ns"):
         run_yield_scan(
-            argon_yield_run,
+            argon_scan_run,
             "run",
             spec=replace(QUICK, max_total_ns=1e-6),
             **QUICK_EQUILIBRATION,
@@ -346,7 +321,7 @@ def test_budget_refuses_before_creating_output(argon_yield_run: Any) -> None:
     "change", ["criterion", "replicas", "system", "coordinates", "box"]
 )
 def test_interrupted_resume_fingerprints_request_and_physical_system(
-    argon_yield_run: Any,
+    argon_scan_run: Any,
     monkeypatch: pytest.MonkeyPatch,
     change: str,
 ) -> None:
@@ -359,7 +334,7 @@ def test_interrupted_resume_fingerprints_request_and_physical_system(
 
     monkeypatch.setattr(yielding, "run_protocol", interrupt)
     with pytest.raises(RuntimeError, match="interrupted"):
-        run_yield_scan(argon_yield_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
+        run_yield_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
     assert Path("run", WORKFLOW_NAME).is_file()
     assert not Path("run/manifest.json").exists()
     changed = QUICK
@@ -368,19 +343,19 @@ def test_interrupted_resume_fingerprints_request_and_physical_system(
     elif change == "replicas":
         changed = replace(QUICK, n_replicas=1)
     elif change == "system":
-        argon_yield_run.system_xml += "\n"
+        argon_scan_run.system_xml += "\n"
     elif change == "coordinates":
-        argon_yield_run.box.positions_nm[0, 0] += 0.001
+        argon_scan_run.box.positions_nm[0, 0] += 0.001
     else:
-        argon_yield_run.box.box_nm = (2.81, 2.8, 2.8)
+        argon_scan_run.box.box_nm = (2.81, 2.8, 2.8)
     with pytest.raises(YieldError, match="different settings"):
-        run_yield_scan(argon_yield_run, "run", spec=changed, **QUICK_EQUILIBRATION)
+        run_yield_scan(argon_scan_run, "run", spec=changed, **QUICK_EQUILIBRATION)
     assert calls == 1
 
 
 @pytest.mark.parametrize("protocol", ["foreign", "yield"])
 def test_foreign_stages_require_a_fresh_directory(
-    argon_yield_run: Any,
+    argon_scan_run: Any,
     tmp_path: Path,
     protocol: str,
 ) -> None:
@@ -390,12 +365,12 @@ def test_foreign_stages_require_a_fresh_directory(
     manifest.protocol = protocol
     manifest.save(tmp_path)
     with pytest.raises(YieldError, match="fresh directory"):
-        run_yield_scan(argon_yield_run, tmp_path, spec=QUICK, **QUICK_EQUILIBRATION)
+        run_yield_scan(argon_scan_run, tmp_path, spec=QUICK, **QUICK_EQUILIBRATION)
     assert not (tmp_path / WORKFLOW_NAME).exists()
 
 
 def test_missing_state_is_refused_before_new_dynamics(
-    argon_yield_run: Any,
+    argon_scan_run: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def interrupt(*args: Any, **kwargs: Any) -> Any:
@@ -403,7 +378,7 @@ def test_missing_state_is_refused_before_new_dynamics(
 
     monkeypatch.setattr(yielding, "run_protocol", interrupt)
     with pytest.raises(RuntimeError, match="interrupted"):
-        run_yield_scan(argon_yield_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
+        run_yield_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
     RunManifest(
         protocol="yield",
         seed=11,
@@ -413,15 +388,15 @@ def test_missing_state_is_refused_before_new_dynamics(
     ).save("run")
     before = Path("run/manifest.json").read_bytes()
     with pytest.raises(YieldError, match="missing state files"):
-        run_yield_scan(argon_yield_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
+        run_yield_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
     assert Path("run/manifest.json").read_bytes() == before
 
 
 def test_real_scan_branches_replicas_and_preserves_stages_on_resume(
-    argon_yield_run: Any,
+    argon_scan_run: Any,
 ) -> None:
     first = run_yield_scan(
-        argon_yield_run, "run", spec=QUICK, resume=False, **QUICK_EQUILIBRATION
+        argon_scan_run, "run", spec=QUICK, resume=False, **QUICK_EQUILIBRATION
     )
     manifest = RunManifest.load("run")
     assert manifest is not None
@@ -447,7 +422,7 @@ def test_real_scan_branches_replicas_and_preserves_stages_on_resume(
         for path in Path("run").iterdir()
         if path.is_file()
     }
-    resumed = run_yield_scan(argon_yield_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
+    resumed = run_yield_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
     for old, new in zip(first.curves, resumed.curves, strict=True):
         assert new.stress_mpa == pytest.approx(old.stress_mpa)
     for path, (content, modified) in before.items():

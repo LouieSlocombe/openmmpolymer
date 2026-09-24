@@ -30,6 +30,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, cast
 
+from ._files import ReportFiles, file_sha256, write_json
 from .breaking import (
     BreakingError,
     BreakingSpec,
@@ -94,9 +95,7 @@ from .property_rates import (
 from .protocols import (
     Protocol,
     ProtocolError,
-    _file_digest,
     _run_identity,
-    _write_atomically,
     melt_quench,
     record_build_request,
     run_protocol,
@@ -109,7 +108,6 @@ from .relaxation import relax_stages
 from .simulate import RELAX_MODES, RunContext, prepare_run
 from .structure import analyse_structure, structure_stages, write_structure_report
 from .tg import (
-    ReportFiles,
     TgSpec,
     analyse_run,
     cooling_rate_series,
@@ -1668,7 +1666,7 @@ def _prepare_cli_melt(
     if previous is not None:
         for name, digest in previous["artifacts"].items():
             path = build / name
-            if not path.is_file() or _file_digest(path) != digest:
+            if not path.is_file() or file_sha256(path) != digest:
                 raise ProtocolError(
                     f"Existing build artifact {name!r} changed or is missing. "
                     "Restore it or use a fresh output directory."
@@ -1719,11 +1717,11 @@ def _prepare_cli_melt(
                 "artifacts": {
                     str(
                         Path(path).resolve().relative_to(working.resolve())
-                    ): _file_digest(path)
+                    ): file_sha256(path)
                     for path in artifacts
                 },
             }
-            _write_atomically(record_path, json.dumps(record, indent=2) + "\n")
+            write_json(record_path, record)
         else:
             # Everything needed for dynamics is now in memory. Returned file
             # references point at the verified persistent originals.

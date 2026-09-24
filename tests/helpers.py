@@ -64,6 +64,40 @@ def build_dimer_pdb(path: Path, *, separation_nm: float = 0.153) -> str:
     return str(path)
 
 
+#: An equilibration short enough for a scan test, and gentle: a kilobar
+#: squeezes a small argon cell past twice its cutoff.
+QUICK_EQUILIBRATION: dict[str, Any] = {
+    "nvt_ps": 0.2,
+    "compress_ps_each": 0.2,
+    "npt_ps": 0.3,
+    "anneal_cycles": 1,
+    "anneal_window_ps": 0.1,
+    "anneal_hold_ps": 0.1,
+    "compress_pressures_bar": (1.0, 20.0, 1.0),
+}
+
+
+def argon_context(
+    n_atoms: int = 64, box_nm: float = 2.4, *, atoms_per_molecule: int = 1
+) -> Any:
+    """A run context over an argon cell, on the deterministic CPU platform."""
+    from openmmpolymer.forcefield import PolymerForceField
+    from openmmpolymer.mdsystem import PackedBox
+    from openmmpolymer.simulate import prepare_run
+
+    system, topology, positions = argon_system(
+        n_atoms, box_nm, atoms_per_molecule=atoms_per_molecule
+    )
+    box = PackedBox(topology, positions, (box_nm,) * 3, n_atoms // atoms_per_molecule)
+    return prepare_run(
+        box,
+        PolymerForceField("unused.xml", (), "AR", "smirnoff"),
+        platform="CPU",
+        seed=11,
+        system=system,
+    )
+
+
 def argon_system(
     n_atoms: int,
     box_nm: float,
@@ -74,7 +108,9 @@ def argon_system(
     """Build an argon cell: a System, a Topology and positions on a lattice.
 
     A real periodic ``NonbondedForce``, so the barostat has something to do and
-    the density is a real number, with no force-field file anywhere.
+    the density is a real number, with no force-field file anywhere. With
+    *atoms_per_molecule* above one, consecutive atoms are bonded into chains at
+    the lattice spacing, so each molecule starts at its bonds' rest length.
     """
     import openmm as mm
     from openmm import app, unit
@@ -89,18 +125,32 @@ def argon_system(
     nonbonded.setNonbondedMethod(mm.NonbondedForce.CutoffPeriodic)
     nonbonded.setCutoffDistance(cutoff_nm * unit.nanometer)
     nonbonded.setUseDispersionCorrection(True)
+    bonds = mm.HarmonicBondForce()
+    spacing_nm = box_nm / math.ceil(n_atoms ** (1 / 3))
 
     topology = app.Topology()
     chain = topology.addChain()
     argon = app.Element.getBySymbol("Ar")
-    for _ in range(n_atoms):
-        system.addParticle(39.948 * unit.dalton)
-        nonbonded.addParticle(
-            0.0, 0.34 * unit.nanometer, 0.996 * unit.kilojoule_per_mole
-        )
+    for _ in range(0, n_atoms, atoms_per_molecule):
         residue = topology.addResidue("AR", chain)
-        topology.addAtom("AR", argon, residue)
+        names = (
+            ["AR"]
+            if atoms_per_molecule == 1
+            else [f"AR{index + 1}" for index in range(atoms_per_molecule)]
+        )
+        atoms = [topology.addAtom(name, argon, residue) for name in names]
+        for _ in atoms:
+            system.addParticle(39.948 * unit.dalton)
+            nonbonded.addParticle(
+                0.0, 0.34 * unit.nanometer, 0.996 * unit.kilojoule_per_mole
+            )
+        for first, second in pairwise(atoms):
+            topology.addBond(first, second)
+            bonds.addBond(first.index, second.index, spacing_nm, 1000.0)
+            nonbonded.addException(first.index, second.index, 0.0, 0.34, 0.0)
     system.addForce(nonbonded)
+    if bonds.getNumBonds():
+        system.addForce(bonds)
     system.addForce(mm.CMMotionRemover())
 
     topology.setPeriodicBoxVectors(
@@ -111,10 +161,10 @@ def argon_system(
         ]
         * unit.nanometer
     )
-    return system, topology, _lattice(n_atoms, box_nm)
+    return system, topology, lattice(n_atoms, box_nm)
 
 
-def _lattice(n_atoms: int, box_nm: float) -> np.ndarray:
+def lattice(n_atoms: int, box_nm: float) -> np.ndarray:
     """Return *n_atoms* positions on a cubic lattice inside the cell."""
     per_side = math.ceil(n_atoms ** (1 / 3))
     spacing = box_nm / per_side
@@ -581,7 +631,7 @@ def ideal_gas_system(
         topology.addAtom("AR", argon, topology.addResidue("AR", chain))
     system.addForce(nonbonded)
     topology.setPeriodicBoxVectors(system.getDefaultPeriodicBoxVectors())
-    return system, topology, _lattice(n_atoms, box_nm)
+    return system, topology, lattice(n_atoms, box_nm)
 
 
 def rigid_rotor_system(
@@ -628,7 +678,7 @@ def rigid_rotor_system(
     system.addForce(nonbonded)
     topology.setPeriodicBoxVectors(system.getDefaultPeriodicBoxVectors())
 
-    centres = _lattice(n_molecules, box_nm)
+    centres = lattice(n_molecules, box_nm)
     positions = np.empty((2 * n_molecules, 3), dtype=np.float64)
     offsets = np.asarray(
         [[bond_nm, 0.0, 0.0], [0.0, bond_nm, 0.0], [0.0, 0.0, bond_nm]],
@@ -680,7 +730,7 @@ def write_deformation(
         samples[f"segment_stress_{'xyz'[index]}{'xyz'[index]}_bar"] = [0.0] * n_steps
     for name, values in boxes.items():
         samples[f"segment_box_{name}_nm"] = values
-    return _write_manifest(
+    return write_manifest(
         run_dir, {stage: {"samples": samples, "mean_temperature_k": temperature_k}}
     )
 
@@ -708,7 +758,7 @@ def write_bulk(
         },
         "mean_temperature_k": temperature_k,
     }
-    return _write_manifest(run_dir, stages)
+    return write_manifest(run_dir, stages)
 
 
 def write_shear(
@@ -734,10 +784,10 @@ def write_shear(
         },
         "mean_temperature_k": temperature_k,
     }
-    return _write_manifest(run_dir, stages)
+    return write_manifest(run_dir, stages)
 
 
-def _write_manifest(run_dir: Path, stages: dict[str, Any]) -> Path:
+def write_manifest(run_dir: Path, stages: dict[str, Any]) -> Path:
     """Write a minimal manifest holding *stages*, merging with any already there."""
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / "manifest.json"
@@ -839,7 +889,7 @@ def write_relaxation(
             "samples": samples,
             "mean_temperature_k": temperature_k,
         }
-    return _write_manifest(run_dir, stages)
+    return write_manifest(run_dir, stages)
 
 
 def write_polymer_snapshot(
@@ -892,7 +942,7 @@ def write_polymer_snapshot(
     pdb = run_dir / f"{stage}.pdb"
     with pdb.open("w") as handle:
         app.PDBFile.writeFile(topology, positions * unit.nanometer, handle)
-    path = _write_manifest(
+    path = write_manifest(
         run_dir,
         {
             stage: {

@@ -10,7 +10,6 @@ trajectories and repeat at longer holds before interpreting the number.
 
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
@@ -19,19 +18,19 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 
+from ._files import ReportFiles, file_sha256, write_json
 from ._validation import require_integer, require_positive
+from ._workflow import run_fingerprint
 from .protocols import (
     Protocol,
     RunManifest,
     RunSummary,
     Stage,
-    _write_atomically,
     run_protocol,
     validate_run_inputs,
 )
 from .reporters import TrajectoryOptions
 from .simulate import RunContext, heating_temperatures, safe_timestep_fs
-from .tg import ReportFiles
 from .trajectory import AnalysisError
 
 PROTOCOL_NAME = "tm_heating"
@@ -578,16 +577,8 @@ def run_tm_scan(
     settings.pop("max_total_ns")
     request = {
         "spec": settings,
-        "system_sha256": hashlib.sha256(run.system_xml.encode()).hexdigest(),
-        "coordinates_sha256": hashlib.sha256(
-            np.asarray(run.box.positions_nm, dtype=np.float64).tobytes()
-        ).hexdigest(),
-        "box_nm": list(run.box.box_nm),
-        "seed": run.seed,
-        "system_spec": asdict(run.spec),
-        "state_sha256": None
-        if state_in is None
-        else hashlib.sha256(Path(state_in).read_bytes()).hexdigest(),
+        **run_fingerprint(run, spec_key="system_spec"),
+        "state_sha256": None if state_in is None else file_sha256(state_in),
     }
     # Round-trip tuple-valued SystemSpec fields before comparing to saved JSON.
     request = json.loads(json.dumps(request, allow_nan=False))
@@ -611,19 +602,14 @@ def run_tm_scan(
     if resume:
         validate_run_inputs(run, directory)
     directory.mkdir(parents=True, exist_ok=True)
-    _write_atomically(
+    write_json(
         path,
-        json.dumps(
-            {
-                "request": request,
-                "crystalline_supplied": True,
-                "method": "apparent melting from NPT heating",
-                "total_ns": total_ns,
-            },
-            indent=2,
-            allow_nan=False,
-        )
-        + "\n",
+        {
+            "request": request,
+            "crystalline_supplied": True,
+            "method": "apparent melting from NPT heating",
+            "total_ns": total_ns,
+        },
     )
     summary = run_protocol(
         protocol,
@@ -668,7 +654,7 @@ def write_melting_report(
         "enthalpy_units": "kJ/mol of simulation cells",
     }
     path = directory / "tm.json"
-    _write_atomically(path, json.dumps(record, indent=2, allow_nan=False) + "\n")
+    write_json(path, record)
     paths: list[str] = []
     if figures:
         from matplotlib.figure import Figure

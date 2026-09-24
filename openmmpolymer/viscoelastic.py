@@ -45,11 +45,23 @@ from typing import Any, cast
 
 import numpy as np
 
-from ._validation import require_choice, require_integer, require_positive
+from ._files import ReportFiles, write_json
+from ._validation import (
+    require_axis,
+    require_choice,
+    require_integer,
+    require_plane,
+    require_positive,
+)
+from ._workflow import (
+    equilibrated_box_nm,
+    group_by_stem,
+    sample_spread,
+    settled_state,
+)
 from .protocols import (
     Protocol,
     RunManifest,
-    RunSummary,
     Stage,
     run_protocol,
     standard_melt_equilibration,
@@ -66,7 +78,6 @@ from .relaxation import (
     relaxation_curve,
 )
 from .simulate import RELAX_MODES, RunContext, relax_bin_edges_ps, safe_timestep_fs
-from .tg import ReportFiles
 from .trajectory import AnalysisError
 
 log = logging.getLogger(__name__)
@@ -206,11 +217,8 @@ class RelaxationSpec:
         require_integer(self.n_replicas, minimum=1, name="n_replicas")
         require_integer(self.bins_per_decade, minimum=1, name="bins_per_decade")
         require_choice(self.mode, RELAX_MODES, name="mode")
-        if self.axis not in (0, 1, 2):
-            raise ValueError(f"axis={self.axis!r} must be 0, 1 or 2.")
-        driven, gradient = self.plane
-        if driven == gradient or not {driven, gradient} <= {0, 1, 2}:
-            raise ValueError(f"plane={self.plane!r} must be two different axes.")
+        require_axis(self.axis)
+        require_plane(self.plane)
         if self.ramp_ps < 0.0:
             raise ValueError(f"ramp_ps={self.ramp_ps} cannot be negative.")
         if self.sample_every_ps >= self.relax_ps:
@@ -591,10 +599,8 @@ def _check_request(run_dir: Path, request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _save_workflow(run_dir: Path, record: dict[str, Any]) -> str:
-    """Write the workflow record. Recomputable, so not written atomically."""
-    path = run_dir / WORKFLOW_NAME
-    path.write_text(json.dumps(record, indent=2, default=str) + "\n")
-    return str(path)
+    """Write the workflow record."""
+    return write_json(run_dir / WORKFLOW_NAME, record, strict=False)
 
 
 def _strains(spec: RelaxationSpec) -> tuple[tuple[str, float], ...]:
@@ -616,8 +622,6 @@ def _report_cost(
     Raises:
         ViscoelasticError: The total is over ``max_total_ns``.
     """
-    from .protocols import _stage_duration_ps
-
     settle_ps = equilibration.total_duration_ps
     passes = len(_strains(spec))
     relax_ps = schedule.total_ps * spec.n_replicas * passes
@@ -625,14 +629,12 @@ def _report_cost(
 
     done = set(manifest.stages) if manifest is not None else set()
     remaining = total_ps - sum(
-        _stage_duration_ps(stage)
-        for stage in equilibration.stages
-        if stage.name in done
+        stage.duration_ps for stage in equilibration.stages if stage.name in done
     )
     for stem, strain in _strains(spec):
         for replica in range(spec.n_replicas):
             remaining -= sum(
-                _stage_duration_ps(stage)
+                stage.duration_ps
                 for stage in _relax_stages(
                     f"{stem}_r{replica}", spec, timestep_fs=2.0, strain=strain
                 )
@@ -661,43 +663,6 @@ def _report_cost(
             f"{spec.max_total_ns:.1f} ns budget. Shorten relax_ps, drop a "
             "replica, skip the linearity pass, or raise max_total_ns."
         )
-
-
-def _equilibrated_box_nm(state_path: str | Path) -> list[float]:
-    """The cell edges a saved state carries, in nanometres.
-
-    Read from the state rather than from ``run.box``, which is the *packed*
-    cell: everything since has compressed it, and a strain measured against
-    the packed edges would be measured against a cell that stopped existing at
-    the first barostat move.
-    """
-    import openmm as mm
-    from openmm import unit
-
-    state = mm.XmlSerializer.deserialize(Path(state_path).read_text())
-    vectors = state.getPeriodicBoxVectors()
-    return [
-        float(vectors[axis][axis].value_in_unit(unit.nanometer)) for axis in range(3)
-    ]
-
-
-def _last_state(summary: RunSummary, directory: Path) -> str:
-    """The state the equilibration finished at, whether it ran or resumed.
-
-    Taken from the summary, which tracks the state through skipped stages as
-    well as run ones, and not by scanning the manifest for the last thing with
-    a state file. The manifest is in run order and a finished scan has put
-    every relaxation stage after ``05_npt`` in it, so the last entry of a
-    *resumed* run is the end of somebody's strained hold - and branching the
-    next replica from that would measure a cell that had already been pulled.
-    """
-    state = summary.final_state
-    if state and state != "None" and Path(state).is_file():
-        return str(state)
-    raise ViscoelasticError(
-        f"{directory} has no finished equilibration stage to strain from. Run "
-        "the equilibration first, or delete the manifest and start over."
-    )
 
 
 # --------------------------------------------------------------------------
@@ -762,8 +727,10 @@ def run_relaxation_scan(
         "expected_characteristic_ratio": expected_characteristic_ratio,
     }
     settled = run_protocol(settle, run, directory, resume=resume, **chains)
-    start_state = _last_state(settled, directory)
-    origin = _equilibrated_box_nm(start_state)
+    start_state = settled_state(
+        settled, directory, error=ViscoelasticError, verb="strain"
+    )
+    origin = equilibrated_box_nm(start_state)
     log.info(
         "Equilibrated cell is %s nm; every replica starts from %s.",
         [round(value, 4) for value in origin],
@@ -888,34 +855,6 @@ def _log_result(
 # --------------------------------------------------------------------------
 
 
-def _replica_groups(run_dir: str | Path) -> list[tuple[str, ...]]:
-    """Group the relaxation stages into one list of chunks per replica.
-
-    Grouped on the stem the chunk suffix hangs off, so a hold split for resume
-    comes back as one curve and two replicas do not come back as one. A stage
-    named by something else entirely - a single ``relax`` run made by hand -
-    becomes its own group, which is what it is.
-    """
-    groups: dict[str, list[str]] = {}
-    for name in relax_stages(run_dir):
-        stem, _, tail = name.rpartition("_")
-        key = stem if stem and tail.isdigit() else name
-        groups.setdefault(key, []).append(name)
-    return [tuple(names) for names in groups.values()]
-
-
-def _spread(values: Sequence[float]) -> float | None:
-    """The sample standard deviation of the replicas, or None below two.
-
-    None rather than zero: one replica has no spread to report, and a zero
-    would read as several runs that agreed perfectly.
-    """
-    usable = [value for value in values if math.isfinite(value)]
-    if len(usable) < 2:
-        return None
-    return float(np.std(usable, ddof=1))
-
-
 def _primary_strain(by_strain: dict[float, list[RelaxationCurve]]) -> float:
     """Which strain's ensemble is the measurement, and which are the check.
 
@@ -993,7 +932,7 @@ def analyse_relaxation(
     notes: list[str] = []
     curves: list[RelaxationCurve] = []
 
-    for group in _replica_groups(directory):
+    for group in group_by_stem(relax_stages(directory)):
         try:
             curves.append(relaxation_curve(directory, group))
         except AnalysisError as error:
@@ -1017,7 +956,7 @@ def analyse_relaxation(
     mean = mean_curve(ensemble)
     kww = fit_kww(mean, min_points=min_points)
     prony = fit_prony(mean, min_points=min_points)
-    spread = _spread([curve.initial_modulus_mpa for curve in ensemble])
+    spread = sample_spread([curve.initial_modulus_mpa for curve in ensemble])
     linearity = _linearity(
         {value: mean_curve(group) for value, group in by_strain.items()}
     )
@@ -1215,7 +1154,7 @@ def write_relaxation_report(
         "notes": list(report.notes),
     }
     json_path = directory / "relaxation.json"
-    json_path.write_text(json.dumps(record, indent=2, default=str) + "\n")
+    write_json(json_path, record, strict=False)
 
     written: list[str] = []
     if figures and report.mean is not None:

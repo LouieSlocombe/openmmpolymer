@@ -37,10 +37,10 @@ def dimer_cell(
     their centres of mass are distinct. Coincident chains make every
     displacement identically zero, which passes a test without exercising it.
     """
-    from .helpers import _lattice
+    from .helpers import lattice
 
     per_side = math.ceil(n_chains ** (1 / 3))
-    origins = _lattice(n_chains, spacing_nm * per_side)
+    origins = lattice(n_chains, spacing_nm * per_side)
     positions = np.zeros((n_chains * 2, 3), dtype=np.float64)
     positions[0::2, :] = origins
     positions[1::2, :] = origins + np.array([0.0, 0.0, separation_nm])

@@ -19,8 +19,8 @@ from openmmpolymer.convergence import (
 from openmmpolymer.trajectory import AnalysisError
 
 from .helpers import (
-    _write_manifest,
     state_data_csv,
+    write_manifest,
     write_polymer_snapshot,
     write_relaxation,
 )
@@ -312,9 +312,7 @@ def test_saved_state_csv_produces_window_reports_without_coordinates(
         for i, value in enumerate(data)
     ]
     csv.write_text(state_data_csv(rows))
-    _write_manifest(
-        tmp_path, {"hold": {"name": "hold", "csv": str(csv), "samples": {}}}
-    )
+    write_manifest(tmp_path, {"hold": {"name": "hold", "csv": str(csv), "samples": {}}})
     result = analyse_convergence(tmp_path)
     assert set(result.results) == {
         "density_g_cm3",
@@ -376,7 +374,7 @@ def test_relaxation_replicas_subtract_their_own_baselines_before_averaging(
 def test_missing_manifest_and_bad_explicit_stage_raise(tmp_path: Path) -> None:
     with pytest.raises(AnalysisError, match="No manifest"):
         analyse_convergence(tmp_path)
-    _write_manifest(tmp_path, {"hold": {"name": "hold", "samples": {}}})
+    write_manifest(tmp_path, {"hold": {"name": "hold", "samples": {}}})
     with pytest.raises(AnalysisError, match="has no stage"):
         analyse_convergence(tmp_path, stage="missing")
     with pytest.raises(ValueError, match="stride"):

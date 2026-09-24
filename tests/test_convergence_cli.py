@@ -11,7 +11,7 @@ import pytest
 
 from openmmpolymer import __main__ as cli
 
-from .helpers import _write_manifest, state_data_csv
+from .helpers import state_data_csv, write_manifest
 
 
 def _state_run(directory: Path) -> None:
@@ -23,7 +23,7 @@ def _state_run(directory: Path) -> None:
     ]
     csv = directory / "hold.csv"
     csv.write_text(state_data_csv(rows))
-    _write_manifest(
+    write_manifest(
         directory, {"hold": {"name": "hold", "csv": str(csv), "samples": {}}}
     )
 

@@ -376,8 +376,10 @@ def test_all_passes_start_from_common_state_and_force_rerun_keeps_replicas(
         return SimpleNamespace(final_state="equilibrated.xml")
 
     monkeypatch.setattr(elastic_rates, "run_protocol", fake)
-    monkeypatch.setattr(elastic_rates, "_equilibrated_box_nm", lambda state: [5.0] * 3)
-    monkeypatch.setattr(elastic_rates, "_last_state", lambda *args: "equilibrated.xml")
+    monkeypatch.setattr(elastic_rates, "equilibrated_box_nm", lambda state: [5.0] * 3)
+    monkeypatch.setattr(
+        elastic_rates, "settled_state", lambda *args, **kwargs: "equilibrated.xml"
+    )
     monkeypatch.setattr(
         elastic_rates, "analyse_elastic_rates", lambda *args, **kwargs: None
     )
@@ -545,9 +547,11 @@ def _interrupted_branch(
 
     monkeypatch.setattr(elastic_rates, "run_protocol", fake)
     monkeypatch.setattr(
-        elastic_rates, "_last_state", lambda summary, path: summary.final_state
+        elastic_rates,
+        "settled_state",
+        lambda summary, path, **kwargs: summary.final_state,
     )
-    monkeypatch.setattr(elastic_rates, "_equilibrated_box_nm", lambda path: [5.0] * 3)
+    monkeypatch.setattr(elastic_rates, "equilibrated_box_nm", lambda path: [5.0] * 3)
     run: Any = SimpleNamespace(
         spec=SystemSpec(),
         seed=17,
@@ -598,7 +602,9 @@ def test_resume_refuses_a_different_returned_preparation_state(
     run, options, _, calls = _interrupted_branch(tmp_path, monkeypatch)
     changed = tmp_path / "other-preparation.xml"
     changed.write_text("another state")
-    monkeypatch.setattr(elastic_rates, "_last_state", lambda *args: str(changed))
+    monkeypatch.setattr(
+        elastic_rates, "settled_state", lambda *args, **kwargs: str(changed)
+    )
     prior_count = len(calls)
     with pytest.raises(MechanicalError, match="preparation state changed"):
         run_elastic_rate_scan(run, tmp_path, **options)

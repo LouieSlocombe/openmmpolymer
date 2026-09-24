@@ -41,7 +41,14 @@ from typing import Any, cast
 
 import numpy as np
 
-from ._validation import require_integer, require_positive
+from ._files import ReportFiles, write_json
+from ._validation import require_axis, require_integer, require_positive
+from ._workflow import (
+    equilibrated_box_nm,
+    group_by_stem,
+    sample_spread,
+    settled_state,
+)
 from .elasticity import (
     BulkModulus,
     ElasticConsistency,
@@ -61,13 +68,11 @@ from .elasticity import (
 from .protocols import (
     Protocol,
     RunManifest,
-    RunSummary,
     Stage,
     run_protocol,
     standard_melt_equilibration,
 )
 from .simulate import RunContext, safe_timestep_fs
-from .tg import ReportFiles
 from .trajectory import AnalysisError
 
 log = logging.getLogger(__name__)
@@ -189,8 +194,7 @@ class ModulusSpec:
             require_positive(getattr(self, name), None, name=name)
         require_integer(self.n_replicas, name="n_replicas")
         require_integer(self.samples_per_step, name="samples_per_step")
-        if self.axis not in (0, 1, 2):
-            raise ValueError(f"axis={self.axis!r} must be 0, 1 or 2.")
+        require_axis(self.axis)
         if self.strain_increment >= self.max_strain:
             raise ValueError(
                 f"strain_increment={self.strain_increment} is not below "
@@ -612,10 +616,8 @@ def _check_request(run_dir: Path, request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _save_workflow(run_dir: Path, record: dict[str, Any]) -> str:
-    """Write the workflow record. Recomputable, so not written atomically."""
-    path = run_dir / WORKFLOW_NAME
-    path.write_text(json.dumps(record, indent=2, default=str) + "\n")
-    return str(path)
+    """Write the workflow record."""
+    return write_json(run_dir / WORKFLOW_NAME, record, strict=False)
 
 
 def _report_cost(
@@ -630,16 +632,14 @@ def _report_cost(
     Raises:
         MechanicalError: The total is over ``max_total_ns``.
     """
-    from .protocols import _stage_duration_ps
-
     settle_ps = equilibration.total_duration_ps
     deform_ps = schedule.total_ps * spec.n_replicas
-    extra_ps = sum(_stage_duration_ps(stage) for stage in extras)
+    extra_ps = sum(stage.duration_ps for stage in extras)
     total_ps = settle_ps + deform_ps + extra_ps
 
     done = set(manifest.stages) if manifest is not None else set()
     remaining = total_ps - sum(
-        _stage_duration_ps(stage)
+        stage.duration_ps
         for stage in (*equilibration.stages, *extras)
         if stage.name in done
     )
@@ -671,24 +671,6 @@ def _report_cost(
             f"{spec.max_total_ns:.1f} ns budget. Shorten relax_ps, drop a "
             "replica, skip a pass, or raise max_total_ns."
         )
-
-
-def _equilibrated_box_nm(state_path: str | Path) -> list[float]:
-    """The cell edges a saved state carries, in nanometres.
-
-    Read from the state rather than from ``run.box``, which is the *packed*
-    cell: everything since has compressed it, and strain measured against
-    the packed edges would be measured against a cell that stopped existing
-    at the first barostat move.
-    """
-    import openmm as mm
-    from openmm import unit
-
-    state = mm.XmlSerializer.deserialize(Path(state_path).read_text())
-    vectors = state.getPeriodicBoxVectors()
-    return [
-        float(vectors[axis][axis].value_in_unit(unit.nanometer)) for axis in range(3)
-    ]
 
 
 # --------------------------------------------------------------------------
@@ -755,8 +737,10 @@ def run_modulus_scan(
         "expected_characteristic_ratio": expected_characteristic_ratio,
     }
     settled = run_protocol(settle, run, directory, resume=resume, **chains)
-    start_state = _last_state(settled, directory)
-    origin = _equilibrated_box_nm(start_state)
+    start_state = settled_state(
+        settled, directory, error=MechanicalError, verb="deform"
+    )
+    origin = equilibrated_box_nm(start_state)
     log.info(
         "Equilibrated cell is %s nm; every pass starts from %s.",
         [round(value, 4) for value in origin],
@@ -830,28 +814,6 @@ def run_modulus_scan(
     )
 
 
-def _last_state(summary: RunSummary, directory: Path) -> str:
-    """The state the equilibration finished at, whether it ran or resumed.
-
-    Taken from the summary, which threads the state through skipped stages as
-    well as run ones, and not by scanning the manifest for the last thing with
-    a state file. The manifest is in run order, so on a resume the last entry
-    is whatever the previous attempt got furthest through - a deformation, a
-    load or a shear - and every pass branches from the *equilibrated* cell,
-    not from one that has already been pulled. Worse than the wrong starting
-    configuration: ``run_modulus_scan`` reads the strain origin off this
-    state, so the strain every remaining chunk reports would be measured
-    against a cell that was already at five per cent.
-    """
-    state = summary.final_state
-    if state and state != "None" and Path(state).is_file():
-        return str(state)
-    raise MechanicalError(
-        f"{directory} has no finished equilibration stage to deform from. "
-        "Run the equilibration first, or delete the manifest and start over."
-    )
-
-
 def _log_result(
     report: ModulusReport, schedule: ModulusSchedule, resolved: bool
 ) -> None:
@@ -905,22 +867,6 @@ def _log_result(
 # --------------------------------------------------------------------------
 
 
-def _replica_groups(run_dir: str | Path) -> list[tuple[str, ...]]:
-    """Group the deformation stages into one list of chunks per replica.
-
-    Grouped on the stem the chunk suffix hangs off, so a ladder split for
-    resume comes back as one curve and two replicas do not come back as one.
-    A stage named by something else entirely - a single ``deform`` run made
-    by hand - becomes its own group, which is what it is.
-    """
-    groups: dict[str, list[str]] = {}
-    for name in deform_stages(run_dir):
-        stem, _, tail = name.rpartition("_")
-        key = stem if stem and tail.isdigit() else name
-        groups.setdefault(key, []).append(name)
-    return [tuple(names) for names in groups.values()]
-
-
 def analyse_mechanics(
     run_dir: str | Path,
     *,
@@ -957,7 +903,7 @@ def analyse_mechanics(
     replicas: list[ElasticModulus] = []
 
     try:
-        groups = _replica_groups(directory)
+        groups = group_by_stem(deform_stages(directory))
     except AnalysisError as error:
         groups = []
         notes.append(f"No extension to fit: {error}")
@@ -979,7 +925,7 @@ def analyse_mechanics(
         if pooled is not None
         else None
     )
-    spread = _spread([fit.modulus_mpa for fit in replicas])
+    spread = sample_spread([fit.modulus_mpa for fit in replicas])
 
     # Named rather than found by shape, and this is the one place that rule
     # is inverted. A bulk ladder is run by the shared `compress` runner, so
@@ -1088,18 +1034,6 @@ def _pool(curves: Sequence[StressStrain]) -> StressStrain | None:
         strain_rate_per_ns=float(np.mean(rates)) if rates else None,
         controlled=curves[0].controlled,
     )
-
-
-def _spread(values: Sequence[float]) -> float | None:
-    """The sample standard deviation of the replicas, or None below two.
-
-    None rather than zero: one replica has no spread to report, and a zero
-    would read as several runs that agreed perfectly.
-    """
-    usable = [value for value in values if math.isfinite(value)]
-    if len(usable) < 2:
-        return None
-    return float(np.std(usable, ddof=1))
 
 
 # --------------------------------------------------------------------------
@@ -1242,7 +1176,7 @@ def write_mechanical_report(
         "notes": list(report.notes),
     }
     json_path = directory / "mechanics.json"
-    json_path.write_text(json.dumps(record, indent=2, default=str) + "\n")
+    write_json(json_path, record, strict=False)
 
     written: list[str] = []
     if figures:

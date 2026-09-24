@@ -16,9 +16,6 @@ from typing import Any
 
 import pytest
 
-from openmmpolymer.forcefield import PolymerForceField
-from openmmpolymer.mdsystem import PackedBox
-from openmmpolymer.simulate import prepare_run
 from openmmpolymer.tg import (
     COARSE_STEM,
     FINE_STEM,
@@ -39,7 +36,6 @@ from openmmpolymer.tg import (
 from openmmpolymer.trajectory import AnalysisError
 
 from .helpers import (
-    argon_system,
     two_line_curve,
     write_quench,
     write_quenches,
@@ -73,30 +69,6 @@ QUICK_EQUILIBRATION: dict[str, Any] = {
     "anneal_hold_ps": 0.1,
     "compress_pressures_bar": (1.0, 20.0, 1.0),
 }
-
-
-@pytest.fixture
-def argon_scan_run() -> Any:
-    """An argon cell big enough to survive an NPT equilibration.
-
-    Sixty-four atoms in the shared fixture reach a liquid density at an edge
-    below twice the cutoff, and OpenMM refuses that outright. Two hundred and
-    sixteen do not, and are still milliseconds a stage.
-    """
-    system, topology, positions = argon_system(216, 2.8)
-    box = PackedBox(
-        topology=topology,
-        positions_nm=positions,
-        box_nm=(2.8, 2.8, 2.8),
-        n_molecules=216,
-    )
-    return prepare_run(
-        box,
-        PolymerForceField("unused.xml", (), "AR", "smirnoff"),
-        platform="CPU",
-        seed=11,
-        system=system,
-    )
 
 
 # --------------------------------------------------------------------------

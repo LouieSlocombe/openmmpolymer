@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import re
 from dataclasses import asdict
@@ -11,15 +10,13 @@ from pathlib import Path
 import numpy as np
 from matplotlib.figure import Figure
 
-from ._reporting import json_value
+from ._files import ReportFiles, json_value, write_json
 from .convergence import (
     ConvergenceReport,
     RelaxationWindowConvergence,
     WindowConvergence,
 )
-from .protocols import _write_atomically
 from .structural_convergence import StructuralWindowConvergence
-from .tg import ReportFiles
 
 
 def plot_window_convergence(result: WindowConvergence) -> Figure:
@@ -172,9 +169,7 @@ def write_convergence_report(
         "models. This does not establish equilibrium or eliminate systematic bias."
     )
     path = directory / "convergence.json"
-    _write_atomically(
-        path, json.dumps(json_value(record), indent=2, allow_nan=False) + "\n"
-    )
+    write_json(path, json_value(record))
     written: list[str] = []
     if figures:
         for name, result in report.results.items():

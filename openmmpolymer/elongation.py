@@ -8,7 +8,6 @@ stress-loss criterion are shared with the breaking-strength workflow.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -19,6 +18,8 @@ from typing import Any
 
 import numpy as np
 
+from ._files import ReportFiles, write_json
+from ._workflow import equilibrated_box_nm, run_fingerprint
 from .breaking import (
     BreakingSchedule,
     BreakingSpec,
@@ -27,18 +28,15 @@ from .breaking import (
     breaking_schedule,
 )
 from .elasticity import StressStrain
-from .mechanical import _equilibrated_box_nm
 from .protocols import (
     Protocol,
     RunManifest,
-    _write_atomically,
     run_protocol,
     standard_melt_equilibration,
     validate_run_inputs,
 )
 from .simulate import RunContext, safe_timestep_fs
 from .strength import ElongationAtBreak, elongation_at_break
-from .tg import ReportFiles
 from .trajectory import AnalysisError
 
 log = logging.getLogger(__name__)
@@ -239,13 +237,7 @@ def run_elongation_scan(
             {
                 "spec": settings,
                 "equilibration": [asdict(stage) for stage in settle.stages],
-                "system": asdict(run.spec),
-                "seed": run.seed,
-                "system_sha256": hashlib.sha256(run.system_xml.encode()).hexdigest(),
-                "coordinates_sha256": hashlib.sha256(
-                    np.asarray(run.box.positions_nm, dtype=np.float64).tobytes()
-                ).hexdigest(),
-                "box_nm": list(run.box.box_nm),
+                **run_fingerprint(run),
             }
         )
     )
@@ -289,7 +281,7 @@ def run_elongation_scan(
     if resume:
         validate_run_inputs(run, directory)
     directory.mkdir(parents=True, exist_ok=True)
-    _write_atomically(directory / WORKFLOW_NAME, json.dumps(record, indent=2) + "\n")
+    write_json(directory / WORKFLOW_NAME, record)
     log.info(
         "Elongation scan: %d replicas, %.3g ns total, %.3g average strain/ns; "
         "apparent stress-loss endpoint with fixed bonds.",
@@ -306,9 +298,9 @@ def run_elongation_scan(
     start_state = settled.final_state
     if not start_state or not Path(start_state).is_file():
         raise ElongationError("The equilibration did not leave a readable final state.")
-    origin = _equilibrated_box_nm(start_state)
+    origin = equilibrated_box_nm(start_state)
     record.update({"reference_box_nm": origin, "start_state": start_state})
-    _write_atomically(directory / WORKFLOW_NAME, json.dumps(record, indent=2) + "\n")
+    write_json(directory / WORKFLOW_NAME, record)
     for replica in range(spec.n_replicas):
         run_protocol(
             elongation_protocol(
@@ -495,7 +487,7 @@ def write_elongation_report(
             curve[key] = curve[key].tolist()
         fit["nominal_stress_mpa"] = fit["nominal_stress_mpa"].tolist()
     json_path = directory / "elongation.json"
-    _write_atomically(json_path, json.dumps(record, indent=2, allow_nan=False) + "\n")
+    write_json(json_path, record)
     figures: list[str] = []
     for index, curve, fit in zip(
         report.replica_indices, report.curves, report.replicas, strict=True

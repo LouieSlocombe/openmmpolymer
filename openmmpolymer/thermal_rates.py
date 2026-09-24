@@ -9,7 +9,6 @@ The existing two-pass Tg scan and its log-linear/VFT analysis are unchanged.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from collections.abc import Sequence
@@ -19,13 +18,13 @@ from typing import Any
 
 import numpy as np
 
-from ._rate_scan import (
-    state_digest,
+from ._files import file_sha256, write_json
+from ._validation import require_integer, require_positive
+from ._workflow import (
+    run_fingerprint,
     validate_extrapolation_limit,
     validate_hold_times,
-    write_workflow,
 )
-from ._validation import require_integer, require_positive
 from .protocols import (
     Protocol,
     RunManifest,
@@ -304,14 +303,8 @@ def run_thermal_rate_scan(
                 "equilibration": asdict(plan.equilibration),
                 "target_rate": target_rate,
                 "max_extrapolation_decades": max_extrapolation_decades,
-                "system_spec": asdict(run.spec),
-                "system_sha256": hashlib.sha256(run.system_xml.encode()).hexdigest(),
-                "coordinates_sha256": hashlib.sha256(
-                    np.asarray(run.box.positions_nm, dtype=np.float64).tobytes()
-                ).hexdigest(),
-                "box_nm": list(run.box.box_nm),
-                "seed": run.seed,
-                "state_sha256": None if state_in is None else state_digest(state_in),
+                **run_fingerprint(run, spec_key="system_spec"),
+                "state_sha256": None if state_in is None else file_sha256(state_in),
                 "crystalline_supplied": crystalline
                 if property_name == "melting_temperature"
                 else None,
@@ -349,7 +342,7 @@ def run_thermal_rate_scan(
         record.update(
             {name: previous[name] for name in ("start_state", "start_state_sha256")}
         )
-    write_workflow(workflow, record)
+    write_json(workflow, record)
     chains: dict[str, Any] = {
         "chain_backbone": chain_backbone,
         "atoms_per_chain": atoms_per_chain,
@@ -366,13 +359,13 @@ def run_thermal_rate_scan(
     start = Path(settled.final_state)
     if not start.is_file():
         raise ThermalRateError("The common preparation did not save a final state.")
-    fingerprint = state_digest(start)
+    fingerprint = file_sha256(start)
     if resume and record.get("start_state_sha256", fingerprint) != fingerprint:
         raise ThermalRateError(
             "The common preparation state changed; use a fresh directory."
         )
     record.update(start_state=str(start), start_state_sha256=fingerprint)
-    write_workflow(workflow, record)
+    write_json(workflow, record)
     for rate_index, protocol in enumerate(plan.protocols):
         for replica in range(n_replicas):
             run_protocol(

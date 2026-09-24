@@ -7,7 +7,6 @@ of a reversing ladder. Finite-rate extrapolation does not establish equilibrium.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from collections.abc import Sequence
@@ -17,15 +16,19 @@ from typing import Any
 
 import numpy as np
 
-from ._rate_scan import (
-    state_digest,
+from ._files import file_sha256, write_json
+from ._validation import require_positive
+from ._workflow import (
+    equilibrated_box_nm,
+    group_by_stem,
+    run_fingerprint,
+    settled_state,
     validate_extrapolation_limit,
     validate_hold_times,
-    write_workflow,
 )
-from ._validation import require_positive
 from .elasticity import (
     bulk_modulus,
+    deform_stages,
     load_curve,
     poisson_ratio,
     shear_modulus,
@@ -37,9 +40,6 @@ from .mechanical import (
     DEFAULT_SPEC,
     MechanicalError,
     ModulusSpec,
-    _equilibrated_box_nm,
-    _last_state,
-    _replica_groups,
     deform_protocol,
     equilibration_protocol,
     extra_stages,
@@ -276,13 +276,7 @@ def run_elastic_rate_scan(
                 "equilibration": asdict(plan.equilibration),
                 "target_rate": target_rate,
                 "max_extrapolation_decades": max_extrapolation_decades,
-                "system": asdict(run.spec),
-                "system_sha256": hashlib.sha256(run.system_xml.encode()).hexdigest(),
-                "coordinates_sha256": hashlib.sha256(
-                    np.asarray(run.box.positions_nm, dtype=np.float64).tobytes()
-                ).hexdigest(),
-                "box_nm": list(run.box.box_nm),
-                "seed": run.seed,
+                **run_fingerprint(run),
             },
             allow_nan=False,
         )
@@ -305,7 +299,7 @@ def run_elastic_rate_scan(
         fingerprint = previous.get("start_state_sha256")
         if fingerprint is not None:
             source = Path(previous.get("start_state", ""))
-            if not source.is_file() or state_digest(source) != fingerprint:
+            if not source.is_file() or file_sha256(source) != fingerprint:
                 raise MechanicalError(
                     "The common preparation state changed or is missing; "
                     "restore it or rerun with resume=False."
@@ -333,7 +327,7 @@ def run_elastic_rate_scan(
         "request": request,
         "run_dirs": names,
     }
-    write_workflow(workflow, record)
+    write_json(workflow, record)
     chains: dict[str, Any] = {
         "chain_backbone": chain_backbone,
         "atoms_per_chain": atoms_per_chain,
@@ -343,13 +337,13 @@ def run_elastic_rate_scan(
     settled = run_protocol(
         plan.equilibration, run, settled_dir, resume=resume, **chains
     )
-    start = _last_state(settled, settled_dir)
-    fingerprint = state_digest(start)
+    start = settled_state(settled, settled_dir, error=MechanicalError, verb="deform")
+    fingerprint = file_sha256(start)
     if resume and previous.get("start_state_sha256", fingerprint) != fingerprint:
         raise MechanicalError(
             "The common preparation state changed; restore it or rerun with resume=False."
         )
-    origin = _equilibrated_box_nm(start)
+    origin = equilibrated_box_nm(start)
     timestep = safe_timestep_fs(spec.temperature_k, run.spec)
     record.update(
         start_state=str(start),
@@ -357,7 +351,7 @@ def run_elastic_rate_scan(
         reference_box_nm=origin,
         timestep_fs=timestep,
     )
-    write_workflow(workflow, record)
+    write_json(workflow, record)
     for i, (name, hold) in enumerate(zip(names, plan.hold_times_ps, strict=True)):
         rate_spec = _rate_spec(spec, property_name, hold)
         for replica in range(spec.n_replicas):
@@ -540,7 +534,7 @@ def _observations(
     stages = _read_stages(directory)
     key = _PATH_KEYS[name]
     if name == "poisson_ratio":
-        groups = _replica_groups(directory)
+        groups = group_by_stem(deform_stages(directory))
     else:
         groups = [
             (stage,)

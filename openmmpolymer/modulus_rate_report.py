@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import asdict
 from pathlib import Path
 
-from ._reporting import json_value
+from ._files import ReportFiles, json_value, write_json
 from .modulus_rates import ModulusRateReport
-from .protocols import _write_atomically
-from .tg import ReportFiles
 
 
 def write_modulus_rate_report(
@@ -44,10 +41,7 @@ def write_modulus_rate_report(
         "the rate model or changing material relaxation mechanisms."
     )
     json_path = directory / "modulus_rates.json"
-    _write_atomically(
-        json_path,
-        json.dumps(json_value(record), indent=2, allow_nan=False) + "\n",
-    )
+    write_json(json_path, json_value(record))
     written: list[str] = []
     if figures:
         for fit in (report.log_linear, report.power_law):

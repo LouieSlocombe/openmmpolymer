@@ -16,12 +16,15 @@ from typing import Any
 
 import numpy as np
 
-from ._rate_scan import (
+from ._files import write_json
+from ._validation import require_positive
+from ._workflow import (
+    equilibrated_box_nm,
+    sample_spread,
+    settled_state,
     validate_extrapolation_limit,
     validate_hold_times,
-    write_workflow,
 )
-from ._validation import require_positive
 from .elasticity import ElasticModulus, StressStrain, youngs_modulus
 from .mechanical import (
     DEFAULT_SPEC,
@@ -29,10 +32,7 @@ from .mechanical import (
     MechanicalError,
     ModulusSchedule,
     ModulusSpec,
-    _equilibrated_box_nm,
-    _last_state,
     _pool,
-    _spread,
     analyse_mechanics,
     deform_protocol,
     deform_schedule,
@@ -183,7 +183,7 @@ def run_modulus_rate_scan(
         validate_run_inputs(run, directory / "equilibration")
     directory.mkdir(parents=True, exist_ok=True)
     record: dict[str, Any] = {"request": request, "run_dirs": relative_dirs}
-    write_workflow(workflow, record)
+    write_json(workflow, record)
     log.info(
         "Modulus rate scan: %d rates, %d replicas per rate, %.3g ns in total.",
         len(plan.schedules),
@@ -199,15 +199,17 @@ def run_modulus_rate_scan(
     settled = run_protocol(
         plan.equilibration, run, settled_dir, resume=resume, **chains
     )
-    start_state = _last_state(settled, settled_dir)
-    origin = _equilibrated_box_nm(start_state)
+    start_state = settled_state(
+        settled, settled_dir, error=MechanicalError, verb="deform"
+    )
+    origin = equilibrated_box_nm(start_state)
     timestep_fs = safe_timestep_fs(spec.temperature_k, run.spec)
     record.update(
         start_state=str(start_state),
         reference_box_nm=origin,
         timestep_fs=timestep_fs,
     )
-    write_workflow(workflow, record)
+    write_json(workflow, record)
     for rate_index, (name, schedule) in enumerate(
         zip(relative_dirs, plan.schedules, strict=True)
     ):
@@ -416,7 +418,7 @@ def analyse_modulus_rates(
         assert pooled is not None
         fit = youngs_modulus(pooled, strain_limit=strain_limit)
         replicas = [youngs_modulus(curve, strain_limit=strain_limit) for curve in group]
-        spread = _spread([replica.modulus_mpa for replica in replicas])
+        spread = sample_spread([replica.modulus_mpa for replica in replicas])
         consistent = spread is None or spread <= MAX_REPLICA_SPREAD * abs(
             fit.modulus_mpa
         )

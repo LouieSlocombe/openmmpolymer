@@ -39,6 +39,8 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
+from ._validation import require_plane
+
 log = logging.getLogger(__name__)
 
 #: Which barostats report which components. The anisotropic one gives the
@@ -410,9 +412,7 @@ def affine_shear(
     Raises:
         ValueError: *plane* is not two different axes.
     """
-    driven, gradient = plane
-    if driven == gradient or not {driven, gradient} <= {0, 1, 2}:
-        raise ValueError(f"plane={plane!r} must be two different axes of 0, 1, 2.")
+    driven, gradient = require_plane(plane)
     sheared = np.array(positions_nm, dtype=np.float64, copy=True)
     sheared[:, driven] += gamma * sheared[:, gradient]
     return sheared

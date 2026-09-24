@@ -40,6 +40,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from ._files import ReportFiles, write_json
 from ._validation import require_integer, require_positive
 from .conformation import MeanSquaredDisplacement, centre_of_mass_msd
 from .protocols import (
@@ -340,19 +341,6 @@ class TgReport:
     notes: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class ReportFiles:
-    """Where :func:`write_report` put things.
-
-    Args:
-        json: The machine-readable record.
-        figures: Every figure written, in the order they were made.
-    """
-
-    json: str
-    figures: tuple[str, ...]
-
-
 # --------------------------------------------------------------------------
 # Protocols
 # --------------------------------------------------------------------------
@@ -599,12 +587,8 @@ def pick_waypoint(
 
 def _remaining_ps(protocol: Protocol, manifest: RunManifest | None) -> float:
     """How much of a protocol is not already recorded as done."""
-    from .protocols import _stage_duration_ps
-
     done = set() if manifest is None else set(manifest.stages)
-    return sum(
-        _stage_duration_ps(stage) for stage in protocol.stages if stage.name not in done
-    )
+    return sum(stage.duration_ps for stage in protocol.stages if stage.name not in done)
 
 
 def _report_cost(
@@ -690,10 +674,8 @@ def _check_request(run_dir: Path, request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _save_workflow(run_dir: Path, record: dict[str, Any]) -> str:
-    """Write the workflow record. Recomputable, so not written atomically."""
-    path = run_dir / WORKFLOW_NAME
-    path.write_text(json.dumps(record, indent=2, default=str) + "\n")
-    return str(path)
+    """Write the workflow record."""
+    return write_json(run_dir / WORKFLOW_NAME, record, strict=False)
 
 
 # --------------------------------------------------------------------------
@@ -1703,7 +1685,7 @@ def write_report(
         "notes": list(report.notes),
     }
     json_path = directory / "tg.json"
-    json_path.write_text(json.dumps(record, indent=2, default=str) + "\n")
+    write_json(json_path, record, strict=False)
 
     written: list[str] = []
     if figures:

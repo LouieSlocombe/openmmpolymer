@@ -18,7 +18,6 @@ from openmmpolymer.protocols import (
     ProtocolError,
     RunManifest,
     Stage,
-    _stage_duration_ps,
     chain_dimensions,
     check_build_request,
     melt_quench,
@@ -551,9 +550,9 @@ def test_heat_is_registered_and_its_endpoint_ladder_duration_is_counted() -> Non
         "heat",
         {"t_start": 100.0, "t_end": 175.0, "step_k": 30.0, "hold_ps": 10.0},
     )
-    assert _stage_duration_ps(custom) == pytest.approx(40.0)
+    assert custom.duration_ps == pytest.approx(40.0)
     chunk = Stage("02_heat", "heat", {"temperatures_k": [200.0], "hold_ps": 10.0})
-    assert _stage_duration_ps(chunk) == pytest.approx(10.0)
+    assert chunk.duration_ps == pytest.approx(10.0)
 
 
 def test_heating_samples_are_retained_in_a_resumable_manifest(
@@ -689,10 +688,10 @@ def test_every_mechanical_stage_prices_itself() -> None:
         ),
     )
     for stage, expected in cases:
-        assert _stage_duration_ps(stage) == pytest.approx(expected)
+        assert stage.duration_ps == pytest.approx(expected)
 
 
 def test_a_mechanical_stage_takes_its_runners_defaults() -> None:
     """Priced from the runner's own signature, so the two cannot drift."""
-    duration = _stage_duration_ps(Stage("d", "deform", {}))
+    duration = Stage("d", "deform", {}).duration_ps
     assert duration > 0.0

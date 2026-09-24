@@ -6,7 +6,6 @@ points would erase the variation this analysis needs to measure.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from collections.abc import Sequence
@@ -17,15 +16,15 @@ from typing import Any
 import numpy as np
 
 from . import breaking, elongation, yielding
-from ._rate_scan import (
-    state_digest,
-    validate_extrapolation_limit,
-    validate_hold_times,
-    write_workflow,
-)
+from ._files import file_sha256, write_json
 from ._seeds import derive_seed
 from ._validation import require_positive
-from .mechanical import _equilibrated_box_nm
+from ._workflow import (
+    equilibrated_box_nm,
+    run_fingerprint,
+    validate_extrapolation_limit,
+    validate_hold_times,
+)
 from .protocols import (
     Protocol,
     RunManifest,
@@ -191,13 +190,7 @@ def run_tensile_rate_scan(
                 "property_name": property_name,
                 "specs": [asdict(item) for item in plan.specs],
                 "equilibration": asdict(plan.equilibration),
-                "system": asdict(run.spec),
-                "system_sha256": hashlib.sha256(run.system_xml.encode()).hexdigest(),
-                "coordinates_sha256": hashlib.sha256(
-                    np.asarray(run.box.positions_nm, dtype=np.float64).tobytes()
-                ).hexdigest(),
-                "box_nm": list(run.box.box_nm),
-                "seed": run.seed,
+                **run_fingerprint(run),
             },
             default=str,
             allow_nan=False,
@@ -222,7 +215,7 @@ def run_tensile_rate_scan(
             start_path = Path(previous["start_state"])
             if not start_path.is_file() or previous.get(
                 "start_state_sha256"
-            ) != state_digest(start_path):
+            ) != file_sha256(start_path):
                 raise ValueError(
                     "The common preparation state is missing, changed or lacks its fingerprint; "
                     "restore the original state or rerun with resume=False."
@@ -243,7 +236,7 @@ def run_tensile_rate_scan(
             if key in previous
         }
     )
-    write_workflow(workflow, root_record)
+    write_json(workflow, root_record)
     chains: dict[str, Any] = {
         "chain_backbone": chain_backbone,
         "atoms_per_chain": atoms_per_chain,
@@ -255,16 +248,16 @@ def run_tensile_rate_scan(
     start = settled.final_state
     if not start or not Path(start).is_file():
         raise ValueError("Common equilibration did not leave a readable state.")
-    fingerprint = state_digest(start)
+    fingerprint = file_sha256(start)
     if previous.get("start_state_sha256", fingerprint) != fingerprint:
         raise ValueError(
             "The common preparation changed on resume; rerun with resume=False."
         )
-    origin = _equilibrated_box_nm(start)
+    origin = equilibrated_box_nm(start)
     root_record.update(
         start_state=start, start_state_sha256=fingerprint, reference_box_nm=origin
     )
-    write_workflow(workflow, root_record)
+    write_json(workflow, root_record)
     timestep = safe_timestep_fs(selected.temperature_k, run.spec)
     for index, (name, rate_spec) in enumerate(zip(names, plan.specs, strict=True)):
         rate_dir = directory / name
@@ -278,7 +271,7 @@ def run_tensile_rate_scan(
             )
             for replica in range(rate_spec.n_replicas)
         )
-        write_workflow(
+        write_json(
             rate_dir / module.WORKFLOW_NAME,
             {
                 "request": {

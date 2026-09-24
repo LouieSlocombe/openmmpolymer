@@ -24,7 +24,7 @@ os.environ.setdefault("OPENMM_CPU_THREADS", "1")
 from openmmpolymer.forcefield import PolymerForceField
 from openmmpolymer.mdsystem import PackedBox
 
-from .helpers import DIMER_FFXML, argon_system
+from .helpers import DIMER_FFXML, argon_context, argon_system
 
 
 @pytest.fixture(autouse=True)
@@ -60,39 +60,25 @@ def argon_box() -> tuple[PackedBox, Any]:
 
 
 @pytest.fixture
-def dimer_argon_run() -> Any:
-    """A cell of 32 two-atom molecules: enough for a chain measurement."""
-    from openmmpolymer.simulate import prepare_run
-
-    system, topology, positions = argon_system(64, 2.4, atoms_per_molecule=2)
-    box = PackedBox(
-        topology=topology,
-        positions_nm=positions,
-        box_nm=(2.4, 2.4, 2.4),
-        n_molecules=32,
-    )
-    return prepare_run(
-        box,
-        PolymerForceField("unused.xml", (), "AR", "smirnoff"),
-        platform="CPU",
-        seed=11,
-        system=system,
-    )
+def argon_run() -> Any:
+    """A run context over the 64-atom argon cell, on the deterministic CPU."""
+    return argon_context(64, 2.4)
 
 
 @pytest.fixture
-def argon_run(argon_box: tuple[PackedBox, Any]) -> Any:
-    """A run context over the argon cell, on the deterministic CPU platform."""
-    from openmmpolymer.simulate import prepare_run
+def argon_scan_run() -> Any:
+    """An argon cell big enough to survive an NPT equilibration and a strain.
 
-    box, system = argon_box
-    return prepare_run(
-        box,
-        PolymerForceField("unused.xml", (), "AR", "smirnoff"),
-        platform="CPU",
-        seed=11,
-        system=system,
-    )
+    Sixty-four atoms reach a liquid density at an edge below twice the cutoff,
+    and OpenMM refuses that outright; two hundred and sixteen do not.
+    """
+    return argon_context(216, 2.8)
+
+
+@pytest.fixture
+def dimer_argon_run() -> Any:
+    """A cell of 32 bonded two-atom molecules: enough for a chain measurement."""
+    return argon_context(64, 2.4, atoms_per_molecule=2)
 
 
 @pytest.fixture

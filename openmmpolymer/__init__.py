@@ -41,6 +41,7 @@ where they matter.
 
 from importlib.metadata import PackageNotFoundError, version
 
+from ._files import ReportFiles
 from .breaking import (
     BreakingError,
     BreakingReport,
@@ -332,7 +333,6 @@ from .tensile_rates import (
 )
 from .tg import (
     MeltEquilibration,
-    ReportFiles,
     TgError,
     TgReport,
     TgResult,

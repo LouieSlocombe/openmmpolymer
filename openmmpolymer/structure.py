@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ._files import ReportFiles, write_json
 from ._validation import require_integer, require_positive
 from .conformation import (
     ConformationSeries,
@@ -53,7 +54,6 @@ from .correlations import (
     structure_factor,
 )
 from .protocols import ChainDimensions, RunManifest
-from .tg import ReportFiles
 from .timeseries import Equilibration
 from .trajectory import (
     AnalysisError,
@@ -825,7 +825,7 @@ def write_structure_report(
         "notes": list(report.notes),
     }
     json_path = directory / "structure.json"
-    json_path.write_text(json.dumps(record, indent=2, default=str) + "\n")
+    write_json(json_path, record, strict=False)
 
     written: list[str] = []
     if figures:

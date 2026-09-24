@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import re
 from dataclasses import asdict
@@ -11,10 +10,8 @@ from pathlib import Path
 import numpy as np
 from matplotlib.figure import Figure
 
-from ._reporting import json_value
-from .protocols import _write_atomically
+from ._files import ReportFiles, json_value, write_json
 from .rate_dependence import RateExtrapolation, RateReport
-from .tg import ReportFiles
 
 
 def plot_rate_dependence(fit: RateExtrapolation) -> Figure:
@@ -147,9 +144,7 @@ def write_rate_report(
         "Errors exclude model choice, correlated runs and systematic simulation errors."
     )
     path = directory / f"{name}_rates.json"
-    _write_atomically(
-        path, json.dumps(json_value(record), indent=2, allow_nan=False) + "\n"
-    )
+    write_json(path, json_value(record))
     written: list[str] = []
     if figures:
         for fit in (report.log_linear, report.power_law):

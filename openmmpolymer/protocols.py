@@ -21,7 +21,6 @@ import hashlib
 import inspect
 import json
 import logging
-import os
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -31,6 +30,7 @@ from typing import Any, cast
 import numpy as np
 import numpy.typing as npt
 
+from ._files import file_sha256, write_json
 from .reporters import TrajectoryOptions
 from .simulate import (
     RunContext,
@@ -109,6 +109,49 @@ class Stage:
                 f"of {', '.join(sorted(STAGE_RUNNERS))}."
             )
 
+    @property
+    def duration_ps(self) -> float:
+        """How much dynamics this stage asks for, from the options it was given."""
+        options = _stage_options(self)
+        if self.kind == "heat":
+            ladder = options.get("temperatures_k")
+            if ladder is None:
+                ladder = heating_temperatures(
+                    float(options["t_start"]),
+                    float(options["t_end"]),
+                    float(options["step_k"]),
+                )
+            return float(options["hold_ps"]) * len(ladder)
+        if self.kind == "quench":
+            ladder = options.get("temperatures_k") or quench_temperatures(
+                float(options["t_start"]),
+                float(options["t_end"]),
+                float(options["step_k"]),
+            )
+            return float(options["hold_ps"]) * len(ladder)
+        if self.kind == "anneal":
+            ramp_ps = int(options["ramp_windows"]) * float(options["window_ps"])
+            return (
+                int(options["n_cycles"]) * 2.0 * (ramp_ps + float(options["hold_ps"]))
+            )
+        if self.kind == "compress":
+            return float(options["duration_ps_each"]) * len(options["pressures_bar"])
+        if self.kind == "deform":
+            return float(options["relax_ps"]) * int(options["n_steps"])
+        if self.kind == "load":
+            return float(options["duration_ps_each"]) * len(options["stresses_bar"])
+        if self.kind == "shear":
+            return float(options["duration_ps_each"]) * len(options["strains"])
+        if self.kind == "relax":
+            # A chunk that opens an already-strained cell repeats neither the
+            # baseline nor the ramp, so counting them would price a resumed
+            # ladder as several first chunks.
+            held = 0.0 if options["strain_applied"] else float(options["baseline_ps"])
+            ramp = 0.0 if options["strain_applied"] else float(options["ramp_ps"])
+            return held + ramp + float(options["duration_ps"])
+        duration = options.get("duration_ps")
+        return 0.0 if duration is None else float(duration)
+
 
 @dataclass(frozen=True)
 class Protocol:
@@ -143,7 +186,7 @@ class Protocol:
         duration, and a budget that silently omits the most expensive stage in
         a protocol is worse than no budget, because it gets believed.
         """
-        return sum(_stage_duration_ps(stage) for stage in self.stages)
+        return sum(stage.duration_ps for stage in self.stages)
 
 
 def _stage_options(stage: Stage) -> dict[str, Any]:
@@ -172,47 +215,6 @@ def _stage_options(stage: Stage) -> dict[str, Any]:
     if stage.kind == "production":
         options["barostat"] = None if options["pressure_bar"] is None else "isotropic"
     return options
-
-
-def _stage_duration_ps(stage: Stage) -> float:
-    """How much dynamics one stage asks for, from the options it was given."""
-    options = _stage_options(stage)
-    if stage.kind == "heat":
-        ladder = options.get("temperatures_k")
-        if ladder is None:
-            ladder = heating_temperatures(
-                float(options["t_start"]),
-                float(options["t_end"]),
-                float(options["step_k"]),
-            )
-        return float(options["hold_ps"]) * len(ladder)
-    if stage.kind == "quench":
-        ladder = options.get("temperatures_k") or quench_temperatures(
-            float(options["t_start"]),
-            float(options["t_end"]),
-            float(options["step_k"]),
-        )
-        return float(options["hold_ps"]) * len(ladder)
-    if stage.kind == "anneal":
-        ramp_ps = int(options["ramp_windows"]) * float(options["window_ps"])
-        return int(options["n_cycles"]) * 2.0 * (ramp_ps + float(options["hold_ps"]))
-    if stage.kind == "compress":
-        return float(options["duration_ps_each"]) * len(options["pressures_bar"])
-    if stage.kind == "deform":
-        return float(options["relax_ps"]) * int(options["n_steps"])
-    if stage.kind == "load":
-        return float(options["duration_ps_each"]) * len(options["stresses_bar"])
-    if stage.kind == "shear":
-        return float(options["duration_ps_each"]) * len(options["strains"])
-    if stage.kind == "relax":
-        # A chunk that opens an already-strained cell repeats neither the
-        # baseline nor the ramp, so counting them would price a resumed
-        # ladder as several first chunks.
-        held = 0.0 if options["strain_applied"] else float(options["baseline_ps"])
-        ramp = 0.0 if options["strain_applied"] else float(options["ramp_ps"])
-        return held + ramp + float(options["duration_ps"])
-    duration = options.get("duration_ps")
-    return 0.0 if duration is None else float(duration)
 
 
 def standard_melt_equilibration(
@@ -466,13 +468,6 @@ def chain_dimensions(
     )
 
 
-def _write_atomically(path: Path, text: str) -> None:
-    """Write *text* to *path* without ever leaving it half-written."""
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(text)
-    os.replace(temporary, path)
-
-
 @dataclass
 class RunManifest:
     """The record of one protocol run, and the basis of resuming it.
@@ -507,9 +502,7 @@ class RunManifest:
 
     def save(self, run_dir: str | Path) -> str:
         """Write the manifest into *run_dir*, atomically."""
-        path = Path(run_dir) / MANIFEST_NAME
-        _write_atomically(path, json.dumps(asdict(self), indent=2, default=str) + "\n")
-        return str(path)
+        return write_json(Path(run_dir) / MANIFEST_NAME, asdict(self), strict=False)
 
     @classmethod
     def load(cls, run_dir: str | Path) -> RunManifest | None:
@@ -562,11 +555,6 @@ def _canonical(value: Any) -> Any:
 
 def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
-
-
-def _file_digest(path: str | Path) -> str:
-    with Path(path).open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def _run_identity(run: RunContext) -> dict[str, Any]:
@@ -622,7 +610,7 @@ def _state_source(state: str | Path | None, manifest: RunManifest) -> dict[str, 
         for index, waypoint in enumerate(recorded.get("waypoints", ())):
             if Path(waypoint).resolve() == path:
                 return {"stage": name, "artifact": index}
-    return {"external_state_sha256": _file_digest(path)}
+    return {"external_state_sha256": file_sha256(path)}
 
 
 def _source_path(source: dict[str, Any], manifest: RunManifest) -> str | None:
@@ -725,7 +713,7 @@ def _prepare_manifest(
         if (
             provenance is None
             or not final.is_file()
-            or provenance.get("output_sha256") != _file_digest(final)
+            or provenance.get("output_sha256") != file_sha256(final)
         ):
             invalid.add(name)
             continue
@@ -735,7 +723,7 @@ def _prepare_manifest(
             if (
                 path is None
                 or not Path(path).is_file()
-                or provenance.get("input_sha256") != _file_digest(path)
+                or provenance.get("input_sha256") != file_sha256(path)
             ):
                 invalid.add(name)
                 # A consumed waypoint is an upstream output too. Recreate
@@ -799,10 +787,7 @@ def record_build_request(run_dir: str | Path, request: dict[str, Any]) -> None:
     check_build_request(run_dir, request)
     directory = Path(run_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    _write_atomically(
-        directory / BUILD_REQUEST_NAME,
-        json.dumps(_canonical(request), indent=2, allow_nan=False) + "\n",
-    )
+    write_json(directory / BUILD_REQUEST_NAME, _canonical(request))
 
 
 @dataclass(frozen=True)
@@ -893,7 +878,7 @@ def run_protocol(
         manifest.chains = None
         runner = STAGE_RUNNERS[stage.kind]
         provenance = manifest.provenance["stages"][stage.name]
-        provenance["input_sha256"] = None if state is None else _file_digest(state)
+        provenance["input_sha256"] = None if state is None else file_sha256(state)
         try:
             result = runner(
                 run,
@@ -912,7 +897,7 @@ def run_protocol(
         results.append(result)
         state = result.final_state
         manifest.stages[stage.name] = asdict(result)
-        provenance["output_sha256"] = _file_digest(result.final_state)
+        provenance["output_sha256"] = file_sha256(result.final_state)
         # Saved after every stage, not at the end: the point of the manifest is
         # to survive whatever stops the run.
         manifest.save(directory)

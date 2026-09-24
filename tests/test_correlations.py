@@ -14,7 +14,7 @@ from openmmpolymer.correlations import (
 )
 from openmmpolymer.trajectory import AnalysisError
 
-from .helpers import _lattice, synthetic_ensemble
+from .helpers import lattice, synthetic_ensemble
 
 #: The simple cubic lattice the argon fixtures use: 64 sites, 0.6 nm apart, in
 #: a 2.4 nm cell. Its neighbour shells are exactly 6, 12 and 8 at 0.6,
@@ -27,7 +27,7 @@ LATTICE_EDGE_NM = 2.4
 def lattice_ensemble(n_chains: int = 64) -> Any:
     """The 64-site cubic lattice, split into *n_chains* equal molecules."""
     return synthetic_ensemble(
-        _lattice(64, LATTICE_EDGE_NM), n_chains=n_chains, box_nm=LATTICE_EDGE_NM
+        lattice(64, LATTICE_EDGE_NM), n_chains=n_chains, box_nm=LATTICE_EDGE_NM
     )
 
 
@@ -110,7 +110,7 @@ def test_the_default_radius_survives_the_kernels_float32_box() -> None:
     edge = 2.7858951568603514
     assert float(np.float32(edge)) / 2.0 < edge / 2.0
     measured = radial_distribution(
-        synthetic_ensemble(_lattice(216, edge), n_chains=216, box_nm=edge),
+        synthetic_ensemble(lattice(216, edge), n_chains=216, box_nm=edge),
         heavy_atoms_only=False,
     )
     assert measured.r_max_nm == pytest.approx(edge / 2)
@@ -132,7 +132,7 @@ def test_a_cell_of_one_molecule_has_no_intermolecular_pairs() -> None:
 def test_dropping_hydrogens_from_an_all_hydrogen_cell_is_refused() -> None:
     """It leaves nothing to measure, and an empty array is not an answer."""
     ensemble = synthetic_ensemble(
-        _lattice(64, LATTICE_EDGE_NM),
+        lattice(64, LATTICE_EDGE_NM),
         n_chains=32,
         box_nm=LATTICE_EDGE_NM,
         is_hydrogen=np.ones(2, dtype=bool),
@@ -145,7 +145,7 @@ def test_hydrogens_can_be_dropped() -> None:
     """A melt's hydrogens trace the same structure as the carbons they hang
     off, at four times the pair count."""
     ensemble = synthetic_ensemble(
-        _lattice(64, LATTICE_EDGE_NM),
+        lattice(64, LATTICE_EDGE_NM),
         n_chains=32,
         box_nm=LATTICE_EDGE_NM,
         is_hydrogen=np.array([False, True]),
@@ -170,7 +170,7 @@ def test_the_bins_span_zero_to_the_measured_radius() -> None:
 def test_the_frame_count_is_reported_alongside_the_answer() -> None:
     """A g(r) from one frame and one from five hundred have the same shape and
     very different standing."""
-    frames = np.repeat(_lattice(64, LATTICE_EDGE_NM)[None, :, :], 6, axis=0)
+    frames = np.repeat(lattice(64, LATTICE_EDGE_NM)[None, :, :], 6, axis=0)
     measured = radial_distribution(
         synthetic_ensemble(
             frames, n_chains=64, box_nm=LATTICE_EDGE_NM, interval_ps=1.0
@@ -230,7 +230,7 @@ def test_asking_for_more_wavevectors_than_will_be_summed_is_refused() -> None:
 def test_the_structure_factor_also_refuses_a_cell_with_no_heavy_atoms() -> None:
     """Same reason as the pair distribution: nothing left to sum over."""
     ensemble = synthetic_ensemble(
-        _lattice(64, LATTICE_EDGE_NM),
+        lattice(64, LATTICE_EDGE_NM),
         n_chains=32,
         box_nm=LATTICE_EDGE_NM,
         is_hydrogen=np.ones(2, dtype=bool),

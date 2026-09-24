@@ -32,9 +32,11 @@ import numpy.typing as npt
 
 from ._seeds import derive_seed, seed_random_stream
 from ._validation import (
+    require_axis,
     require_choice,
     require_finite,
     require_integer,
+    require_plane,
     require_positive,
 )
 from .forcefield import PolymerForceField
@@ -1658,8 +1660,7 @@ def run_deform(
     """
     from .stress import affine_scale
 
-    if axis not in (0, 1, 2):
-        raise ValueError(f"axis={axis!r} must be 0, 1 or 2.")
+    require_axis(axis)
     require_integer(n_steps, minimum=1, name="n_steps")
     require_integer(samples_per_step, minimum=1, name="samples_per_step")
     require_positive(relax_ps, None, name="relax_ps")
@@ -2010,8 +2011,7 @@ def run_load(
     Raises:
         ValueError: The axis is not 0, 1 or 2, or no stresses were given.
     """
-    if axis not in (0, 1, 2):
-        raise ValueError(f"axis={axis!r} must be 0, 1 or 2.")
+    require_axis(axis)
     rungs = [float(value) for value in stresses_bar]
     if not rungs:
         raise ValueError("stresses_bar is empty, so there is nothing to pull with.")
@@ -2215,9 +2215,7 @@ def run_shear(
     """
     from .stress import STRESS_ESTIMATOR_VERSION, affine_shear, shear_box_vectors
 
-    driven, gradient = plane
-    if driven == gradient or not {driven, gradient} <= {0, 1, 2}:
-        raise ValueError(f"plane={plane!r} must be two different axes of 0, 1, 2.")
+    driven, gradient = require_plane(plane)
     ladder = [float(value) for value in strains]
     if not ladder:
         raise ValueError("strains is empty, so there is nothing to shear.")
@@ -2698,11 +2696,8 @@ def run_relax(
     from .stress import deviatoric_strain
 
     require_choice(mode, RELAX_MODES, name="mode")
-    if axis not in (0, 1, 2):
-        raise ValueError(f"axis={axis!r} must be 0, 1 or 2.")
-    driven, gradient = plane
-    if driven == gradient or not {driven, gradient} <= {0, 1, 2}:
-        raise ValueError(f"plane={plane!r} must be two different axes of 0, 1, 2.")
+    require_axis(axis)
+    driven, gradient = require_plane(plane)
     require_positive(duration_ps, None, name="duration_ps")
     require_positive(sample_every_ps, None, name="sample_every_ps")
     require_positive(late_sample_every_ps, None, name="late_sample_every_ps")

@@ -184,7 +184,7 @@ def fake_dynamics(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
         return SimpleNamespace(final_state=str(final_state))
 
     monkeypatch.setattr(modulus_rates, "run_protocol", run_protocol)
-    monkeypatch.setattr(modulus_rates, "_equilibrated_box_nm", lambda path: [5.0] * 3)
+    monkeypatch.setattr(modulus_rates, "equilibrated_box_nm", lambda path: [5.0] * 3)
     return calls
 
 

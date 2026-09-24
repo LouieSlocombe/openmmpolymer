@@ -24,13 +24,10 @@ from openmmpolymer.elongation import (
     run_elongation_scan,
     write_elongation_report,
 )
-from openmmpolymer.forcefield import PolymerForceField
-from openmmpolymer.mdsystem import PackedBox
 from openmmpolymer.protocols import RunManifest, standard_melt_equilibration
-from openmmpolymer.simulate import prepare_run
 from openmmpolymer.trajectory import AnalysisError
 
-from .helpers import argon_system, write_deformation
+from .helpers import QUICK_EQUILIBRATION, write_deformation
 
 QUICK = ElongationSpec(
     temperature_k=120.0,
@@ -41,15 +38,6 @@ QUICK = ElongationSpec(
     samples_per_step=2,
     stage_ps=0.1,
 )
-QUICK_EQUILIBRATION: dict[str, Any] = {
-    "nvt_ps": 0.2,
-    "compress_ps_each": 0.2,
-    "npt_ps": 0.3,
-    "anneal_cycles": 1,
-    "anneal_window_ps": 0.1,
-    "anneal_hold_ps": 0.1,
-    "compress_pressures_bar": (1.0, 20.0, 1.0),
-}
 PLANTED = ElongationSpec(
     strain_increment=0.1,
     max_strain=1.1,
@@ -57,20 +45,6 @@ PLANTED = ElongationSpec(
     stage_ps=4.0,
     n_replicas=2,
 )
-
-
-@pytest.fixture
-def argon_elongation_run() -> Any:
-    """A real periodic cell, large enough for the short equilibration."""
-    system, topology, positions = argon_system(216, 2.8)
-    box = PackedBox(topology, positions, (2.8, 2.8, 2.8), 216)
-    return prepare_run(
-        box,
-        PolymerForceField("unused.xml", (), "AR", "smirnoff"),
-        platform="CPU",
-        seed=11,
-        system=system,
-    )
 
 
 def _plant(directory: Path, *, spec: ElongationSpec = PLANTED) -> None:
@@ -385,11 +359,11 @@ def test_unresolved_report_uses_json_null_and_can_skip_figures(tmp_path: Path) -
 
 
 def test_budget_refuses_a_scan_before_creating_any_output(
-    argon_elongation_run: Any,
+    argon_scan_run: Any,
 ) -> None:
     with pytest.raises(ElongationError, match="max_total_ns"):
         run_elongation_scan(
-            argon_elongation_run,
+            argon_scan_run,
             "run",
             spec=replace(QUICK, max_total_ns=1e-6),
             **QUICK_EQUILIBRATION,
@@ -398,7 +372,7 @@ def test_budget_refuses_a_scan_before_creating_any_output(
 
 
 def test_an_interrupted_request_cannot_resume_with_different_settings(
-    argon_elongation_run: Any, monkeypatch: pytest.MonkeyPatch
+    argon_scan_run: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = 0
 
@@ -409,14 +383,12 @@ def test_an_interrupted_request_cannot_resume_with_different_settings(
 
     monkeypatch.setattr(elongation, "run_protocol", interrupt)
     with pytest.raises(RuntimeError, match="synthetic interruption"):
-        run_elongation_scan(
-            argon_elongation_run, "run", spec=QUICK, **QUICK_EQUILIBRATION
-        )
+        run_elongation_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
     assert Path("run", WORKFLOW_NAME).is_file()
     assert not Path("run/manifest.json").exists()
     with pytest.raises(ElongationError, match="different settings"):
         run_elongation_scan(
-            argon_elongation_run,
+            argon_scan_run,
             "run",
             spec=replace(QUICK, n_replicas=1),
             **QUICK_EQUILIBRATION,
@@ -426,31 +398,27 @@ def test_an_interrupted_request_cannot_resume_with_different_settings(
 
 @pytest.mark.parametrize("change", ["system", "coordinates", "box"])
 def test_resume_fingerprints_the_physical_system_and_initial_configuration(
-    argon_elongation_run: Any, monkeypatch: pytest.MonkeyPatch, change: str
+    argon_scan_run: Any, monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
     def interrupt(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("interrupted")
 
     monkeypatch.setattr(elongation, "run_protocol", interrupt)
     with pytest.raises(RuntimeError, match="interrupted"):
-        run_elongation_scan(
-            argon_elongation_run, "run", spec=QUICK, **QUICK_EQUILIBRATION
-        )
+        run_elongation_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
     if change == "system":
-        argon_elongation_run.system_xml += "\n"
+        argon_scan_run.system_xml += "\n"
     elif change == "coordinates":
-        argon_elongation_run.box.positions_nm[0, 0] += 0.001
+        argon_scan_run.box.positions_nm[0, 0] += 0.001
     else:
-        argon_elongation_run.box.box_nm = (2.81, 2.8, 2.8)
+        argon_scan_run.box.box_nm = (2.81, 2.8, 2.8)
     with pytest.raises(ElongationError, match="different settings"):
-        run_elongation_scan(
-            argon_elongation_run, "run", spec=QUICK, **QUICK_EQUILIBRATION
-        )
+        run_elongation_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
 
 
 @pytest.mark.parametrize("protocol", ["foreign", "elongation"])
 def test_foreign_stages_require_a_fresh_directory(
-    argon_elongation_run: Any,
+    argon_scan_run: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     protocol: str,
@@ -466,14 +434,12 @@ def test_foreign_stages_require_a_fresh_directory(
 
     monkeypatch.setattr(elongation, "run_protocol", unexpected)
     with pytest.raises(ElongationError, match="fresh directory"):
-        run_elongation_scan(
-            argon_elongation_run, tmp_path, spec=QUICK, **QUICK_EQUILIBRATION
-        )
+        run_elongation_scan(argon_scan_run, tmp_path, spec=QUICK, **QUICK_EQUILIBRATION)
     assert not (tmp_path / WORKFLOW_NAME).exists()
 
 
 def test_missing_completed_state_is_refused_before_new_dynamics(
-    argon_elongation_run: Any,
+    argon_scan_run: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = 0
@@ -485,9 +451,7 @@ def test_missing_completed_state_is_refused_before_new_dynamics(
 
     monkeypatch.setattr(elongation, "run_protocol", interrupt)
     with pytest.raises(RuntimeError, match="interrupted"):
-        run_elongation_scan(
-            argon_elongation_run, "run", spec=QUICK, **QUICK_EQUILIBRATION
-        )
+        run_elongation_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
     RunManifest(
         protocol="elongation",
         seed=11,
@@ -495,9 +459,7 @@ def test_missing_completed_state_is_refused_before_new_dynamics(
     ).save("run")
     before = Path("run/manifest.json").read_bytes()
     with pytest.raises(ElongationError, match="missing state files"):
-        run_elongation_scan(
-            argon_elongation_run, "run", spec=QUICK, **QUICK_EQUILIBRATION
-        )
+        run_elongation_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
     assert calls == 1
     assert Path("run/manifest.json").read_bytes() == before
 
@@ -506,7 +468,7 @@ def test_missing_completed_state_is_refused_before_new_dynamics(
     "damage", ["equilibration_gap", "replica_gap", "early_replica", "unexpected"]
 )
 def test_resume_cannot_mix_new_predecessors_with_saved_descendants(
-    argon_elongation_run: Any, monkeypatch: pytest.MonkeyPatch, damage: str
+    argon_scan_run: Any, monkeypatch: pytest.MonkeyPatch, damage: str
 ) -> None:
     calls = 0
 
@@ -517,9 +479,7 @@ def test_resume_cannot_mix_new_predecessors_with_saved_descendants(
 
     monkeypatch.setattr(elongation, "run_protocol", interrupt)
     with pytest.raises(RuntimeError, match="interrupted"):
-        run_elongation_scan(
-            argon_elongation_run, "run", spec=QUICK, **QUICK_EQUILIBRATION
-        )
+        run_elongation_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
     settled = [
         stage.name
         for stage in elongation_scan(QUICK, **QUICK_EQUILIBRATION).stages
@@ -541,18 +501,16 @@ def test_resume_cannot_mix_new_predecessors_with_saved_descendants(
     ).save("run")
     before = {path: path.read_bytes() for path in Path("run").iterdir()}
     with pytest.raises(ElongationError, match="Cannot resume"):
-        run_elongation_scan(
-            argon_elongation_run, "run", spec=QUICK, **QUICK_EQUILIBRATION
-        )
+        run_elongation_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
     assert calls == 1
     assert {path: path.read_bytes() for path in Path("run").iterdir()} == before
 
 
 def test_real_scan_preserves_every_stage_on_explicit_rerun_and_resume(
-    argon_elongation_run: Any,
+    argon_scan_run: Any,
 ) -> None:
     first = run_elongation_scan(
-        argon_elongation_run, "run", spec=QUICK, resume=False, **QUICK_EQUILIBRATION
+        argon_scan_run, "run", spec=QUICK, resume=False, **QUICK_EQUILIBRATION
     )
     manifest = RunManifest.load("run")
     assert manifest is not None
@@ -581,7 +539,7 @@ def test_real_scan_preserves_every_stage_on_explicit_rerun_and_resume(
         if path.is_file()
     }
     resumed = run_elongation_scan(
-        argon_elongation_run, "run", spec=QUICK, **QUICK_EQUILIBRATION
+        argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION
     )
     assert [fit.peak_stress_mpa for fit in resumed.replicas] == pytest.approx(
         [fit.peak_stress_mpa for fit in first.replicas]

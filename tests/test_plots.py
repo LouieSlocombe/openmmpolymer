@@ -45,8 +45,8 @@ from openmmpolymer.timeseries import (
 )
 
 from .helpers import (
-    _lattice,
     freely_rotating_chain,
+    lattice,
     random_walk_frames,
     rod_positions,
     state_data_csv,
@@ -197,7 +197,7 @@ def test_the_conformation_figure_labels_its_axes_with_units(walk: Any) -> None:
 
 def test_the_correlations_figure_marks_the_ideal_gas_line() -> None:
     """A g(r) is read against one, so the eye needs it drawn."""
-    ensemble = synthetic_ensemble(_lattice(64, 2.4), n_chains=32, box_nm=2.4)
+    ensemble = synthetic_ensemble(lattice(64, 2.4), n_chains=32, box_nm=2.4)
     figure = plot_correlations(
         radial_distribution(ensemble, n_bins=60, heavy_atoms_only=False)
     )
@@ -208,7 +208,7 @@ def test_the_correlations_figure_marks_the_ideal_gas_line() -> None:
 
 def test_the_structure_factor_gets_its_own_panel_and_its_resolution_floor() -> None:
     """The shaded region is where the cell cannot hold a wave at all."""
-    ensemble = synthetic_ensemble(_lattice(64, 2.4), n_chains=32, box_nm=2.4)
+    ensemble = synthetic_ensemble(lattice(64, 2.4), n_chains=32, box_nm=2.4)
     figure = plot_correlations(
         radial_distribution(ensemble, n_bins=60, heavy_atoms_only=False),
         structure=structure_factor(

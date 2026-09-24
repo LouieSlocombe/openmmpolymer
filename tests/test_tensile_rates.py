@@ -24,9 +24,8 @@ from openmmpolymer.tensile_rates import (
 from openmmpolymer.trajectory import AnalysisError
 from openmmpolymer.yielding import YieldSpec
 
-from .helpers import _write_manifest
+from .helpers import QUICK_EQUILIBRATION, write_manifest
 from .test_breaking import PLANTED as BREAKING_SPEC
-from .test_breaking import QUICK_EQUILIBRATION
 from .test_breaking import _plant as plant_breaking
 from .test_elongation_workflow import PLANTED as ELONGATION_SPEC
 from .test_elongation_workflow import _plant as plant_elongation
@@ -192,7 +191,7 @@ def test_shared_start_independent_rate_seeds_and_resume_guard(
         return SimpleNamespace(final_state=str(state))
 
     monkeypatch.setattr(tensile_rates, "run_protocol", dynamics)
-    monkeypatch.setattr(tensile_rates, "_equilibrated_box_nm", lambda _: [2.4] * 3)
+    monkeypatch.setattr(tensile_rates, "equilibrated_box_nm", lambda _: [2.4] * 3)
     monkeypatch.setattr(
         tensile_rates, "analyse_tensile_rates", lambda *args, **kwargs: None
     )
@@ -228,7 +227,7 @@ def test_unconfirmed_terminal_event_is_preserved_as_missing(tmp_path: Path) -> N
         record = json.loads(path.read_text())
         for stage in record["stages"].values():
             stage["samples"]["segment_stress_zz_bar"] = [100.0] * 4
-        _write_manifest(directory, record["stages"])
+        write_manifest(directory, record["stages"])
     report = analyse_tensile_rates(
         directories, property_name="breaking_strength", target_rate=0.1
     )
@@ -376,7 +375,7 @@ def test_tensile_shared_state_is_checked_before_any_resume_write(
         return SimpleNamespace(final_state=str(final))
 
     monkeypatch.setattr(tensile_rates, "run_protocol", dynamics)
-    monkeypatch.setattr(tensile_rates, "_equilibrated_box_nm", lambda _: [2.4] * 3)
+    monkeypatch.setattr(tensile_rates, "equilibrated_box_nm", lambda _: [2.4] * 3)
     monkeypatch.setattr(
         tensile_rates, "analyse_tensile_rates", lambda *args, **kwargs: None
     )

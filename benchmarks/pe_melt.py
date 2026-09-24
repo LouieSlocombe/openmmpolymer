@@ -44,7 +44,7 @@ from openmmpolymer import (
     run_protocol,
     standard_melt_equilibration,
 )
-from openmmpolymer._reporting import json_value
+from openmmpolymer._files import json_value
 from openmmpolymer.protocols import (
     RunManifest,
     record_build_request,

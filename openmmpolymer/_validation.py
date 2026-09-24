@@ -13,6 +13,7 @@ for one, and convert it to the float the rest of the package works in.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from typing import Any, cast
 
 
@@ -107,6 +108,36 @@ def require_integer(value: object, *, name: str, minimum: int = 1) -> int:
     if value < minimum:
         raise ValueError(f"{name}={value!r} must be at least {minimum}.")
     return value
+
+
+def require_axis(value: object, *, name: str = "axis") -> int:
+    """Return *value* as a Cartesian axis index: 0, 1 or 2.
+
+    Raises:
+        ValueError: The value is not one of those integers.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value not in (0, 1, 2):
+        raise ValueError(f"{name}={value!r} must be 0, 1 or 2.")
+    return value
+
+
+def require_plane(value: Sequence[int], *, name: str = "plane") -> tuple[int, int]:
+    """Return *value* as two different axes, ``(driven, gradient)``.
+
+    Raises:
+        ValueError: The value is not two different axes of 0, 1 and 2.
+    """
+    axes = tuple(value)
+    if (
+        len(axes) != 2
+        or axes[0] == axes[1]
+        or not all(
+            isinstance(axis, int) and not isinstance(axis, bool) and axis in (0, 1, 2)
+            for axis in axes
+        )
+    ):
+        raise ValueError(f"{name}={value!r} must be two different axes of 0, 1, 2.")
+    return axes[0], axes[1]
 
 
 def require_choice(value: str, valid: tuple[str, ...], *, name: str) -> str:

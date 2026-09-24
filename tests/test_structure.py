@@ -21,7 +21,7 @@ from openmmpolymer.structure import (
 )
 from openmmpolymer.trajectory import AnalysisError
 
-from .helpers import _write_manifest, synthetic_ensemble, write_polymer_snapshot
+from .helpers import synthetic_ensemble, write_manifest, write_polymer_snapshot
 
 ROD_SQUARE_NM2 = (4 * 0.153) ** 2
 
@@ -93,7 +93,7 @@ def test_a_stage_with_a_trajectory_is_readable(dimer_run_directory: Path) -> Non
 
 def test_a_stage_that_left_no_files_is_not_readable(tmp_path: Path) -> None:
     """A manifest entry with nothing on disk behind it is not coordinates."""
-    _write_manifest(tmp_path, {"05_npt": {"name": "05_npt", "samples": {}}})
+    write_manifest(tmp_path, {"05_npt": {"name": "05_npt", "samples": {}}})
     with pytest.raises(AnalysisError, match="left coordinates"):
         structure_stages(tmp_path)
 
