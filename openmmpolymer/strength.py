@@ -1,9 +1,12 @@
 """Apparent tensile properties from recorded strain-controlled deformation.
 
-Yield uses the intersection with an offset elastic line; breaking strength
-requires a peak followed by sustained stress loss. These are criteria on
-measured curves, not direct observations of permanent strain or covalent
-fracture. The fixed-topology force fields used here cannot break polymer bonds.
+Yield uses the intersection with an offset elastic line. Breaking strength
+requires a peak followed by sustained stress loss, and elongation at break is
+the strain at which that loss begins. These are criteria on measured curves,
+not direct observations of permanent strain or covalent fracture: the
+fixed-topology force fields used here cannot break polymer bonds. Every result
+carries the curve's temperature and strain rate, because the apparent values
+depend on both, and its nominal stress, so the criterion can be audited.
 """
 
 from __future__ import annotations
@@ -29,10 +32,8 @@ class BreakingStrength:
     interval, with ``failure_bracket`` bounding the threshold crossing between
     two sampled strains. They are None for an unresolved curve.
 
-    ``resolved`` refers only to the apparent tensile-strength criterion. It
-    does not establish bond scission or predict an experimental breaking
-    strength. Temperature and strain rate travel with the result because the
-    apparent strength depends on both.
+    ``resolved`` refers only to the apparent tensile-strength criterion; it
+    does not predict an experimental breaking strength.
     """
 
     peak_stress_mpa: float
@@ -214,16 +215,13 @@ def breaking_strength(
 class ElongationAtBreak:
     """Engineering elongation at the onset of confirmed terminal stress loss.
 
-    ``strain_at_break`` is the dimensionless engineering strain
-    ``(L - L0) / L0``; ``elongation_percent`` is 100 times that strain.
-    ``break_stress_mpa`` is nominal stress at the same sampled point, and
-    ``break_bracket`` bounds the threshold crossing between consecutive
-    sampled engineering strains. These four values are None when unresolved.
-
-    The peak stress, its strain, and the nominal-stress curve remain available
-    for diagnostics. The peak strain is generally earlier than the reported
-    break strain. Neither this operational stress-loss criterion nor the
-    sampling bracket establishes a molecular rupture event or its uncertainty.
+    ``strain_at_break`` is the engineering strain ``(L - L0) / L0`` of the
+    first sample in the confirmed interval and ``elongation_percent`` 100
+    times that strain. ``break_stress_mpa`` is the nominal stress there and
+    ``break_bracket`` the sampled strains either side of the threshold
+    crossing, not an uncertainty. All four are None when unresolved, while
+    the peak and the nominal-stress curve remain for diagnostics; the peak
+    strain generally comes before the break strain.
     """
 
     strain_at_break: float | None
@@ -245,31 +243,18 @@ def elongation_at_break(
     failure_fraction: float = 0.5,
     confirmation_steps: int = 3,
 ) -> ElongationAtBreak:
-    """Calculate apparent elongation at break from a tensile deformation curve.
+    """Read apparent elongation at break from a tensile deformation curve.
 
-    Use the same nominal-stress conversion and sustained terminal stress-loss
-    criterion as :func:`breaking_strength`. After a positive interior peak,
-    at least ``confirmation_steps`` final samples must remain at or below
-    ``failure_fraction`` of that peak. Report the engineering strain at the
-    first sample of this final interval, together with its percentage and
-    the preceding strain as a sampling bracket. No crossing is interpolated.
-
-    The peak strain and the last recorded strain are not substitutes for an
-    unresolved break strain. A plateau, recovery, boundary peak, or too few
-    confirmation samples leaves the break values None while retaining the
-    observed curve and peak. This is an apparent stress-loss criterion:
-    fixed-topology force fields cannot model covalent bond scission.
-
-    Args:
-        curve: Finite, strain-controlled tensile samples with strictly
-            increasing, nonnegative engineering strain.
-        failure_fraction: Fraction of peak nominal stress defining the loss,
-            strictly between zero and one.
-        confirmation_steps: At least two terminal samples below the threshold.
+    The break is where :func:`breaking_strength`'s sustained terminal loss of
+    stress begins, read as engineering strain and as a percentage of the
+    reference length; nothing is interpolated. Neither the peak strain nor
+    the last strain stands in for a break that the criterion leaves
+    unresolved. The curve and the criterion are those of
+    :func:`breaking_strength`, and are refused as it refuses them.
 
     Raises:
-        ValueError: The curve or a numeric argument is invalid; see
-            :func:`breaking_strength` for the shared validation requirements.
+        ValueError: As :func:`breaking_strength` does, or the strain at break
+            is too large to express as a finite percentage.
         TypeError: ``confirmation_steps`` is not an integer.
     """
     strength = breaking_strength(
@@ -277,15 +262,13 @@ def elongation_at_break(
         failure_fraction=failure_fraction,
         confirmation_steps=confirmation_steps,
     )
-    strain_at_break = strength.failure_strain
-    elongation_percent = (
-        100.0 * strain_at_break if strain_at_break is not None else None
-    )
-    if elongation_percent is not None and not math.isfinite(elongation_percent):
+    strain = strength.failure_strain
+    percent = None if strain is None else 100.0 * strain
+    if percent is not None and not math.isfinite(percent):
         raise ValueError("elongation_percent must remain finite.")
     return ElongationAtBreak(
-        strain_at_break=strain_at_break,
-        elongation_percent=elongation_percent,
+        strain_at_break=strain,
+        elongation_percent=percent,
         break_stress_mpa=strength.failure_stress_mpa,
         break_bracket=strength.failure_bracket,
         peak_stress_mpa=strength.peak_stress_mpa,
@@ -306,11 +289,8 @@ class YieldStrength:
     the elastic fitting window. ``yield_bracket`` gives the two measured
     strains surrounding it, not a confidence interval. All three are None
     when the fit or crossing is unresolved. Finite fit diagnostics remain
-    available even for unresolved curves; unavailable values are None.
-
-    The offset line includes the fitted intercept, correcting for initial
-    stress. This operational criterion does not establish permanent strain
-    through an unloading experiment.
+    available even for unresolved curves; unavailable values are None. The
+    offset line includes the fitted intercept, correcting for initial stress.
     """
 
     strength_mpa: float | None
@@ -351,8 +331,6 @@ def yield_strength(
     slope, relative standard error and half-window slope checks used by
     :func:`~openmmpolymer.elasticity.youngs_modulus`. A missing crossing, an
     unreliable fit or a crossing within the fit window is unresolved.
-    A resolved result is an apparent proof stress at the recorded temperature
-    and strain rate, not a direct measurement of irreversible deformation.
 
     Args:
         curve: Finite tensile samples with strictly increasing, nonnegative
