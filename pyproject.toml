@@ -7,12 +7,8 @@ name = "openmmpolymer"
 version = "0.1.0"
 description = "Build, pack, parameterise and equilibrate all-atom polymer melts with OpenMM."
 readme = "README.md"
-# forcefill's floor. The whole conda-forge stack (openmm, ambertools, rdkit,
-# openff-toolkit) also builds for 3.14, so the ceiling is what CI runs, not what
-# the ecosystem supports.
 requires-python = ">=3.12"
 license = "MIT"
-license-files = ["LICENSE"]
 authors = [
   { name = "Louie Slocombe", email = "louies@hotmail.co.uk" },
 ]
@@ -28,21 +24,15 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Chemistry",
   "Typing :: Typed",
 ]
-# conda-forge is the only route that resolves these. AmberTools is not a Python
-# package at all (and is what supplies the `packmol` binary this package shells
-# out to), and openmmforcefields >= 0.16 - forcefill's floor - has never been
-# published to PyPI. `pip install openmmpolymer` will not give you a working
-# install; build_tools/environment.yml will.
+# Declared for completeness; only conda-forge resolves them, because
+# AmberTools (which supplies packmol) is not a Python package and
+# openmmforcefields >= 0.16 is not on PyPI. See build_tools/environment.yml.
 dependencies = [
   "numpy>=2.5.3",
   "openmm>=8.6.1",
   "rdkit",
   "forcefill>=1.0",
   "openff-toolkit>=0.16",
-  # The analysis layer. MDAnalysis reads the trajectories this package writes -
-  # openmm.app's XTCFile and DCDFile are write-only - and matplotlib draws them.
-  # The floor is 2.10 because only build 1 of 2.10.0 has a py314 conda-forge
-  # build, and CI runs 3.14.
   "MDAnalysis>=2.10",
   "matplotlib>=3.8",
 ]
@@ -55,58 +45,31 @@ Homepage = "https://github.com/LouieSlocombe/openmmpolymer"
 Issues = "https://github.com/LouieSlocombe/openmmpolymer/issues"
 Repository = "https://github.com/LouieSlocombe/openmmpolymer"
 
-[dependency-groups]
-dev = [
-  "build>=1.6.0",
-  "mypy>=2.3.1",
-  "pre-commit>=4.6.2",
-  "pytest>=9.1.1",
-  "pytest-cov>=7.1.0",
-  "ruff>=0.16.8",
-  "twine>=7.0.0",
-]
-
 [tool.setuptools.packages.find]
-where = ["."]
 include = ["openmmpolymer", "openmmpolymer.*"]
 
-[tool.setuptools.package-data]
-openmmpolymer = ["py.typed"]
-
 [tool.pytest.ini_options]
-addopts = "-ra --strict-config --strict-markers --cov=openmmpolymer --cov-report=term-missing"
+addopts = "-ra --strict-config --strict-markers --cov --cov-report=term-missing"
 testpaths = ["tests"]
-# Left at "error" deliberately: the whole stack (forcefill, parmed,
-# openff.toolkit, openmmforcefields, rdkit) imports clean under `python -W error`.
-# Add an ignore only when a real warning is observed, and quote the observed
-# message in the comment - a module-scoped filter matches the module a warning is
-# *attributed* to, so it silently does nothing for any library using stacklevel>=2.
+# Warnings are errors. Each ignore quotes a warning actually observed, and
+# matches on its message: a module filter matches the module a warning is
+# attributed to, which for a library using stacklevel >= 2 is the caller.
 filterwarnings = [
   "error",
-  # Observed importing forcefill, which reaches netCDF4 through parmed:
-  #   RuntimeWarning: numpy.ndarray size changed, may indicate binary
-  #   incompatibility. Expected 16 from C header, got 96 from PyObject
-  # It is a mismatch between netCDF4's compiled extension and the numpy it
-  # runs against, in a dependency two levels down, and nothing here can act on
-  # it. Matched on the message rather than the module: a module filter matches
-  # the module a warning is *attributed* to, which for any library using
-  # stacklevel>=2 is the caller, so it would silently match nothing.
+  # netCDF4, reached through parmed when forcefill is imported, was compiled
+  # against a different numpy: "numpy.ndarray size changed, may indicate
+  # binary incompatibility".
   "ignore:numpy.ndarray size changed:RuntimeWarning",
-  # Observed on this package's default path - NAGL charges handed to the
-  # smirnoff backend - because OpenFF Sage carries virtual-site parameters:
-  #   PresetChargesAndVirtualSitesWarning: Preset charges were provided (via
-  #   `charge_from_molecules`) alongside a force field that includes virtual
-  #   site parameters.
-  # It matters only when the polymer actually gets virtual sites, which
-  # PolymerForceField.virtual_site_residues reports and the package acts on;
-  # for everything without them it is noise on every single run.
+  # OpenFF Sage carries virtual-site parameters, so the preset NAGL charges
+  # this package hands it trigger PresetChargesAndVirtualSitesWarning on every
+  # run. It matters only when a polymer gets virtual sites, which
+  # PolymerForceField.virtual_site_residues reports.
   "ignore:Preset charges were provided",
 ]
 markers = [
-  "forcefield: parameterises a chain through forcefill; needs AmberTools/OpenFF (deselect with -m 'not forcefield')",
-  "packmol: shells out to the real packmol binary; needs it on PATH (deselect with -m 'not packmol')",
-  "slow: runs more than a second of real dynamics (deselect with -m 'not slow')",
-  "cuda: needs a working CUDA platform (deselect with -m 'not cuda')",
+  "forcefield: parameterises a chain through forcefill; needs AmberTools/OpenFF",
+  "packmol: shells out to the real packmol binary; needs it on PATH",
+  "slow: runs more than a second of real dynamics",
 ]
 
 [tool.coverage.run]
@@ -114,22 +77,12 @@ branch = true
 source = ["openmmpolymer"]
 
 [tool.coverage.report]
-# The engine adapters (openmm, packmol, forcefill) cannot be fully branch-covered
-# without the heavy legs, which the fast CI job deselects. The floor sits below
-# the achieved number so coverage-neutral changes pass; raise it as coverage
-# improves.
 fail_under = 90
-show_missing = true
 exclude_also = [
   "if __name__ == .__main__.:",
   "if TYPE_CHECKING:",
   "raise NotImplementedError",
 ]
-
-[tool.ruff]
-line-length = 88
-src = ["."]
-target-version = "py312"
 
 [tool.ruff.lint]
 select = ["B", "E4", "E7", "E9", "F", "I", "RUF", "SIM", "UP"]
@@ -138,35 +91,25 @@ select = ["B", "E4", "E7", "E9", "F", "I", "RUF", "SIM", "UP"]
 files = ["openmmpolymer", "tests"]
 python_version = "3.12"
 pretty = true
-show_error_codes = true
 strict = true
 warn_unreachable = true
 
-# None of these ship type information. A wildcard does not match the top-level
-# module it names, so `openmm` and `MDAnalysis` are each listed twice. rdkit
-# ships rdkit-stubs, and forcefill and matplotlib ship py.typed, so none of
-# those belongs here: an override that matches nothing is dead config. It does
-# not fail the type check - `strict` does not imply warn_unused_configs, and an
-# unused-section note exits zero - so nothing will tell you it is dead. That is
-# the reason to keep this list honest by hand.
+# Packages without type information. A wildcard does not match the top-level
+# module it names, hence both spellings.
 [[tool.mypy.overrides]]
 module = [
   "openmm",
   "openmm.*",
   "openff.*",
-  "parmed.*",
   "openmmforcefields.*",
   "MDAnalysis",
   "MDAnalysis.*",
 ]
 ignore_missing_imports = true
 
-# forcefill ships py.typed, but how it resolves depends on how it was
-# installed: a PEP 660 editable install is not importable by mypy at all, and a
-# source checkout on MYPYPATH gets its own body type-checked, reporting that
-# package's errors as this one's. Neither is this package's business, and its
-# calls into forcefill are wrapped in try/except with errors re-raised as
-# ForceFieldError, so the loss is small.
+# forcefill ships py.typed, but an editable install of it is invisible to mypy
+# and a source checkout gets its own body type-checked. Its calls here are
+# wrapped and re-raised as ForceFieldError, so following it adds little.
 [[tool.mypy.overrides]]
 module = ["forcefill", "forcefill.*"]
 follow_imports = "silent"

@@ -1,17 +1,13 @@
-# Python bytecode and native extensions
+# Python bytecode
 __pycache__/
 *.py[cod]
-*.so
 
 # Packaging artifacts
 build/
 dist/
 *.egg-info/
 
-# Virtual environments and local configuration
-.env
-.env.*
-!.env.example
+# Virtual environments
 .venv/
 env/
 venv/
@@ -21,18 +17,13 @@ venv/
 .coverage.*
 coverage.xml
 htmlcov/
-.hypothesis/
 .mypy_cache/
-.nox/
 .pytest_cache/
 .ruff_cache/
-.tox/
 
-# Editors and operating systems
+# Editors, operating systems and notebooks
 .idea/
 .vscode/
 *.swp
 .DS_Store
-
-# Notebooks
 .ipynb_checkpoints/
