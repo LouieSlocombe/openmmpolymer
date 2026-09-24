@@ -15,7 +15,6 @@ from typing import Any
 
 import numpy as np
 
-from . import breaking, elongation, yielding
 from ._files import file_sha256, write_json
 from ._seeds import derive_seed
 from ._validation import require_positive
@@ -39,9 +38,22 @@ from .rate_dependence import (
     analyse_rate_observations,
 )
 from .simulate import RunContext, safe_timestep_fs
+from .tensile import (
+    BREAKING,
+    ELONGATION,
+    YIELD,
+    BreakingSpec,
+    ElongationSpec,
+    TensileSpec,
+    YieldSpec,
+    analyse_breaking,
+    analyse_elongation,
+    analyse_yield,
+    tensile_protocol,
+    tensile_schedule,
+)
 from .trajectory import AnalysisError
 
-TensileSpec = breaking.BreakingSpec | elongation.ElongationSpec | yielding.YieldSpec
 WORKFLOW_NAME = "tensile_rate_workflow.json"
 TENSILE_RATE_PROPERTIES = {
     "yield_strength": RateProperty(
@@ -65,28 +77,22 @@ TENSILE_RATE_PROPERTIES = {
 
 def _adapter(property_name: str) -> tuple[Any, type[Any], Any, Any, Any]:
     if property_name in ("yield_strength", "yield_strain"):
-        return (
-            yielding,
-            yielding.YieldSpec,
-            yielding.yield_protocol,
-            yielding.yield_schedule,
-            yielding.analyse_yield,
-        )
+        return YIELD, YieldSpec, tensile_protocol, tensile_schedule, analyse_yield
     if property_name == "breaking_strength":
         return (
-            breaking,
-            breaking.BreakingSpec,
-            breaking.breaking_protocol,
-            breaking.breaking_schedule,
-            breaking.analyse_breaking,
+            BREAKING,
+            BreakingSpec,
+            tensile_protocol,
+            tensile_schedule,
+            analyse_breaking,
         )
     if property_name == "elongation_at_break":
         return (
-            elongation,
-            elongation.ElongationSpec,
-            elongation.elongation_protocol,
-            elongation.elongation_schedule,
-            elongation.analyse_elongation,
+            ELONGATION,
+            ElongationSpec,
+            tensile_protocol,
+            tensile_schedule,
+            analyse_elongation,
         )
     raise ValueError(f"Unknown tensile rate property {property_name!r}.")
 
@@ -172,7 +178,7 @@ def run_tensile_rate_scan(
     stress loss remains censored; the scan never fabricates an event by
     extrapolating its stress-strain curve. Engine failures propagate.
     """
-    module, spec_type, protocol, schedule, _ = _adapter(property_name)
+    measurement, spec_type, protocol, schedule, _ = _adapter(property_name)
     selected: TensileSpec = spec_type() if spec is None else spec
     plan = validate_tensile_rate_scan(
         selected,
@@ -272,7 +278,7 @@ def run_tensile_rate_scan(
             for replica in range(rate_spec.n_replicas)
         )
         write_json(
-            rate_dir / module.WORKFLOW_NAME,
+            rate_dir / measurement.workflow_name,
             {
                 "request": {
                     "spec": asdict(rate_spec),
@@ -332,9 +338,9 @@ def _directories(
             specs = record.get("request", {}).get("specs", [])
             if len(specs) != len(candidates):
                 raise AnalysisError(f"{path} has inconsistent requested rate counts.")
-            module = _adapter(property_name)[0]
+            measurement = _adapter(property_name)[0]
             for candidate, spec in zip(candidates, specs, strict=True):
-                child = candidate / module.WORKFLOW_NAME
+                child = candidate / measurement.workflow_name
                 if (
                     not child.is_file()
                     or json.loads(child.read_text()).get("request", {}).get("spec")
@@ -371,12 +377,12 @@ def analyse_tensile_rates(
     are never relabelled as standard errors. All censored replicas survive
     in the report and prevent a confidently extrapolated event.
     """
-    module, spec_type, protocol, _, analyse = _adapter(property_name)
+    measurement, spec_type, protocol, _, analyse = _adapter(property_name)
     observations: list[RateObservation] = []
     directories = _directories(run_dirs, property_name)
     for directory in directories:
         report = analyse(directory)
-        workflow = directory / module.WORKFLOW_NAME
+        workflow = directory / measurement.workflow_name
         request = (
             json.loads(workflow.read_text()).get("request", {})
             if workflow.is_file()

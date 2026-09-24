@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from openmmpolymer import __main__ as cli
-from openmmpolymer.elongation import ElongationSpec
+from openmmpolymer.tensile import ElongationSpec
 
 
 def _report(*, resolved: bool = True) -> Any:
@@ -170,14 +170,16 @@ def test_analyse_detects_elongation_and_writes_the_requested_report(
 ) -> None:
     report = _report()
     read: list[Path] = []
-    written: list[tuple[Any, Any, Any]] = []
+    written: list[tuple[Any, Any, bool, str]] = []
 
     def analyse(run_dir: Path) -> Any:
         read.append(run_dir)
         return report
 
-    def write(result: Any, output_dir: Any, *, formats: Any) -> Any:
-        written.append((result, output_dir, formats))
+    def write(
+        result: Any, output_dir: Any, *, figures: bool, figure_format: str
+    ) -> Any:
+        written.append((result, output_dir, figures, figure_format))
         return SimpleNamespace(json="reports/elongation.json", figures=())
 
     for name in (
@@ -206,7 +208,7 @@ def test_analyse_detects_elongation_and_writes_the_requested_report(
         == 0
     )
     assert read == [Path("tensile")]
-    assert written == [(report, "reports", ())]
+    assert written == [(report, "reports", False, "png")]
     output = capsys.readouterr().out
     assert "elongation at break = 60%" in output
     assert "chemical bond scission" in output
@@ -235,8 +237,8 @@ def test_the_scan_passes_chain_metadata_and_writes_into_its_analysis_directory(
         calls.append((run, directory, kwargs))
         return report
 
-    def write(result: Any, directory: Any, *, formats: Any) -> Any:
-        calls.append((result, directory, formats))
+    def write(result: Any, directory: Any, *, figures: bool, figure_format: str) -> Any:
+        calls.append((result, directory, figures, figure_format))
         return SimpleNamespace(
             json="tensile/analysis/elongation.json", figures=("curve.svg",)
         )
@@ -257,4 +259,4 @@ def test_the_scan_passes_chain_metadata_and_writes_into_its_analysis_directory(
             "expected_characteristic_ratio": 5.5,
         },
     )
-    assert calls[1] == (report, None, ("svg",))
+    assert calls[1] == (report, None, True, "svg")

@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from openmmpolymer import __main__ as cli
-from openmmpolymer.breaking import BreakingSpec
+from openmmpolymer.tensile import BreakingSpec
 
 
 def _report(*, resolved: bool = True) -> Any:
@@ -27,6 +27,7 @@ def _report(*, resolved: bool = True) -> Any:
     return SimpleNamespace(
         strength_mpa=120.0 if resolved else None,
         replica_spread_mpa=None,
+        replica_indices=(0,),
         replicas=(replica,),
         resolved=resolved,
         notes=("Fixed bonds cannot describe chemical bond scission.",),
@@ -145,20 +146,30 @@ def test_an_unconfirmed_peak_is_never_printed_as_strength() -> None:
     assert "unknown strain rate" in lines
 
 
+def test_missing_replicas_do_not_renumber_the_remaining_results() -> None:
+    report = _report(resolved=False)
+    report.replica_indices = (1,)
+    lines = "\n".join(cli._breaking_lines(report))
+    assert "replica 1: peak 120 MPa" in lines
+    assert "replica 0:" not in lines
+
+
 def test_analyse_detects_breaking_and_writes_the_requested_report(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     report = _report()
     read: list[Path] = []
-    written: list[tuple[Any, Any, Any]] = []
+    written: list[tuple[Any, Any, bool, str]] = []
 
     def analyse(run_dir: Path) -> Any:
         read.append(run_dir)
         return report
 
-    def write(result: Any, output_dir: Any, *, formats: Any) -> Any:
-        written.append((result, output_dir, formats))
+    def write(
+        result: Any, output_dir: Any, *, figures: bool, figure_format: str
+    ) -> Any:
+        written.append((result, output_dir, figures, figure_format))
         return SimpleNamespace(json="reports/breaking.json", figures=())
 
     for name in (
@@ -185,7 +196,7 @@ def test_analyse_detects_breaking_and_writes_the_requested_report(
         == 0
     )
     assert read == [Path("tensile")]
-    assert written == [(report, "reports", ())]
+    assert written == [(report, "reports", False, "png")]
     output = capsys.readouterr().out
     assert "ultimate nominal tensile strength" in output
     assert "chemical bond scission" in output
@@ -214,8 +225,8 @@ def test_the_scan_passes_chain_metadata_and_writes_into_its_analysis_directory(
         calls.append((run, directory, kwargs))
         return report
 
-    def write(result: Any, directory: Any, *, formats: Any) -> Any:
-        calls.append((result, directory, formats))
+    def write(result: Any, directory: Any, *, figures: bool, figure_format: str) -> Any:
+        calls.append((result, directory, figures, figure_format))
         return SimpleNamespace(
             json="tensile/analysis/breaking.json", figures=("curve.svg",)
         )
@@ -234,4 +245,4 @@ def test_the_scan_passes_chain_metadata_and_writes_into_its_analysis_directory(
             "expected_characteristic_ratio": 5.5,
         },
     )
-    assert calls[1] == (report, None, ("svg",))
+    assert calls[1] == (report, None, True, "svg")

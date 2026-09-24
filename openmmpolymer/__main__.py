@@ -31,29 +31,11 @@ from tempfile import TemporaryDirectory
 from typing import Any, cast
 
 from ._files import ReportFiles, file_sha256, write_json
-from .breaking import (
-    BreakingError,
-    BreakingSpec,
-    analyse_breaking,
-    breaking_scan,
-    breaking_stages,
-    run_breaking_scan,
-    write_breaking_report,
-)
 from .chain import ChainResult, ChainSpec, build_chain
 from .charges import CHARGE_METHODS, assign_charges
 from .convergence import DEFAULT_WINDOW_FRACTIONS, analyse_convergence
 from .convergence_report import write_convergence_report
 from .elasticity import deform_stages, load_stages, shear_stages
-from .elongation import (
-    ElongationError,
-    ElongationSpec,
-    analyse_elongation,
-    elongation_scan,
-    elongation_stages,
-    run_elongation_scan,
-    write_elongation_report,
-)
 from .forcefield import BACKENDS, PolymerForceField, build_polymer_forcefield
 from .mdsystem import (
     PackedBox,
@@ -107,6 +89,27 @@ from .rate_reports import write_rate_report
 from .relaxation import relax_stages
 from .simulate import RELAX_MODES, RunContext, prepare_run
 from .structure import analyse_structure, structure_stages, write_structure_report
+from .tensile import (
+    BreakingError,
+    BreakingSpec,
+    ElongationError,
+    ElongationSpec,
+    YieldError,
+    YieldSpec,
+    analyse_breaking,
+    analyse_elongation,
+    analyse_yield,
+    breaking_stages,
+    elongation_stages,
+    run_breaking_scan,
+    run_elongation_scan,
+    run_yield_scan,
+    tensile_scan,
+    write_breaking_report,
+    write_elongation_report,
+    write_yield_report,
+    yield_stages,
+)
 from .tg import (
     TgSpec,
     analyse_run,
@@ -137,15 +140,6 @@ from .viscoelastic import (
     relaxation_scan,
     run_relaxation_scan,
     write_relaxation_report,
-)
-from .yielding import (
-    YieldError,
-    YieldSpec,
-    analyse_yield,
-    run_yield_scan,
-    write_yield_report,
-    yield_scan,
-    yield_stages,
 )
 
 log = logging.getLogger(__name__)
@@ -464,7 +458,7 @@ def _breaking_protocol(**options: Any) -> Protocol:
     """Build the equilibration and every replica of the tensile ladder."""
     spec = _breaking_spec(**options)
     return _check_scan_budget(
-        breaking_scan(spec), spec.max_total_ns, "breaking", BreakingError
+        tensile_scan(spec), spec.max_total_ns, "breaking", BreakingError
     )
 
 
@@ -506,7 +500,7 @@ def _elongation_protocol(**options: Any) -> Protocol:
     """Build the equilibration and every replica of the tensile ladder."""
     spec = _elongation_spec(**options)
     return _check_scan_budget(
-        elongation_scan(spec), spec.max_total_ns, "elongation", ElongationError
+        tensile_scan(spec), spec.max_total_ns, "elongation", ElongationError
     )
 
 
@@ -549,7 +543,9 @@ def _yield_spec(
 def _yield_protocol(**options: Any) -> Protocol:
     """Validate equilibration and every tensile replica before building a cell."""
     spec = _yield_spec(**options)
-    return _check_scan_budget(yield_scan(spec), spec.max_total_ns, "yield", YieldError)
+    return _check_scan_budget(
+        tensile_scan(spec), spec.max_total_ns, "yield", YieldError
+    )
 
 
 def _check_scan_budget(
@@ -2380,7 +2376,7 @@ def _breaking_lines(report: Any) -> list[str]:
             f"breaking: apparent ultimate nominal tensile strength = "
             f"{report.strength_mpa:.4g} MPa{spread}"
         ]
-    for index, result in enumerate(report.replicas):
+    for index, result in zip(report.replica_indices, report.replicas, strict=True):
         rate = (
             "unknown strain rate"
             if result.strain_rate_per_ns is None
@@ -2413,7 +2409,8 @@ def _write_tensile_result(
     files = writer(
         report,
         arguments.output_dir if arguments.analyse else None,
-        formats=() if arguments.no_figures else (cast(str, arguments.figure_format),),
+        figures=not arguments.no_figures,
+        figure_format=cast(str, arguments.figure_format),
     )
     print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
 

@@ -6,14 +6,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from .breaking import BreakingSpec
 from .elastic_rates import (
     ELASTIC_RATE_PROPERTIES,
     analyse_elastic_rates,
     run_elastic_rate_scan,
     validate_elastic_rate_scan,
 )
-from .elongation import ElongationSpec
 from .mechanical import ModulusSpec
 from .modulus_rates import (
     ModulusRateReport,
@@ -28,6 +26,7 @@ from .rate_dependence import (
     analyse_rate_observations,
 )
 from .simulate import RunContext
+from .tensile import BreakingSpec, ElongationSpec, YieldSpec
 from .tensile_rates import (
     TENSILE_RATE_PROPERTIES,
     analyse_tensile_rates,
@@ -42,7 +41,6 @@ from .thermal_rates import (
     validate_thermal_rate_scan,
 )
 from .tm import TmSpec
-from .yielding import YieldSpec
 
 RATE_PROPERTIES = {
     "youngs_modulus": RateProperty(

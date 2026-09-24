@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from itertools import pairwise
 from pathlib import Path
 from typing import Any, cast
@@ -18,6 +19,7 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 
+from openmmpolymer.tensile import BreakingSpec, ElongationSpec, TensileSpec, YieldSpec
 from openmmpolymer.timeseries import GlassTransition
 
 #: A force field for a two-atom "dimer" residue: enough to exercise the real
@@ -962,3 +964,95 @@ def write_polymer_snapshot(
     }
     path.write_text(json.dumps(record, indent=2))
     return (0, 1, 2, 3, 4)
+
+
+#: The tensile ladders :func:`write_tensile_scan` plants curves on, two
+#: replicas each: eight holds of compounding 10% strain in two chunks for
+#: breaking and elongation, twelve of 0.2% in three chunks for yield.
+PLANTED_TENSILE: dict[str, Any] = {
+    "breaking": BreakingSpec(
+        strain_increment=0.1, max_strain=1.1, relax_ps=1.0, stage_ps=4.0, n_replicas=2
+    ),
+    "elongation": ElongationSpec(
+        strain_increment=0.1, max_strain=1.1, relax_ps=1.0, stage_ps=4.0, n_replicas=2
+    ),
+    "yield": YieldSpec(
+        max_strain=0.024,
+        relax_ps=1.0,
+        n_replicas=2,
+        samples_per_step=2,
+        stage_ps=4.0,
+        fit_max_strain=0.0125,
+    ),
+}
+
+
+def write_tensile_scan(run_dir: Path, spec: TensileSpec) -> Path:
+    """Write the manifest and workflow record a finished tensile scan leaves.
+
+    The nominal stresses are planted, so every result has an answer written
+    down. Yield replica ``r`` rises as ``(1 + 0.2 r)(1000 strain + 2)`` MPa to
+    a plateau at ``18 (1 + 0.2 r)``, which the 0.2% offset line meets at
+    strain 0.018. A breaking or elongation replica peaks at ``100 (1 + 0.2 r)``
+    MPa on the fourth hold and then loses stress for good; replica 1 falls to
+    45 MPa on the fifth, so it crosses half its peak a hold before replica 0.
+    The cell narrows as ``1 - 0.2 strain`` on both lateral axes under -1 bar,
+    and the axial stress is whatever makes the nominal stress exactly that.
+    *spec* must keep its planted ladder; its criterion and replica count are
+    free. Returns the workflow record's path.
+    """
+    from openmmpolymer.protocols import RunManifest
+    from openmmpolymer.tensile import tensile_protocol, tensile_schedule
+
+    n_steps = tensile_schedule(spec).n_steps
+    strains = (1.0 + spec.strain_increment) ** np.arange(1, n_steps + 1) - 1.0
+    lateral = 1.0 - 0.2 * strains
+    ladders = [
+        tensile_protocol(spec, replica=replica) for replica in range(spec.n_replicas)
+    ]
+    stages: dict[str, Any] = {}
+    for replica, ladder in enumerate(ladders):
+        scale = 1.0 + 0.2 * replica
+        if isinstance(spec, YieldSpec):
+            nominal = np.minimum(1000.0 * strains + 2.0, 18.0) * scale
+        else:
+            nominal = np.asarray([0.0, 20.0, 60.0, 100.0, 70.0, 35.0, 30.0, 20.0])
+            nominal *= scale
+            if replica == 1:
+                nominal[4] = 45.0
+        axial_bar = (nominal / lateral**2 - 0.1) / 0.1
+        done = 0
+        for stage in ladder.stages:
+            count = stage.options["n_steps"]
+            part = slice(done, done + count)
+            done += count
+            stages[stage.name] = {
+                "mean_temperature_k": spec.temperature_k,
+                "samples": {
+                    "segment_strain": strains[part].tolist(),
+                    "segment_stress_xx_bar": [-1.0] * count,
+                    "segment_stress_yy_bar": [-1.0] * count,
+                    "segment_stress_zz_bar": axial_bar[part].tolist(),
+                    "segment_box_x_nm": (5.0 * lateral[part]).tolist(),
+                    "segment_box_y_nm": (5.0 * lateral[part]).tolist(),
+                    "segment_box_z_nm": (5.0 * (1.0 + strains[part])).tolist(),
+                    "segment_duration_ps": [spec.relax_ps] * count,
+                    "reference_box_nm": [5.0] * 3,
+                    "deform_axis": [float(spec.axis)],
+                },
+            }
+    run_dir.mkdir(parents=True, exist_ok=True)
+    name = ladders[0].name
+    RunManifest(protocol=name, seed=11, stages=stages).save(run_dir)
+    record = {
+        "request": {"spec": asdict(spec)},
+        "reference_box_nm": [5.0] * 3,
+        "replica_stages": [
+            [stage.name for stage in ladder.stages] for ladder in ladders
+        ],
+        "steps_per_replica": n_steps,
+        "timestep_fs": 2.0,
+    }
+    path = run_dir / f"{name}_workflow.json"
+    path.write_text(json.dumps(record))
+    return path

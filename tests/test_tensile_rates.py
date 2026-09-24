@@ -12,9 +12,8 @@ import numpy as np
 import pytest
 
 from openmmpolymer import tensile_rates
-from openmmpolymer.breaking import BreakingSpec
-from openmmpolymer.elongation import ElongationSpec
 from openmmpolymer.protocols import Protocol
+from openmmpolymer.tensile import BreakingSpec, ElongationSpec, YieldSpec
 from openmmpolymer.tensile_rates import (
     WORKFLOW_NAME,
     analyse_tensile_rates,
@@ -22,29 +21,30 @@ from openmmpolymer.tensile_rates import (
     validate_tensile_rate_scan,
 )
 from openmmpolymer.trajectory import AnalysisError
-from openmmpolymer.yielding import YieldSpec
 
-from .helpers import QUICK_EQUILIBRATION, write_manifest
-from .test_breaking import PLANTED as BREAKING_SPEC
-from .test_breaking import _plant as plant_breaking
-from .test_elongation_workflow import PLANTED as ELONGATION_SPEC
-from .test_elongation_workflow import _plant as plant_elongation
-from .test_yielding import PLANTED as YIELD_SPEC
-from .test_yielding import _plant as plant_yield
+from .helpers import (
+    PLANTED_TENSILE,
+    QUICK_EQUILIBRATION,
+    write_manifest,
+    write_tensile_scan,
+)
+
+BREAKING_SPEC = PLANTED_TENSILE["breaking"]
 
 
 def _series(root: Path, property_name: str) -> list[Path]:
-    adapters: dict[str, tuple[Any, Any]] = {
-        "yield_strength": (plant_yield, YIELD_SPEC),
-        "yield_strain": (plant_yield, YIELD_SPEC),
-        "breaking_strength": (plant_breaking, BREAKING_SPEC),
-        "elongation_at_break": (plant_elongation, ELONGATION_SPEC),
-    }
-    planter, spec = adapters[property_name]
+    spec = PLANTED_TENSILE[
+        {
+            "yield_strength": "yield",
+            "yield_strain": "yield",
+            "breaking_strength": "breaking",
+            "elongation_at_break": "elongation",
+        }[property_name]
+    ]
     directories = []
     for index, hold in enumerate((1.0, 10.0, 100.0)):
         directory = root / f"rate_{index}"
-        planter(directory, spec=replace(spec, relax_ps=hold, stage_ps=4 * hold))
+        write_tensile_scan(directory, replace(spec, relax_ps=hold, stage_ps=4 * hold))
         directories.append(directory)
     return directories
 
