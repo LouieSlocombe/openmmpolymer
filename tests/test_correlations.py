@@ -103,6 +103,19 @@ def test_the_default_radius_is_as_far_as_the_cell_allows() -> None:
     assert measured.r_max_nm == pytest.approx(LATTICE_EDGE_NM / 2)
 
 
+def test_the_default_radius_survives_the_kernels_float32_box() -> None:
+    """An NPT cell whose float32 half-edge rounds below the float64 one: the
+    distance kernel must not refuse the radius it was just handed. A hundred
+    atoms or more, because below that MDAnalysis never uses its grid search."""
+    edge = 2.7858951568603514
+    assert float(np.float32(edge)) / 2.0 < edge / 2.0
+    measured = radial_distribution(
+        synthetic_ensemble(_lattice(216, edge), n_chains=216, box_nm=edge),
+        heavy_atoms_only=False,
+    )
+    assert measured.r_max_nm == pytest.approx(edge / 2)
+
+
 def test_a_radius_past_half_the_cell_is_refused() -> None:
     """Past it the convention counts one neighbour as two, and the distance
     kernel applies it anyway without complaining."""

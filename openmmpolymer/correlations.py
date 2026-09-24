@@ -363,8 +363,11 @@ def _intermolecular_distances(
     box = np.array(
         [box_nm[0], box_nm[1], box_nm[2], 90.0, 90.0, 90.0], dtype=np.float32
     )
+    # The kernel checks the cutoff against its float32 box, which can round
+    # half an edge down past the float64 limit by one ulp and refuse it.
+    cutoff = min(float(r_max_nm), float(box[:3].min()) / 2.0)
     found, measured = self_capped_distance(
-        coordinates, max_cutoff=float(r_max_nm), box=box, return_distances=True
+        coordinates, max_cutoff=cutoff, box=box, return_distances=True
     )
     pairs = np.asarray(found, dtype=np.int64)
     if pairs.size == 0:

@@ -10,11 +10,16 @@ only they can test.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+# The test cells are tens of atoms: one CPU thread runs them three times faster
+# than a thread per core spinning on barriers.
+os.environ.setdefault("OPENMM_CPU_THREADS", "1")
 
 from openmmpolymer.forcefield import PolymerForceField
 from openmmpolymer.mdsystem import PackedBox
