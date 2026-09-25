@@ -189,6 +189,24 @@ def test_shared_start_independent_rate_seeds_and_resume_guard(
     assert len(calls) == before
     assert (tmp_path / WORKFLOW_NAME).is_file()
 
+    run_tensile_rate_scan(
+        argon_run,
+        tmp_path,
+        resume=False,
+        **{**options, "hold_times_ps": (1, 2, 4)},
+    )
+    assert [call["resume"] for call in calls[before:]] == [
+        False,
+        False,
+        True,
+        False,
+        True,
+        False,
+        True,
+    ]
+    record = json.loads((tmp_path / WORKFLOW_NAME).read_text())
+    assert [item["relax_ps"] for item in record["request"]["specs"]] == [1, 2, 4]
+
 
 def test_unconfirmed_terminal_event_is_preserved_as_missing(tmp_path: Path) -> None:
     directories = write_tensile_rate_series(tmp_path, "breaking_strength")

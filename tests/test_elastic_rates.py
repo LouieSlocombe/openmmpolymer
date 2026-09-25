@@ -902,6 +902,42 @@ def test_a_record_from_before_fingerprints_still_resumes(
     assert "start_state_sha256" in json.loads(path.read_text())
 
 
+@pytest.mark.parametrize("interrupted_at", ["equilibration", "rate_01"])
+def test_interrupted_forced_rerun_does_not_reuse_removed_replicas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupted_at: str
+) -> None:
+    calls: list[dict[str, Any]] = []
+    dynamics = planted_extension_runner(calls)
+    fake_scan_dynamics(monkeypatch, elastic_rates, dynamics)
+    run = _run()
+    _youngs_scan(run, tmp_path)
+    manifests = [tmp_path / f"rate_{index:02d}/manifest.json" for index in range(3)]
+    assert all(len(json.loads(path.read_text())["stages"]) == 2 for path in manifests)
+
+    def interrupted(
+        protocol: Protocol, run: Any, directory: Path, **options: Any
+    ) -> Any:
+        if directory.name == interrupted_at:
+            raise RuntimeError("interrupted forced rerun")
+        return dynamics(protocol, run, directory, **options)
+
+    fake_scan_dynamics(monkeypatch, elastic_rates, interrupted)
+    smaller = replace(YOUNGS_SPEC, n_replicas=1)
+    with pytest.raises(RuntimeError, match="interrupted forced rerun"):
+        _youngs_scan(run, tmp_path, spec=smaller, resume=False)
+    record = json.loads((tmp_path / YOUNGS_WORKFLOW_NAME).read_text())
+    assert record["request"]["spec"]["n_replicas"] == 1
+    assert all(not path.exists() for path in manifests[1:])
+
+    # Preparation deliberately produces the same digest on every attempt.
+    # Resuming must still have no old replica available for analysis.
+    fake_scan_dynamics(monkeypatch, elastic_rates, dynamics)
+    report = _youngs_scan(run, tmp_path, spec=smaller)
+    assert len(report.observations) == 3
+    for index, path in enumerate(manifests):
+        assert set(json.loads(path.read_text())["stages"]) == {f"06_deform_r{index}_00"}
+
+
 def test_changed_hamiltonian_is_rejected_before_workflow_metadata_is_overwritten(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argon_run: Any
 ) -> None:

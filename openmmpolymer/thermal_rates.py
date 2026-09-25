@@ -21,6 +21,7 @@ from ._files import file_sha256, write_json
 from ._validation import require_integer
 from ._workflow import (
     chain_options,
+    record_scan_request,
     require_distinct,
     resumable_record,
     run_fingerprint,
@@ -320,14 +321,19 @@ def run_thermal_rate_scan(
         resume=resume,
         error=ThermalRateError,
     )
-    directory.mkdir(parents=True, exist_ok=True)
-    record.update(
-        request=request,
+    record_scan_request(
+        workflow,
+        record,
+        request,
+        [
+            directory / "equilibration",
+            *(directory / item["directory"] for item in entries),
+        ],
+        resume=resume,
         entries=entries,
         temperatures_k=plan.temperatures_k,
         total_ns=plan.total_ns,
     )
-    write_json(workflow, record)
     settled = run_protocol(
         plan.equilibration,
         run,

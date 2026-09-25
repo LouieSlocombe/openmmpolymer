@@ -40,22 +40,21 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ._files import ReportFiles, write_json
+from ._files import ReportFiles
 from ._validation import require_axis, require_integer
 from ._workflow import (
     StrainSchedule,
-    check_request,
+    chain_options,
     deformation_stages,
-    equilibrate,
     equilibration_at,
     group_by_stem,
     optional,
     remaining_ps,
     require_positive_fields,
-    run_branches,
+    run_branched_scan,
     sample_spread,
     scan_listing,
-    spec_request,
+    scan_request,
     with_reference_box,
     write_report_files,
 )
@@ -496,13 +495,16 @@ def run_modulus_scan(
     """Equilibrate a cell, measure its elastic constants, and report them.
 
     Nothing is written before the budget and a resumed directory's settings
-    have been checked. The workflow record is written once the scan is done.
+    have been checked. The request is saved before equilibration, and the
+    reference cell before the measurement branches run.
 
     Args:
         run: The run context.
         run_dir: Where to work. An interrupted scan resumes from here.
         spec: What to measure and how.
-        resume: Whether to pick up from what the manifest records.
+        resume: Whether to pick up from what the manifest records. Requires
+            the saved scan request; False replaces the scan, including legacy
+            runs without a complete request.
         chain_backbone: Backbone atom indices, for the chain measurements.
         atoms_per_chain: Likewise.
         expected_characteristic_ratio: Likewise.
@@ -517,49 +519,29 @@ def run_modulus_scan(
             run with different settings.
     """
     directory = Path(run_dir)
-    request = spec_request(spec)
-    record = (
-        check_request(directory / WORKFLOW_NAME, request, error=MechanicalError)
-        if resume
-        else {}
-    )
     settle = equilibration_protocol(spec, **equilibration)
     _report_cost(spec, settle, RunManifest.load(directory) if resume else None)
 
     timestep_fs = safe_timestep_fs(spec.temperature_k, run.spec)
-    chains: dict[str, Any] = {
-        "chain_backbone": chain_backbone,
-        "atoms_per_chain": atoms_per_chain,
-        "expected_characteristic_ratio": expected_characteristic_ratio,
-    }
-    start_state, origin = equilibrate(
-        settle,
+    chains = chain_options(
+        chain_backbone, atoms_per_chain, expected_characteristic_ratio
+    )
+    run_branched_scan(
         run,
-        directory,
+        directory / WORKFLOW_NAME,
+        scan_request(run, spec, settle, **chains),
+        settle,
+        lambda origin: _branches(
+            spec, timestep_fs=timestep_fs, reference_box_nm=origin
+        ),
         resume=resume,
         error=MechanicalError,
         verb="deform",
-        **chains,
-    )
-    run_branches(
-        _branches(spec, timestep_fs=timestep_fs, reference_box_nm=origin),
-        run,
-        directory,
-        start_state,
+        metadata={"timestep_fs": timestep_fs, "n_replicas": spec.n_replicas},
         **chains,
     )
 
     report = analyse_mechanics(directory, strain_limit=spec.elastic_strain_limit)
-    record.update(
-        {
-            "request": request,
-            "reference_box_nm": origin,
-            "start_state": str(start_state),
-            "timestep_fs": timestep_fs,
-            "n_replicas": spec.n_replicas,
-        }
-    )
-    write_json(directory / WORKFLOW_NAME, record, strict=False)
     _log_result(report, deform_schedule(spec))
     return report
 

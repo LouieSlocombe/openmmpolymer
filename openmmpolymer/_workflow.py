@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, Self
 import numpy as np
 import numpy.typing as npt
 
-from ._files import ReportFiles, file_sha256, write_report
+from ._files import ReportFiles, file_sha256, write_json, write_report
 from ._validation import require_positive
 from .protocols import (
     MANIFEST_NAME,
@@ -331,7 +331,7 @@ def check_request(
             f"{path} records a scan run with different settings "
             f"({', '.join(_changed(previous, request)) or 'unknown'}), and "
             "resuming would keep results measured under the old ones. Run into "
-            "a fresh directory, or put the settings back."
+            "a fresh directory, put the settings back, or rerun with resume=False."
         )
     return record
 
@@ -397,6 +397,91 @@ def run_branches(
     """
     for protocol in branches:
         run_protocol(protocol, run, directory, resume=True, state_in=state_in, **chains)
+
+
+def record_scan_request(
+    workflow: Path,
+    record: dict[str, Any],
+    request: dict[str, Any],
+    runs: Sequence[Path],
+    *,
+    resume: bool,
+    **metadata: Any,
+) -> None:
+    """Save a checked request before dynamics, clearing runs it replaces.
+
+    Call after request, input and budget checks. A forced rerun clears every
+    participating manifest before saving its new request: interruption before
+    any branch starts must not pair new settings with old completed replicas.
+    Only the supplied manifests are removed; states and unrelated runs remain.
+    """
+    if not resume:
+        for directory in runs:
+            (directory / MANIFEST_NAME).unlink(missing_ok=True)
+    workflow.parent.mkdir(parents=True, exist_ok=True)
+    record.update(request=request, **metadata)
+    write_json(workflow, record, strict=False)
+
+
+def scan_request(
+    run: RunContext, spec: Any, settle: Protocol, **chains: Any
+) -> dict[str, Any]:
+    """The measurement, preparation and starting inputs of a complete scan."""
+    return spec_request(
+        spec,
+        equilibration=[asdict(stage) for stage in settle.stages],
+        **run_fingerprint(run),
+        **chains,
+    )
+
+
+def run_branched_scan(
+    run: RunContext,
+    workflow: Path,
+    request: dict[str, Any],
+    settle: Protocol,
+    branches: Callable[[Sequence[float]], Iterable[Protocol]],
+    *,
+    resume: bool,
+    error: type[Exception],
+    verb: str,
+    metadata: dict[str, Any],
+    **chains: Any,
+) -> None:
+    """Record, equilibrate and run a budgeted scan in one manifest.
+
+    Check the complete request and starting inputs before writing anything.
+    Save the request before equilibration and the reference cell before any
+    branch, so interruptions during dynamics or analysis cannot leave stages
+    without their settings. A forced rerun discards the old manifest before
+    replacing its request; only equilibration resets it, and the branches
+    preserve each other's results.
+    """
+    directory = workflow.parent
+    record = check_request(workflow, request, error=error) if resume else {}
+    if resume:
+        manifest = RunManifest.load(directory)
+        if manifest is not None:
+            if manifest.protocol != settle.name:
+                raise error(
+                    f"{directory} contains a different protocol; use a fresh directory."
+                )
+            if record.get("request") is None:
+                raise error(
+                    f"{directory} already holds runs without a request in "
+                    f"{workflow.name}, so their settings cannot be verified. "
+                    "Use a fresh directory or rerun with resume=False."
+                )
+            validate_run_inputs(run, directory)
+    record_scan_request(
+        workflow, record, request, [directory], resume=resume, **metadata
+    )
+    start, origin = equilibrate(
+        settle, run, directory, resume=resume, error=error, verb=verb, **chains
+    )
+    record.update(start_state=start, reference_box_nm=origin)
+    write_json(workflow, record, strict=False)
+    run_branches(branches(origin), run, directory, start, **chains)
 
 
 def optional[T](read: Callable[[], T], notes: list[str], what: str) -> T | None:
@@ -475,9 +560,11 @@ def resumable_record(
 ) -> dict[str, Any]:
     """The saved record a branched scan goes on from, once it is safe to.
 
-    The manifests say what each run did, not that the runs belong together,
-    so this refuses before anything is written: a record of another request;
-    runs in the directory that no record accounts for; and, on a resume,
+    A forced rerun returns an empty record without checking the previous run;
+    :func:`record_scan_request` then clears its manifests before saving it.
+    On a resume, the manifests say what each run did, not that the runs belong
+    together, so this refuses before anything is written: a record of another
+    request; runs in the directory that no record accounts for;
     completed stages whose saved states are gone, *branches* whose common
     starting state is missing, changed or was never fingerprinted, or a
     *run* other than the one the equilibration recorded. Resuming any of them
@@ -487,6 +574,8 @@ def resumable_record(
 
     Returns the record to extend: empty, unless resuming.
     """
+    if not resume:
+        return {}
     directory = workflow.parent
     record = check_request(workflow, request, error=error)
     if not record and directory.is_dir() and any(directory.rglob(MANIFEST_NAME)):
@@ -494,8 +583,6 @@ def resumable_record(
             f"{directory} already holds runs but no {workflow.name}, so their "
             "settings cannot be verified. Use a fresh directory."
         )
-    if not resume:
-        return {}
     runs = [directory / "equilibration", *(directory / name for name in branches)]
     for path in runs:
         manifest = path / MANIFEST_NAME

@@ -20,6 +20,7 @@ from ._seeds import derive_seed
 from ._workflow import (
     chain_options,
     equilibrate,
+    record_scan_request,
     require_distinct,
     resumable_record,
     run_fingerprint,
@@ -191,14 +192,17 @@ def run_tensile_rate_scan(
             allow_nan=False,
         )
     )
-    record = (
-        resumable_record(run, workflow, request, names, resume=True, error=ValueError)
-        if resume
-        else {}
+    record = resumable_record(
+        run, workflow, request, names, resume=resume, error=ValueError
     )
-    directory.mkdir(parents=True, exist_ok=True)
-    record.update(request=request, run_dirs=names)
-    write_json(workflow, record)
+    record_scan_request(
+        workflow,
+        record,
+        request,
+        [directory / "equilibration", *(directory / name for name in names)],
+        resume=resume,
+        run_dirs=names,
+    )
     chains = chain_options(
         chain_backbone, atoms_per_chain, expected_characteristic_ratio
     )

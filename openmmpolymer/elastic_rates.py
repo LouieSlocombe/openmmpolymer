@@ -30,6 +30,7 @@ from ._workflow import (
     chain_options,
     equilibrate,
     group_by_stem,
+    record_scan_request,
     require_distinct,
     resumable_record,
     run_fingerprint,
@@ -341,9 +342,14 @@ def run_elastic_rate_scan(
         error=MechanicalError,
         fingerprinted=not youngs,
     )
-    directory.mkdir(parents=True, exist_ok=True)
-    record.update(request=request, run_dirs=names)
-    write_json(workflow, record)
+    record_scan_request(
+        workflow,
+        record,
+        request,
+        [directory / "equilibration", *(directory / name for name in names)],
+        resume=resume,
+        run_dirs=names,
+    )
     chains = chain_options(
         chain_backbone, atoms_per_chain, expected_characteristic_ratio
     )
@@ -379,8 +385,8 @@ def run_elastic_rate_scan(
                 run,
                 directory / name,
                 state_in=start,
-                # A forced rerun resets each rate's manifest once; its later
-                # replicas keep the ones completed before them.
+                # The first replica creates each rate's fresh manifest;
+                # later replicas keep the ones completed before them.
                 resume=resume or replica > 0,
                 **chains,
             )
