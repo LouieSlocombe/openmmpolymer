@@ -24,6 +24,7 @@ from openmmpolymer.tm import (
     analyse_melting,
     heating_curve,
     heating_stages,
+    load_crystal,
     melting_scan,
     melting_temperature,
     run_tm_scan,
@@ -31,68 +32,7 @@ from openmmpolymer.tm import (
 )
 from openmmpolymer.trajectory import AnalysisError
 
-
-def planted_curve(
-    *,
-    volume_jump: float = 0.1,
-    enthalpy_jump: float = 400.0,
-    volume_split: int = 10,
-    enthalpy_split: int = 10,
-    noise: float = 1.0,
-) -> HeatingCurve:
-    """Two expanding branches separated by a known first-order jump."""
-    temperatures = np.arange(300.0, 500.0, 10.0)
-    index = np.arange(len(temperatures))
-    # Noise is much smaller than a real jump, and differs between observables.
-    volume = (
-        1.0
-        + 0.0003 * (temperatures - 300.0)
-        + volume_jump * (index >= volume_split)
-        + noise * 0.0002 * np.sin(index * 2.1)
-    )
-    enthalpy = (
-        -4000.0
-        + 5.0 * (temperatures - 300.0)
-        + enthalpy_jump * (index >= enthalpy_split)
-        + noise * 0.7 * np.cos(index * 1.7)
-    )
-    return HeatingCurve(
-        temperature_k=tuple(float(t) for t in temperatures),
-        density_g_cm3=tuple(float(1.0 / v) for v in volume),
-        enthalpy_kj_mol=tuple(float(h) for h in enthalpy),
-        hold_ps=(1000.0,) * len(temperatures),
-        pressure_bar=(1.0,) * len(temperatures),
-        stages=("heating",),
-    )
-
-
-def write_heating(
-    directory: Path,
-    curve: HeatingCurve,
-    *,
-    chunks: tuple[int, ...] = (9, 10, 1),
-) -> Path:
-    """Store the public stage-result schema without running dynamics."""
-    directory.mkdir(parents=True, exist_ok=True)
-    stages: dict[str, Any] = {}
-    start = 0
-    for number, length in enumerate(chunks):
-        stop = start + length
-        name = f"heat_{number:02d}"
-        stages[name] = {
-            "name": name,
-            "samples": {
-                "segment_temperature_k": list(curve.temperature_k[start:stop]),
-                "segment_density_g_cm3": list(curve.density_g_cm3[start:stop]),
-                "segment_enthalpy_kj_mol": list(curve.enthalpy_kj_mol[start:stop]),
-                "segment_duration_ps": list(curve.hold_ps[start:stop]),
-                "segment_pressure_bar": list(curve.pressure_bar[start:stop]),
-            },
-        }
-        start = stop
-    assert start == curve.n_points
-    RunManifest(protocol="tm_heating", seed=11, stages=stages).save(directory)
-    return directory
+from .helpers import planted_curve, write_crystal, write_heating
 
 
 def test_matching_enthalpy_and_volume_jumps_resolve_a_temperature_bracket() -> None:
@@ -301,6 +241,8 @@ def test_protocol_preserves_the_crystal_and_visits_every_heating_point_once() ->
     assert all(stage.kind == "heat" for stage in heating)
     ladder = [t for stage in heating for t in stage.options["temperatures_k"]]
     assert ladder == [300.0, 310.0, 320.0, 330.0, 340.0, 350.0, 355.0]
+    # Unlike a quench, a trailing one-temperature chunk is kept as it is.
+    assert [len(stage.options["temperatures_k"]) for stage in heating] == [2, 2, 2, 1]
     assert all(stage.options["barostat"] == "anisotropic" for stage in heating)
     assert protocol.total_duration_ps == pytest.approx(8000.0)
 
@@ -444,7 +386,127 @@ def test_unconfirmed_amorphous_coordinates_are_refused_before_dynamics(
         run_tm_scan(argon_run, crystalline=False)
 
 
-@pytest.mark.parametrize("control", ["thermostat", "barostat"])
+def _ensemble_controls(control: str) -> list[Any]:
+    """Forces that would fight the heating stages' own thermostat and barostat."""
+    import openmm as mm
+
+    return {
+        "thermostat": [mm.AndersenThermostat(100.0, 100.0)],
+        "barostat": [mm.MonteCarloBarostat(1.0, 100.0)],
+        "anisotropic": [mm.MonteCarloAnisotropicBarostat(mm.Vec3(1, 1, 1), 100.0)],
+        "membrane": [
+            mm.MonteCarloMembraneBarostat(
+                1.0,
+                0.0,
+                100.0,
+                mm.MonteCarloMembraneBarostat.XYIsotropic,
+                mm.MonteCarloMembraneBarostat.ZFree,
+            )
+        ],
+        "two_barostats": [
+            mm.MonteCarloBarostat(1.0, 100.0),
+            mm.MonteCarloFlexibleBarostat(1.0, 100.0),
+        ],
+    }[control]
+
+
+def test_a_prepared_crystal_loads_as_it_was_written(
+    argon_box: tuple[Any, Any], tmp_path: Path
+) -> None:
+    """Nothing is repacked or reparameterised: the System is the one supplied."""
+    box, system = argon_box
+    pdb, xml = write_crystal(box, system, tmp_path)
+    run = load_crystal(pdb, xml, platform="Reference", seed=5)
+
+    assert run.box.topology.getNumAtoms() == 64
+    assert run.box.n_molecules == 64
+    assert run.box.box_nm == pytest.approx((2.4, 2.4, 2.4))
+    assert run.spec.constraints == "none"
+    assert run.forcefield.backend == "prepared-system"
+    assert run.forcefield.forcefield_xml == str(xml.resolve())
+    assert (run.platform_name, run.seed) == ("Reference", 5)
+
+
+def test_a_matching_starting_state_is_accepted(
+    argon_box: tuple[Any, Any], tmp_path: Path
+) -> None:
+    import openmm as mm
+
+    box, system = argon_box
+    pdb, xml = write_crystal(box, system, tmp_path)
+    context = mm.Context(
+        system, mm.VerletIntegrator(0.001), mm.Platform.getPlatformByName("Reference")
+    )
+    context.setPositions(box.positions)
+    context.setVelocitiesToTemperature(250.0, 1)
+    state = tmp_path / "crystal-state.xml"
+    state.write_text(
+        mm.XmlSerializer.serialize(
+            context.getState(getPositions=True, getVelocities=True)
+        )
+    )
+    assert load_crystal(pdb, xml, state_in=state).box.n_molecules == 64
+
+
+@pytest.mark.parametrize(
+    ("invalid", "message"),
+    [
+        ("atom_count", "same number of atoms"),
+        ("thermostat", "no barostat or Andersen thermostat"),
+        ("barostat", "no barostat or Andersen thermostat"),
+        ("anisotropic", "no barostat or Andersen thermostat"),
+        ("membrane", "no barostat or Andersen thermostat"),
+        ("two_barostats", "no barostat or Andersen thermostat"),
+        ("periodicity", "periodic boundary conditions"),
+        ("box", "CRYST1"),
+        ("state", "starting State"),
+        ("unequal", "equal atom counts"),
+        ("interleaved", "contiguous atom blocks"),
+    ],
+)
+def test_a_crystal_the_scan_could_not_heat_is_refused_as_it_loads(
+    invalid: str, message: str, argon_box: tuple[Any, Any], tmp_path: Path
+) -> None:
+    """Each of these would otherwise surface mid-scan, or in its reports."""
+    import openmm as mm
+
+    box, system = argon_box
+    atoms = list(box.topology.atoms())
+    if invalid == "atom_count":
+        system.addParticle(1.0)
+    elif invalid in (
+        "thermostat",
+        "barostat",
+        "anisotropic",
+        "membrane",
+        "two_barostats",
+    ):
+        for force in _ensemble_controls(invalid):
+            system.addForce(force)
+    elif invalid == "periodicity":
+        system.getForce(0).setNonbondedMethod(mm.NonbondedForce.NoCutoff)
+    elif invalid == "unequal":
+        box.topology.addBond(atoms[0], atoms[1])
+    elif invalid == "interleaved":
+        for left, right in [(0, 2), (1, 3), *((i, i + 1) for i in range(4, 64, 2))]:
+            box.topology.addBond(atoms[left], atoms[right])
+    pdb, xml = write_crystal(box, system, tmp_path)
+    if invalid == "box":
+        pdb.write_text(
+            "\n".join(
+                line
+                for line in pdb.read_text().splitlines()
+                if not line.startswith("CRYST1")
+            )
+        )
+    state = tmp_path / "missing-state.xml" if invalid == "state" else None
+    with pytest.raises(ValueError, match=message):
+        load_crystal(pdb, xml, state_in=state)
+
+
+@pytest.mark.parametrize(
+    "control", ["thermostat", "barostat", "anisotropic", "two_barostats"]
+)
 def test_imported_ensemble_controls_are_refused_before_heating(
     control: str,
     argon_run: Any,
@@ -453,12 +515,8 @@ def test_imported_ensemble_controls_are_refused_before_heating(
     import openmm as mm
 
     system = mm.XmlSerializer.deserialize(argon_run.system_xml)
-    force = (
-        mm.AndersenThermostat(100.0, 100.0)
-        if control == "thermostat"
-        else mm.MonteCarloBarostat(1.0, 100.0)
-    )
-    system.addForce(force)
+    for force in _ensemble_controls(control):
+        system.addForce(force)
     argon_run.system_xml = mm.XmlSerializer.serialize(system)
     directory = tmp_path / "conflicting_controls"
     with pytest.raises(TmError, match="barostat or Andersen thermostat"):

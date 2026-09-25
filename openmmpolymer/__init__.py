@@ -1,77 +1,33 @@
 """All-atom polymer melts with OpenMM, packmol and forcefill.
 
-The package takes a monomer SMILES to an equilibrated melt in four steps, each
-of which is usable on its own::
+A monomer SMILES becomes an equilibrated, measured melt::
 
-    from openmmpolymer import (
-        ChainSpec, build_chain, assign_charges, build_polymer_forcefield,
-        PackedComponent, box_edge_nm, pack_box, assemble_box, prepare_box,
-        prepare_run, standard_melt_equilibration, run_protocol,
-    )
+    from openmmpolymer import ChainSpec, build_melt, run_protocol, standard_melt_equilibration
 
-    chain = build_chain(
+    chain, run = build_melt(
         ChainSpec(monomer_smiles="[*]CC[*]", degree_of_polymerization=20,
                   residue_name="PE"),
-        n_conformers=50,
+        n_chains=50,
+        directory="run",
+        target_density_g_cm3=0.85,
     )
-    assign_charges(chain.sdf_paths[0], "nagl")
-    forcefield = build_polymer_forcefield(chain.sdf_paths[0], residue_name="PE")
+    run_protocol(standard_melt_equilibration(), run, "run",
+                 chain_backbone=chain.backbone, atoms_per_chain=chain.n_atoms)
 
-    components = [PackedComponent(path, 1) for path in chain.pdb_paths]
-    edge = box_edge_nm([50], [chain.molar_mass_g_mol], 0.3)
-    packed = pack_box(components, edge)
-
-    box = prepare_box(assemble_box(components, packed.packed_pdb, packed.box_nm),
-                      forcefield)
-    run = prepare_run(box, forcefield)
-    run_protocol(standard_melt_equilibration(), run, "run")
-
-The shape of all this follows from one constraint. forcefill will not
-parameterise a residue bonded to its neighbours, and it is right not to: a
-stand-alone GAFF treatment of a chain-linked residue is not valid. So a chain
-is built as a single molecule and a single residue, charged here rather than by
-the backend - a graph neural network scales where AM1-BCC's semi-empirical QM
-does not - and packed by conformer so that the cell holds fifty different
-conformations rather than fifty copies of one.
-
-It sits next to two of the same author's packages: ``forcefill`` does the
-parameterisation, and ``openmmnqe`` covers nuclear quantum effects for systems
-where they matter.
+:func:`build_melt` is the four layers in turn - :func:`build_chain`,
+:func:`assign_charges`, :func:`build_polymer_forcefield` and :func:`pack_box` -
+each usable on its own. Their shape follows from one constraint: forcefill will
+not parameterise a residue bonded to its neighbours, and it is right not to, so
+a chain is one molecule and one residue, charged here rather than by the
+backend and packed by conformer. The measurement workflows (``run_*_scan``,
+``analyse_*``, ``write_*_report``) take the run from there.
 """
 
 from importlib.metadata import PackageNotFoundError, version
 
-from .breaking import (
-    BreakingError,
-    BreakingReport,
-    BreakingSchedule,
-    BreakingSpec,
-    analyse_breaking,
-    breaking_protocol,
-    breaking_scan,
-    breaking_schedule,
-    breaking_stages,
-    run_breaking_scan,
-    write_breaking_report,
-)
-from .chain import (
-    ChainError,
-    ChainResult,
-    ChainSpec,
-    assemble_chain,
-    atom_names,
-    backbone_path,
-    build_chain,
-    characteristic_ratio,
-    trans_fraction,
-)
-from .charges import (
-    CHARGE_METHODS,
-    ChargeError,
-    ChargeResult,
-    assign_charges,
-    default_nagl_model,
-)
+from ._files import ReportFiles
+from .chain import ChainError, ChainResult, ChainSpec, build_chain
+from .charges import CHARGE_METHODS, ChargeError, ChargeResult, assign_charges
 from .conformation import (
     ConformationSeries,
     EndToEndRelaxation,
@@ -84,20 +40,17 @@ from .conformation import (
 )
 from .convergence import (
     DEFAULT_WINDOW_FRACTIONS,
-    ConvergenceReport,
     ParameterConvergence,
     RelaxationWindowConvergence,
     RelaxationWindowEstimate,
     WindowConvergence,
     WindowEstimate,
-    analyse_convergence,
     relaxation_window_convergence,
     time_window_convergence,
 )
 from .convergence_report import (
-    plot_relaxation_convergence,
-    plot_structural_convergence,
-    plot_window_convergence,
+    ConvergenceReport,
+    analyse_convergence,
     write_convergence_report,
 )
 from .correlations import (
@@ -131,50 +84,30 @@ from .elasticity import (
     stress_strain,
     youngs_modulus,
 )
-from .elongation import (
-    ElongationError,
-    ElongationReport,
-    ElongationSchedule,
-    ElongationSpec,
-    analyse_elongation,
-    elongation_protocol,
-    elongation_scan,
-    elongation_schedule,
-    elongation_stages,
-    run_elongation_scan,
-    write_elongation_report,
-)
 from .forcefield import (
     BACKENDS,
     DEFAULT_BASE_FORCEFIELD,
     ForceFieldError,
     PolymerForceField,
     build_polymer_forcefield,
-    check_forcefield,
 )
 from .mdsystem import (
     PackedBox,
     SystemAssemblyError,
     SystemSpec,
     assemble_box,
-    barostat_kind,
     build_system,
-    check_box,
     check_target_density,
     check_timestep,
     find_barostat,
     make_barostat,
     max_timestep_fs,
-    minimum_mass_g_mol,
-    platform_is_usable,
     prepare_box,
-    replicate_topology,
     select_platform,
 )
 from .mechanical import (
     MechanicalError,
     ModulusReport,
-    ModulusResult,
     ModulusSchedule,
     ModulusSpec,
     analyse_mechanics,
@@ -182,32 +115,19 @@ from .mechanical import (
     run_modulus_scan,
     write_mechanical_report,
 )
-from .modulus_rate_report import write_modulus_rate_report
-from .modulus_rates import (
-    ModulusRatePlan,
-    ModulusRateReport,
-    analyse_modulus_rates,
-    run_modulus_rate_scan,
-    validate_modulus_rate_scan,
-)
+from .melt import build_melt
+from .melt_check import MeltEquilibration, melt_equilibration
 from .packing import (
     DEFAULT_PACKING_DENSITY,
-    DEFAULT_TOLERANCE_NM,
     PackedComponent,
     PackmolError,
     PackResult,
     box_edge_nm,
     check_packing,
-    density_g_cm3,
     distribute_conformers,
-    find_packmol,
-    find_rings,
-    load_positions_nm,
     pack_box,
-    packmol_version,
     read_packed_pdb,
     read_pdb,
-    render_packmol_input,
 )
 from .plots import (
     plot_breaking_strength,
@@ -219,11 +139,14 @@ from .plots import (
     plot_moduli,
     plot_persistence,
     plot_quench_curve,
+    plot_rate_dependence,
     plot_relaxation,
+    plot_relaxation_convergence,
     plot_relaxation_spectrum,
     plot_state_data,
-    plot_strain_rate,
     plot_stress_strain,
+    plot_structural_convergence,
+    plot_window_convergence,
     plot_yield_strength,
 )
 from .property_rates import (
@@ -253,7 +176,7 @@ from .rate_dependence import (
     analyse_rate_observations,
     rate_extrapolation,
 )
-from .rate_reports import plot_rate_dependence, write_rate_report
+from .rate_reports import write_rate_report
 from .relaxation import (
     KWWFit,
     PronyFit,
@@ -261,8 +184,6 @@ from .relaxation import (
     fit_kww,
     fit_prony,
     mean_curve,
-    nnls,
-    prony_times_ps,
     relax_stages,
     relaxation_curve,
 )
@@ -293,7 +214,6 @@ from .simulate import (
     run_shear,
     safe_timestep_fs,
 )
-from .strain_rate import StrainRateExtrapolation, strain_rate_extrapolation
 from .strength import (
     BreakingStrength,
     ElongationAtBreak,
@@ -306,7 +226,6 @@ from .stress import (
     StressError,
     deviatoric_strain,
     pressure_bar,
-    pressure_tensor_bar,
     stress_tensor_bar,
     tensile_stress_bar,
 )
@@ -323,6 +242,34 @@ from .structure import (
     structure_stages,
     write_structure_report,
 )
+from .tensile import (
+    BreakingError,
+    BreakingReport,
+    BreakingSpec,
+    ElongationError,
+    ElongationReport,
+    ElongationSpec,
+    TensileSchedule,
+    TensileSpec,
+    YieldError,
+    YieldReport,
+    YieldSpec,
+    analyse_breaking,
+    analyse_elongation,
+    analyse_yield,
+    breaking_stages,
+    elongation_stages,
+    run_breaking_scan,
+    run_elongation_scan,
+    run_yield_scan,
+    tensile_protocol,
+    tensile_scan,
+    tensile_schedule,
+    write_breaking_report,
+    write_elongation_report,
+    write_yield_report,
+    yield_stages,
+)
 from .tensile_rates import (
     TENSILE_RATE_PROPERTIES,
     TensileRatePlan,
@@ -331,20 +278,17 @@ from .tensile_rates import (
     validate_tensile_rate_scan,
 )
 from .tg import (
-    MeltEquilibration,
-    ReportFiles,
     TgError,
     TgReport,
     TgResult,
     TgSchedule,
     TgSpec,
-    analyse_run,
+    analyse_tg,
     cooling_rate_series,
-    melt_equilibration,
     run_tg_scan,
     tg_coarse_scan,
     tg_fine_scan,
-    write_report,
+    write_tg_report,
 )
 from .thermal_rates import (
     THERMAL_RATE_PROPERTIES,
@@ -379,6 +323,7 @@ from .tm import (
     analyse_melting,
     heating_curve,
     heating_stages,
+    load_crystal,
     melting_scan,
     melting_temperature,
     run_tm_scan,
@@ -395,7 +340,6 @@ from .trajectory import (
 from .viscoelastic import (
     LinearityCheck,
     RelaxationReport,
-    RelaxationResult,
     RelaxationSchedule,
     RelaxationSpec,
     ViscoelasticError,
@@ -405,19 +349,6 @@ from .viscoelastic import (
     relaxation_scan,
     run_relaxation_scan,
     write_relaxation_report,
-)
-from .yielding import (
-    YieldError,
-    YieldReport,
-    YieldSchedule,
-    YieldSpec,
-    analyse_yield,
-    run_yield_scan,
-    write_yield_report,
-    yield_protocol,
-    yield_scan,
-    yield_schedule,
-    yield_stages,
 )
 
 try:
@@ -430,7 +361,6 @@ __all__ = [
     "CHARGE_METHODS",
     "DEFAULT_BASE_FORCEFIELD",
     "DEFAULT_PACKING_DENSITY",
-    "DEFAULT_TOLERANCE_NM",
     "DEFAULT_WINDOW_FRACTIONS",
     "DSC_COOLING_RATE_K_PER_NS",
     "ELASTIC_RATE_PROPERTIES",
@@ -442,7 +372,6 @@ __all__ = [
     "AnalysisError",
     "BreakingError",
     "BreakingReport",
-    "BreakingSchedule",
     "BreakingSpec",
     "BreakingStrength",
     "BulkModulus",
@@ -461,7 +390,6 @@ __all__ = [
     "ElongationAtBreak",
     "ElongationError",
     "ElongationReport",
-    "ElongationSchedule",
     "ElongationSpec",
     "EndToEndRelaxation",
     "Ensemble",
@@ -477,10 +405,7 @@ __all__ = [
     "MeltEquilibration",
     "MeltingReport",
     "MeltingTransition",
-    "ModulusRatePlan",
-    "ModulusRateReport",
     "ModulusReport",
-    "ModulusResult",
     "ModulusSchedule",
     "ModulusSpec",
     "PackResult",
@@ -502,7 +427,6 @@ __all__ = [
     "RateReport",
     "RelaxationCurve",
     "RelaxationReport",
-    "RelaxationResult",
     "RelaxationSchedule",
     "RelaxationSpec",
     "RelaxationWindowConvergence",
@@ -518,7 +442,6 @@ __all__ = [
     "StageFiles",
     "StageResult",
     "StateData",
-    "StrainRateExtrapolation",
     "StressError",
     "StressStrain",
     "StructuralParameterConvergence",
@@ -529,6 +452,8 @@ __all__ = [
     "SystemAssemblyError",
     "SystemSpec",
     "TensileRatePlan",
+    "TensileSchedule",
+    "TensileSpec",
     "TgError",
     "TgReport",
     "TgResult",
@@ -545,7 +470,6 @@ __all__ = [
     "WindowEstimate",
     "YieldError",
     "YieldReport",
-    "YieldSchedule",
     "YieldSpec",
     "YieldStrength",
     "__version__",
@@ -555,59 +479,42 @@ __all__ = [
     "analyse_elongation",
     "analyse_mechanics",
     "analyse_melting",
-    "analyse_modulus_rates",
     "analyse_property_rates",
     "analyse_rate_observations",
     "analyse_relaxation",
-    "analyse_run",
     "analyse_structure",
     "analyse_tensile_rates",
+    "analyse_tg",
     "analyse_thermal_rates",
     "analyse_yield",
     "assemble_box",
-    "assemble_chain",
     "assign_charges",
-    "atom_names",
-    "backbone_path",
-    "barostat_kind",
     "box_edge_nm",
-    "breaking_protocol",
-    "breaking_scan",
-    "breaking_schedule",
     "breaking_stages",
     "breaking_strength",
     "build_chain",
+    "build_melt",
     "build_polymer_forcefield",
     "build_system",
     "bulk_modulus",
     "centre_of_mass_msd",
     "chain_conformation",
     "chain_dimensions",
-    "characteristic_ratio",
-    "check_box",
-    "check_forcefield",
     "check_packing",
     "check_target_density",
     "check_timestep",
     "cooling_rate_extrapolation",
     "cooling_rate_series",
-    "default_nagl_model",
     "default_rate_spec",
     "deform_stages",
-    "density_g_cm3",
     "deviatoric_strain",
     "distribute_conformers",
     "elastic_consistency",
     "elongation_at_break",
-    "elongation_protocol",
-    "elongation_scan",
-    "elongation_schedule",
     "elongation_stages",
     "end_to_end_relaxation",
     "equilibration",
     "find_barostat",
-    "find_packmol",
-    "find_rings",
     "fit_kww",
     "fit_prony",
     "glass_transition",
@@ -615,8 +522,8 @@ __all__ = [
     "heating_stages",
     "heating_temperatures",
     "infer_backbone",
+    "load_crystal",
     "load_curve",
-    "load_positions_nm",
     "load_stages",
     "make_barostat",
     "max_timestep_fs",
@@ -626,13 +533,9 @@ __all__ = [
     "melt_quench",
     "melting_scan",
     "melting_temperature",
-    "minimum_mass_g_mol",
-    "nnls",
     "open_run",
     "pack_box",
-    "packmol_version",
     "persistence_length",
-    "platform_is_usable",
     "plot_breaking_strength",
     "plot_conformation",
     "plot_cooling_rate",
@@ -647,7 +550,6 @@ __all__ = [
     "plot_relaxation_convergence",
     "plot_relaxation_spectrum",
     "plot_state_data",
-    "plot_strain_rate",
     "plot_stress_strain",
     "plot_structural_convergence",
     "plot_window_convergence",
@@ -656,8 +558,6 @@ __all__ = [
     "prepare_box",
     "prepare_run",
     "pressure_bar",
-    "pressure_tensor_bar",
-    "prony_times_ps",
     "quench_curve",
     "quench_stages",
     "quench_temperatures",
@@ -673,8 +573,6 @@ __all__ = [
     "relaxation_curve",
     "relaxation_scan",
     "relaxation_window_convergence",
-    "render_packmol_input",
-    "replicate_topology",
     "run_anneal",
     "run_breaking_scan",
     "run_compress",
@@ -684,7 +582,6 @@ __all__ = [
     "run_heat",
     "run_load",
     "run_minimise",
-    "run_modulus_rate_scan",
     "run_modulus_scan",
     "run_npt",
     "run_nvt",
@@ -709,19 +606,19 @@ __all__ = [
     "stage_files",
     "standard_melt_equilibration",
     "steps_for",
-    "strain_rate_extrapolation",
     "stress_strain",
     "stress_tensor_bar",
     "structural_window_convergence",
     "structure_factor",
     "structure_stages",
+    "tensile_protocol",
+    "tensile_scan",
+    "tensile_schedule",
     "tensile_stress_bar",
     "tg_coarse_scan",
     "tg_fine_scan",
     "time_window_convergence",
-    "trans_fraction",
     "validate_elastic_rate_scan",
-    "validate_modulus_rate_scan",
     "validate_property_rate_scan",
     "validate_tensile_rate_scan",
     "validate_thermal_rate_scan",
@@ -730,15 +627,11 @@ __all__ = [
     "write_elongation_report",
     "write_mechanical_report",
     "write_melting_report",
-    "write_modulus_rate_report",
     "write_rate_report",
     "write_relaxation_report",
-    "write_report",
     "write_structure_report",
+    "write_tg_report",
     "write_yield_report",
-    "yield_protocol",
-    "yield_scan",
-    "yield_schedule",
     "yield_stages",
     "yield_strength",
     "youngs_modulus",

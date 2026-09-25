@@ -14,40 +14,75 @@ an exception but a System with every parameter on the wrong atom.
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import numpy.typing as npt
+import openmm as mm
+from openmm import unit
 
 from ._seeds import seed_random_stream
 from ._validation import require_choice, require_positive
 from .forcefield import PolymerForceField
-from .packing import PackedComponent, read_packed_pdb, read_pdb
+from .packing import (
+    AVOGADRO,
+    NM3_PER_CM3,
+    PackedComponent,
+    box_edge_nm,
+    read_packed_pdb,
+    read_pdb,
+)
 
 log = logging.getLogger(__name__)
 
 #: Constraint settings, by the name used in configuration.
 CONSTRAINTS = ("none", "hbonds", "allbonds", "hangles")
 
-#: Barostat kinds. ``flexible`` lets the whole box matrix fluctuate, including
-#: the off-diagonal elements; it is here because it is the only barostat whose
-#: ``computeCurrentPressure`` reports shear, and at ``frequency=0`` it is a
-#: pressure-tensor probe that never moves anything.
-BAROSTATS = ("isotropic", "anisotropic", "flexible")
 
-#: The global parameter each barostat reads its temperature from. They are not
-#: the same name, and setting the isotropic one on an anisotropic barostat
+class BarostatKind(NamedTuple):
+    """What one kind of barostat is to OpenMM.
+
+    Args:
+        force: Its class. The three are siblings, not a hierarchy -
+            ``MonteCarloFlexibleBarostat.__mro__`` is
+            ``(MonteCarloFlexibleBarostat, Force, object)`` - so a check
+            written as "a MonteCarloBarostat, else anisotropic" does not merely
+            misname a flexible barostat, it cannot see one at all, and neither
+            can the guard against a System carrying two.
+        temperature: The Context parameter its Metropolis test reads the
+            temperature from.
+        pressures: The Context parameters it reads its pressure from: one per
+            axis for the anisotropic barostat, one for the others.
+    """
+
+    force: Any
+    temperature: str
+    pressures: tuple[str, ...]
+
+
+#: The barostats a stage can attach, by the name used in configuration.
+#: ``flexible`` lets the whole box matrix fluctuate, including the off-diagonal
+#: elements; it is here because it is the only barostat that reports shear.
+#: The parameter names differ by kind, and setting one a barostat does not have
 #: raises rather than being ignored. The flexible barostat shares the isotropic
-#: one's names: observed from ``MonteCarloFlexibleBarostat.Temperature()``
-#: rather than assumed, because nothing in the class hierarchy implies it -
-#: ``MonteCarloFlexibleBarostat`` does not subclass ``MonteCarloBarostat``.
-BAROSTAT_TEMPERATURE_PARAMETER = {
-    "isotropic": "MonteCarloTemperature",
-    "anisotropic": "AnisotropicMonteCarloTemperature",
-    "flexible": "MonteCarloTemperature",
+#: one's names - observed from ``MonteCarloFlexibleBarostat.Temperature()`` and
+#: ``Pressure()``, not assumed from the classes, which have nothing in common.
+BAROSTATS = {
+    "isotropic": BarostatKind(
+        mm.MonteCarloBarostat, "MonteCarloTemperature", ("MonteCarloPressure",)
+    ),
+    "anisotropic": BarostatKind(
+        mm.MonteCarloAnisotropicBarostat,
+        "AnisotropicMonteCarloTemperature",
+        ("MonteCarloPressureX", "MonteCarloPressureY", "MonteCarloPressureZ"),
+    ),
+    "flexible": BarostatKind(
+        mm.MonteCarloFlexibleBarostat, "MonteCarloTemperature", ("MonteCarloPressure",)
+    ),
 }
 
 #: Platforms in the order they are tried when none is named.
@@ -160,8 +195,6 @@ class PackedBox:
     @property
     def positions(self) -> Any:
         """Positions as an ``openmm.unit.Quantity``, for OpenMM calls."""
-        from openmm import unit
-
         return self.positions_nm * unit.nanometer
 
 
@@ -206,9 +239,6 @@ def assemble_box(
         SystemAssemblyError: The packed file and the replicated topology disagree, so
             the coordinates cannot be trusted to belong to these atoms.
     """
-    import openmm as mm
-    from openmm import unit
-
     topology, _ = replicate_topology(components)
     packed_topology, positions = read_packed_pdb(packed_pdb)
 
@@ -307,8 +337,6 @@ def minimum_mass_g_mol(density_g_cm3: float, spec: SystemSpec) -> float:
     Returns:
         The total molar mass required, in g/mol.
     """
-    from .packing import AVOGADRO, NM3_PER_CM3
-
     edge = spec.minimum_box_factor * spec.nonbonded_cutoff_nm
     return float(edge**3 * density_g_cm3 * AVOGADRO / NM3_PER_CM3)
 
@@ -335,7 +363,7 @@ def prepare_box(box: PackedBox, forcefield: PolymerForceField) -> PackedBox:
         return box
 
     import forcefill
-    from openmm import app, unit
+    from openmm import app
 
     log.info(
         "Adding virtual sites for %s.", ", ".join(forcefield.virtual_site_residues)
@@ -395,7 +423,7 @@ def build_system(
         SystemAssemblyError: The cell is too small for the cutoff, or the System would
             not build.
     """
-    from openmm import app, unit
+    from openmm import app
 
     settings = spec or SystemSpec()
     check_box(box.box_nm, settings)
@@ -409,10 +437,8 @@ def build_system(
         "rigidWater": settings.rigid_water,
         "removeCMMotion": settings.remove_cm_motion,
         "ewaldErrorTolerance": settings.ewald_error_tolerance,
-        # Explicitly, and never as None: createSystem coerces this with
-        # bool(), so None would silently switch the correction off. It is
-        # worth one to three per cent on the melt density, which is the number
-        # most of these runs exist to produce.
+        # Always passed, and never as None: see
+        # SystemSpec.use_dispersion_correction.
         "useDispersionCorrection": settings.use_dispersion_correction,
     }
     if settings.switch_distance_nm is not None:
@@ -440,10 +466,11 @@ def _create_system(forcefield: Any, topology: Any, kwargs: dict[str, Any]) -> An
 
     Both retries are for settings this package adds for speed or for
     correctness that a particular force-field file may already have an opinion
-    about. Anything else is the caller's problem, and is re-raised with the
-    context OpenMM's own message leaves out.
+    about, and each drops its setting, so there are at most two. Anything else
+    is the caller's problem, and is re-raised with the context OpenMM's own
+    message leaves out.
     """
-    for _ in range(3):
+    while True:
         try:
             return forcefield.createSystem(topology, **kwargs)
         except Exception as error:
@@ -473,15 +500,10 @@ def _create_system(forcefield: Any, topology: Any, kwargs: dict[str, Any]) -> An
                 f"The System would not build from "
                 f"{topology.getNumResidues()} residues: {error}"
             ) from error
-    raise SystemAssemblyError(  # pragma: no cover - the loop always returns or raises
-        "The System would not build after exhausting every fallback."
-    )
 
 
 def _verify_dispersion_correction(system: Any, spec: SystemSpec) -> None:
     """Log the correction that is actually in force, whatever was asked for."""
-    import openmm as mm
-
     for force in system.getForces():
         if isinstance(force, mm.NonbondedForce):
             actual = force.getUseDispersionCorrection()
@@ -511,22 +533,24 @@ def make_barostat(
 
     Args:
         kind: One of :data:`BAROSTATS`.
-        temperature_k: The temperature its Metropolis test uses. This must
-            agree with the integrator's; they are set separately and nothing
-            checks that they match.
+        temperature_k: The temperature its Metropolis test uses. It has to
+            agree with the integrator's, and nothing here can check that - see
+            :func:`openmmpolymer.simulate.set_temperature`.
         pressure_bar: The pressure, on every axis that has no entry in
             *pressures_bar*.
-        frequency: Steps between volume moves. Zero means never: the barostat
-            is then attached only so that its ``computeCurrentPressure`` can
-            be called, which OpenMM refuses for a force that is not in the
-            Context.
+        frequency: Steps between volume moves. Zero means never, and is how a
+            stage that holds its box still reads a pressure at all: OpenMM
+            reports one only through a barostat's ``computeCurrentPressure``
+            or ``computeStressTensor``, and refuses both for a force that is
+            not in the Context. A barostat at zero frequency never moves the
+            box and exists purely to be asked.
         seed: Its random seed. Must be non-zero, or OpenMM chooses its own and
             the run stops being reproducible.
         scale_molecules_as_rigid: Whether a volume move translates each
             molecule rigidly. See :class:`SystemSpec` for why this is on by
             default and why turning it off needs ``constraints="none"``. It
-            also decides whether ``computeCurrentPressure`` reports the
-            molecular or the atomic virial.
+            also decides whether the pressure it reports is the molecular or
+            the atomic virial.
         pressures_bar: Per-axis pressures, for the anisotropic barostat only.
             None applies *pressure_bar* to all three. This is what makes a
             uniaxial load: a different pressure along one axis from the other
@@ -542,10 +566,7 @@ def make_barostat(
         ValueError: *kind* is not one of :data:`BAROSTATS`, a per-axis setting
             was given for a barostat that has no axes, or no axis may move.
     """
-    import openmm as mm
-    from openmm import unit
-
-    require_choice(kind, BAROSTATS, name="kind")
+    require_choice(kind, tuple(BAROSTATS), name="kind")
     axes = tuple(bool(flag) for flag in scale_axes)
     if len(axes) != 3:
         raise ValueError(f"scale_axes={scale_axes!r} must have three entries.")
@@ -599,40 +620,9 @@ def make_barostat(
             axes[2],
             frequency,
         )
-    # OpenMM 8.3's isotropic/anisotropic barostats always translate whole
-    # molecules; only newer releases expose an atomic-scaling switch for them.
-    set_rigid = getattr(barostat, "setScaleMoleculesAsRigid", None)
-    if callable(set_rigid):
-        set_rigid(scale_molecules_as_rigid)
-    elif not scale_molecules_as_rigid:
-        raise SystemAssemblyError(
-            f"This OpenMM version cannot use scale_molecules_as_rigid=False "
-            f"with a {kind} barostat. Use rigid molecular scaling, select a "
-            "flexible barostat, or upgrade OpenMM to a release exposing "
-            "setScaleMoleculesAsRigid for this barostat."
-        )
+    barostat.setScaleMoleculesAsRigid(scale_molecules_as_rigid)
     seed_random_stream(barostat, seed)
     return barostat
-
-
-def _barostat_types() -> dict[str, Any]:
-    """The barostat class behind each name in :data:`BAROSTATS`.
-
-    Spelled out rather than tested with one ``isinstance`` chain because the
-    three classes are siblings, not a hierarchy:
-    ``MonteCarloFlexibleBarostat.__mro__`` is ``(MonteCarloFlexibleBarostat,
-    Force, object)``. A check written as "a MonteCarloBarostat, else
-    anisotropic" therefore does not merely misname a flexible barostat, it
-    cannot see one at all - and neither can the guard below that exists to
-    catch a System carrying two.
-    """
-    import openmm as mm
-
-    return {
-        "isotropic": mm.MonteCarloBarostat,
-        "anisotropic": mm.MonteCarloAnisotropicBarostat,
-        "flexible": mm.MonteCarloFlexibleBarostat,
-    }
 
 
 def find_barostat(system: Any) -> tuple[str, Any] | None:
@@ -648,12 +638,11 @@ def find_barostat(system: Any) -> tuple[str, Any] | None:
         SystemAssemblyError: The System carries more than one barostat. OpenMM
             accepts that without complaint and then applies both.
     """
-    types = _barostat_types()
     found = [
         (kind, force)
         for force in system.getForces()
-        for kind, cls in types.items()
-        if isinstance(force, cls)
+        for kind, barostat in BAROSTATS.items()
+        if isinstance(force, barostat.force)
     ]
     if len(found) > 1:
         raise SystemAssemblyError(
@@ -665,17 +654,22 @@ def find_barostat(system: Any) -> tuple[str, Any] | None:
     return found[0] if found else None
 
 
-def barostat_kind(system: Any) -> str | None:
-    """Return the kind of barostat in *system*, or None if it has none.
+def ensemble_controls(system: Any) -> list[str]:
+    """Name every barostat and Andersen thermostat *system* already carries.
 
-    Raises:
-        SystemAssemblyError: The System carries more than one barostat. OpenMM accepts
-            that without complaint and then applies both.
+    Every barostat counts, the membrane barostat that no stage here attaches
+    among them: OpenMM applies each one a System carries, so a stage adding
+    its own would run under both.
     """
-    found = find_barostat(system)
-    return found[0] if found is not None else None
+    return [
+        type(force).__name__
+        for force in system.getForces()
+        if type(force).__name__.endswith("Barostat")
+        or isinstance(force, mm.AndersenThermostat)
+    ]
 
 
+@functools.cache
 def platform_is_usable(name: str) -> bool:
     """Whether a Context can actually be built on the named platform.
 
@@ -683,7 +677,9 @@ def platform_is_usable(name: str) -> bool:
     newer toolkit than the installed driver appears in the platform list and
     then fails with ``CUDA_ERROR_UNSUPPORTED_PTX_VERSION`` the moment a
     Context is made - which, without this, is at the start of the first stage
-    rather than at platform selection.
+    rather than at platform selection. The answer is kept for the life of the
+    process, so a run that picks its platform automatically probes it once
+    rather than once per stage.
 
     Args:
         name: The platform to try.
@@ -691,9 +687,6 @@ def platform_is_usable(name: str) -> bool:
     Returns:
         Whether a one-particle Context could be built on it.
     """
-    import openmm as mm
-    from openmm import unit
-
     system = mm.System()
     system.addParticle(1.0 * unit.dalton)
     try:
@@ -730,8 +723,6 @@ def select_platform(
         SystemAssemblyError: The named platform does not exist, or nothing
             available works.
     """
-    import openmm as mm
-
     available = {
         mm.Platform.getPlatform(index).getName()
         for index in range(mm.Platform.getNumPlatforms())
@@ -791,8 +782,6 @@ def check_target_density(
         SystemAssemblyError: The compressed cell would be too small, with the
             extra material needed named in the message.
     """
-    from .packing import box_edge_nm
-
     settings = spec or SystemSpec()
     edge = box_edge_nm(counts, molar_masses_g_mol, target_density_g_cm3)
     required = settings.minimum_box_factor * settings.nonbonded_cutoff_nm

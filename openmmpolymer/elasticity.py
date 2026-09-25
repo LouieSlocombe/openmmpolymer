@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -40,8 +40,15 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
-from .timeseries import _fit_line
-from .trajectory import AnalysisError
+from ._fitting import NEGLIGIBLE, fit_line, slope_error
+from .stress import STRESS_ESTIMATOR_VERSION
+from .trajectory import (
+    AnalysisError,
+    load_manifest,
+    stage_names,
+    stage_record,
+    stages_holding,
+)
 
 log = logging.getLogger(__name__)
 
@@ -65,9 +72,6 @@ MAX_BULK_HYSTERESIS = 0.25
 #: How far a measured K or G may sit from the one E and nu imply before the
 #: four constants stop describing one isotropic solid.
 MAX_CONSISTENCY_GAP = 0.3
-
-#: Smallest denominator worth dividing by.
-_TINY = 1.0e-12
 
 
 # --------------------------------------------------------------------------
@@ -169,14 +173,9 @@ class ElasticModulus:
     resolved: bool
 
     @property
-    def modulus_gpa(self) -> float:
-        """The same number in GPa, which is how a stiff polymer is quoted."""
-        return self.modulus_mpa / 1000.0
-
-    @property
     def relative_standard_error(self) -> float:
         """The standard error as a fraction of the modulus, or infinity."""
-        if abs(self.modulus_mpa) < _TINY:
+        if abs(self.modulus_mpa) < NEGLIGIBLE:
             return math.inf
         return abs(self.standard_error_mpa / self.modulus_mpa)
 
@@ -251,7 +250,7 @@ class BulkModulus:
     @property
     def relative_standard_error(self) -> float:
         """The propagated standard error as a fraction of the modulus."""
-        if not math.isfinite(self.modulus_mpa) or abs(self.modulus_mpa) < _TINY:
+        if not math.isfinite(self.modulus_mpa) or abs(self.modulus_mpa) < NEGLIGIBLE:
             return math.inf
         return abs(self.standard_error_mpa / self.modulus_mpa)
 
@@ -320,43 +319,21 @@ class ElasticConsistency:
 # --------------------------------------------------------------------------
 
 
-def _manifest_stages(run_dir: str | Path) -> dict[str, dict[str, Any]]:
-    """Every stage a manifest records, or a message saying there is none."""
-    from .protocols import RunManifest
+def _ladder(key: str) -> Callable[[dict[str, Any]], bool]:
+    """Whether a stage's samples hold a ladder of *key*."""
 
-    directory = Path(run_dir)
-    manifest = RunManifest.load(directory)
-    if manifest is None:
-        raise AnalysisError(f"No manifest in {directory}.")
-    return manifest.stages
+    def holds(samples: dict[str, Any]) -> bool:
+        values = samples.get(key)
+        return isinstance(values, list) and len(values) >= 1
 
-
-def _is_kind(recorded: dict[str, Any], key: str) -> bool:
-    """Whether a recorded stage holds a ladder of *key*."""
-    samples = recorded.get("samples") or {}
-    values = samples.get(key)
-    return isinstance(values, list) and len(values) >= 1
-
-
-def _stages_holding(run_dir: str | Path, key: str, what: str) -> tuple[str, ...]:
-    """Name every stage whose samples carry *key*, in manifest order."""
-    stages = _manifest_stages(run_dir)
-    found = tuple(name for name, recorded in stages.items() if _is_kind(recorded, key))
-    if not found:
-        raise AnalysisError(
-            f"No stage in {Path(run_dir)} recorded {what}. It records: "
-            f"{', '.join(stages) or 'nothing'}."
-        )
-    return found
+    return holds
 
 
 def deform_stages(run_dir: str | Path) -> tuple[str, ...]:
     """Name every stage in a run that stretched the cell along an axis.
 
-    Found by what a stage recorded rather than by what it was called, the
-    same way :func:`~openmmpolymer.timeseries.quench_stages` finds a quench,
-    so a ladder split into chunks for resume - or repeated as several
-    replicas - is read without anything having to agree on names in advance.
+    Found by what each stage recorded rather than by its name, as
+    :func:`~openmmpolymer.trajectory.stages_holding` explains.
 
     Args:
         run_dir: A directory a run wrote to.
@@ -368,7 +345,7 @@ def deform_stages(run_dir: str | Path) -> tuple[str, ...]:
         AnalysisError: There is no manifest, or nothing in it was a
             deformation.
     """
-    return _stages_holding(run_dir, "segment_strain", "a ladder of strains")
+    return stages_holding(run_dir, _ladder("segment_strain"), "a ladder of strains")
 
 
 def load_stages(run_dir: str | Path) -> tuple[str, ...]:
@@ -377,8 +354,8 @@ def load_stages(run_dir: str | Path) -> tuple[str, ...]:
     Raises:
         AnalysisError: There is no manifest, or nothing in it was a load.
     """
-    return _stages_holding(
-        run_dir, "segment_applied_stress_bar", "a ladder of applied stresses"
+    return stages_holding(
+        run_dir, _ladder("segment_applied_stress_bar"), "a ladder of applied stresses"
     )
 
 
@@ -388,7 +365,9 @@ def shear_stages(run_dir: str | Path) -> tuple[str, ...]:
     Raises:
         AnalysisError: There is no manifest, or nothing in it was a shear.
     """
-    return _stages_holding(run_dir, "segment_shear_strain", "a ladder of shear strains")
+    return stages_holding(
+        run_dir, _ladder("segment_shear_strain"), "a ladder of shear strains"
+    )
 
 
 def bulk_stages(run_dir: str | Path) -> tuple[str, ...]:
@@ -397,7 +376,9 @@ def bulk_stages(run_dir: str | Path) -> tuple[str, ...]:
     Raises:
         AnalysisError: There is no manifest, or nothing in it was a ladder.
     """
-    return _stages_holding(run_dir, "segment_pressure_bar", "a ladder of pressures")
+    return stages_holding(
+        run_dir, _ladder("segment_pressure_bar"), "a ladder of pressures"
+    )
 
 
 def _gather(
@@ -408,16 +389,12 @@ def _gather(
     A strain ladder split across stages for resume is one curve; reading each
     chunk as its own would give several short ones and fit a modulus to each.
     """
-    stages = _manifest_stages(run_dir)
+    directory = Path(run_dir)
+    manifest = load_manifest(directory)
     merged: dict[str, list[float]] = {}
     temperatures: list[float] = []
     for name in names:
-        recorded = stages.get(name)
-        if recorded is None:
-            raise AnalysisError(
-                f"{Path(run_dir)} has no stage called {name!r}. It records: "
-                f"{', '.join(stages) or 'nothing'}."
-            )
+        recorded = stage_record(manifest, name, directory)
         samples = recorded.get("samples") or {}
         for key, values in samples.items():
             merged.setdefault(key, []).extend(float(value) for value in values)
@@ -431,8 +408,6 @@ def _require_stress_estimator(
     samples: dict[str, list[float]], names: Sequence[str]
 ) -> None:
     """Require a current stress estimator tag on every gathered shear stage."""
-    from .stress import STRESS_ESTIMATOR_VERSION
-
     versions = samples.get("stress_estimator_version", [])
     if len(versions) != len(names) or any(
         version != STRESS_ESTIMATOR_VERSION for version in versions
@@ -455,10 +430,7 @@ def _strain_rate_per_ns(
     """
     if not durations or len(durations) != len(strains) or min(durations) <= 0.0:
         return None
-    total_ps = float(sum(durations))
-    if total_ps <= 0.0:
-        return None
-    return abs(float(strains[-1])) / total_ps * 1000.0
+    return abs(float(strains[-1])) / float(sum(durations)) * 1000.0
 
 
 def stress_strain(
@@ -479,11 +451,7 @@ def stress_strain(
         AnalysisError: There is nothing there to read, or what is there is
             not a deformation.
     """
-    names = (
-        deform_stages(run_dir)
-        if stage is None
-        else ((stage,) if isinstance(stage, str) else tuple(stage))
-    )
+    names = deform_stages(run_dir) if stage is None else stage_names(stage)
     samples, temperature = _gather(run_dir, names)
     if "segment_strain" not in samples:
         raise AnalysisError(
@@ -556,11 +524,7 @@ def load_curve(
     Raises:
         AnalysisError: There is nothing there to read.
     """
-    names = (
-        load_stages(run_dir)
-        if stage is None
-        else ((stage,) if isinstance(stage, str) else tuple(stage))
-    )
+    names = load_stages(run_dir) if stage is None else stage_names(stage)
     samples, temperature = _gather(run_dir, names)
     axis = int(samples.get("load_axis", [2.0])[0])
     lateral = [index for index in range(3) if index != axis]
@@ -595,23 +559,6 @@ def load_curve(
 # --------------------------------------------------------------------------
 
 
-def _slope_error(
-    x: npt.NDArray[np.float64], y: npt.NDArray[np.float64], residual_sum: float
-) -> float:
-    """Standard error of a least-squares slope.
-
-    ``sqrt( sum(residual^2) / (n - 2) / sum((x - xbar)^2) )``, which is
-    infinite when there are only two points: a line through two points has no
-    residual and no error, and reporting zero would make the least supported
-    fit look like the best one.
-    """
-    n = x.size
-    spread = float(((x - x.mean()) ** 2).sum())
-    if n <= 2 or spread < _TINY:
-        return math.inf
-    return math.sqrt(max(residual_sum, 0.0) / (n - 2) / spread)
-
-
 def _half_disagreement(
     x: npt.NDArray[np.float64], y: npt.NDArray[np.float64], slope: float
 ) -> float:
@@ -624,23 +571,27 @@ def _half_disagreement(
     a curve slopes differently at its two ends by construction, and a line
     does not.
     """
-    if x.size < 4 or abs(slope) < _TINY:
-        return 0.0 if x.size < 4 else math.inf
+    if x.size < 4:
+        return 0.0
+    if abs(slope) < NEGLIGIBLE:
+        return math.inf
     middle = x.size // 2
-    slopes = []
-    for part in (slice(None, middle), slice(middle, None)):
-        if x[part].size < 2:
-            return math.inf
-        (piece, _), _ = _fit_line(x[part], y[part])
-        slopes.append(piece)
-    return abs(slopes[0] - slopes[1]) / abs(slope)
+    (early, _), _ = fit_line(x[:middle], y[:middle])
+    (late, _), _ = fit_line(x[middle:], y[middle:])
+    return abs(early - late) / abs(slope)
 
 
 def _window(
     strain: npt.NDArray[np.float64], strain_limit: float
 ) -> npt.NDArray[np.bool_]:
-    """Which points fall inside the elastic window."""
-    return np.asarray(np.abs(strain) <= strain_limit + _TINY, dtype=np.bool_)
+    """Which points fall inside the elastic window.
+
+    Raises:
+        ValueError: The window is not a strain.
+    """
+    if strain_limit <= 0.0:
+        raise ValueError(f"strain_limit={strain_limit} must be above zero.")
+    return np.asarray(np.abs(strain) <= strain_limit + NEGLIGIBLE, dtype=np.bool_)
 
 
 def youngs_modulus(
@@ -666,8 +617,6 @@ def youngs_modulus(
     Raises:
         ValueError: The window is not a strain.
     """
-    if strain_limit <= 0.0:
-        raise ValueError(f"strain_limit={strain_limit} must be above zero.")
     inside = _window(curve.strain, strain_limit)
     x = curve.strain[inside]
     y = curve.tensile_stress_mpa[inside]
@@ -685,8 +634,8 @@ def youngs_modulus(
             resolved=False,
         )
 
-    (slope, intercept), residual_sum = _fit_line(x, y)
-    error = _slope_error(x, y, residual_sum)
+    (slope, intercept), residual_sum = fit_line(x, y)
+    error = slope_error(x, residual_sum)
     disagreement = _half_disagreement(x, y, slope)
     resolved = bool(
         x.size >= min_points
@@ -728,6 +677,9 @@ def poisson_ratio(
     Returns:
         The ratio, ``resolved`` False when the fit is poor or the answer is
         not one an isotropic solid can have.
+
+    Raises:
+        ValueError: The window is not a strain.
     """
     inside = _window(curve.strain, strain_limit)
     x = curve.strain[inside]
@@ -740,8 +692,8 @@ def poisson_ratio(
             strain_limit=strain_limit,
             resolved=False,
         )
-    (slope, _), residual_sum = _fit_line(x, y)
-    error = _slope_error(x, y, residual_sum)
+    (slope, _), residual_sum = fit_line(x, y)
+    error = slope_error(x, residual_sum)
     ratio = -float(slope)
     resolved = bool(
         x.size >= min_points
@@ -792,11 +744,7 @@ def bulk_modulus(
     Raises:
         AnalysisError: There is nothing there to read.
     """
-    names = (
-        bulk_stages(run_dir)
-        if stage is None
-        else ((stage,) if isinstance(stage, str) else tuple(stage))
-    )
+    names = bulk_stages(run_dir) if stage is None else stage_names(stage)
     samples, temperature = _gather(run_dir, names)
     pressure = np.asarray(samples.get("segment_pressure_bar", []), dtype=np.float64)
     density = np.asarray(samples.get("segment_density_g_cm3", []), dtype=np.float64)
@@ -818,17 +766,17 @@ def bulk_modulus(
 
     def fit(mask: npt.NDArray[np.bool_]) -> tuple[float | None, float, float]:
         x, y = pressure[mask], log_volume[mask]
-        if x.size < 2 or np.ptp(x) < _TINY:
+        if x.size < 2 or np.ptp(x) < NEGLIGIBLE:
             return None, math.inf, math.nan
         # Centering protects the slope fit when absolute pressure dwarfs the
         # ladder's pressure increments.
         x = x - x.mean()
-        (slope, _), residual_sum = _fit_line(x, y)
+        (slope, _), residual_sum = fit_line(x, y)
         residual = math.sqrt(max(residual_sum, 0.0) / x.size)
-        if not math.isfinite(slope) or abs(slope) < _TINY:
+        if not math.isfinite(slope) or abs(slope) < NEGLIGIBLE:
             return None, math.inf, residual
         modulus = -MPA_PER_BAR / slope
-        error = MPA_PER_BAR * _slope_error(x, y, residual_sum) / slope**2
+        error = MPA_PER_BAR * slope_error(x, residual_sum) / slope**2
         return float(modulus), float(error), residual
 
     everything = np.ones(pressure.size, dtype=np.bool_)
@@ -842,7 +790,7 @@ def bulk_modulus(
     up = fit(rising)[0] if peak >= 1 else None
     down = fit(falling)[0] if peak <= pressure.size - 2 else None
     hysteresis = math.nan
-    if up is not None and down is not None and abs(up) > _TINY:
+    if up is not None and down is not None and abs(up) > NEGLIGIBLE:
         hysteresis = abs(down - up) / abs(up)
 
     unique_pressure = np.unique(pressure)
@@ -911,11 +859,7 @@ def shear_modulus(
         AnalysisError: There is nothing there to read, or the stress was
             recorded with an obsolete or unidentified estimator.
     """
-    names = (
-        shear_stages(run_dir)
-        if stage is None
-        else ((stage,) if isinstance(stage, str) else tuple(stage))
-    )
+    names = shear_stages(run_dir) if stage is None else stage_names(stage)
     samples, temperature = _gather(run_dir, names)
     _require_stress_estimator(samples, names)
     strain = np.asarray(samples["segment_shear_strain"], dtype=np.float64)
@@ -935,8 +879,8 @@ def shear_modulus(
             temperature_k=temperature,
             resolved=False,
         )
-    (slope, _), residual_sum = _fit_line(strain, stress)
-    error = _slope_error(strain, stress, residual_sum)
+    (slope, _), residual_sum = fit_line(strain, stress)
+    error = slope_error(strain, residual_sum)
     resolved = bool(
         strain.size >= min_points
         and slope > 0.0
@@ -976,11 +920,13 @@ def elastic_consistency(
     """
     nu, modulus = poisson.ratio, youngs.modulus_mpa
     denominator = 3.0 * (1.0 - 2.0 * nu)
-    implied_bulk = modulus / denominator if abs(denominator) > _TINY else math.nan
-    implied_shear = modulus / (2.0 * (1.0 + nu)) if abs(1.0 + nu) > _TINY else math.nan
+    implied_bulk = modulus / denominator if abs(denominator) > NEGLIGIBLE else math.nan
+    implied_shear = (
+        modulus / (2.0 * (1.0 + nu)) if abs(1.0 + nu) > NEGLIGIBLE else math.nan
+    )
 
     def gap(measured: float | None, implied: float) -> float:
-        if measured is None or not math.isfinite(implied) or abs(implied) < _TINY:
+        if measured is None or not math.isfinite(implied) or abs(implied) < NEGLIGIBLE:
             return math.nan
         return abs(measured - implied) / abs(implied)
 

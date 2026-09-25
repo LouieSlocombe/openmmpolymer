@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -70,15 +71,36 @@ class ChargeResult:
     n_atoms: int
 
 
-def default_nagl_model() -> str:
+def read_chain_molecule(sdf_path: Path, error: type[RuntimeError] = ChargeError) -> Any:
+    """Return the one molecule a chain SDF holds, as an OpenFF ``Molecule``.
+
+    Args:
+        sdf_path: The SDF, as :func:`openmmpolymer.chain.build_chain` writes it.
+        error: What to raise if it holds more than one, so each caller reports
+            the fault as its own.
+
+    Raises:
+        ChargeError: Or *error*: the file holds more than one molecule.
+    """
+    from openff.toolkit import Molecule
+
+    molecule = Molecule.from_file(str(sdf_path), allow_undefined_stereo=True)
+    if not isinstance(molecule, list):
+        return molecule
+    if len(molecule) != 1:
+        raise error(
+            f"{sdf_path} holds {len(molecule)} molecules; a chain SDF holds "
+            "exactly one."
+        )
+    return molecule[0]
+
+
+def _default_nagl_model() -> str:
     """Return the newest released NAGL AM1-BCC model installed.
 
     Release candidates and alphas are skipped when a final release is present,
     because pinning a package to a name like ``openff-gnn-am1bcc-0.1.0-rc.3``
     is how a workflow stops working when the model that supersedes it lands.
-
-    Returns:
-        The model file name, as ``assign_partial_charges`` wants it.
 
     Raises:
         ChargeError: openff-nagl-models is not installed, or ships no model.
@@ -101,25 +123,14 @@ def default_nagl_model() -> str:
 
 
 def _version_key(name: str) -> tuple[int, ...]:
-    """Sort key over the digits in a NAGL model file name."""
-    digits: list[int] = []
-    current = ""
-    for character in name:
-        if character.isdigit():
-            current += character
-        elif current:
-            digits.append(int(current))
-            current = ""
-    if current:
-        digits.append(int(current))
-    return tuple(digits)
+    """Sort key over the digit runs in a NAGL model file name."""
+    return tuple(int(digits) for digits in re.findall(r"\d+", name))
 
 
 def assign_charges(
     sdf_path: str | Path,
     method: str = "nagl",
     *,
-    model: str | None = None,
     output_sdf: str | Path | None = None,
 ) -> ChargeResult:
     """Charge the molecule in *sdf_path* and write it back out.
@@ -127,8 +138,8 @@ def assign_charges(
     Args:
         sdf_path: An SDF holding exactly one molecule, as
             :func:`openmmpolymer.chain.build_chain` writes.
-        method: One of :data:`CHARGE_METHODS`.
-        model: NAGL model file name. Defaults to :func:`default_nagl_model`.
+        method: One of :data:`CHARGE_METHODS`. ``nagl`` uses the newest
+            released model installed.
         output_sdf: Where to write. Defaults to overwriting *sdf_path*.
 
     Returns:
@@ -142,17 +153,7 @@ def assign_charges(
     source = Path(sdf_path)
     destination = Path(output_sdf) if output_sdf is not None else source
 
-    from openff.toolkit import Molecule
-
-    molecule = Molecule.from_file(str(source), allow_undefined_stereo=True)
-    if isinstance(molecule, list):
-        if len(molecule) != 1:
-            raise ChargeError(
-                f"{source} holds {len(molecule)} molecules; a chain SDF holds "
-                "exactly one."
-            )
-        molecule = molecule[0]
-
+    molecule = read_chain_molecule(source)
     formal_charge = round(float(molecule.total_charge.m))
     if method == "none":
         log.info("Leaving %s uncharged; the backend will charge it.", source.name)
@@ -165,37 +166,35 @@ def assign_charges(
             n_atoms=molecule.n_atoms,
         )
 
-    chosen = _assign(molecule, method, model)
+    model = _assign(molecule, method)
     total = float(sum(molecule.partial_charges.m))
     _check_total(total, formal_charge, method)
 
-    if not molecule.conformers:  # pragma: no cover - build_chain always embeds
-        molecule.generate_conformers(n_conformers=1)
     molecule.to_file(str(destination), file_format="SDF")
     log.info(
         "Charged %d atoms of %s with %s%s (sum %+.4f e).",
         molecule.n_atoms,
         source.name,
         method,
-        f" [{chosen}]" if chosen else "",
+        f" [{model}]" if model else "",
         total,
     )
     return ChargeResult(
         sdf_path=str(destination),
         method=method,
-        model=chosen,
+        model=model,
         total_charge=total,
         formal_charge=formal_charge,
         n_atoms=molecule.n_atoms,
     )
 
 
-def _assign(molecule: Any, method: str, model: str | None) -> str | None:
-    """Run the chosen charge method on *molecule* in place."""
+def _assign(molecule: Any, method: str) -> str | None:
+    """Run the chosen charge method on *molecule* in place; return the model."""
     if method == "nagl":
-        chosen = model or default_nagl_model()
-        molecule.assign_partial_charges(chosen)
-        return chosen
+        model = _default_nagl_model()
+        molecule.assign_partial_charges(model)
+        return model
     if method == "gasteiger":
         log.warning(
             "Gasteiger charges have no hydrogen bonding and no dipole "
@@ -209,17 +208,7 @@ def _assign(molecule: Any, method: str, model: str | None) -> str | None:
 
 
 def _check_total(total: float, formal_charge: int, method: str) -> None:
-    """Raise unless the charges sum to the formal charge.
-
-    Args:
-        total: The charges' sum.
-        formal_charge: What it should be.
-        method: The method used, for the error message.
-
-    Raises:
-        ChargeError: The two disagree by more than
-            :data:`CHARGE_SUM_TOLERANCE`.
-    """
+    """Raise unless the charges sum to the formal charge."""
     if math.isclose(total, formal_charge, abs_tol=CHARGE_SUM_TOLERANCE):
         return
     raise ChargeError(

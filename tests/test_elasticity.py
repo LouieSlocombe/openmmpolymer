@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -275,8 +276,6 @@ def test_a_curve_that_bends_inside_the_window_is_not_resolved(
     at both ends and below it in the middle - so residual alone does not see
     this. Comparing the two halves of the window does.
     """
-    import json
-
     write_deformation(tmp_path, n_steps=12)
     manifest = tmp_path / "manifest.json"
     record = json.loads(manifest.read_text())
@@ -308,6 +307,16 @@ def test_too_few_points_is_not_resolved(tmp_path: Path) -> None:
     assert fit.n_points == 3
 
 
+@pytest.mark.parametrize("fit", [youngs_modulus, poisson_ratio])
+def test_a_window_that_is_not_a_strain_is_refused(
+    tmp_path: Path, fit: Callable[..., object]
+) -> None:
+    """Both fits read the same window, so both refuse the same nonsense."""
+    write_deformation(tmp_path)
+    with pytest.raises(ValueError, match="strain_limit"):
+        fit(stress_strain(tmp_path), strain_limit=0.0)
+
+
 def test_an_unphysical_poissons_ratio_is_not_resolved(tmp_path: Path) -> None:
     """An isotropic solid cannot have one, so the cell did not relax."""
     write_deformation(tmp_path, poisson=-0.2)
@@ -324,28 +333,11 @@ def test_a_negative_modulus_is_not_resolved(tmp_path: Path) -> None:
 
 def test_a_ladder_that_does_not_come_back_is_not_resolved(tmp_path: Path) -> None:
     """Hysteresis means the ladder deformed the cell rather than probing it."""
-    pressures = [1.0, 100.0, 200.0, 100.0, 1.0]
-    densities = [0.90, 0.906, 0.912, 0.930, 0.950]
-    import json
-
-    record = {
-        "protocol": "test",
-        "seed": 1,
-        "versions": {},
-        "system": {},
-        "stages": {
-            "08_bulk": {
-                "samples": {
-                    "segment_pressure_bar": pressures,
-                    "segment_density_g_cm3": densities,
-                },
-                "mean_temperature_k": 298.15,
-            }
-        },
-        "chains": None,
-        "box": None,
-    }
-    (tmp_path / "manifest.json").write_text(json.dumps(record))
+    _write_bulk_samples(
+        tmp_path,
+        [1.0, 100.0, 200.0, 100.0, 1.0],
+        [0.90, 0.906, 0.912, 0.930, 0.950],
+    )
     fit = bulk_modulus(tmp_path)
     assert fit.hysteresis > 0.25
     assert not fit.resolved
@@ -366,8 +358,6 @@ def test_a_liquid_has_no_shear_modulus_and_says_so(tmp_path: Path) -> None:
 def test_chunks_of_one_ladder_read_back_as_one_curve(tmp_path: Path) -> None:
     """A ladder split for resume is one deformation, not several."""
     write_deformation(tmp_path, n_steps=5, stage="06_deform_r0_00")
-    import json
-
     manifest = tmp_path / "manifest.json"
     record = json.loads(manifest.read_text())
     first = record["stages"]["06_deform_r0_00"]["samples"]

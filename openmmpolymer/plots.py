@@ -11,27 +11,17 @@ render, and is garbage-collected with the variable holding it.
 So these return a figure and write nothing. Saving it, showing it or embedding
 it is the caller's business - ``figure.savefig("density.png")`` - and the code
 in this package that writes files stays the code that runs simulations and the
-driver that reports on them.
-For the same reason no function takes an ``ax`` to draw into: each one owns a
-multi-panel layout, and passing axes in would break that while inviting
-``pyplot`` back.
+driver that reports on them. For the same reason no function takes an ``ax``
+to draw into: each one owns a multi-panel layout, and passing axes in would
+break that while inviting ``pyplot`` back.
 
-Where a result carries a caveat, the caveat is drawn. A quench curve is titled
-with its cooling rate, because the transition temperature read off it is not
-comparable with an experiment cooled ten orders of magnitude slower. A
-structure factor shades the region below ``2 pi / L``, where the cell cannot
-hold a wave. A mean-squared displacement gets a slope-one guide line, so a
-sub-diffusive curve looks sub-diffusive. A rate extrapolation shades the
-decades it reached across, because that is the whole story of the figure. And
-a stress-strain curve is titled with its strain rate, for the same reason a
-quench curve is titled with its cooling rate: the number read off it is not
-the one an experiment measures. A relaxation modulus gets two of these at
-once: the level its own baseline scatter could not see past is shaded, and
-the readings behind each point are drawn underneath, because the early part
-of that curve rests on one reading a bin and looks far more certain than it
-is. A persistence length shades the separations past the end of the chain,
-because a fit that had to reach past the molecule to find 1/e is an
-extrapolation whatever number it came back with.
+Where a result carries a caveat, the caveat is drawn. The rate a number was
+measured at goes in the title, because a transition or a modulus read off a
+simulation is not comparable with an experiment run orders of magnitude
+slower. What the data cannot reach - below a structure factor's resolution
+floor, past the end of a chain or a run, across the decades an extrapolation
+spans, under a relaxation's own noise floor - is shaded. And a fit the
+analysis did not resolve says so in its label.
 """
 
 from __future__ import annotations
@@ -41,7 +31,9 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import numpy.typing as npt
 
+from ._fitting import TINY
 from .conformation import (
     DECORRELATION_THRESHOLD,
     ConformationSeries,
@@ -61,10 +53,10 @@ from .timeseries import (
 )
 
 if TYPE_CHECKING:
-    import numpy.typing as npt
-
-    from .strain_rate import StrainRateExtrapolation
+    from .convergence import RelaxationWindowConvergence, WindowConvergence
+    from .rate_dependence import RateExtrapolation
     from .strength import BreakingStrength, ElongationAtBreak, YieldStrength
+    from .structural_convergence import StructuralWindowConvergence
 
 #: Figure size in inches. Wide enough for a four-panel column to stay legible
 #: at a report's width.
@@ -74,11 +66,19 @@ FIGURE_SIZE_IN = (7.0, 4.5)
 #: a vector-free 300.
 FIGURE_DPI = 150
 
-#: Colour for the thing being measured, and for the reference lines drawn
-#: behind it. Named rather than repeated so a figure stays one figure.
+#: Colour for the thing being measured, for what the analysis drew on top of
+#: it, for the reference lines behind it, and for a second, independent
+#: estimate beside the first. Named rather than repeated so a figure stays
+#: one figure.
 _DATA_COLOUR = "#1f4e79"
 _GUIDE_COLOUR = "#b03a2e"
 _REFERENCE_COLOUR = "#7f8c8d"
+_ALTERNATIVE_COLOUR = "#6c3483"
+
+
+# --------------------------------------------------------------------------
+# Thermal: the state data and the quench
+# --------------------------------------------------------------------------
 
 
 def plot_state_data(data: StateData, *, settled: Equilibration | None = None) -> Any:
@@ -102,20 +102,13 @@ def plot_state_data(data: StateData, *, settled: Equilibration | None = None) ->
     )
     figure, axes = _figure(len(panels), 1, height_per_row=1.3)
     for axis, (label, values) in zip(axes, panels, strict=True):
-        axis.plot(data.time_ps, values, color=_DATA_COLOUR, linewidth=0.9)
+        _measured(axis, data.time_ps, values, markersize=None)
         axis.set_ylabel(label, fontsize=8)
         if settled is not None:
-            axis.axvline(
-                settled.start_ps, color=_GUIDE_COLOUR, linewidth=0.9, linestyle="--"
-            )
-            axis.axhline(
-                float(settled.window(values).mean()),
-                color=_REFERENCE_COLOUR,
-                linewidth=0.8,
-                linestyle=":",
-            )
+            _settling(axis, settled)
+            _level(axis, float(settled.window(values).mean()), linestyle=":")
     axes[-1].set_xlabel("Time (ps)")
-    axes[0].set_title(_state_title(data, settled), fontsize=9)
+    _title(axes[0], _state_title(data, settled))
     return figure
 
 
@@ -133,17 +126,8 @@ def plot_quench_curve(
     Returns:
         A ``matplotlib.figure.Figure``.
     """
-    figure, axes = _figure(1, 1)
-    axis = axes[0]
-    axis.plot(
-        curve.temperature_k,
-        curve.specific_volume_cm3_g,
-        marker="o",
-        markersize=3.5,
-        linewidth=0.9,
-        color=_DATA_COLOUR,
-        label="measured",
-    )
+    figure, axis = _panel()
+    _measured(axis, curve.temperature_k, curve.specific_volume_cm3_g, label="measured")
     if transition is not None:
         span = np.asarray(
             [curve.temperature_k.min(), curve.temperature_k.max()], dtype=np.float64
@@ -153,14 +137,7 @@ def plot_quench_curve(
             (transition.melt_expansion_per_k, "melt"),
         ):
             offset = _branch_offset(transition, slope)
-            axis.plot(
-                span,
-                offset + slope * span,
-                linewidth=0.8,
-                linestyle="--",
-                color=_REFERENCE_COLOUR,
-                label=f"{name} fit",
-            )
+            _guide(axis, span, offset + slope * span, label=f"{name} fit")
         axis.axvline(
             transition.temperature_k,
             color=_GUIDE_COLOUR,
@@ -173,8 +150,8 @@ def plot_quench_curve(
         )
     axis.set_xlabel("Temperature (K)")
     axis.set_ylabel("Specific volume (cm3/g)")
-    axis.set_title(_quench_title(curve, transition), fontsize=9)
-    axis.legend(fontsize=7, frameon=False)
+    _title(axis, _quench_title(curve, transition))
+    _legend(axis)
     return figure
 
 
@@ -193,327 +170,42 @@ def plot_cooling_rate(extrapolation: CoolingRateExtrapolation) -> Any:
     Returns:
         A ``matplotlib.figure.Figure``.
     """
-    figure, axes = _figure(1, 1)
-    axis = axes[0]
+    figure, axis = _panel()
     rates = extrapolation.cooling_rate_k_per_ns
     target = extrapolation.target_rate_k_per_ns
     lowest = min(float(rates.min()), target)
 
-    axis.axvspan(lowest, float(rates.min()), color=_GUIDE_COLOUR, alpha=0.15)
+    _span(axis, lowest, float(rates.min()), _GUIDE_COLOUR, alpha=0.15)
     span = np.geomspace(lowest, float(rates.max()), 200)
-    axis.plot(
+    _guide(
+        axis,
         span,
-        _predicted(extrapolation, span),
+        extrapolation.predict(span),
         linewidth=0.9,
-        linestyle="--",
-        color=_REFERENCE_COLOUR,
         label=f"{extrapolation.form} fit",
     )
-    axis.plot(
+    _measured(
+        axis,
         rates,
         extrapolation.transition_k,
-        marker="o",
         markersize=4.0,
         linestyle="none",
-        color=_DATA_COLOUR,
         label="measured",
     )
-    axis.plot(
-        [target],
-        [extrapolation.temperature_k],
-        marker="*",
-        markersize=9.0,
-        linestyle="none",
-        color=_GUIDE_COLOUR,
+    _point(
+        axis,
+        target,
+        extrapolation.temperature_k,
+        "*",
+        9.0,
         label=f"{extrapolation.temperature_k:.0f} K at {target:.3g} K/ns",
     )
     axis.set_xscale("log")
     axis.set_xlabel("Cooling rate (K/ns)")
     axis.set_ylabel("Transition temperature (K)")
-    axis.set_title(_cooling_rate_title(extrapolation), fontsize=9)
-    axis.legend(fontsize=7, frameon=False)
+    _title(axis, _cooling_rate_title(extrapolation))
+    _legend(axis)
     return figure
-
-
-def _predicted(extrapolation: CoolingRateExtrapolation, rate_k_per_ns: Any) -> Any:
-    """The fitted relation evaluated over a range of rates."""
-    parameters = extrapolation.parameters
-    if extrapolation.form == "log_linear":
-        return parameters["a_k"] + parameters["b_k_per_decade"] * np.log10(
-            rate_k_per_ns
-        )
-    return parameters["t0_k"] + parameters["b_k"] / (
-        parameters["ln_r0"] - np.log(rate_k_per_ns)
-    )
-
-
-def plot_strain_rate(extrapolation: StrainRateExtrapolation) -> Any:
-    """Plot measured Young's moduli and a finite-rate empirical estimate.
-
-    Error bars show one standard error. The unsampled interval between the
-    measurements and target is shaded, including when the target lies above
-    the sampled rates. The title retains the temperature, elastic fit window
-    and resolution verdict so that a long extrapolation stays visible.
-
-    Args:
-        extrapolation: A fit from
-            :func:`~openmmpolymer.strain_rate.strain_rate_extrapolation`.
-
-    Returns:
-        A ``matplotlib.figure.Figure``.
-    """
-    figure, axes = _figure(1, 1)
-    axis = axes[0]
-    rates = extrapolation.strain_rate_per_ns
-    target = extrapolation.target_rate_per_ns
-    minimum = float(rates.min())
-    maximum = float(rates.max())
-    if target < minimum or target > maximum:
-        boundary = minimum if target < minimum else maximum
-        axis.axvspan(
-            min(target, boundary),
-            max(target, boundary),
-            color=_GUIDE_COLOUR,
-            alpha=0.15,
-            label="extrapolated interval",
-        )
-    span = np.geomspace(min(target, minimum), max(target, maximum), 200)
-    predicted = extrapolation.predict(span)
-    axis.plot(
-        span,
-        np.where(np.isfinite(predicted), predicted, np.nan),
-        linewidth=0.9,
-        linestyle="--",
-        color=_REFERENCE_COLOUR,
-        label=f"{extrapolation.form} fit",
-    )
-    axis.errorbar(
-        rates,
-        extrapolation.moduli_mpa,
-        yerr=extrapolation.standard_errors_mpa,
-        marker="o",
-        markersize=4.0,
-        linestyle="none",
-        elinewidth=0.9,
-        capsize=2,
-        color=_DATA_COLOUR,
-        label="measured (1 SE)",
-    )
-    if math.isfinite(extrapolation.modulus_mpa):
-        target_error = extrapolation.standard_error_mpa
-        has_error = math.isfinite(target_error)
-        error_label = "1 SE" if has_error else "SE unavailable"
-        axis.errorbar(
-            [target],
-            [extrapolation.modulus_mpa],
-            yerr=[target_error] if has_error else None,
-            marker="*",
-            markersize=9.0,
-            linestyle="none",
-            elinewidth=0.9,
-            capsize=2,
-            color=_GUIDE_COLOUR,
-            label=(
-                f"target = {extrapolation.modulus_mpa:.1f} MPa "
-                f"at {target:.3g} strain/ns ({error_label})"
-            ),
-        )
-    else:
-        axis.axvline(
-            target,
-            color=_GUIDE_COLOUR,
-            linewidth=0.9,
-            label=f"target estimate not finite at {target:.3g} strain/ns",
-        )
-    axis.set_xscale("log")
-    axis.set_xlabel("Strain rate (strain/ns)")
-    axis.set_ylabel("Young's modulus (MPa)")
-    verdict = "resolved" if extrapolation.resolved else "not resolved"
-    axis.set_title(
-        f"{extrapolation.temperature_k:.0f} K, "
-        f"elastic strain <= {extrapolation.strain_limit:g}\n"
-        f"{extrapolation.form}: {extrapolation.extrapolation_decades:.1f} "
-        f"decades extrapolated, {verdict}",
-        fontsize=9,
-    )
-    axis.legend(fontsize=7, frameon=False)
-    return figure
-
-
-def plot_conformation(series: ConformationSeries) -> Any:
-    """Plot chain dimensions against time.
-
-    Args:
-        series: A series from
-            :func:`~openmmpolymer.conformation.chain_conformation`.
-
-    Returns:
-        A ``matplotlib.figure.Figure``.
-    """
-    figure, axes = _figure(2, 1, height_per_row=1.8)
-    axes[0].plot(
-        series.time_ps,
-        series.mean_squared_end_to_end_nm2,
-        color=_DATA_COLOUR,
-        linewidth=0.9,
-        label="measured",
-    )
-    expected = _expected_square(series)
-    if expected is not None:
-        axes[0].axhline(
-            expected,
-            color=_REFERENCE_COLOUR,
-            linewidth=0.8,
-            linestyle="--",
-            label="expected from C-infinity",
-        )
-    axes[0].set_ylabel("<R^2> (nm2)", fontsize=8)
-    axes[0].legend(fontsize=7, frameon=False)
-
-    axes[1].plot(
-        series.time_ps,
-        series.mean_radius_of_gyration_nm,
-        color=_DATA_COLOUR,
-        linewidth=0.9,
-    )
-    axes[1].set_ylabel("Rg (nm)", fontsize=8)
-    axes[1].set_xlabel("Time (ps)")
-    if series.settled is not None:
-        for axis in axes:
-            axis.axvline(
-                series.settled.start_ps,
-                color=_GUIDE_COLOUR,
-                linewidth=0.9,
-                linestyle="--",
-            )
-    axes[0].set_title(_conformation_title(series), fontsize=9)
-    return figure
-
-
-def plot_correlations(
-    distribution: RadialDistribution, *, structure: StructureFactor | None = None
-) -> Any:
-    """Plot the pair distribution, and the structure factor beside it.
-
-    Args:
-        distribution: A distribution from
-            :func:`~openmmpolymer.correlations.radial_distribution`.
-        structure: A structure factor from
-            :func:`~openmmpolymer.correlations.structure_factor`, drawn on a
-            second panel when given.
-
-    Returns:
-        A ``matplotlib.figure.Figure``.
-    """
-    figure, axes = _figure(1, 1 if structure is None else 2)
-    axis = axes[0]
-    axis.plot(distribution.r_nm, distribution.g_r, color=_DATA_COLOUR, linewidth=1.0)
-    axis.axhline(1.0, color=_REFERENCE_COLOUR, linewidth=0.8, linestyle="--")
-    axis.set_xlabel("r (nm)")
-    axis.set_ylabel("g(r), intermolecular")
-    axis.set_title(
-        f"{distribution.n_pairs:,} pairs over {distribution.n_frames} frame(s)",
-        fontsize=9,
-    )
-
-    if structure is not None:
-        second = axes[1]
-        second.plot(
-            structure.q_per_nm, structure.s_q, color=_DATA_COLOUR, linewidth=1.0
-        )
-        second.axvspan(0.0, structure.q_min_per_nm, color=_GUIDE_COLOUR, alpha=0.15)
-        second.set_xlabel("q (1/nm)")
-        second.set_ylabel("S(q)")
-        second.set_title(
-            f"below {structure.q_min_per_nm:.1f} /nm the cell cannot resolve",
-            fontsize=9,
-        )
-    return figure
-
-
-def plot_dynamics(
-    msd: MeanSquaredDisplacement, *, relaxation: EndToEndRelaxation | None = None
-) -> Any:
-    """Plot the mean-squared displacement, and the end-to-end decay beside it.
-
-    Args:
-        msd: A displacement curve from
-            :func:`~openmmpolymer.conformation.centre_of_mass_msd`.
-        relaxation: A correlation function from
-            :func:`~openmmpolymer.conformation.end_to_end_relaxation`, drawn
-            on a second panel when given.
-
-    Returns:
-        A ``matplotlib.figure.Figure``.
-    """
-    figure, axes = _figure(1, 1 if relaxation is None else 2)
-    axis = axes[0]
-    usable = (msd.lag_ps > 0.0) & (msd.msd_nm2 > 0.0)
-    axis.plot(
-        msd.lag_ps[usable],
-        msd.msd_nm2[usable],
-        color=_DATA_COLOUR,
-        linewidth=1.0,
-        label=f"measured (slope {msd.log_slope:.2f})",
-    )
-    if usable.any():
-        lags = msd.lag_ps[usable]
-        reference = msd.msd_nm2[usable][-1] * (lags / lags[-1])
-        axis.plot(
-            lags,
-            reference,
-            color=_GUIDE_COLOUR,
-            linewidth=0.8,
-            linestyle="--",
-            label="slope 1 (diffusive)",
-        )
-        axis.set_xscale("log")
-        axis.set_yscale("log")
-    axis.set_xlabel("Lag (ps)")
-    axis.set_ylabel("Centre-of-mass MSD (nm2)")
-    axis.set_title(_msd_title(msd), fontsize=9)
-    axis.legend(fontsize=7, frameon=False)
-
-    if relaxation is not None:
-        second = axes[1]
-        second.plot(
-            relaxation.lag_ps,
-            relaxation.correlation,
-            color=_DATA_COLOUR,
-            linewidth=1.0,
-        )
-        second.axhline(
-            DECORRELATION_THRESHOLD,
-            color=_GUIDE_COLOUR,
-            linewidth=0.8,
-            linestyle="--",
-        )
-        second.set_xlabel("Lag (ps)")
-        second.set_ylabel("End-to-end correlation")
-        second.set_title(_relaxation_title(relaxation), fontsize=9)
-    return figure
-
-
-def _figure(
-    n_rows: int, n_columns: int, *, height_per_row: float | None = None
-) -> tuple[Any, list[Any]]:
-    """Build a figure and return it with its axes flattened.
-
-    Constructed rather than obtained from ``pyplot``, so no backend is chosen
-    and no global figure registry is touched.
-    """
-    from matplotlib.figure import Figure
-
-    height = (
-        FIGURE_SIZE_IN[1]
-        if height_per_row is None
-        else max(FIGURE_SIZE_IN[1], height_per_row * n_rows)
-    )
-    figure = Figure(
-        figsize=(FIGURE_SIZE_IN[0], height), dpi=FIGURE_DPI, layout="constrained"
-    )
-    grid = figure.subplots(n_rows, n_columns, squeeze=False)
-    return figure, [axis for row in grid for axis in row]
 
 
 def _state_title(data: StateData, settled: Equilibration | None) -> str:
@@ -562,6 +254,202 @@ def _cooling_rate_title(extrapolation: CoolingRateExtrapolation) -> str:
     )
 
 
+def _branch_offset(transition: GlassTransition, slope: float) -> float:
+    """The intercept of a fitted branch, from its slope and the crossing.
+
+    Both branches pass through the transition by construction, so the volume
+    there plus a slope fixes each line.
+    """
+    return transition.specific_volume_cm3_g - slope * transition.temperature_k
+
+
+# --------------------------------------------------------------------------
+# Structure and dynamics
+# --------------------------------------------------------------------------
+
+
+def plot_conformation(series: ConformationSeries) -> Any:
+    """Plot chain dimensions against time.
+
+    Args:
+        series: A series from
+            :func:`~openmmpolymer.conformation.chain_conformation`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axes = _figure(2, 1, height_per_row=1.8)
+    _measured(
+        axes[0],
+        series.time_ps,
+        series.mean_squared_end_to_end_nm2,
+        markersize=None,
+        label="measured",
+    )
+    expected = _expected_square(series)
+    if expected is not None:
+        _level(axes[0], expected, label="expected from C-infinity")
+    axes[0].set_ylabel("<R^2> (nm2)", fontsize=8)
+    _legend(axes[0])
+
+    _measured(
+        axes[1], series.time_ps, series.mean_radius_of_gyration_nm, markersize=None
+    )
+    axes[1].set_ylabel("Rg (nm)", fontsize=8)
+    axes[1].set_xlabel("Time (ps)")
+    if series.settled is not None:
+        for axis in axes:
+            _settling(axis, series.settled)
+    _title(axes[0], _conformation_title(series))
+    return figure
+
+
+def plot_correlations(
+    distribution: RadialDistribution, *, structure: StructureFactor | None = None
+) -> Any:
+    """Plot the pair distribution, and the structure factor beside it.
+
+    Args:
+        distribution: A distribution from
+            :func:`~openmmpolymer.correlations.radial_distribution`.
+        structure: A structure factor from
+            :func:`~openmmpolymer.correlations.structure_factor`, drawn on a
+            second panel when given.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axes = _figure(1, 1 if structure is None else 2)
+    axis = axes[0]
+    _measured(axis, distribution.r_nm, distribution.g_r, markersize=None, linewidth=1.0)
+    _level(axis, 1.0)
+    axis.set_xlabel("r (nm)")
+    axis.set_ylabel("g(r), intermolecular")
+    _title(
+        axis, f"{distribution.n_pairs:,} pairs over {distribution.n_frames} frame(s)"
+    )
+
+    if structure is not None:
+        second = axes[1]
+        _measured(
+            second, structure.q_per_nm, structure.s_q, markersize=None, linewidth=1.0
+        )
+        _span(second, 0.0, structure.q_min_per_nm, _GUIDE_COLOUR, alpha=0.15)
+        second.set_xlabel("q (1/nm)")
+        second.set_ylabel("S(q)")
+        _title(
+            second, f"below {structure.q_min_per_nm:.1f} /nm the cell cannot resolve"
+        )
+    return figure
+
+
+def plot_dynamics(
+    msd: MeanSquaredDisplacement, *, relaxation: EndToEndRelaxation | None = None
+) -> Any:
+    """Plot the mean-squared displacement, and the end-to-end decay beside it.
+
+    A slope-one guide is drawn through the displacement, so a sub-diffusive
+    curve looks sub-diffusive.
+
+    Args:
+        msd: A displacement curve from
+            :func:`~openmmpolymer.conformation.centre_of_mass_msd`.
+        relaxation: A correlation function from
+            :func:`~openmmpolymer.conformation.end_to_end_relaxation`, drawn
+            on a second panel when given.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axes = _figure(1, 1 if relaxation is None else 2)
+    axis = axes[0]
+    usable = (msd.lag_ps > 0.0) & (msd.msd_nm2 > 0.0)
+    _measured(
+        axis,
+        msd.lag_ps[usable],
+        msd.msd_nm2[usable],
+        markersize=None,
+        linewidth=1.0,
+        label=f"measured (slope {msd.log_slope:.2f})",
+    )
+    if usable.any():
+        lags = msd.lag_ps[usable]
+        reference = msd.msd_nm2[usable][-1] * (lags / lags[-1])
+        _guide(axis, lags, reference, colour=_GUIDE_COLOUR, label="slope 1 (diffusive)")
+        axis.set_xscale("log")
+        axis.set_yscale("log")
+    axis.set_xlabel("Lag (ps)")
+    axis.set_ylabel("Centre-of-mass MSD (nm2)")
+    _title(axis, _msd_title(msd))
+    _legend(axis)
+
+    if relaxation is not None:
+        second = axes[1]
+        _measured(
+            second,
+            relaxation.lag_ps,
+            relaxation.correlation,
+            markersize=None,
+            linewidth=1.0,
+        )
+        _level(second, DECORRELATION_THRESHOLD, _GUIDE_COLOUR)
+        second.set_xlabel("Lag (ps)")
+        second.set_ylabel("End-to-end correlation")
+        _title(second, _relaxation_title(relaxation))
+    return figure
+
+
+def plot_persistence(length: PersistenceLength) -> Any:
+    """Plot the bond-direction correlation along the backbone, and its decay.
+
+    The 1/e line is where the persistence length is read off, so it is drawn.
+    A curve that never gets down to it within the chain has been fitted and
+    then extrapolated past the end of the molecule, and that region is shaded:
+    a persistence length longer than the chain it was measured on should look
+    like one.
+
+    Args:
+        length: A measurement from
+            :func:`~openmmpolymer.conformation.persistence_length`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axis = _panel()
+    separation = length.separation
+    last = float(separation[-1]) if separation.size else float(length.n_bonds)
+    fitted = (
+        math.isfinite(length.persistence_length_nm)
+        and length.persistence_length_nm > 0.0
+        and length.bond_length_nm > 0.0
+    )
+    x_max = last
+    if not length.decayed:
+        x_max = 1.5 * last
+        if fitted:
+            reach = 1.2 * length.persistence_length_nm / length.bond_length_nm
+            x_max = max(x_max, min(reach, 10.0 * last))
+
+    _measured(axis, separation, length.correlation, markersize=3.0, label="measured")
+    _level(axis, DECORRELATION_THRESHOLD, _GUIDE_COLOUR, label="1/e")
+    if fitted:
+        span = np.linspace(0.0, x_max, 200)
+        _guide(
+            axis,
+            span,
+            np.exp(-span * length.bond_length_nm / length.persistence_length_nm),
+            label=f"exp(-s l_b / l_p), l_p = {length.persistence_length_nm:.2f} nm",
+        )
+    if not length.decayed:
+        _span(axis, last, x_max, _REFERENCE_COLOUR, label="past the end of the chain")
+        axis.set_xlim(0.0, x_max)
+    axis.set_xlabel("Separation (bonds)")
+    axis.set_ylabel("<cos theta(s)>")
+    _title(axis, _persistence_title(length))
+    _legend(axis)
+    return figure
+
+
 def _conformation_title(series: ConformationSeries) -> str:
     """A title naming what was averaged and whether it had stopped moving."""
     scope = f"{series.n_chains} chains over {series.n_frames} frame(s)"
@@ -585,13 +473,23 @@ def _relaxation_title(relaxation: EndToEndRelaxation) -> str:
     return f"relaxes in {relaxation.relaxation_time_ps:.0f} ps"
 
 
-def _branch_offset(transition: GlassTransition, slope: float) -> float:
-    """The intercept of a fitted branch, from its slope and the crossing.
-
-    Both branches pass through the transition by construction, so the volume
-    there plus a slope fixes each line.
-    """
-    return transition.specific_volume_cm3_g - slope * transition.temperature_k
+def _persistence_title(length: PersistenceLength) -> str:
+    """A title that says whether the length was measured or extrapolated."""
+    contour = f"{length.contour_length_nm:.2f} nm contour"
+    fitted = length.persistence_length_nm
+    if math.isinf(fitted):
+        return f"no decay along a {contour} ({length.n_bonds} bonds): rod-like"
+    if not fitted > 0.0:
+        return f"no persistence length could be fitted over a {contour}"
+    if not length.decayed:
+        return (
+            f"l_p = {fitted:.2f} nm, extrapolated: not decayed to 1/e within "
+            f"the {contour}"
+        )
+    return (
+        f"l_p = {fitted:.2f} nm from {length.n_bonds} bonds of "
+        f"{length.bond_length_nm:.3f} nm ({contour})"
+    )
 
 
 def _expected_square(series: ConformationSeries) -> float | None:
@@ -602,10 +500,15 @@ def _expected_square(series: ConformationSeries) -> float | None:
     two scales the measured mean square.
     """
     measured = series.mean.characteristic_ratio
-    if abs(measured) < 1.0e-30:
+    if abs(measured) < TINY:
         return None
     scale = series.mean.expected_characteristic_ratio / measured
     return series.mean.mean_squared_end_to_end_nm2 * scale
+
+
+# --------------------------------------------------------------------------
+# Mechanical: stress and strain, the moduli, and strength
+# --------------------------------------------------------------------------
 
 
 def plot_stress_strain(
@@ -632,339 +535,38 @@ def plot_stress_strain(
     Returns:
         A ``matplotlib.figure.Figure``.
     """
-    figure, axes = _figure(2, 1, height_per_row=2.6)
-    stress, lateral = axes
+    figure, (stress, lateral) = _figure(2, 1, height_per_row=2.6)
+    span = np.asarray([0.0, float(curve.strain.max())], dtype=np.float64)
 
-    stress.plot(
-        curve.strain,
-        curve.tensile_stress_mpa,
-        marker="o",
-        markersize=3.5,
-        linewidth=0.9,
-        color=_DATA_COLOUR,
-        label="measured",
-    )
+    _measured(stress, curve.strain, curve.tensile_stress_mpa, label="measured")
     if fit is not None and np.isfinite(fit.modulus_mpa):
-        span = np.asarray([0.0, float(curve.strain.max())], dtype=np.float64)
-        stress.plot(
+        _guide(
+            stress,
             span,
             fit.intercept_mpa + fit.modulus_mpa * span,
-            linewidth=0.8,
-            linestyle="--",
-            color=_GUIDE_COLOUR,
-            label=(
-                f"E = {fit.modulus_mpa:.0f} MPa"
-                f"{'' if fit.resolved else ' (unresolved)'}"
-            ),
+            colour=_GUIDE_COLOUR,
+            label=f"E = {fit.modulus_mpa:.0f} MPa{_unresolved(fit.resolved)}",
         )
-        stress.axvspan(0.0, fit.strain_limit, color=_REFERENCE_COLOUR, alpha=0.12, lw=0)
-    stress.axhline(0.0, color=_REFERENCE_COLOUR, linewidth=0.6)
+        _span(stress, 0.0, fit.strain_limit, _REFERENCE_COLOUR)
+    _zero_line(stress)
     stress.set_ylabel("Tensile stress (MPa)")
-    stress.set_title(_stress_title(curve, fit), fontsize=9)
-    stress.legend(fontsize=7, frameon=False)
+    _title(stress, _stress_title(curve, fit))
+    _legend(stress)
 
-    lateral.plot(
-        curve.strain,
-        curve.transverse_strain,
-        marker="o",
-        markersize=3.5,
-        linewidth=0.9,
-        color=_DATA_COLOUR,
-        label="measured",
-    )
+    _measured(lateral, curve.strain, curve.transverse_strain, label="measured")
     if poisson is not None and np.isfinite(poisson.ratio):
-        span = np.asarray([0.0, float(curve.strain.max())], dtype=np.float64)
-        lateral.plot(
+        _guide(
+            lateral,
             span,
             -poisson.ratio * span,
-            linewidth=0.8,
-            linestyle="--",
-            color=_GUIDE_COLOUR,
-            label=(
-                f"nu = {poisson.ratio:.3f}{'' if poisson.resolved else ' (unresolved)'}"
-            ),
+            colour=_GUIDE_COLOUR,
+            label=f"nu = {poisson.ratio:.3f}{_unresolved(poisson.resolved)}",
         )
-    lateral.axhline(0.0, color=_REFERENCE_COLOUR, linewidth=0.6)
-    lateral.set_xlabel(f"Engineering strain along {'xyz'[curve.axis]}")
+    _zero_line(lateral)
+    lateral.set_xlabel(_strain_axis(curve))
     lateral.set_ylabel("Mean transverse strain")
-    lateral.legend(fontsize=7, frameon=False)
+    _legend(lateral)
     return figure
-
-
-def plot_breaking_strength(curve: StressStrain, result: BreakingStrength) -> Any:
-    """Plot the nominal tensile response, its peak and a resolved stress drop.
-
-    The nominal stress includes the measured change in lateral area. A
-    sampled maximum is always labelled as a sampled maximum; it is reported
-    as an apparent tensile strength only when the analysis resolved the
-    subsequent sustained loss of stress. The shaded failure bracket shows
-    the sampling interval, rather than suggesting a precise rupture strain.
-
-    Args:
-        curve: The stress-strain curve analysed for strength.
-        result: Its result from :func:`~openmmpolymer.strength.breaking_strength`.
-
-    Returns:
-        A ``matplotlib.figure.Figure``.
-    """
-    figure, axis = _nominal_stress_figure(curve.strain, result.nominal_stress_mpa)
-    axis.plot(
-        [result.strain_at_peak],
-        [result.peak_stress_mpa],
-        marker="*",
-        markersize=10,
-        linestyle="none",
-        color=_GUIDE_COLOUR,
-        label=f"sampled peak = {result.peak_stress_mpa:.1f} MPa",
-    )
-    if result.resolved:
-        if result.failure_bracket is not None:
-            axis.axvspan(
-                *result.failure_bracket,
-                color=_GUIDE_COLOUR,
-                alpha=0.12,
-                linewidth=0,
-                label="failure strain bracket",
-            )
-        if result.failure_strain is not None and result.failure_stress_mpa is not None:
-            axis.plot(
-                [result.failure_strain],
-                [result.failure_stress_mpa],
-                marker="D",
-                markersize=5,
-                linestyle="none",
-                color=_GUIDE_COLOUR,
-                label="sustained stress drop",
-            )
-    axis.axhline(0.0, color=_REFERENCE_COLOUR, linewidth=0.6)
-    axis.set_xlabel(f"Engineering strain along {'xyz'[curve.axis]}")
-    axis.set_ylabel("Nominal tensile stress (MPa)")
-    verdict = (
-        f"Apparent tensile strength = {result.strength_mpa:.1f} MPa"
-        if result.resolved and result.strength_mpa is not None
-        else "Apparent tensile strength not resolved"
-    )
-    axis.set_title(_strength_title(curve, result, verdict), fontsize=9)
-    axis.legend(fontsize=7, frameon=False)
-    return figure
-
-
-def plot_elongation_at_break(
-    curve: StressStrain,
-    result: ElongationAtBreak | None = None,
-    *,
-    failure_fraction: float = 0.5,
-    confirmation_steps: int = 3,
-) -> Any:
-    """Plot apparent elongation at break on the nominal tensile response.
-
-    The horizontal axis and the break bracket use percent engineering strain.
-    The marker identifies the first sampled hold in a confirmed terminal loss
-    of stress, rather than the strain at peak stress. Its shaded bracket shows
-    the sampling interval, not a confidence interval or an interpolated crack.
-
-    Args:
-        curve: The tensile curve analysed for elongation at break.
-        result: Its result from
-            :func:`~openmmpolymer.strength.elongation_at_break`. If omitted,
-            analyse the curve with the supplied failure criterion.
-        failure_fraction: Fraction of peak stress defining a drop when
-            ``result`` is omitted.
-        confirmation_steps: Required terminal holds at or below that threshold when
-            ``result`` is omitted.
-
-    Returns:
-        A ``matplotlib.figure.Figure``.
-    """
-    if result is None:
-        from .strength import elongation_at_break
-
-        result = elongation_at_break(
-            curve,
-            failure_fraction=failure_fraction,
-            confirmation_steps=confirmation_steps,
-        )
-    figure, axis = _nominal_stress_figure(
-        100.0 * curve.strain, result.nominal_stress_mpa
-    )
-    axis.plot(
-        [100.0 * result.strain_at_peak],
-        [result.peak_stress_mpa],
-        marker="*",
-        markersize=10,
-        linestyle="none",
-        color=_REFERENCE_COLOUR,
-        label=f"sampled peak = {result.peak_stress_mpa:.1f} MPa",
-    )
-    if result.resolved:
-        if result.break_bracket is not None:
-            axis.axvspan(
-                *(100.0 * strain for strain in result.break_bracket),
-                color=_GUIDE_COLOUR,
-                alpha=0.12,
-                linewidth=0,
-                label="break elongation bracket",
-            )
-        if (
-            result.elongation_percent is not None
-            and result.break_stress_mpa is not None
-        ):
-            axis.plot(
-                [result.elongation_percent],
-                [result.break_stress_mpa],
-                marker="D",
-                markersize=5,
-                linestyle="none",
-                color=_GUIDE_COLOUR,
-                label="onset of sustained stress drop",
-            )
-    axis.axhline(0.0, color=_REFERENCE_COLOUR, linewidth=0.6)
-    axis.set_xlabel(f"Engineering elongation along {'xyz'[curve.axis]} (%)")
-    axis.set_ylabel("Nominal tensile stress (MPa)")
-    verdict = (
-        f"Apparent elongation at break = {result.elongation_percent:.1f}%"
-        if result.resolved and result.elongation_percent is not None
-        else "Apparent elongation at break not resolved"
-    )
-    axis.set_title(_strength_title(curve, result, verdict), fontsize=9)
-    axis.legend(fontsize=7, frameon=False)
-    return figure
-
-
-def plot_yield_strength(curve: StressStrain, result: YieldStrength) -> Any:
-    """Plot an offset yield construction on the nominal tensile response.
-
-    The fit window and the offset line show how the criterion was chosen.
-    A resolved intersection is interpolated between samples; its shaded
-    bracket shows the sampling interval, not a confidence interval. An
-    unresolved result is labelled without drawing a yield-strength marker.
-
-    Args:
-        curve: The stress-strain curve analysed for yield strength.
-        result: Its result from :func:`~openmmpolymer.strength.yield_strength`.
-
-    Returns:
-        A ``matplotlib.figure.Figure``.
-    """
-    figure, axis = _nominal_stress_figure(curve.strain, result.nominal_stress_mpa)
-    fit_span = np.asarray(
-        [result.fit_min_strain, result.fit_max_strain], dtype=np.float64
-    )
-    axis.axvspan(
-        *fit_span,
-        color=_REFERENCE_COLOUR,
-        alpha=0.12,
-        linewidth=0,
-        label="elastic fit window",
-    )
-    offset_label = f"{100.0 * result.offset_strain:g}% offset"
-    if (
-        result.modulus_mpa is not None
-        and result.intercept_mpa is not None
-        and math.isfinite(result.modulus_mpa)
-        and math.isfinite(result.intercept_mpa)
-    ):
-        axis.plot(
-            fit_span,
-            result.modulus_mpa * fit_span + result.intercept_mpa,
-            linewidth=1.0,
-            linestyle="--",
-            color=_REFERENCE_COLOUR,
-            label=(
-                f"elastic fit: E = {result.modulus_mpa:.1f} MPa"
-                f"{'' if result.fit_resolved else ' (unresolved)'}"
-            ),
-        )
-        span = np.asarray(
-            [float(curve.strain.min()), float(curve.strain.max())], dtype=np.float64
-        )
-        axis.plot(
-            span,
-            result.modulus_mpa * (span - result.offset_strain) + result.intercept_mpa,
-            linewidth=1.0,
-            linestyle="--",
-            color=_GUIDE_COLOUR,
-            label=f"{offset_label} line",
-        )
-    if result.resolved:
-        if result.yield_bracket is not None:
-            axis.axvspan(
-                *result.yield_bracket,
-                color=_GUIDE_COLOUR,
-                alpha=0.12,
-                linewidth=0,
-                label="yield strain bracket",
-            )
-        if result.yield_strain is not None and result.strength_mpa is not None:
-            axis.plot(
-                [result.yield_strain],
-                [result.strength_mpa],
-                marker="*",
-                markersize=10,
-                linestyle="none",
-                color=_GUIDE_COLOUR,
-                label="interpolated offset intersection",
-            )
-
-    # Extending the elastic line to the final strain can give stresses far
-    # above the measured response. Keep that extrapolation from setting the
-    # scale and hiding the curve whose intersection is being reported.
-    low = min(0.0, float(result.nominal_stress_mpa.min()))
-    high = max(0.0, float(result.nominal_stress_mpa.max()))
-    margin = max(high - low, 1.0) * 0.05
-    axis.set_ylim(low - margin, high + margin)
-    axis.axhline(0.0, color=_REFERENCE_COLOUR, linewidth=0.6)
-    axis.set_xlabel(f"Engineering strain along {'xyz'[curve.axis]}")
-    axis.set_ylabel("Nominal tensile stress (MPa)")
-    verdict = (
-        f"{offset_label} yield strength = {result.strength_mpa:.1f} MPa"
-        if result.resolved and result.strength_mpa is not None
-        else f"{offset_label} yield strength not resolved"
-    )
-    axis.set_title(_strength_title(curve, result, verdict), fontsize=9)
-    axis.legend(fontsize=7, frameon=False)
-    return figure
-
-
-def _nominal_stress_figure(
-    strain: npt.NDArray[np.float64], stress_mpa: npt.NDArray[np.float64]
-) -> tuple[Any, Any]:
-    """Start a tensile-strength figure with its measured nominal response."""
-    figure, axes = _figure(1, 1)
-    axis = axes[0]
-    axis.plot(
-        strain,
-        stress_mpa,
-        marker="o",
-        markersize=3.5,
-        linewidth=0.9,
-        color=_DATA_COLOUR,
-        label="nominal tensile stress",
-    )
-    return figure, axis
-
-
-def _strength_title(
-    curve: StressStrain,
-    result: BreakingStrength | ElongationAtBreak | YieldStrength,
-    verdict: str,
-) -> str:
-    """Keep the source, loading conditions and verdict with each strength plot."""
-    chunks = curve.stage.split(", ")
-    stage = chunks[0]
-    if len(chunks) > 1:
-        stage += f" (+{len(chunks) - 1} chunks)"
-    return (
-        f"{stage}: {result.temperature_k:.0f} K, "
-        f"{_strain_rate_label(result.strain_rate_per_ns)}\n{verdict}"
-    )
-
-
-def _strain_rate_label(rate_per_ns: float | None) -> str:
-    """Describe the measured rate, including when it was not recorded."""
-    return (
-        "rate not recorded" if rate_per_ns is None else f"{rate_per_ns:.3g} strain/ns"
-    )
 
 
 def plot_moduli(report: Any) -> Any:
@@ -984,8 +586,7 @@ def plot_moduli(report: Any) -> Any:
     Returns:
         A ``matplotlib.figure.Figure``.
     """
-    figure, axes = _figure(1, 1)
-    axis = axes[0]
+    figure, axis = _panel()
 
     labels: list[str] = []
     values: list[float] = []
@@ -1017,43 +618,284 @@ def plot_moduli(report: Any) -> Any:
         linewidth=1.0,
         label="measured",
     )
-    check = getattr(report, "consistency", None)
+    check = report.consistency
     if check is not None:
         for label, implied in (
             ("K", check.bulk_implied_mpa),
             ("G", check.shear_implied_mpa),
         ):
             if label in labels and np.isfinite(implied):
-                axis.plot(
-                    [labels.index(label)],
-                    [implied],
-                    marker="_",
-                    markersize=22,
+                _point(
+                    axis,
+                    labels.index(label),
+                    implied,
+                    "_",
+                    22,
                     markeredgewidth=2.0,
-                    linestyle="none",
-                    color=_GUIDE_COLOUR,
                     label="implied by E and nu"
                     if label == labels[min(len(labels) - 1, 1)]
                     else None,
                 )
     if report.load_modulus is not None and "E" in labels:
-        axis.plot(
-            [labels.index("E")],
-            [report.load_modulus.modulus_mpa],
-            marker="x",
-            markersize=8,
-            linestyle="none",
-            color="#7d3c98",
+        _point(
+            axis,
+            labels.index("E"),
+            report.load_modulus.modulus_mpa,
+            "x",
+            8,
+            colour=_ALTERNATIVE_COLOUR,
             label="constant-stress cross-check",
         )
     axis.set_xticks(positions)
     axis.set_xticklabels(labels)
     axis.set_ylabel("Modulus (MPa)")
-    axis.set_title(_moduli_title(report), fontsize=9)
+    _title(axis, _moduli_title(report))
     handles, names = axis.get_legend_handles_labels()
     if handles:
         axis.legend(handles, names, fontsize=7, frameon=False)
     return figure
+
+
+def plot_breaking_strength(curve: StressStrain, result: BreakingStrength) -> Any:
+    """Plot the nominal tensile response, its peak and a resolved stress drop.
+
+    The nominal stress includes the measured change in lateral area. A
+    sampled maximum is always labelled as a sampled maximum; it is reported
+    as an apparent tensile strength only when the analysis resolved the
+    subsequent sustained loss of stress. The shaded failure bracket shows
+    the sampling interval, rather than suggesting a precise rupture strain.
+
+    Args:
+        curve: The stress-strain curve analysed for strength.
+        result: Its result from :func:`~openmmpolymer.strength.breaking_strength`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    return _failure_figure(
+        curve,
+        result,
+        percent=False,
+        peak_colour=_GUIDE_COLOUR,
+        bracket=result.failure_bracket,
+        bracket_label="failure strain bracket",
+        failure=(result.failure_strain, result.failure_stress_mpa),
+        failure_label="sustained stress drop",
+        verdict=(
+            f"Apparent tensile strength = {result.strength_mpa:.1f} MPa"
+            if result.resolved and result.strength_mpa is not None
+            else "Apparent tensile strength not resolved"
+        ),
+    )
+
+
+def plot_elongation_at_break(curve: StressStrain, result: ElongationAtBreak) -> Any:
+    """Plot apparent elongation at break on the nominal tensile response.
+
+    The horizontal axis and the break bracket use percent engineering strain.
+    The marker identifies the first sampled hold in a confirmed terminal loss
+    of stress, rather than the strain at peak stress, which is drawn as
+    context rather than as the answer. Its shaded bracket shows the sampling
+    interval, not a confidence interval or an interpolated crack.
+
+    Args:
+        curve: The tensile curve analysed for elongation at break.
+        result: Its result from
+            :func:`~openmmpolymer.strength.elongation_at_break`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    return _failure_figure(
+        curve,
+        result,
+        percent=True,
+        peak_colour=_REFERENCE_COLOUR,
+        bracket=result.break_bracket,
+        bracket_label="break elongation bracket",
+        failure=(result.elongation_percent, result.break_stress_mpa),
+        failure_label="onset of sustained stress drop",
+        verdict=(
+            f"Apparent elongation at break = {result.elongation_percent:.1f}%"
+            if result.resolved and result.elongation_percent is not None
+            else "Apparent elongation at break not resolved"
+        ),
+    )
+
+
+def plot_yield_strength(curve: StressStrain, result: YieldStrength) -> Any:
+    """Plot an offset yield construction on the nominal tensile response.
+
+    The fit window and the offset line show how the criterion was chosen.
+    A resolved intersection is interpolated between samples; its shaded
+    bracket shows the sampling interval, not a confidence interval. An
+    unresolved result is labelled without drawing a yield-strength marker.
+
+    Args:
+        curve: The stress-strain curve analysed for yield strength.
+        result: Its result from :func:`~openmmpolymer.strength.yield_strength`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axis = _nominal_stress_figure(curve.strain, result.nominal_stress_mpa)
+    fit_span = np.asarray(
+        [result.fit_min_strain, result.fit_max_strain], dtype=np.float64
+    )
+    _span(
+        axis,
+        result.fit_min_strain,
+        result.fit_max_strain,
+        _REFERENCE_COLOUR,
+        label="elastic fit window",
+    )
+    offset_label = f"{100.0 * result.offset_strain:g}% offset"
+    if (
+        result.modulus_mpa is not None
+        and result.intercept_mpa is not None
+        and math.isfinite(result.modulus_mpa)
+        and math.isfinite(result.intercept_mpa)
+    ):
+        _guide(
+            axis,
+            fit_span,
+            result.modulus_mpa * fit_span + result.intercept_mpa,
+            linewidth=1.0,
+            label=(
+                f"elastic fit: E = {result.modulus_mpa:.1f} MPa"
+                f"{_unresolved(result.fit_resolved)}"
+            ),
+        )
+        span = np.asarray(
+            [float(curve.strain.min()), float(curve.strain.max())], dtype=np.float64
+        )
+        _guide(
+            axis,
+            span,
+            result.modulus_mpa * (span - result.offset_strain) + result.intercept_mpa,
+            colour=_GUIDE_COLOUR,
+            linewidth=1.0,
+            label=f"{offset_label} line",
+        )
+    if result.resolved:
+        if result.yield_bracket is not None:
+            _span(
+                axis, *result.yield_bracket, _GUIDE_COLOUR, label="yield strain bracket"
+            )
+        if result.yield_strain is not None and result.strength_mpa is not None:
+            _point(
+                axis,
+                result.yield_strain,
+                result.strength_mpa,
+                "*",
+                10,
+                label="interpolated offset intersection",
+            )
+
+    # Extending the elastic line to the final strain can give stresses far
+    # above the measured response. Keep that extrapolation from setting the
+    # scale and hiding the curve whose intersection is being reported.
+    low = min(0.0, float(result.nominal_stress_mpa.min()))
+    high = max(0.0, float(result.nominal_stress_mpa.max()))
+    margin = max(high - low, 1.0) * 0.05
+    axis.set_ylim(low - margin, high + margin)
+    _zero_line(axis)
+    axis.set_xlabel(_strain_axis(curve))
+    axis.set_ylabel("Nominal tensile stress (MPa)")
+    verdict = (
+        f"{offset_label} yield strength = {result.strength_mpa:.1f} MPa"
+        if result.resolved and result.strength_mpa is not None
+        else f"{offset_label} yield strength not resolved"
+    )
+    _title(axis, _strength_title(curve, result, verdict))
+    _legend(axis)
+    return figure
+
+
+def _failure_figure(
+    curve: StressStrain,
+    result: BreakingStrength | ElongationAtBreak,
+    *,
+    percent: bool,
+    peak_colour: str,
+    bracket: tuple[float, float] | None,
+    bracket_label: str,
+    failure: tuple[float | None, float | None],
+    failure_label: str,
+    verdict: str,
+) -> Any:
+    """The nominal response, its sampled peak, and a resolved loss of stress.
+
+    What a breaking strength and an elongation at break are both read off:
+    the peak is marked as a sample, and the sustained drop after it only when
+    the analysis resolved one, with the holds either side of it shaded.
+    *failure* is already in the units the axis is drawn in.
+    """
+    scale = 100.0 if percent else 1.0
+    figure, axis = _nominal_stress_figure(
+        scale * curve.strain, result.nominal_stress_mpa
+    )
+    _point(
+        axis,
+        scale * result.strain_at_peak,
+        result.peak_stress_mpa,
+        "*",
+        10,
+        colour=peak_colour,
+        label=f"sampled peak = {result.peak_stress_mpa:.1f} MPa",
+    )
+    if result.resolved:
+        if bracket is not None:
+            _span(
+                axis,
+                scale * bracket[0],
+                scale * bracket[1],
+                _GUIDE_COLOUR,
+                label=bracket_label,
+            )
+        strain, stress = failure
+        if strain is not None and stress is not None:
+            _point(axis, strain, stress, "D", 5, label=failure_label)
+    _zero_line(axis)
+    axis.set_xlabel(
+        _strain_axis(curve, "elongation", " (%)") if percent else _strain_axis(curve)
+    )
+    axis.set_ylabel("Nominal tensile stress (MPa)")
+    _title(axis, _strength_title(curve, result, verdict))
+    _legend(axis)
+    return figure
+
+
+def _nominal_stress_figure(
+    strain: npt.NDArray[np.float64], stress_mpa: npt.NDArray[np.float64]
+) -> tuple[Any, Any]:
+    """Start a tensile-strength figure with its measured nominal response."""
+    figure, axis = _panel()
+    _measured(axis, strain, stress_mpa, label="nominal tensile stress")
+    return figure, axis
+
+
+def _strength_title(
+    curve: StressStrain,
+    result: BreakingStrength | ElongationAtBreak | YieldStrength,
+    verdict: str,
+) -> str:
+    """Keep the source, loading conditions and verdict with each strength plot."""
+    chunks = curve.stage.split(", ")
+    stage = chunks[0]
+    if len(chunks) > 1:
+        stage += f" (+{len(chunks) - 1} chunks)"
+    return (
+        f"{stage}: {result.temperature_k:.0f} K, "
+        f"{_strain_rate_label(result.strain_rate_per_ns)}\n{verdict}"
+    )
+
+
+def _strain_rate_label(rate_per_ns: float | None) -> str:
+    """Describe the measured rate, including when it was not recorded."""
+    return (
+        "rate not recorded" if rate_per_ns is None else f"{rate_per_ns:.3g} strain/ns"
+    )
 
 
 def _stress_title(curve: StressStrain, fit: ElasticModulus | None) -> str:
@@ -1073,7 +915,7 @@ def _stress_title(curve: StressStrain, fit: ElasticModulus | None) -> str:
 
 def _moduli_title(report: Any) -> str:
     """A title saying whether the constants describe one isotropic solid."""
-    check = getattr(report, "consistency", None)
+    check = report.consistency
     if check is None:
         return "Elastic constants"
     gaps = [
@@ -1085,6 +927,11 @@ def _moduli_title(report: Any) -> str:
         return "Elastic constants - nothing to check them against"
     verdict = "consistent" if check.consistent else "not consistent"
     return f"Elastic constants - {verdict} ({', '.join(gaps)} from E and nu)"
+
+
+# --------------------------------------------------------------------------
+# Relaxation
+# --------------------------------------------------------------------------
 
 
 def plot_relaxation(
@@ -1116,8 +963,7 @@ def plot_relaxation(
     Returns:
         A ``matplotlib.figure.Figure``.
     """
-    figure, axes = _figure(2, 1, height_per_row=2.6)
-    decay, counts = axes
+    figure, (decay, counts) = _figure(2, 1, height_per_row=2.6)
 
     for replica in replicas:
         if replica.n_points:
@@ -1128,13 +974,11 @@ def plot_relaxation(
                 color=_REFERENCE_COLOUR,
                 alpha=0.35,
             )
-    decay.plot(
+    _measured(
+        decay,
         curve.time_ps,
         np.abs(curve.modulus_mpa),
-        marker="o",
         markersize=2.5,
-        linewidth=0.9,
-        color=_DATA_COLOUR,
         label=f"measured ({curve.n_replicas} replica(s))",
     )
     if curve.n_points and np.any(np.isfinite(curve.standard_error_mpa)):
@@ -1147,27 +991,28 @@ def plot_relaxation(
             linewidth=0,
         )
     if kww is not None and math.isfinite(kww.tau_ps) and curve.n_points:
-        decay.plot(
+        _guide(
+            decay,
             curve.time_ps,
             kww.modulus_mpa * np.exp(-((curve.time_ps / kww.tau_ps) ** kww.beta)),
+            colour=_GUIDE_COLOUR,
             linewidth=0.9,
-            linestyle="--",
-            color=_GUIDE_COLOUR,
             label=(
                 f"KWW: beta = {kww.beta:.2f}, <tau> = {kww.mean_tau_ps:.3g} ps"
-                f"{'' if kww.resolved else ' (unresolved)'}"
+                f"{_unresolved(kww.resolved)}"
             ),
         )
     if prony is not None and prony.n_terms and curve.n_points:
         fitted = prony.equilibrium_mpa + (
             np.exp(-curve.time_ps[:, None] / prony.tau_ps) @ prony.weights_mpa
         )
-        decay.plot(
+        _guide(
+            decay,
             curve.time_ps,
             fitted,
+            colour=_ALTERNATIVE_COLOUR,
             linewidth=0.9,
             linestyle=":",
-            color="#6c3483",
             label=(
                 f"Prony: {prony.n_active} terms, G_inf = "
                 f"{prony.equilibrium_mpa:.3g} MPa"
@@ -1180,14 +1025,14 @@ def plot_relaxation(
             curve.noise_floor_mpa,
             color=_REFERENCE_COLOUR,
             alpha=0.18,
-            lw=0,
+            linewidth=0,
             label="below the baseline noise",
         )
     decay.set_xscale("log")
     decay.set_yscale("log")
     decay.set_ylabel("|G(t)| (MPa)")
-    decay.set_title(_relaxation_modulus_title(curve), fontsize=9)
-    decay.legend(fontsize=7, frameon=False)
+    _title(decay, _relaxation_modulus_title(curve))
+    _legend(decay)
 
     counts.plot(
         curve.time_ps,
@@ -1196,21 +1041,12 @@ def plot_relaxation(
         linewidth=0.9,
         color=_REFERENCE_COLOUR,
     )
-    counts.axhline(1.0, color=_GUIDE_COLOUR, linewidth=0.6, linestyle="--")
+    _level(counts, 1.0, _GUIDE_COLOUR, linewidth=0.6)
     counts.set_xscale("log")
     counts.set_yscale("log")
     counts.set_xlabel("Time since the step strain (ps)")
     counts.set_ylabel("Readings per bin")
     return figure
-
-
-def _relaxation_modulus_title(curve: RelaxationCurve) -> str:
-    """A title carrying the strain and the temperature the decay belongs to."""
-    return (
-        f"{curve.mode} step of {curve.step_strain:+.3f} at "
-        f"{curve.temperature_k:.0f} K: {curve.n_points} bins over "
-        f"{curve.decades:.1f} decades"
-    )
 
 
 def plot_relaxation_spectrum(prony: PronyFit) -> Any:
@@ -1228,9 +1064,7 @@ def plot_relaxation_spectrum(prony: PronyFit) -> Any:
     Returns:
         A ``matplotlib.figure.Figure``.
     """
-    figure, axes = _figure(1, 1)
-    spectrum = axes[0]
-
+    figure, spectrum = _panel()
     spectrum.stem(
         prony.tau_ps,
         prony.weights_mpa,
@@ -1240,123 +1074,425 @@ def plot_relaxation_spectrum(prony: PronyFit) -> Any:
         label="relaxation weights",
     )
     if math.isfinite(prony.equilibrium_mpa):
-        spectrum.axhline(
+        _level(
+            spectrum,
             prony.equilibrium_mpa,
-            color=_GUIDE_COLOUR,
-            linewidth=0.8,
-            linestyle="--",
+            _GUIDE_COLOUR,
             label=f"G_inf = {prony.equilibrium_mpa:.3g} MPa",
         )
     if prony.n_terms and math.isfinite(prony.window_ps[1]):
-        spectrum.axvspan(
+        _span(
+            spectrum,
             prony.window_ps[1],
             max(prony.window_ps[1] * 1.001, float(prony.tau_ps[-1]) * 10.0),
-            color=_REFERENCE_COLOUR,
-            alpha=0.12,
-            lw=0,
+            _REFERENCE_COLOUR,
             label="past the end of the run",
         )
     spectrum.set_xscale("log")
     spectrum.set_xlabel("Relaxation time (ps)")
     spectrum.set_ylabel("Weight (MPa)")
-    spectrum.set_title(
+    _title(
+        spectrum,
         f"{prony.n_active} of {prony.n_terms} terms carry weight"
-        f"{'' if prony.resolved else ' (unresolved)'}",
-        fontsize=9,
+        f"{_unresolved(prony.resolved)}",
     )
-    spectrum.legend(fontsize=7, frameon=False)
+    _legend(spectrum)
     return figure
 
 
-def plot_persistence(length: PersistenceLength) -> Any:
-    """Plot the bond-direction correlation along the backbone, and its decay.
+def _relaxation_modulus_title(curve: RelaxationCurve) -> str:
+    """A title carrying the strain and the temperature the decay belongs to."""
+    return (
+        f"{curve.mode} step of {curve.step_strain:+.3f} at "
+        f"{curve.temperature_k:.0f} K: {curve.n_points} bins over "
+        f"{curve.decades:.1f} decades"
+    )
 
-    The 1/e line is where the persistence length is read off, so it is drawn.
-    A curve that never gets down to it within the chain has been fitted and
-    then extrapolated past the end of the molecule, and that region is shaded:
-    a persistence length longer than the chain it was measured on should look
-    like one.
+
+# --------------------------------------------------------------------------
+# Rate dependence
+# --------------------------------------------------------------------------
+
+
+def plot_rate_dependence(fit: RateExtrapolation) -> Any:
+    """Plot a property against the rate it was measured at, and the fit's target.
+
+    Each measured rate carries one standard error - the replicas' spread
+    retained as its floor where they were pooled - and so does the target, or
+    its label says none is known. The fit is drawn out to the target, and the
+    stretch between the target and the nearest measured rate is shaded on
+    whichever side it lies: the distance the number was carried is something
+    the eye can see, and the title says how far and whether it resolved.
 
     Args:
-        length: A measurement from
-            :func:`~openmmpolymer.conformation.persistence_length`.
+        fit: Either model of a
+            :func:`~openmmpolymer.rate_dependence.analyse_rate_observations`
+            report.
 
     Returns:
         A ``matplotlib.figure.Figure``.
     """
-    figure, axes = _figure(1, 1)
-    axis = axes[0]
-    separation = length.separation
-    last = float(separation[-1]) if separation.size else float(length.n_bonds)
-    fitted = (
-        math.isfinite(length.persistence_length_nm)
-        and length.persistence_length_nm > 0.0
-        and length.bond_length_nm > 0.0
-    )
-    x_max = last
-    if not length.decayed:
-        x_max = 1.5 * last
-        if fitted:
-            reach = 1.2 * length.persistence_length_nm / length.bond_length_nm
-            x_max = max(x_max, min(reach, 10.0 * last))
-
-    axis.plot(
-        separation,
-        length.correlation,
-        marker="o",
-        markersize=3.0,
+    figure, axis = _panel()
+    prop = fit.property
+    lowest, highest = float(fit.rates.min()), float(fit.rates.max())
+    target = fit.target_rate
+    if not lowest <= target <= highest:
+        boundary = lowest if target < lowest else highest
+        _span(
+            axis,
+            min(target, boundary),
+            max(target, boundary),
+            _GUIDE_COLOUR,
+            alpha=0.15,
+            label="extrapolated interval",
+        )
+    span = np.geomspace(min(target, lowest), max(target, highest), 200)
+    predicted = fit.predict(span)
+    _guide(
+        axis,
+        span,
+        np.where(np.isfinite(predicted), predicted, np.nan),
         linewidth=0.9,
-        color=_DATA_COLOUR,
-        label="measured",
+        label=f"{fit.form} fit",
     )
-    axis.axhline(
-        DECORRELATION_THRESHOLD,
-        color=_GUIDE_COLOUR,
-        linewidth=0.8,
-        linestyle="--",
-        label="1/e",
+    known = np.isfinite(fit.standard_errors)
+    for mask, errors, label in (
+        (known, fit.standard_errors[known], "measured (1 SE; replica spread retained)"),
+        (~known, None, "measured (SE unavailable)"),
+    ):
+        if np.any(mask):
+            _error_bars(
+                axis,
+                fit.rates[mask],
+                fit.values[mask],
+                errors,
+                marker="o",
+                markersize=4.0,
+                label=label,
+            )
+    if math.isfinite(fit.value):
+        has_error = math.isfinite(fit.standard_error)
+        _error_bars(
+            axis,
+            [target],
+            [fit.value],
+            [fit.standard_error] if has_error else None,
+            colour=_GUIDE_COLOUR,
+            marker="*",
+            markersize=9.0,
+            label=(
+                f"target = {fit.value:.4g} {prop.value_unit} at {target:.3g} "
+                f"{prop.rate_unit} ({'1 SE' if has_error else 'SE unavailable'})"
+            ),
+        )
+    else:
+        axis.axvline(
+            target,
+            color=_GUIDE_COLOUR,
+            linewidth=0.9,
+            label=f"target estimate not finite at {target:.3g} {prop.rate_unit}",
+        )
+    axis.set_xscale("log")
+    axis.set_xlabel(f"Rate ({prop.rate_unit})")
+    axis.set_ylabel(
+        f"{prop.label} ({prop.value_unit})" if prop.value_unit else prop.label
     )
-    if fitted:
-        span = np.linspace(0.0, x_max, 200)
-        axis.plot(
-            span,
-            np.exp(-span * length.bond_length_nm / length.persistence_length_nm),
-            linewidth=0.8,
-            linestyle="--",
-            color=_REFERENCE_COLOUR,
-            label=f"exp(-s l_b / l_p), l_p = {length.persistence_length_nm:.2f} nm",
-        )
-    if not length.decayed:
-        axis.axvspan(
-            last,
-            x_max,
-            color=_REFERENCE_COLOUR,
-            alpha=0.12,
-            lw=0,
-            label="past the end of the chain",
-        )
-        axis.set_xlim(0.0, x_max)
-    axis.set_xlabel("Separation (bonds)")
-    axis.set_ylabel("<cos theta(s)>")
-    axis.set_title(_persistence_title(length), fontsize=9)
-    axis.legend(fontsize=7, frameon=False)
+    _title(
+        axis,
+        f"{prop.label}: {fit.form}\n{fit.extrapolation_decades:.1f} decades "
+        f"extrapolated, {'resolved' if fit.resolved else 'not resolved'}",
+    )
+    _legend(axis)
     return figure
 
 
-def _persistence_title(length: PersistenceLength) -> str:
-    """A title that says whether the length was measured or extrapolated."""
-    contour = f"{length.contour_length_nm:.2f} nm contour"
-    fitted = length.persistence_length_nm
-    if math.isinf(fitted):
-        return f"no decay along a {contour} ({length.n_bonds} bonds): rod-like"
-    if not fitted > 0.0:
-        return f"no persistence length could be fitted over a {contour}"
-    if not length.decayed:
-        return (
-            f"l_p = {fitted:.2f} nm, extrapolated: not decayed to 1/e within "
-            f"the {contour}"
-        )
-    return (
-        f"l_p = {fitted:.2f} nm from {length.n_bonds} bonds of "
-        f"{length.bond_length_nm:.3f} nm ({contour})"
+# --------------------------------------------------------------------------
+# The scaffolding every figure is drawn with
+# --------------------------------------------------------------------------
+
+
+def _figure(
+    n_rows: int = 1, n_columns: int = 1, *, height_per_row: float | None = None
+) -> tuple[Any, list[Any]]:
+    """Build a figure and return it with its axes flattened.
+
+    Constructed rather than obtained from ``pyplot``, so no backend is chosen
+    and no global figure registry is touched, and imported only when a figure
+    is wanted, so reading a run never pays for matplotlib.
+    """
+    from matplotlib.figure import Figure
+
+    height = (
+        FIGURE_SIZE_IN[1]
+        if height_per_row is None
+        else max(FIGURE_SIZE_IN[1], height_per_row * n_rows)
     )
+    figure = Figure(
+        figsize=(FIGURE_SIZE_IN[0], height), dpi=FIGURE_DPI, layout="constrained"
+    )
+    grid = figure.subplots(n_rows, n_columns, squeeze=False)
+    return figure, [axis for row in grid for axis in row]
+
+
+def _panel() -> tuple[Any, Any]:
+    """A figure of one panel, and that panel."""
+    figure, axes = _figure()
+    return figure, axes[0]
+
+
+def _title(axis: Any, text: str) -> None:
+    """Title a panel, in the size every panel is titled in."""
+    axis.set_title(text, fontsize=9)
+
+
+def _legend(axis: Any) -> None:
+    """Add a panel's legend, small and unframed."""
+    axis.legend(fontsize=7, frameon=False)
+
+
+def _measured(
+    axis: Any, x: Any, y: Any, *, markersize: float | None = 3.5, **style: Any
+) -> None:
+    """Draw what was measured, with a marker at each point unless told not to."""
+    marker = {} if markersize is None else {"marker": "o", "markersize": markersize}
+    axis.plot(x, y, **{"color": _DATA_COLOUR, "linewidth": 0.9, **marker, **style})
+
+
+def _guide(
+    axis: Any, x: Any, y: Any, *, colour: str = _REFERENCE_COLOUR, **style: Any
+) -> None:
+    """Draw a fitted or reference line through the data, dashed."""
+    axis.plot(x, y, **{"color": colour, "linewidth": 0.8, "linestyle": "--", **style})
+
+
+def _level(
+    axis: Any, value: float, colour: str = _REFERENCE_COLOUR, **style: Any
+) -> None:
+    """Draw a horizontal reference level across the panel, dashed."""
+    axis.axhline(
+        value, **{"color": colour, "linewidth": 0.8, "linestyle": "--", **style}
+    )
+
+
+def _zero_line(axis: Any) -> None:
+    """Draw the zero a stress or a strain is read against."""
+    _level(axis, 0.0, linewidth=0.6, linestyle="-")
+
+
+def _settling(axis: Any, settled: Equilibration) -> None:
+    """Mark where a series settled, which is what it is discarded up to."""
+    axis.axvline(settled.start_ps, color=_GUIDE_COLOUR, linewidth=0.9, linestyle="--")
+
+
+def _point(
+    axis: Any,
+    x: float,
+    y: float,
+    marker: str,
+    markersize: float,
+    *,
+    colour: str = _GUIDE_COLOUR,
+    **style: Any,
+) -> None:
+    """Mark one point the analysis picked out."""
+    axis.plot(
+        [x],
+        [y],
+        **{
+            "marker": marker,
+            "markersize": markersize,
+            "linestyle": "none",
+            "color": colour,
+            **style,
+        },
+    )
+
+
+def _error_bars(
+    axis: Any, x: Any, y: Any, errors: Any, *, colour: str = _DATA_COLOUR, **style: Any
+) -> None:
+    """Mark points with one standard error each, or none when *errors* is None."""
+    axis.errorbar(
+        x,
+        y,
+        yerr=errors,
+        **{
+            "linestyle": "none",
+            "elinewidth": 0.9,
+            "capsize": 2,
+            "color": colour,
+            **style,
+        },
+    )
+
+
+def _span(axis: Any, low: float, high: float, colour: str, **style: Any) -> None:
+    """Shade the stretch of the horizontal axis between *low* and *high*."""
+    axis.axvspan(low, high, **{"color": colour, "alpha": 0.12, "linewidth": 0, **style})
+
+
+def _unresolved(resolved: bool) -> str:
+    """What a legend label adds for a fit the analysis did not resolve."""
+    return "" if resolved else " (unresolved)"
+
+
+def _strain_axis(curve: StressStrain, quantity: str = "strain", unit: str = "") -> str:
+    """Label an axis with the engineering strain along the driven direction."""
+    return f"Engineering {quantity} along {'xyz'[curve.axis]}{unit}"
+
+
+def plot_window_convergence(result: WindowConvergence) -> Any:
+    """Show prefix means/errors and disjoint tail-block estimates side by side.
+
+    A mean whose error is unknown is drawn as a cross rather than left out.
+
+    Args:
+        result: A stationary trace from
+            :func:`~openmmpolymer.convergence.time_window_convergence`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, (prefix, blocks) = _figure(1, 2)
+    for axis, positions, values, errors, label in (
+        (
+            prefix,
+            [item.duration_ps for item in result.windows],
+            [item.mean for item in result.windows],
+            [item.standard_error for item in result.windows],
+            "overlapping prefixes",
+        ),
+        (
+            blocks,
+            [1.0, 2.0, 3.0],
+            result.block_means,
+            result.block_standard_errors,
+            "disjoint tail blocks",
+        ),
+    ):
+        x, y, error = np.asarray(positions), np.asarray(values), np.asarray(errors)
+        finite = np.isfinite(y)
+        known = finite & np.isfinite(error)
+        if np.any(known):
+            axis.errorbar(
+                x[known],
+                y[known],
+                yerr=error[known],
+                marker="o",
+                linestyle="none",
+                capsize=3,
+                color=_DATA_COLOUR,
+                label="mean (1 SE)",
+            )
+        unknown = finite & ~known
+        if np.any(unknown):
+            axis.plot(
+                x[unknown], y[unknown], "x", color=_GUIDE_COLOUR, label="SE unavailable"
+            )
+        _title(axis, label)
+        axis.set_ylabel(f"{result.property_name} ({result.value_unit})")
+        if np.any(finite):
+            _legend(axis)
+    prefix.set_xlabel("Observation duration (ps)")
+    blocks.set_xlabel("Late-time block")
+    blocks.set_xticks([1, 2, 3])
+    verdict = "resolved" if result.resolved else "not resolved"
+    figure.suptitle(
+        f"Window stability: {verdict}; tolerance {result.relative_tolerance:.0%}",
+        fontsize=10,
+    )
+    return figure
+
+
+def plot_relaxation_convergence(result: RelaxationWindowConvergence) -> Any:
+    """Show model parameters as the observed decay window increases.
+
+    One panel per refitted parameter, and no error bars: the windows overlap,
+    so the spread is sensitivity to the observation time, not an uncertainty.
+
+    Args:
+        result: The refits from
+            :func:`~openmmpolymer.convergence.relaxation_window_convergence`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axes = _figure(2, 2, height_per_row=3.5)
+    durations = np.asarray([item.duration_ps for item in result.windows])
+    for axis, metric in zip(axes, result.metrics.values(), strict=True):
+        finite = np.isfinite(metric.values)
+        axis.plot(durations[finite], metric.values[finite], "o-", color=_DATA_COLOUR)
+        if np.any(finite):
+            scale = float(np.max(np.abs(metric.values[finite])))
+            if scale > 0.0 and float(np.ptp(metric.values[finite])) < 1e-8 * scale:
+                centre = float(np.mean(metric.values[finite]))
+                axis.set_ylim(centre - 0.05 * scale, centre + 0.05 * scale)
+        axis.ticklabel_format(axis="y", useOffset=False)
+        axis.set_xlabel("Observation duration (ps)")
+        axis.set_ylabel(f"{metric.property_name} ({metric.value_unit})")
+        verdict = "resolved" if metric.resolved else "not resolved"
+        difference = (
+            f"{metric.relative_change:.1%}"
+            if math.isfinite(metric.relative_change)
+            else "unavailable"
+        )
+        _title(axis, f"{verdict}; change {difference}")
+    figure.suptitle(
+        "Relaxation window sensitivity; overlapping refits are not error bars",
+        fontsize=10,
+    )
+    return figure
+
+
+def plot_structural_convergence(result: StructuralWindowConvergence) -> Any:
+    """Show structural prefix estimates without treating their spread as SE.
+
+    One panel per parameter, with the windows that did not resolve crossed.
+
+    Args:
+        result: The windows from
+            :func:`~openmmpolymer.structural_convergence.structural_window_convergence`.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    rows = max(1, math.ceil(len(result.parameters) / 2))
+    figure, axes = _figure(rows, 2, height_per_row=2.8)
+    durations = np.asarray([item.duration_ps for item in result.windows])
+    for axis, metric in zip(axes, result.parameters.values(), strict=False):
+        values = np.asarray(metric.values, dtype=np.float64)
+        finite = np.isfinite(values)
+        valid = finite & np.asarray(metric.valid, dtype=bool)
+        axis.plot(
+            durations[finite],
+            values[finite],
+            "--",
+            color=_REFERENCE_COLOUR,
+            linewidth=0.7,
+        )
+        axis.plot(
+            durations[valid],
+            values[valid],
+            "o",
+            color=_DATA_COLOUR,
+            label="valid window",
+        )
+        if np.any(finite & ~valid):
+            axis.plot(
+                durations[finite & ~valid],
+                values[finite & ~valid],
+                "x",
+                color=_GUIDE_COLOUR,
+                label="unresolved window",
+            )
+        axis.set_xlabel("Observation duration (ps)")
+        axis.set_ylabel(f"{metric.property_name} ({metric.value_unit})", fontsize=8)
+        _title(axis, "resolved" if metric.resolved else "not resolved")
+        _legend(axis)
+    for axis in axes[len(result.parameters) :]:
+        axis.set_visible(False)
+    figure.suptitle(
+        "Structural window sensitivity; curves and tail blocks retained in JSON",
+        fontsize=10,
+    )
+    return figure

@@ -1,26 +1,22 @@
 """The stress tensor of a running cell, and the strain that is applied to it.
 
-OpenMM 8.3 added ``Barostat.computeCurrentPressure``. Its flexible-barostat
-implementation differentiates individual box entries, which is not a physical
-stress in a tilted cell. In particular, a zero tilt can incorrectly imply zero
-potential shear stress. A Cauchy stress instead differentiates energy under
-the same infinitesimal deformation of positions and every box vector.
+OpenMM reports a pressure only through a barostat, and which barostat is
+attached decides what can be read. An anisotropic barostat reports the three
+diagonal components, and reports all three even when one axis is frozen with
+``scaleZ=False`` - which is the whole basis of a uniaxial extension, where the
+driven axis is held and its stress is the measurement. Only the flexible
+barostat reports shear. A stage that must not move its box still attaches one,
+at ``frequency=0`` - see :func:`openmmpolymer.mdsystem.make_barostat`.
 
-For a flexible barostat we use ``computeStressTensor`` where available, and
-otherwise evaluate that consistent-strain derivative here. Both paths retain
-the barostat's molecular convention: translate geometric molecular centres
-rigidly and use centre-of-mass kinetic energy, or deform individual atoms when
-``getScaleMoleculesAsRigid()`` is false. The isotropic and anisotropic readouts
-use the pressure API directly. OpenMM 8.6.1 is the minimum supported release.
-
-Which barostat is attached decides what can be read. An anisotropic barostat
-reports the three diagonal components, and reports all three even when one
-axis is frozen with ``scaleZ=False`` - which is the whole basis of a uniaxial
-extension, where the driven axis is held and its stress is the measurement.
-Only the flexible barostat reports shear. A barostat that is not in the
-Context cannot be asked at all: OpenMM raises ``getImplInContext``. So a
-constant-volume shear stage attaches a flexible barostat at ``frequency=0``,
-which never moves the box and exists only to be asked.
+The flexible barostat is read through ``computeStressTensor``, never through its
+``computeCurrentPressure``. The latter differentiates individual box entries,
+which is not a physical stress in a tilted cell: in particular, a zero tilt can
+incorrectly imply zero potential shear stress. ``computeStressTensor`` is the
+Cauchy stress - the energy differentiated under one consistent infinitesimal
+deformation of every position and box vector - and it keeps the barostat's
+molecular convention: molecular centres move rigidly and the kinetic term is
+the centre-of-mass one, or individual atoms move when
+``getScaleMoleculesAsRigid()`` is false.
 
 The one thing to carry away from OpenMM's own documentation of it: *the
 fluctuations around the average are extremely large, and it may take a very
@@ -31,19 +27,16 @@ standard error does not support it.
 
 from __future__ import annotations
 
-import logging
-import re
 from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+import openmm as mm
+from openmm import unit
 
-log = logging.getLogger(__name__)
-
-#: Which barostats report which components. The anisotropic one gives the
-#: diagonal; only the flexible one gives shear.
-TENSOR_BAROSTATS = ("anisotropic", "flexible")
+from ._validation import require_plane
+from .mdsystem import find_barostat
 
 #: Recorded in shear stage samples so analysis can reject legacy box-entry
 #: derivatives, which cannot be corrected from averaged stress data alone.
@@ -58,145 +51,26 @@ class StressError(RuntimeError):
     """A stress could not be read, or a strain could not be applied."""
 
 
-def _require_pressure_api(barostat: Any) -> None:
-    """Give a useful failure for an old OpenMM installed with --no-deps."""
-    from openmm import version
-
-    release = re.match(r"(\d+)\.(\d+)\.(\d+)", version.version)
-    unsupported = release is not None and tuple(map(int, release.groups())) < (8, 6, 1)
-    if unsupported or not callable(getattr(barostat, "computeCurrentPressure", None)):
-        raise StressError(
-            "Stress measurement requires OpenMM >= 8.6.1 with "
-            "computeCurrentPressure available. "
-            "Upgrade OpenMM in this environment."
-        )
-
-
-def _current_pressure_bar(barostat: Any, context: Any) -> Any:
-    """8.3 returns bare bar values; newer wrappers attach a pressure unit."""
-    from openmm import unit
-
-    value = barostat.computeCurrentPressure(context)
-    return value.value_in_unit(unit.bar) if unit.is_quantity(value) else value
-
-
-def _strain_pressure_tensor_bar(
-    simulation: Any, barostat: Any
-) -> npt.NDArray[np.float64]:
-    """Consistent-strain pressure for releases without computeStressTensor.
-
-    Use the same 1e-3 central difference as OpenMM's native stress estimator.
-    It is large enough to resolve energy changes in mixed precision. No
-    integration or constraint projection occurs, and positions and the box
-    are restored even if an energy evaluation fails. The integration force
-    groups and the molecular kinetic convention match the native estimator.
-    """
-    from openmm import unit
-
-    context = simulation.context
-    state = context.getState(getPositions=True, getVelocities=True)
-    positions = np.asarray(
-        state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-    )
-    box = np.asarray(
-        state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer)
-    )
-    velocities = np.asarray(
-        state.getVelocities(asNumpy=True).value_in_unit(
-            unit.nanometer / unit.picosecond
-        )
-    )
-    masses = np.asarray(
-        [
-            simulation.system.getParticleMass(i).value_in_unit(unit.dalton)
-            for i in range(simulation.system.getNumParticles())
-        ]
-    )
-    rigid = barostat.getScaleMoleculesAsRigid()
-    groups = (
-        molecule_groups(simulation)
-        if rigid
-        else tuple(np.asarray([i]) for i in range(len(masses)))
-    )
-    centres = np.empty_like(positions)
-    kinetic = np.zeros((3, 3), dtype=np.float64)
-    for group in groups:
-        centres[group] = positions[group].mean(axis=0)
-        mass = float(masses[group].sum())
-        if mass > 0.0:
-            momentum = (masses[group, None] * velocities[group]).sum(axis=0)
-            kinetic += np.outer(momentum, momentum) / mass
-
-    volume = float(np.linalg.det(box))
-    force_groups = simulation.integrator.getIntegrationForceGroups()
-    delta = 1.0e-3
-    tensor = np.empty((3, 3), dtype=np.float64)
-    try:
-        for row, column in _FLEXIBLE_ORDER:
-            energies = []
-            for strain in (delta, -delta):
-                strained_box = box.copy()
-                strained_box[:, row] += strain * box[:, column]
-                # A physically equivalent reduced lattice is required by OpenMM.
-                strained_box[2] -= strained_box[1] * round(
-                    strained_box[2, 1] / strained_box[1, 1]
-                )
-                strained_box[2] -= strained_box[0] * round(
-                    strained_box[2, 0] / strained_box[0, 0]
-                )
-                strained_box[1] -= strained_box[0] * round(
-                    strained_box[1, 0] / strained_box[0, 0]
-                )
-                displaced = positions.copy()
-                displaced[:, row] += strain * centres[:, column]
-                context.setPeriodicBoxVectors(*(strained_box * unit.nanometer))
-                context.setPositions(displaced * unit.nanometer)
-                energy = context.getState(
-                    getEnergy=True, groups=force_groups
-                ).getPotentialEnergy()
-                energies.append(energy.value_in_unit(unit.kilojoule_per_mole))
-            derivative = (energies[0] - energies[1]) / (2.0 * delta)
-            value = (kinetic[row, column] - derivative) / volume * 16.605390671738468
-            tensor[row, column] = tensor[column, row] = value
-    finally:
-        context.setPeriodicBoxVectors(*state.getPeriodicBoxVectors())
-        context.setPositions(state.getPositions())
-    return tensor
-
-
 def _flexible_pressure_tensor_bar(
     simulation: Any, barostat: Any
 ) -> npt.NDArray[np.float64]:
-    """Read Cauchy stress, never the flexible box-entry pressure derivative."""
-    from openmm import unit
-
-    if not callable(getattr(barostat, "computeStressTensor", None)):
-        return _strain_pressure_tensor_bar(simulation, barostat)
-    # OpenMM returns tensile stress; this function's public convention is pressure.
-    numbers = barostat.computeStressTensor(simulation.context, True).value_in_unit(
-        unit.bar
-    )
+    """Read the Cauchy stress, as a pressure: OpenMM returns tension positive."""
+    numbers = barostat.computeStressTensor(
+        simulation.context, includeKinetic=True
+    ).value_in_unit(unit.bar)
     tensor = np.empty((3, 3), dtype=np.float64)
     for value, (row, column) in zip(numbers, _FLEXIBLE_ORDER, strict=True):
         tensor[row, column] = tensor[column, row] = -float(value)
     return tensor
 
 
-def find_barostat(simulation: Any) -> tuple[str, Any]:
+def _require_barostat(simulation: Any) -> tuple[str, Any]:
     """Return the kind and force of the barostat driving *simulation*.
-
-    Args:
-        simulation: The running simulation.
-
-    Returns:
-        ``(kind, force)``.
 
     Raises:
         StressError: There is no barostat, so there is nothing to ask.
     """
-    from .mdsystem import find_barostat as _find
-
-    found = _find(simulation.system)
+    found = find_barostat(simulation.system)
     if found is None:
         raise StressError(
             "This System has no barostat, and OpenMM reports pressure only "
@@ -222,13 +96,12 @@ def pressure_bar(simulation: Any) -> float:
         The pressure in bar. Instantaneously very noisy - see the module
         docstring.
     """
-    kind, barostat = find_barostat(simulation)
-    _require_pressure_api(barostat)
+    kind, barostat = _require_barostat(simulation)
     if kind == "flexible":
         return float(
             np.trace(_flexible_pressure_tensor_bar(simulation, barostat)) / 3.0
         )
-    value = _current_pressure_bar(barostat, simulation.context)
+    value = barostat.computeCurrentPressure(simulation.context).value_in_unit(unit.bar)
     if kind == "isotropic":
         return float(value)
     return float(np.mean([value[axis] for axis in range(3)]))
@@ -255,8 +128,7 @@ def pressure_tensor_bar(simulation: Any) -> npt.NDArray[np.float64]:
             reports a single number and cannot say how it is distributed over
             the axes.
     """
-    kind, barostat = find_barostat(simulation)
-    _require_pressure_api(barostat)
+    kind, barostat = _require_barostat(simulation)
     if kind == "isotropic":
         raise StressError(
             "An isotropic barostat reports one pressure, not a tensor, so "
@@ -268,7 +140,9 @@ def pressure_tensor_bar(simulation: Any) -> npt.NDArray[np.float64]:
     if kind == "flexible":
         return _flexible_pressure_tensor_bar(simulation, barostat)
     tensor = np.full((3, 3), np.nan, dtype=np.float64)
-    numbers = _current_pressure_bar(barostat, simulation.context)
+    numbers = barostat.computeCurrentPressure(simulation.context).value_in_unit(
+        unit.bar
+    )
     for axis in range(3):
         tensor[axis, axis] = float(numbers[axis])
     return tensor
@@ -309,28 +183,6 @@ def tensile_stress_bar(stress: npt.NDArray[np.float64], axis: int = 2) -> float:
     return float(stress[axis, axis] - 0.5 * (sum(stress[i, i] for i in lateral)))
 
 
-def molecule_groups(simulation: Any) -> tuple[npt.NDArray[np.int64], ...]:
-    """Return the atom indices of each molecule, as OpenMM groups them.
-
-    Taken from ``Context.getMolecules()``, which groups by bonds and
-    constraints - the same grouping the barostat scales and the same one its
-    molecular virial is computed over. Worth checking against the number of
-    chains that were packed: if packmol merged two of them, this is where the
-    merge becomes visible, and a cell of one giant molecule has almost no
-    molecular virial at all.
-
-    Args:
-        simulation: The running simulation.
-
-    Returns:
-        One array of atom indices per molecule.
-    """
-    return tuple(
-        np.asarray(sorted(group), dtype=np.int64)
-        for group in simulation.context.getMolecules()
-    )
-
-
 def affine_scale(
     positions_nm: npt.NDArray[np.float64], factors: Sequence[float]
 ) -> npt.NDArray[np.float64]:
@@ -351,10 +203,7 @@ def affine_scale(
     Metropolis test: the barostat evaluates the energy of a
     constraint-violating configuration and accepts or rejects on a number
     that is not the energy of any real state. Here the strain is applied
-    once and the constraints are repaired immediately afterwards, before
-    anything reads an energy - see
-    :func:`openmmpolymer.simulate.run_deform`, which calls
-    ``applyConstraints`` and ``applyVelocityConstraints`` on the way in.
+    once and the constraints are repaired before anything reads an energy.
     Measured on a cell with the usual ``constraints="hbonds"``: a strain
     increment of 0.002 stretches the longest constrained bond by 0.2 pm, and
     the repair moves no atom further than 2e-4 nm.
@@ -410,9 +259,7 @@ def affine_shear(
     Raises:
         ValueError: *plane* is not two different axes.
     """
-    driven, gradient = plane
-    if driven == gradient or not {driven, gradient} <= {0, 1, 2}:
-        raise ValueError(f"plane={plane!r} must be two different axes of 0, 1, 2.")
+    driven, gradient = require_plane(plane)
     sheared = np.array(positions_nm, dtype=np.float64, copy=True)
     sheared[:, driven] += gamma * sheared[:, gradient]
     return sheared
@@ -437,9 +284,6 @@ def shear_box_vectors(vectors_nm: Any, gamma: float, plane: tuple[int, int]) -> 
     Raises:
         StressError: The tilt is past OpenMM's reduced form.
     """
-    import openmm as mm
-    from openmm import unit
-
     driven, gradient = plane
     rows = [
         [vector[axis].value_in_unit(unit.nanometer) for axis in range(3)]

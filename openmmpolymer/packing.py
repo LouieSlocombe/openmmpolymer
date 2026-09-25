@@ -19,9 +19,10 @@ usable volume and cannot produce that failure.
 from __future__ import annotations
 
 import logging
-import re
+import os
 import shutil
 import subprocess
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,8 +41,8 @@ AVOGADRO = 6.02214076e23
 #: 1 cm^3 in nm^3.
 NM3_PER_CM3 = 1.0e21
 
-#: Angstrom per nanometre. packmol works in angstrom, OpenMM in nanometres, and
-#: this module is the one place the two meet.
+#: Angstrom per nanometre. RDKit, packmol and MDAnalysis work in angstrom;
+#: OpenMM and this package work in nanometres.
 ANGSTROM_PER_NM = 10.0
 
 #: Default closest approach packmol enforces between atoms of different
@@ -51,11 +52,26 @@ DEFAULT_TOLERANCE_NM = 0.2
 #: Density to pack at, in g/cm3. See the module docstring.
 DEFAULT_PACKING_DENSITY = 0.3
 
-#: Environment variable consulted when the binary is not passed explicitly.
+#: Seconds packmol is allowed by default.
+PACKMOL_TIMEOUT_S = 3600.0
+
+#: Environment variable naming the packmol executable, consulted before PATH.
 PACKMOL_ENV_VAR = "PACKMOL"
 
 #: packmol's own exit codes start here.
 _PACKMOL_ERROR_BASE = 170
+
+#: The longest bond :func:`check_packing` tolerates, in nanometres.
+_MAX_BOND_NM = 0.25
+
+#: The closest approach :func:`check_packing` tolerates between atoms of
+#: different molecules, in nanometres: between heavy atoms, and where either
+#: atom is a hydrogen.
+_MIN_HEAVY_NM = 0.20
+_MIN_HYDROGEN_NM = 0.15
+
+#: The largest ring the ring-spearing check looks for.
+_MAX_RING_SIZE = 8
 
 
 class PackmolError(RuntimeError):
@@ -132,28 +148,6 @@ def box_edge_nm(
     return float(volume_nm3 ** (1.0 / 3.0))
 
 
-def density_g_cm3(
-    counts: Sequence[int],
-    molar_masses_g_mol: Sequence[float],
-    volume_nm3: float,
-) -> float:
-    """Return the density of this much material in this volume.
-
-    Args:
-        counts: How many of each component.
-        molar_masses_g_mol: Each component's molar mass.
-        volume_nm3: The cell volume.
-
-    Returns:
-        The density in g/cm3.
-    """
-    require_positive(volume_nm3, None, name="volume_nm3")
-    total_mass = sum(
-        count * mass for count, mass in zip(counts, molar_masses_g_mol, strict=True)
-    )
-    return float(total_mass * NM3_PER_CM3 / (volume_nm3 * AVOGADRO))
-
-
 def distribute_conformers(
     pdb_paths: Sequence[str], n_molecules: int
 ) -> list[PackedComponent]:
@@ -182,34 +176,20 @@ def distribute_conformers(
 
     base, extra = divmod(n_molecules, len(pdb_paths))
     return [
-        PackedComponent(path, base + (1 if index < extra else 0))
+        PackedComponent(path, count)
         for index, path in enumerate(pdb_paths)
-        if base + (1 if index < extra else 0) > 0
+        if (count := base + (1 if index < extra else 0))
     ]
 
 
-def find_packmol(packmol: str | Path | None = None) -> str:
-    """Locate the packmol executable.
-
-    Looks at the explicit argument, then ``$PACKMOL``, then ``PATH``.
-
-    Args:
-        packmol: An explicit path, or None to search.
-
-    Returns:
-        The path to the executable.
-
-    Raises:
-        PackmolError: No executable was found.
-    """
-    import os
-
-    for candidate in (packmol, os.environ.get(PACKMOL_ENV_VAR)):
-        if candidate:
-            resolved = shutil.which(str(candidate)) or str(candidate)
-            if Path(resolved).is_file():
-                return resolved
-            raise PackmolError(f"packmol={candidate!r} is not an executable file.")
+def _find_packmol() -> str:
+    """Return the packmol executable: ``$PACKMOL`` if it is set, else PATH's."""
+    override = os.environ.get(PACKMOL_ENV_VAR)
+    if override:
+        resolved = shutil.which(override) or override
+        if Path(resolved).is_file():
+            return resolved
+        raise PackmolError(f"{PACKMOL_ENV_VAR}={override!r} is not an executable file.")
 
     found = shutil.which("packmol")
     if found is None:
@@ -222,37 +202,7 @@ def find_packmol(packmol: str | Path | None = None) -> str:
     return found
 
 
-def packmol_version(packmol: str | Path | None = None) -> tuple[int, ...]:
-    """Return packmol's version.
-
-    packmol prints a banner and then asks for an input file, so running it with
-    nothing on stdin is how it is asked.
-
-    Args:
-        packmol: An explicit path, or None to search.
-
-    Returns:
-        The version as a tuple of integers, e.g. ``(21, 0, 1)``.
-
-    Raises:
-        PackmolError: The banner could not be read.
-    """
-    binary = find_packmol(packmol)
-    completed = subprocess.run(
-        [binary],
-        input="",
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    match = re.search(r"Version\s+([0-9]+(?:\.[0-9]+)*)", completed.stdout)
-    if match is None:
-        raise PackmolError(f"{binary} did not print a recognisable version banner.")
-    return tuple(int(part) for part in match.group(1).split("."))
-
-
-def render_packmol_input(
+def _render_packmol_input(
     components: Sequence[PackedComponent],
     box_angstrom: tuple[float, float, float],
     output_pdb: str,
@@ -260,7 +210,6 @@ def render_packmol_input(
     tolerance_angstrom: float,
     inset_angstrom: float,
     seed: int,
-    nloop: int | None = None,
 ) -> str:
     """Render a packmol input file.
 
@@ -268,29 +217,14 @@ def render_packmol_input(
     units of the PDB it is given while the rest of this package works in
     nanometres. A ten-fold slip in the tolerance packs atoms on top of each
     other; the same slip in the box is a cell a thousand times the wrong size.
-
-    Args:
-        components: What to place.
-        box_angstrom: The periodic cell edges.
-        output_pdb: Where packmol writes the packed cell.
-        tolerance_angstrom: Closest approach between different molecules.
-        inset_angstrom: How far the packing region is held back from each face.
-        seed: packmol's random seed.
-        nloop: Optimisation loops per structure; packmol's default when None.
-
-    Returns:
-        The input file's text.
     """
     lines = [
         f"tolerance {tolerance_angstrom:.4f}",
         "filetype pdb",
         f"output {output_pdb}",
         f"seed {seed}",
+        "",
     ]
-    if nloop is not None:
-        lines.append(f"nloop {nloop}")
-    lines.append("")
-
     low = inset_angstrom
     high = tuple(edge - inset_angstrom for edge in box_angstrom)
     for component in components:
@@ -324,28 +258,25 @@ def pack_box(
     output_pdb: str | Path = "packed.pdb",
     *,
     tolerance_nm: float = DEFAULT_TOLERANCE_NM,
-    inset_nm: float | None = None,
     seed: int = 0xF0,
-    nloop: int | None = None,
-    packmol: str | Path | None = None,
-    timeout: float | None = 3600.0,
+    timeout_s: float | None = PACKMOL_TIMEOUT_S,
     workdir: str | Path | None = None,
 ) -> PackResult:
     """Pack *components* into a periodic cell of *box_nm*.
+
+    The binary is ``$PACKMOL`` if that is set, and otherwise the ``packmol``
+    on PATH.
 
     Args:
         components: What to place, and how many of each.
         box_nm: Cubic edge, or the three edges.
         output_pdb: Where the packed cell is written.
-        tolerance_nm: Closest approach between different molecules.
-        inset_nm: How far the packing region is held back from each face.
-            Defaults to half the tolerance, which is the least that keeps two
-            molecules on opposite faces a full tolerance apart across the
-            periodic boundary.
+        tolerance_nm: Closest approach between different molecules. The
+            packing region is held back from each face by half of it, the
+            least that keeps molecules on opposite faces a full tolerance
+            apart across the periodic boundary.
         seed: packmol's random seed.
-        nloop: Optimisation loops per structure.
-        packmol: Path to the executable, or None to search.
-        timeout: Seconds to allow.
+        timeout_s: Seconds to allow, or None for no limit.
         workdir: Where the input file and log are written. Defaults to the
             output's directory.
 
@@ -354,21 +285,20 @@ def pack_box(
 
     Raises:
         PackmolError: packmol is missing, failed, or did not converge.
-        ValueError: A component would not fit in the cell.
+        ValueError: The tolerance or a box edge is not positive.
     """
     require_positive(tolerance_nm, None, name="tolerance_nm")
     edges = (box_nm, box_nm, box_nm) if isinstance(box_nm, int | float) else box_nm
     for edge in edges:
         require_positive(edge, None, name="box_nm")
-    inset = tolerance_nm / 2.0 if inset_nm is None else inset_nm
+    inset = tolerance_nm / 2.0
 
     destination = Path(output_pdb)
     directory = Path(workdir) if workdir is not None else destination.parent
-    directory = directory if str(directory) else Path()
     directory.mkdir(parents=True, exist_ok=True)
 
-    binary = find_packmol(packmol)
-    text = render_packmol_input(
+    binary = _find_packmol()
+    text = _render_packmol_input(
         [
             PackedComponent(str(Path(item.pdb_path).resolve()), item.count)
             for item in components
@@ -378,7 +308,6 @@ def pack_box(
         tolerance_angstrom=tolerance_nm * ANGSTROM_PER_NM,
         inset_angstrom=inset * ANGSTROM_PER_NM,
         seed=seed,
-        nloop=nloop,
     )
     input_path = directory / f"{destination.stem}.inp"
     log_path = directory / f"{destination.stem}.packmol.log"
@@ -390,7 +319,7 @@ def pack_box(
         total,
         *edges,
     )
-    output = _run_packmol(binary, input_path, timeout)
+    output = _run_packmol(binary, input_path, timeout_s)
     log_path.write_text(output)
 
     if "Success!" not in output:
@@ -412,13 +341,8 @@ def pack_box(
     )
 
 
-def _run_packmol(binary: str, input_path: Path, timeout: float | None) -> str:
+def _run_packmol(binary: str, input_path: Path, timeout_s: float | None) -> str:
     """Run packmol on *input_path*, which it reads from stdin.
-
-    Args:
-        binary: The executable.
-        input_path: The generated input file.
-        timeout: Seconds to allow.
 
     Returns:
         packmol's combined output.
@@ -434,13 +358,13 @@ def _run_packmol(binary: str, input_path: Path, timeout: float | None) -> str:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                timeout=timeout,
+                timeout=timeout_s,
                 check=False,
             )
         except subprocess.TimeoutExpired as error:
             raise PackmolError(
-                f"packmol did not finish within {timeout} s. Pack at a lower "
-                "density, or lower nloop."
+                f"packmol did not finish within {timeout_s} s. Pack at a lower "
+                "density, or allow it longer."
             ) from error
 
     if completed.returncode != 0:
@@ -458,12 +382,10 @@ def _run_packmol(binary: str, input_path: Path, timeout: float | None) -> str:
 
 
 def read_pdb(path: str | Path) -> Any:
-    """Read a PDB and close the file.
+    """Read a PDB through ``openmm.app.PDBFile``.
 
-    Handed a path, ``openmm.app.PDBFile`` opens it and leaves the handle to
-    the garbage collector, which under ``-W error`` is a ResourceWarning and
-    in a long build is a slow leak of descriptors. Handed an open file it
-    reads and returns, so opening it here is all it takes.
+    ``PDBFile`` opens a file only when handed a ``str``; anything else it takes
+    for an open file, so a :class:`~pathlib.Path` fails inside the parser.
 
     Args:
         path: The file to read.
@@ -473,8 +395,7 @@ def read_pdb(path: str | Path) -> Any:
     """
     from openmm import app
 
-    with Path(path).open() as handle:
-        return app.PDBFile(handle)
+    return app.PDBFile(str(path))
 
 
 def read_packed_pdb(packed_pdb: str | Path) -> tuple[Any, npt.NDArray[np.float64]]:
@@ -482,10 +403,7 @@ def read_packed_pdb(packed_pdb: str | Path) -> tuple[Any, npt.NDArray[np.float64
 
     Read through ``openmm.app.PDBFile`` rather than by slicing columns: the
     coordinate fields are not where a naive slice puts them, and getting the z
-    column off by one is a silent error of a few tenths of an angstrom. The
-    file is opened here rather than by path so that closing it is this
-    function's job: handed a path, ``PDBFile`` leaves the handle to the
-    garbage collector.
+    column off by one is a silent error of a few tenths of an angstrom.
 
     Args:
         packed_pdb: packmol's output.
@@ -504,72 +422,26 @@ def read_packed_pdb(packed_pdb: str | Path) -> tuple[Any, npt.NDArray[np.float64
     return pdb.topology, positions
 
 
-def load_positions_nm(packed_pdb: str | Path) -> npt.NDArray[np.float64]:
-    """Read the packed coordinates, in nanometres.
-
-    Args:
-        packed_pdb: packmol's output.
-
-    Returns:
-        An ``(n_atoms, 3)`` array in nanometres.
-    """
-    return read_packed_pdb(packed_pdb)[1]
-
-
-def check_packing(
-    topology: Any,
-    positions_nm: npt.NDArray[np.float64],
-    *,
-    max_bond_nm: float = 0.25,
-    min_heavy_nm: float = 0.20,
-    min_hydrogen_nm: float = 0.15,
-    check_rings: bool = True,
-) -> None:
+def check_packing(topology: Any, positions_nm: npt.NDArray[np.float64]) -> None:
     """Check a packed cell for the three faults that survive minimisation.
+
+    A molecule split across the periodic boundary, two molecules on top of each
+    other, and a bond threaded through a ring.
 
     Args:
         topology: The assembled box topology, with bonds.
         positions_nm: Its positions.
-        max_bond_nm: Longest bond tolerated. A molecule split across the
-            periodic boundary shows up here as a bond the length of the cell.
-        min_heavy_nm: Closest approach allowed between heavy atoms of different
-            molecules.
-        min_hydrogen_nm: The same where either atom is a hydrogen.
-        check_rings: Whether to test for bonds threaded through rings.
 
     Raises:
         PackmolError: The cell has a fault that would not survive a run.
     """
-    _check_bond_lengths(topology, positions_nm, max_bond_nm)
-    _check_contacts(topology, positions_nm, min_heavy_nm, min_hydrogen_nm)
-    if check_rings:
-        _check_ring_spearing(topology, positions_nm)
+    _check_bond_lengths(topology, positions_nm)
+    _check_contacts(topology, positions_nm)
+    _check_ring_spearing(topology, positions_nm)
 
 
-def _box_lengths_nm(topology: Any) -> npt.NDArray[np.float64] | None:
-    """Return the periodic cell edges in nanometres, or None if unset."""
-    from openmm import unit
-
-    vectors = topology.getPeriodicBoxVectors()
-    if vectors is None:
-        return None
-    lengths = [vectors[axis][axis].value_in_unit(unit.nanometer) for axis in range(3)]
-    return np.asarray(lengths, dtype=np.float64)
-
-
-def _minimum_image(
-    delta: npt.NDArray[np.float64], box: npt.NDArray[np.float64] | None
-) -> npt.NDArray[np.float64]:
-    """Wrap displacement *delta* into the periodic cell, if there is one."""
-    if box is None:
-        return delta
-    return delta - box * np.round(delta / box)
-
-
-def _check_bond_lengths(
-    topology: Any, positions_nm: npt.NDArray[np.float64], max_bond_nm: float
-) -> None:
-    """Raise if any bond is implausibly long.
+def _check_bond_lengths(topology: Any, positions_nm: npt.NDArray[np.float64]) -> None:
+    """Raise if any bond is longer than :data:`_MAX_BOND_NM`.
 
     This is the test for a molecule split across the periodic boundary. OpenMM
     computes bonded terms without the minimum image, so a split molecule has
@@ -583,32 +455,40 @@ def _check_bond_lengths(
         length = float(np.sqrt(delta @ delta))
         if length > worst:
             worst, worst_pair = length, (first.index, second.index)
-    if worst > max_bond_nm:
+    if worst > _MAX_BOND_NM:
         raise PackmolError(
             f"Atoms {worst_pair[0]} and {worst_pair[1]} are bonded but "
-            f"{worst:.3f} nm apart, against a limit of {max_bond_nm} nm. A "
+            f"{worst:.3f} nm apart, against a limit of {_MAX_BOND_NM} nm. A "
             "molecule is split across the periodic boundary, or the packed "
             "coordinates do not correspond to this topology."
         )
 
 
-class _CellList:
-    """Atoms bucketed by position, for near-neighbour queries."""
+class CellList:
+    """Points bucketed on a uniform grid, for near-neighbour queries.
 
-    def __init__(self, positions: npt.NDArray[np.float64], spacing: float) -> None:
+    Not periodic, which suits both users: a packed cell holds whole molecules,
+    and a chain being grown has no boundary at all.
+    """
+
+    def __init__(self, spacing: float) -> None:
         self._spacing = spacing
         self._cells: dict[tuple[int, int, int], list[int]] = {}
-        for index, point in enumerate(positions):
-            self._cells.setdefault(self.cell(point), []).append(index)
+        self.points: list[npt.NDArray[np.float64]] = []
 
-    def cell(self, point: npt.NDArray[np.float64]) -> tuple[int, int, int]:
-        """Return the grid cell *point* falls in."""
+    def _cell(self, point: npt.NDArray[np.float64]) -> tuple[int, int, int]:
         x, y, z = np.floor(point / self._spacing).astype(int)
         return int(x), int(y), int(z)
 
+    def add(self, points: npt.NDArray[np.float64]) -> None:
+        """Record *points*, indexed on from those already recorded."""
+        for point in points:
+            self._cells.setdefault(self._cell(point), []).append(len(self.points))
+            self.points.append(point)
+
     def neighbours(self, point: npt.NDArray[np.float64]) -> list[int]:
-        """Return every atom in the 27 cells around *point*."""
-        cx, cy, cz = self.cell(point)
+        """Return the index of every recorded point in the 27 cells around *point*."""
+        cx, cy, cz = self._cell(point)
         found: list[int] = []
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
@@ -617,19 +497,13 @@ class _CellList:
         return found
 
 
-def _check_contacts(
-    topology: Any,
-    positions_nm: npt.NDArray[np.float64],
-    min_heavy_nm: float,
-    min_hydrogen_nm: float,
-) -> None:
+def _check_contacts(topology: Any, positions_nm: npt.NDArray[np.float64]) -> None:
     """Raise if two different molecules are closer than they should be.
 
     Only pairs in *different* molecules are considered. packmol's tolerance is
     an intermolecular constraint and says nothing about bonded neighbours, so a
     test that included them would fail on every C-H bond at 0.11 nm.
     """
-    box = _box_lengths_nm(topology)
     molecule = np.empty(topology.getNumAtoms(), dtype=np.int64)
     is_hydrogen = np.zeros(topology.getNumAtoms(), dtype=bool)
     for index, residue in enumerate(topology.residues()):
@@ -639,18 +513,18 @@ def _check_contacts(
                 atom.element.atomic_number == 1
             )
 
-    spacing = max(min_heavy_nm, min_hydrogen_nm)
-    cells = _CellList(positions_nm, spacing)
+    cells = CellList(max(_MIN_HEAVY_NM, _MIN_HYDROGEN_NM))
+    cells.add(positions_nm)
     for index, point in enumerate(positions_nm):
         for other in cells.neighbours(point):
             if other <= index or molecule[other] == molecule[index]:
                 continue
-            delta = _minimum_image(point - positions_nm[other], box)
+            delta = point - positions_nm[other]
             distance = float(np.sqrt(delta @ delta))
             limit = (
-                min_hydrogen_nm
+                _MIN_HYDROGEN_NM
                 if is_hydrogen[index] or is_hydrogen[other]
-                else min_heavy_nm
+                else _MIN_HEAVY_NM
             )
             if distance < limit:
                 raise PackmolError(
@@ -660,38 +534,26 @@ def _check_contacts(
                 )
 
 
-def find_rings(topology: Any, max_size: int = 8) -> list[tuple[int, ...]]:
-    """Return the small rings in *topology*, as tuples of atom indices.
+def _find_rings(
+    topology: Any, neighbours: dict[int, list[int]]
+) -> list[tuple[int, ...]]:
+    """Return the rings in *topology* up to :data:`_MAX_RING_SIZE` atoms.
 
     Every molecule in a packed cell is a copy of the same chain, so the rings
     are found once on the first residue and shifted onto the rest. Falling back
     to a per-residue search when the residues differ in size keeps this honest
     for a mixed cell.
-
-    Args:
-        topology: The topology to search.
-        max_size: Largest ring to look for.
-
-    Returns:
-        One tuple of atom indices per ring.
     """
-    neighbours: dict[int, list[int]] = {}
-    for first, second in topology.bonds():
-        neighbours.setdefault(first.index, []).append(second.index)
-        neighbours.setdefault(second.index, []).append(first.index)
-
     residues = [
         [atom.index for atom in residue.atoms()] for residue in topology.residues()
     ]
     counts = {len(indices) for indices in residues}
     if len(counts) != 1:
         return [
-            ring
-            for indices in residues
-            for ring in _rings_within(neighbours, indices, max_size)
+            ring for indices in residues for ring in _rings_within(neighbours, indices)
         ]
 
-    base = _rings_within(neighbours, residues[0], max_size)
+    base = _rings_within(neighbours, residues[0])
     stride = counts.pop()
     return [
         tuple(index + offset * stride for index in ring)
@@ -701,9 +563,9 @@ def find_rings(topology: Any, max_size: int = 8) -> list[tuple[int, ...]]:
 
 
 def _rings_within(
-    neighbours: dict[int, list[int]], atoms: Sequence[int], max_size: int
+    neighbours: dict[int, list[int]], atoms: Sequence[int]
 ) -> list[tuple[int, ...]]:
-    """Return the rings up to *max_size* among *atoms*, by shortest-cycle search."""
+    """Return the rings among *atoms*, by shortest-cycle search."""
     members = set(atoms)
     seen: set[frozenset[int]] = set()
     rings: list[tuple[int, ...]] = []
@@ -712,7 +574,7 @@ def _rings_within(
             if neighbour not in members or neighbour < start:
                 continue
             path = _shortest_path_avoiding(
-                neighbours, neighbour, start, max_size - 1, members
+                neighbours, neighbour, start, _MAX_RING_SIZE - 1, members
             )
             if path is None:
                 continue
@@ -737,10 +599,10 @@ def _shortest_path_avoiding(
     step. Letting the search pass through it instead returns paths that leave
     the goal and come back, which read as rings and are not.
     """
-    queue: list[tuple[int, tuple[int, ...]]] = [(start, (start,))]
+    queue: deque[tuple[int, tuple[int, ...]]] = deque([(start, (start,))])
     visited = {start, goal}
     while queue:
-        node, path = queue.pop(0)
+        node, path = queue.popleft()
         if len(path) > max_length:
             continue
         for neighbour in neighbours.get(node, ()):
@@ -763,7 +625,11 @@ def _check_ring_spearing(topology: Any, positions_nm: npt.NDArray[np.float64]) -
     other and says nothing about a chain segment threaded through a ring; the
     knot survives minimisation and every stage after it, permanently.
     """
-    rings = find_rings(topology)
+    neighbours: dict[int, list[int]] = {}
+    for first, second in topology.bonds():
+        neighbours.setdefault(first.index, []).append(second.index)
+        neighbours.setdefault(second.index, []).append(first.index)
+    rings = _find_rings(topology, neighbours)
     if not rings:
         return
 
@@ -771,11 +637,6 @@ def _check_ring_spearing(topology: Any, positions_nm: npt.NDArray[np.float64]) -
     normals: list[npt.NDArray[np.float64]] = []
     radii: list[float] = []
     excluded: list[set[int]] = []
-    neighbours: dict[int, list[int]] = {}
-    for first, second in topology.bonds():
-        neighbours.setdefault(first.index, []).append(second.index)
-        neighbours.setdefault(second.index, []).append(first.index)
-
     for ring in rings:
         points = positions_nm[list(ring)]
         centre = points.mean(axis=0)
@@ -790,14 +651,14 @@ def _check_ring_spearing(topology: Any, positions_nm: npt.NDArray[np.float64]) -
             nearby.update(neighbours.get(index, ()))
         excluded.append(nearby)
 
-    reach = max(radii) + 0.2
-    grid = _CellList(np.asarray(centres, dtype=np.float64), reach)
+    grid = CellList(max(radii) + 0.2)
+    grid.add(np.asarray(centres, dtype=np.float64))
     for first, second in topology.bonds():
         start, end = positions_nm[first.index], positions_nm[second.index]
         for ring_index in grid.neighbours((start + end) / 2.0):
             if (
                 first.index in excluded[ring_index]
-                or second.index in (excluded[ring_index])
+                or second.index in excluded[ring_index]
             ):
                 continue
             if _segment_pierces_ring(

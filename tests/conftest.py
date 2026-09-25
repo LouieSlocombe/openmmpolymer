@@ -10,16 +10,21 @@ only they can test.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+# The test cells are tens of atoms: one CPU thread runs them three times faster
+# than a thread per core spinning on barriers.
+os.environ.setdefault("OPENMM_CPU_THREADS", "1")
+
 from openmmpolymer.forcefield import PolymerForceField
 from openmmpolymer.mdsystem import PackedBox
 
-from .helpers import DIMER_FFXML, argon_system
+from .helpers import DIMER_FFXML, argon_context, argon_system
 
 
 @pytest.fixture(autouse=True)
@@ -55,39 +60,25 @@ def argon_box() -> tuple[PackedBox, Any]:
 
 
 @pytest.fixture
-def dimer_argon_run() -> Any:
-    """A cell of 32 two-atom molecules: enough for a chain measurement."""
-    from openmmpolymer.simulate import prepare_run
-
-    system, topology, positions = argon_system(64, 2.4, atoms_per_molecule=2)
-    box = PackedBox(
-        topology=topology,
-        positions_nm=positions,
-        box_nm=(2.4, 2.4, 2.4),
-        n_molecules=32,
-    )
-    return prepare_run(
-        box,
-        PolymerForceField("unused.xml", (), "AR", "smirnoff"),
-        platform="CPU",
-        seed=11,
-        system=system,
-    )
+def argon_run() -> Any:
+    """A run context over the 64-atom argon cell, on the deterministic CPU."""
+    return argon_context(64, 2.4)
 
 
 @pytest.fixture
-def argon_run(argon_box: tuple[PackedBox, Any]) -> Any:
-    """A run context over the argon cell, on the deterministic CPU platform."""
-    from openmmpolymer.simulate import prepare_run
+def argon_scan_run() -> Any:
+    """An argon cell big enough to survive an NPT equilibration and a strain.
 
-    box, system = argon_box
-    return prepare_run(
-        box,
-        PolymerForceField("unused.xml", (), "AR", "smirnoff"),
-        platform="CPU",
-        seed=11,
-        system=system,
-    )
+    Sixty-four atoms reach a liquid density at an edge below twice the cutoff,
+    and OpenMM refuses that outright; two hundred and sixteen do not.
+    """
+    return argon_context(216, 2.8)
+
+
+@pytest.fixture
+def dimer_argon_run() -> Any:
+    """A cell of 32 bonded two-atom molecules: enough for a chain measurement."""
+    return argon_context(64, 2.4, atoms_per_molecule=2)
 
 
 @pytest.fixture
@@ -175,3 +166,81 @@ def fake_packmol(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
     monkeypatch.setenv("PATH", f"{directory}{':'}{Path('/usr/bin')}")
     monkeypatch.delenv("PACKMOL", raising=False)
     yield script
+
+
+@pytest.fixture
+def staged_melt(monkeypatch: pytest.MonkeyPatch, argon_run: Any) -> dict[str, Any]:
+    """Stand in for the chemistry behind ``build_melt``, keeping its staging real.
+
+    Each preparation writes the four kinds of asset ``build_melt`` records,
+    adds an entry to the force-field cache it was handed, and returns the argon
+    run with its force-field reference in the build directory. Set
+    ``system_suffix`` to change the next preparation's Hamiltonian or ``fail``
+    to make it raise; ``builds`` lists every build directory used and
+    ``options`` the settings the last preparation was given.
+    """
+    from dataclasses import replace
+
+    from openmmpolymer import melt
+    from openmmpolymer.chain import ChainResult
+
+    control: dict[str, Any] = {
+        "system_suffix": "",
+        "fail": False,
+        "builds": [],
+        "options": {},
+    }
+
+    def prepare(
+        spec: Any, n_chains: int, build_dir: Path, cache_dir: Path, **options: Any
+    ) -> Any:
+        control["builds"].append(build_dir)
+        control["options"] = options
+        number = len(control["builds"])
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / f"entry_{number}.xml").write_text("parameters")
+        build_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("chain_0.sdf", "chain_0.pdb", "polymer_ff.xml", "packed.pdb"):
+            (build_dir / name).write_text(f"prepared artifact {number}")
+        if control["fail"]:
+            raise RuntimeError("preparation failed")
+        chain = ChainResult(
+            sdf_paths=(str(build_dir / "chain_0.sdf"),),
+            pdb_paths=(str(build_dir / "chain_0.pdb"),),
+            smiles="[Ar]",
+            n_atoms=1,
+            molar_mass_g_mol=39.948,
+        )
+        run = replace(
+            argon_run,
+            system_xml=argon_run.system_xml + control["system_suffix"],
+            forcefield=replace(
+                argon_run.forcefield,
+                forcefield_xml=str(build_dir / "polymer_ff.xml"),
+            ),
+        )
+        return chain, run
+
+    monkeypatch.setattr(melt, "_prepare", prepare)
+    return control
+
+
+@pytest.fixture
+def no_build(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Stop any melt build where it would begin, with :class:`BuildReached`.
+
+    Returns the chain specs the build was asked for, so that a test can check
+    what reached it - or that nothing did.
+    """
+    from openmmpolymer import melt
+
+    from .helpers import BuildReached
+
+    asked: list[Any] = []
+
+    def build(spec: Any, *args: Any, **kwargs: Any) -> Any:
+        asked.append(spec)
+        raise BuildReached
+
+    monkeypatch.setattr(melt, "build_chain", build)
+    return asked

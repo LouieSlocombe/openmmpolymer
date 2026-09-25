@@ -1,5 +1,6 @@
 """Observation-window stability for structural and dynamical measurements.
 
+The rules are :mod:`openmmpolymer.convergence`'s, applied to a trajectory.
 Every prefix uses the same coordinate sampling policy and histogram grids.
 Stationary quantities are also measured in disjoint tail blocks. Prefixes
 overlap, so their differences are stability diagnostics, never standard errors.
@@ -24,20 +25,53 @@ from .conformation import (
     end_to_end_relaxation,
     persistence_length,
 )
+from .convergence import (
+    DEFAULT_MIN_SAMPLES,
+    DEFAULT_RELATIVE_TOLERANCE,
+    DEFAULT_WINDOW_FRACTIONS,
+    ENDPOINTS_REFUSAL,
+    SNAPSHOT_REFUSAL,
+    distinct_endpoints,
+    require_fractions,
+)
 from .correlations import (
     MIN_WAVEVECTORS_PER_BIN,
     RadialDistribution,
     StructureFactor,
+    _pair_limit,
+    peak_bins,
     radial_distribution,
     structure_factor,
 )
 from .structure import MAX_DISTRIBUTION_FRAMES, MAX_STRUCTURE_FACTOR_FRAMES
-from .trajectory import AnalysisError, Ensemble, Frame, backbone_indices, boxes_nm
+from .trajectory import (
+    AnalysisError,
+    Ensemble,
+    Frame,
+    backbone_indices,
+    boxes_nm,
+    capped_stride,
+)
 
 
 @dataclass(frozen=True)
 class StructuralParameterConvergence:
-    """Parameter stability, with unknown values and no manufactured error bar."""
+    """Parameter stability, with unknown values and no manufactured error bar.
+
+    Args:
+        property_name: The measured parameter.
+        value_unit: Its unit.
+        values: Its value in each prefix, None where it was not measured or
+            remained censored.
+        valid: Whether each prefix's value is one to compare.
+        block_values: Its value in each disjoint tail block, for a
+            stationary parameter; empty for a dynamical one.
+        relative_change: Spread of the last three prefix values over their
+            scale, or None when one is missing.
+        block_relative_change: The same over the blocks.
+        resolved: Whether nothing refused it.
+        notes: The standing caveat, then every refusal.
+    """
 
     property_name: str
     value_unit: str
@@ -52,7 +86,21 @@ class StructuralParameterConvergence:
 
 @dataclass(frozen=True)
 class StructuralWindow:
-    """The measured scalars and full curves from one trajectory interval."""
+    """The measured scalars and full curves from one trajectory interval.
+
+    Args:
+        fraction: The share of the trajectory the interval covers.
+        first_frame: Where it starts.
+        n_frames: Frames in it.
+        duration_ps: Time from its first frame to its last.
+        values: Each parameter measured over it, None where there was none.
+        valid: Whether each of those is a measurement rather than a
+            censored or degenerate one.
+        sample_counts: Frames or time origins behind each parameter.
+        curves: The full curves the parameters were read off.
+        configuration_varied: Whether anything moved except by translation.
+        notes: What could not be measured over it.
+    """
 
     fraction: float
     first_frame: int
@@ -73,6 +121,17 @@ class StructuralWindowConvergence:
     ``resolved`` requires every reported parameter to resolve. Read individual
     entries in ``parameters`` when only a subset is applicable to the system.
     This is observation-window stability, not proof of melt equilibration.
+
+    Args:
+        stage: The stage measured.
+        windows: One interval per prefix fraction, each starting at frame 0.
+        blocks: Three disjoint intervals spanning the final half.
+        parameters: The stability of each parameter, by name.
+        relative_tolerance: The most the compared values may spread.
+        min_frames: Fewest frames a compared interval may rest on.
+        settings: The strides, grids and masks every interval shared.
+        resolved: Whether every parameter resolved.
+        notes: The standing caveats.
     """
 
     stage: str
@@ -86,6 +145,9 @@ class StructuralWindowConvergence:
     notes: tuple[str, ...]
 
 
+#: Every parameter measured, its unit, and whether it is stationary - a
+#: property of the equilibrium state the tail blocks can check - rather than
+#: dynamical, which only the prefixes can.
 _PARAMETERS = {
     "persistence_length_nm": ("nm", True),
     "characteristic_ratio": ("dimensionless", True),
@@ -108,6 +170,7 @@ class _BlockEnsemble(Ensemble):
     def frames(
         self, *, start: int = 0, stop: int | None = None, stride: int = 1
     ) -> Iterator[Frame]:
+        """The block's frames, indexed and timed as in the whole trajectory."""
         last = self.n_frames if stop is None else min(stop, self.n_frames)
         whole = replace(self, n_frames=self.first_frame + self.n_frames, first_frame=0)
         yield from Ensemble.frames(
@@ -119,6 +182,7 @@ class _BlockEnsemble(Ensemble):
 
 
 def _block(ensemble: Ensemble, start: int, stop: int) -> Ensemble:
+    """Frames *start* to *stop* of *ensemble*, as an ensemble of their own."""
     return _BlockEnsemble(
         **{
             field.name: getattr(ensemble, field.name)
@@ -130,32 +194,13 @@ def _block(ensemble: Ensemble, start: int, stop: int) -> Ensemble:
     )
 
 
-def _fractions(values: Sequence[float]) -> tuple[float, ...]:
-    fractions = tuple(float(value) for value in values)
-    if (
-        len(fractions) < 3
-        or any(not math.isfinite(v) or not 0 < v <= 1 for v in fractions)
-        or tuple(sorted(set(fractions))) != fractions
-        or fractions[-1] != 1
-    ):
-        raise ValueError(
-            "window_fractions needs at least three increasing fractions in (0, 1], ending at 1."
-        )
-    return fractions
-
-
-def _stride(n_frames: int, stride: int, cap: int | None) -> int:
-    if cap is None:
-        return stride
-    require_integer(cap, name="frame cap")
-    return max(stride, math.ceil(n_frames / cap))
-
-
 def _finite(value: float | None) -> float | None:
+    """A measured value, or None when there is none worth comparing."""
     return None if value is None or not math.isfinite(value) else float(value)
 
 
 def _curve(**columns: Any) -> dict[str, tuple[float, ...]]:
+    """A curve's columns as plain floats, for the report."""
     return {
         name: tuple(float(value) for value in values)
         for name, values in columns.items()
@@ -195,6 +240,12 @@ def _measure(
     heavy_atoms_only: bool,
     max_lag_fraction: float,
 ) -> tuple[StructuralWindow, StructureFactor | None]:
+    """Measure every parameter over one interval, noting what could not be.
+
+    The structure factor's peak is left for the caller, which picks it from
+    the bins every interval can resolve; the factor itself is returned for
+    that.
+    """
     values: dict[str, float | None] = {name: None for name in _PARAMETERS}
     valid = {name: False for name in _PARAMETERS}
     counts = {name: 0 for name in _PARAMETERS}
@@ -237,7 +288,8 @@ def _measure(
             )
             if not persistence.decayed:
                 notes.append(
-                    "Backbone correlation did not decay within the chain; persistence length remains censored."
+                    "Backbone correlation did not decay within the chain; "
+                    "persistence length remains censored."
                 )
         relaxation = attempt(
             "end-to-end relaxation",
@@ -259,11 +311,13 @@ def _measure(
             )
             if not relaxation.decorrelated:
                 notes.append(
-                    "End-to-end correlation did not cross 1/e within observed lags; relaxation time remains censored."
+                    "End-to-end correlation did not cross 1/e within observed lags; "
+                    "relaxation time remains censored."
                 )
     else:
         notes.append(
-            "No backbone supplied; chain dimensions, persistence and orientational relaxation are unavailable."
+            "No backbone supplied; chain dimensions, persistence and orientational "
+            "relaxation are unavailable."
         )
     displacement = attempt(
         "COM diffusion",
@@ -285,7 +339,8 @@ def _measure(
         )
         if not displacement.diffusive:
             notes.append(
-                f"COM MSD slope {displacement.log_slope:.3g} does not establish diffusion; coefficient remains censored."
+                f"COM MSD slope {displacement.log_slope:.3g} does not establish "
+                "diffusion; coefficient remains censored."
             )
     distribution: RadialDistribution | None = attempt(
         "RDF",
@@ -329,21 +384,23 @@ def _measure(
         )
         for name in ("structure_factor_peak_per_nm", "structure_factor_peak_height"):
             counts[name] = factor.n_frames
-    return StructuralWindow(
-        fraction,
-        first_frame,
-        ensemble.n_frames,
-        max(0, ensemble.n_frames - 1) * ensemble.interval_ps,
-        values,
-        valid,
-        counts,
-        curves,
-        _configuration_varied(ensemble),
-        tuple(notes),
-    ), factor
+    window = StructuralWindow(
+        fraction=fraction,
+        first_frame=first_frame,
+        n_frames=ensemble.n_frames,
+        duration_ps=max(0, ensemble.n_frames - 1) * ensemble.interval_ps,
+        values=values,
+        valid=valid,
+        sample_counts=counts,
+        curves=curves,
+        configuration_varied=_configuration_varied(ensemble),
+        notes=tuple(notes),
+    )
+    return window, factor
 
 
 def _relative_change(values: Sequence[float | None]) -> float | None:
+    """How far *values* spread over their scale, or None if one is missing."""
     if any(value is None for value in values) or not values:
         return None
     array = np.asarray(values, dtype=float)
@@ -360,6 +417,7 @@ def _parameter(
     tolerance: float,
     minimum: int,
 ) -> StructuralParameterConvergence:
+    """Judge one parameter over the prefixes and, if stationary, the blocks."""
     values = tuple(window.values[name] for window in windows)
     valid = tuple(window.valid[name] for window in windows)
     block_values = tuple(block.values[name] for block in blocks) if stationary else ()
@@ -367,52 +425,57 @@ def _parameter(
     selected = windows[-3:]
     change = _relative_change([window.values[name] for window in selected])
     block_change = _relative_change(block_values) if stationary else None
-    notes = [
-        "Overlapping prefix differences are stability estimates, not standard errors."
-    ]
-    if len({window.n_frames for window in selected}) < 3:
-        notes.append("Fewer than three distinct observed prefix lengths.")
+    refusals: list[str] = []
+    if not distinct_endpoints([window.duration_ps for window in windows]):
+        refusals.append(ENDPOINTS_REFUSAL)
     if not all(window.valid[name] for window in selected):
-        notes.append(
+        refusals.append(
             "At least one of the last three windows is missing, censored or invalid."
         )
     if any(not window.configuration_varied for window in selected):
-        notes.append(
-            "A compared prefix shows no configurational variation; repeated frozen coordinates cannot establish temporal convergence."
+        refusals.append(
+            "A compared prefix shows no configurational variation; repeated frozen "
+            "coordinates cannot establish temporal convergence."
         )
     if any(window.sample_counts[name] < minimum for window in selected):
-        notes.append(
-            f"Fewer than {minimum} sampled frames in a compared prefix; increase trajectory sampling or lift the frame cap."
+        refusals.append(
+            f"Fewer than {minimum} sampled frames in a compared prefix; increase "
+            "trajectory sampling or lift the frame cap."
         )
     if change is None or change > tolerance:
-        notes.append(
+        refusals.append(
             "The last three prefix estimates do not agree within relative_tolerance."
         )
     if stationary:
         if len(blocks) < 3 or any(not block.valid[name] for block in blocks):
-            notes.append(
-                "Three valid disjoint tail blocks are required for a stationary observable."
+            refusals.append(
+                "Three valid disjoint tail blocks are required for a stationary "
+                "observable."
             )
         if any(block.sample_counts[name] < minimum for block in blocks):
-            notes.append(
+            refusals.append(
                 f"Disjoint tail blocks need at least {minimum} sampled frames each."
             )
         if any(not block.configuration_varied for block in blocks):
-            notes.append("A disjoint tail block shows no configurational variation.")
+            refusals.append("A disjoint tail block shows no configurational variation.")
         if block_change is None or block_change > tolerance:
-            notes.append(
+            refusals.append(
                 "Disjoint tail estimates do not agree within relative_tolerance."
             )
     return StructuralParameterConvergence(
-        name,
-        unit,
-        values,
-        valid,
-        block_values,
-        change,
-        block_change,
-        len(notes) == 1,
-        tuple(notes),
+        property_name=name,
+        value_unit=unit,
+        values=values,
+        valid=valid,
+        block_values=block_values,
+        relative_change=change,
+        block_relative_change=block_change,
+        resolved=not refusals,
+        notes=(
+            "Overlapping prefix differences are stability estimates, not standard "
+            "errors.",
+            *refusals,
+        ),
     )
 
 
@@ -420,9 +483,9 @@ def structural_window_convergence(
     ensemble: Ensemble,
     backbone: Sequence[int] | None = None,
     *,
-    window_fractions: Sequence[float] = (0.25, 0.5, 0.75, 1.0),
-    relative_tolerance: float = 0.1,
-    min_frames: int = 20,
+    window_fractions: Sequence[float] = DEFAULT_WINDOW_FRACTIONS,
+    relative_tolerance: float = DEFAULT_RELATIVE_TOLERANCE,
+    min_frames: int = DEFAULT_MIN_SAMPLES,
     stride: int = 1,
     max_distribution_frames: int | None = MAX_DISTRIBUTION_FRAMES,
     max_structure_factor_frames: int | None = MAX_STRUCTURE_FACTOR_FRAMES,
@@ -448,8 +511,13 @@ def structural_window_convergence(
     their existing diffusion/decorrelation tests in each of the final three
     prefixes. These diagnostics do not measure statistical uncertainty or
     certify independently sampled configurations.
+
+    Raises:
+        ValueError: An option is out of range.
+        AnalysisError: The ensemble has no frames, no usable frame interval,
+            or a box the radius does not fit.
     """
-    fractions = _fractions(window_fractions)
+    fractions = require_fractions(window_fractions)
     relative_tolerance = require_positive(
         relative_tolerance, None, name="relative_tolerance"
     )
@@ -479,19 +547,13 @@ def structural_window_convergence(
     boxes = boxes_nm(ensemble)
     if not np.all(np.isfinite(boxes)) or np.any(boxes <= 0):
         raise AnalysisError("Structural convergence needs finite positive box edges.")
-    half = float(np.min(boxes)) / 2
-    radius = (
-        half if r_max_nm is None else require_positive(r_max_nm, None, name="r_max_nm")
-    )
-    if radius > half:
-        raise AnalysisError("r_max_nm exceeds half the smallest recorded box edge.")
-    pair_stride = _stride(ensemble.n_frames, stride, max_distribution_frames)
-    factor_stride = _stride(ensemble.n_frames, stride, max_structure_factor_frames)
     options: dict[str, Any] = dict(
         stride=stride,
-        pair_stride=pair_stride,
-        factor_stride=factor_stride,
-        r_max_nm=radius,
+        pair_stride=capped_stride(ensemble.n_frames, stride, max_distribution_frames),
+        factor_stride=capped_stride(
+            ensemble.n_frames, stride, max_structure_factor_frames
+        ),
+        r_max_nm=_pair_limit(boxes, r_max_nm),
         rdf_bins=rdf_bins,
         q_max_per_nm=q_max_per_nm,
         q_bins=q_bins,
@@ -523,15 +585,18 @@ def structural_window_convergence(
     # A fixed, conservative q floor and eligibility mask avoid changing which
     # reciprocal bins can win the peak simply because a prefix is longer.
     all_measured = measured + blocks
-    factors = [factor for _, factor in all_measured]
     mask = np.ones(q_bins, dtype=bool)
     floor = 2 * math.pi / float(np.min(boxes))
-    for factor in factors:
+    for _, factor in all_measured:
         if factor is None:
             mask[:] = False
         else:
-            mask &= (factor.q_per_nm >= floor) & (
-                factor.n_vectors / factor.n_frames >= min_vectors_per_bin
+            mask &= peak_bins(
+                factor.q_per_nm,
+                factor.n_vectors,
+                factor.n_frames,
+                floor,
+                min_vectors_per_bin,
             )
     updated = []
     for window, factor in all_measured:
@@ -569,35 +634,36 @@ def structural_window_convergence(
         for name, (unit, stationary) in _PARAMETERS.items()
     }
     notes = [
-        "Window stability is not a zero-rate correction, independent-replica uncertainty or proof of equilibration.",
-        "Prefixes overlap; reported differences are not standard errors. All curves retain the same bin grids and global strides.",
-        "End-to-end relaxation uses every recorded frame; other structural and COM analyses use the recorded stride settings.",
+        "Window stability is not a zero-rate correction, independent-replica "
+        "uncertainty or proof of equilibration.",
+        "Prefixes overlap; reported differences are not standard errors. All "
+        "curves retain the same bin grids and global strides.",
+        "End-to-end relaxation uses every recorded frame; other structural and COM "
+        "analyses use the recorded stride settings.",
     ]
     if ensemble.is_snapshot:
-        notes.append(
-            "A single snapshot cannot establish observation-window convergence."
-        )
+        notes.append(SNAPSHOT_REFUSAL)
         parameters = {
             name: replace(
                 parameter,
                 resolved=False,
-                notes=(*parameter.notes, "Only a snapshot is available."),
+                notes=(*parameter.notes, SNAPSHOT_REFUSAL),
             )
             for name, parameter in parameters.items()
         }
     return StructuralWindowConvergence(
-        ensemble.stage,
-        prefix_windows,
-        block_windows,
-        parameters,
-        relative_tolerance,
-        min_frames,
-        {
+        stage=ensemble.stage,
+        windows=prefix_windows,
+        blocks=block_windows,
+        parameters=parameters,
+        relative_tolerance=relative_tolerance,
+        min_frames=min_frames,
+        settings={
             **options,
             "min_vectors_per_bin_per_frame": min_vectors_per_bin,
             "common_q_floor_per_nm": floor,
             "common_q_bins": tuple(bool(value) for value in mask),
         },
-        all(item.resolved for item in parameters.values()),
-        tuple(notes),
+        resolved=all(item.resolved for item in parameters.values()),
+        notes=tuple(notes),
     )

@@ -1,9 +1,9 @@
 """Reading a finished run's structure and dynamics back, and reporting them.
 
-The other three workflow modules run a scan and then read it; this one only
-reads. Every stage a run finishes leaves a closing structure, and a stage asked
-for a trajectory leaves frames, so any run directory has something to say about
-how its chains are arranged - the intermolecular pair distribution and the
+The workflow modules run a scan and then read it; this one only reads. Every
+stage a run finishes leaves a closing structure, and a stage asked for a
+trajectory leaves frames, so any run directory has something to say about how
+its chains are arranged - the intermolecular pair distribution and the
 structure factor - and, given a backbone, how big the chains are and how stiff.
 A trajectory adds whether they moved: the centre-of-mass displacement and the
 end-to-end relaxation.
@@ -15,27 +15,27 @@ and carries on with what it can measure, rather than failing the whole report
 over the part it cannot.
 
 The backbone is the awkward one. It comes from the attachment points the caps
-consumed when the chain was built, and the manifest does not record it: the
-workflow drivers write it into their own ``*_workflow.json``, a plain protocol
-run writes it nowhere. So it is looked for in that order - given, recorded by a
-workflow, recorded in the manifest - and failing all three it is inferred from
-the bond graph as the longest shortest path through one chain's heavy atoms,
-which for a linear polymer is the backbone. The report says which of those it
-used, because an inferred path can end on a terminal side group and put one
-extra bond on the end-to-end vector.
+consumed when the chain was built, and a run records it in its manifest only
+when it was given one to measure the chains with. So it is taken as given,
+else as recorded, and failing both it is inferred from the bond graph as the
+longest shortest path through one chain's heavy atoms, which for a linear
+polymer is the backbone. The report says which of those it used, because an
+inferred path can end on a terminal side group and put one extra bond on the
+end-to-end vector.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from ._files import ReportFiles
 from ._validation import require_integer, require_positive
+from ._workflow import optional, write_report_files
 from .conformation import (
     ConformationSeries,
     EndToEndRelaxation,
@@ -52,8 +52,13 @@ from .correlations import (
     radial_distribution,
     structure_factor,
 )
+from .plots import (
+    plot_conformation,
+    plot_correlations,
+    plot_dynamics,
+    plot_persistence,
+)
 from .protocols import ChainDimensions, RunManifest
-from .tg import ReportFiles
 from .timeseries import Equilibration
 from .trajectory import (
     AnalysisError,
@@ -64,13 +69,10 @@ from .trajectory import (
     stage_files,
 )
 
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
+
 log = logging.getLogger(__name__)
-
-#: How a stage came to be the one measured.
-STAGE_SOURCES = ("requested", "last_trajectory", "last_snapshot")
-
-#: Where a backbone came from.
-BACKBONE_SOURCES = ("argument", "workflow", "manifest", "inferred")
 
 #: Most frames the pair distribution averages over, whatever the stride. Past
 #: a few dozen frames the curve stops changing and the cost keeps climbing.
@@ -89,7 +91,8 @@ class StructureReport:
     Args:
         run_dir: The directory read.
         stage: The stage measured.
-        stage_source: How it was chosen, one of :data:`STAGE_SOURCES`.
+        stage_source: How it was chosen: ``"requested"``,
+            ``"last_trajectory"`` or ``"last_snapshot"``.
         is_snapshot: Whether only a closing structure was read.
         n_frames: Frames in the stage. One for a snapshot.
         interval_ps: Time between frames. Zero for a snapshot.
@@ -100,8 +103,8 @@ class StructureReport:
             ``n_frames`` say how many frames they saw.
         backbone: Backbone atom indices within one chain, or None when none
             was known.
-        backbone_source: Where it came from, one of
-            :data:`BACKBONE_SOURCES`, or None.
+        backbone_source: Where it came from: ``"argument"``, ``"manifest"``
+            or ``"inferred"``, or None.
         backbone_file: The file it was read from, when it was read from one.
         distribution: The intermolecular pair distribution, or None.
         structure: The static structure factor, or None.
@@ -161,13 +164,13 @@ def structure_stages(run_dir: str | Path) -> tuple[str, ...]:
     """
     directory = Path(run_dir)
     manifest = RunManifest.load(directory)
-    if manifest is None or not manifest.stages:
-        # stage_files raises the two refusals with the messages already worded.
+    names = list(manifest.stages) if manifest is not None else []
+    if not names:
+        # Refuses a directory with no manifest, or no stages, in its own words.
         stage_files(directory)
-        raise AnalysisError(f"No stages in {directory}.")  # pragma: no cover
 
     readable: list[str] = []
-    for name in manifest.stages:
+    for name in names:
         try:
             files = stage_files(directory, name)
         except AnalysisError as error:
@@ -179,12 +182,12 @@ def structure_stages(run_dir: str | Path) -> tuple[str, ...]:
         raise AnalysisError(
             f"No stage in {directory} left coordinates to read. Every stage "
             f"writes <stem>.pdb at its end; the manifest records: "
-            f"{', '.join(manifest.stages)}."
+            f"{', '.join(names)}."
         )
     return tuple(readable)
 
 
-def _select_stage(directory: Path, stage: str | None) -> tuple[StageFiles, str]:
+def select_stage(directory: Path, stage: str | None) -> tuple[StageFiles, str]:
     """Choose the stage to measure, and say how it was chosen.
 
     A trajectory beats a snapshot because it can answer the dynamic
@@ -304,7 +307,7 @@ def _is_index_list(value: object) -> bool:
     )
 
 
-def _resolve_backbone(
+def resolve_backbone(
     directory: Path,
     manifest: RunManifest | None,
     ensemble: Ensemble,
@@ -312,8 +315,8 @@ def _resolve_backbone(
     infer: bool,
     notes: list[str],
 ) -> tuple[tuple[int, ...] | None, str | None, str | None]:
-    """Find the backbone: given, recorded by a workflow, recorded in the
-    manifest, or inferred - in that order - saying which."""
+    """Find the backbone - given, recorded in the manifest, or inferred, in
+    that order - and say which, and from which file."""
     n_atoms = ensemble.atoms_per_chain
 
     if explicit is not None:
@@ -327,19 +330,6 @@ def _resolve_backbone(
             )
             return None, None, None
         return tuple(int(index) for index in path), "argument", None
-
-    for candidate in sorted(directory.glob("*_workflow.json")):
-        try:
-            record = json.loads(candidate.read_text())
-        except (OSError, ValueError) as error:
-            log.info("%s could not be read: %s", candidate.name, error)
-            continue
-        value = record.get("chain_backbone") if isinstance(record, dict) else None
-        if value is None:
-            continue
-        found = _recorded_backbone(value, n_atoms, candidate.name, notes)
-        if found is not None:
-            return found, "workflow", candidate.name
 
     chains = manifest.chains if manifest is not None else None
     value = chains.get("backbone") if isinstance(chains, dict) else None
@@ -380,8 +370,8 @@ def _recorded_backbone(
     """Validate a backbone read from a file, turning a bad one into a note."""
     if not _is_index_list(value):
         notes.append(
-            f"{source} records a chain_backbone that is not a list of atom "
-            "indices, so it was not used."
+            f"{source} records a backbone that is not a list of atom indices, "
+            "so it was not used."
         )
         return None
     try:
@@ -395,20 +385,6 @@ def _recorded_backbone(
 # --------------------------------------------------------------------------
 # Reading
 # --------------------------------------------------------------------------
-
-
-def _optional(read: Callable[[], Any], notes: list[str], what: str) -> Any:
-    """Run a measurement, turning "this cannot be measured" into a note.
-
-    A measurement that does not apply and one that broke look identical from
-    outside, so the distinction is drawn here once rather than at each of six
-    call sites.
-    """
-    try:
-        return read()
-    except AnalysisError as error:
-        notes.append(f"{what}: {error}")
-        return None
 
 
 def _capped_stride(n_frames: int, stride: int, cap: int) -> int:
@@ -497,7 +473,7 @@ def analyse_structure(
     """
     require_integer(stride, name="stride")
     directory = Path(run_dir)
-    files, stage_source = _select_stage(directory, stage)
+    files, stage_source = select_stage(directory, stage)
     ensemble = open_run(directory, files.stage)
     manifest = RunManifest.load(directory)
     notes: list[str] = []
@@ -531,7 +507,7 @@ def analyse_structure(
                 "measured."
             )
 
-    path, backbone_source, backbone_file = _resolve_backbone(
+    path, backbone_source, backbone_file = resolve_backbone(
         directory, manifest, ensemble, backbone, infer_backbone, notes
     )
 
@@ -539,14 +515,14 @@ def analyse_structure(
     factor_stride = _capped_stride(
         ensemble.n_frames, stride, MAX_STRUCTURE_FACTOR_FRAMES
     )
-    distribution = _optional(
+    distribution = optional(
         lambda: radial_distribution(
             ensemble, heavy_atoms_only=heavy_atoms_only, stride=pair_stride
         ),
         notes,
         "No pair distribution",
     )
-    structure = _optional(
+    structure = optional(
         lambda: structure_factor(
             ensemble,
             q_max_per_nm=q_max_per_nm,
@@ -559,7 +535,7 @@ def analyse_structure(
 
     conformation = persistence = displacement = relaxation = None
     if path is not None:
-        conformation = _optional(
+        conformation = optional(
             lambda: chain_conformation(
                 ensemble,
                 path,
@@ -569,13 +545,13 @@ def analyse_structure(
             notes,
             "No chain dimensions",
         )
-        persistence = _optional(
+        persistence = optional(
             lambda: persistence_length(ensemble, path, stride=stride),
             notes,
             "No persistence length",
         )
     if not ensemble.is_snapshot:
-        displacement = _optional(
+        displacement = optional(
             lambda: centre_of_mass_msd(
                 ensemble, max_lag_fraction=max_lag_fraction, stride=stride
             ),
@@ -583,7 +559,7 @@ def analyse_structure(
             "No mean-squared displacement",
         )
         if path is not None:
-            relaxation = _optional(
+            relaxation = optional(
                 lambda: end_to_end_relaxation(
                     ensemble, path, max_lag_fraction=max_lag_fraction
                 ),
@@ -621,12 +597,7 @@ def analyse_structure(
 
 
 def _distribution_record(distribution: RadialDistribution) -> dict[str, Any]:
-    """A pair distribution as plain JSON types.
-
-    Written out field by field rather than with ``asdict``, which would render
-    the arrays unhelpfully. Spelling it out also pins what is on disk
-    independently of how the dataclasses are laid out.
-    """
+    """A pair distribution as plain JSON types."""
     return {
         "r_nm": distribution.r_nm.tolist(),
         "g_r": distribution.g_r.tolist(),
@@ -743,41 +714,11 @@ def write_structure_report(
     figures: bool = True,
     figure_format: str = "png",
 ) -> ReportFiles:
-    """Write a structure report out, as JSON and as figures.
+    """Write ``structure.json`` and its figures into ``<run_dir>/analysis``.
 
-    Args:
-        report: What :func:`analyse_structure` found.
-        output_dir: Where to write, defaulting to ``<run_dir>/analysis``. Give
-            one when the run directory should not be touched.
-        figures: Write figures as well as the record.
-        figure_format: What matplotlib should save them as.
-
-    Returns:
-        Where everything went.
+    Or into *output_dir*, when the run directory should not be touched.
     """
-    from importlib.metadata import PackageNotFoundError, version
-
-    from .plots import (
-        plot_conformation,
-        plot_correlations,
-        plot_dynamics,
-        plot_persistence,
-    )
-
-    directory = (
-        Path(report.run_dir) / "analysis" if output_dir is None else Path(output_dir)
-    )
-    directory.mkdir(parents=True, exist_ok=True)
-
-    try:
-        own = version("openmmpolymer")
-    except PackageNotFoundError:  # pragma: no cover - uninstalled checkout
-        own = "0.0.0+unknown"
-    manifest = RunManifest.load(report.run_dir)
-    record: dict[str, Any] = {
-        "openmmpolymer": own,
-        "run_dir": report.run_dir,
-        "versions": {} if manifest is None else manifest.versions,
+    fields: dict[str, Any] = {
         "stage": report.stage,
         "stage_source": report.stage_source,
         "is_snapshot": report.is_snapshot,
@@ -824,43 +765,29 @@ def write_structure_report(
         ),
         "notes": list(report.notes),
     }
-    json_path = directory / "structure.json"
-    json_path.write_text(json.dumps(record, indent=2, default=str) + "\n")
-
-    written: list[str] = []
-    if figures:
-        if report.distribution is not None:
-            written.append(
-                _save(
-                    plot_correlations(report.distribution, structure=report.structure),
-                    directory / f"correlations.{figure_format}",
-                )
-            )
-        if report.conformation is not None:
-            written.append(
-                _save(
-                    plot_conformation(report.conformation),
-                    directory / f"conformation.{figure_format}",
-                )
-            )
-        if report.persistence is not None:
-            written.append(
-                _save(
-                    plot_persistence(report.persistence),
-                    directory / f"persistence.{figure_format}",
-                )
-            )
-        if report.displacement is not None:
-            written.append(
-                _save(
-                    plot_dynamics(report.displacement, relaxation=report.relaxation),
-                    directory / f"dynamics.{figure_format}",
-                )
-            )
-    return ReportFiles(json=str(json_path), figures=tuple(written))
+    return write_report_files(
+        report.run_dir,
+        output_dir,
+        "structure.json",
+        fields,
+        _figures(report) if figures else (),
+        figure_format,
+    )
 
 
-def _save(figure: Any, path: Path) -> str:
-    """Save a figure and close it, returning where it went."""
-    figure.savefig(path, bbox_inches="tight")
-    return str(path)
+def _figures(report: StructureReport) -> Iterator[tuple[str, Figure]]:
+    """A figure for each measurement that was made."""
+    if report.distribution is not None:
+        yield (
+            "correlations",
+            plot_correlations(report.distribution, structure=report.structure),
+        )
+    if report.conformation is not None:
+        yield "conformation", plot_conformation(report.conformation)
+    if report.persistence is not None:
+        yield "persistence", plot_persistence(report.persistence)
+    if report.displacement is not None:
+        yield (
+            "dynamics",
+            plot_dynamics(report.displacement, relaxation=report.relaxation),
+        )

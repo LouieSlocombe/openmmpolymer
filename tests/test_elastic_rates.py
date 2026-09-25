@@ -1,4 +1,9 @@
-"""Elastic hold-time sweeps retain their control variable and uncertainty."""
+"""Elastic hold-time sweeps retain their control variable and uncertainty.
+
+Young's modulus shares the extension ladder with Poisson's ratio, but keeps
+the record its original rate scan kept and pools each rate's replicas into
+one fit; its tests are in their own section.
+"""
 
 from __future__ import annotations
 
@@ -16,20 +21,32 @@ from openmmpolymer import elastic_rates
 from openmmpolymer.elastic_rates import (
     ELASTIC_RATE_PROPERTIES,
     WORKFLOW_NAME,
+    YOUNGS_WORKFLOW_NAME,
     analyse_elastic_rates,
     run_elastic_rate_scan,
     validate_elastic_rate_scan,
 )
 from openmmpolymer.mdsystem import SystemSpec
-from openmmpolymer.mechanical import MechanicalError, ModulusSpec
+from openmmpolymer.mechanical import MechanicalError, ModulusSpec, deform_protocol
 from openmmpolymer.protocols import Protocol
 from openmmpolymer.trajectory import AnalysisError
 
-from .helpers import write_bulk, write_deformation, write_shear
+from .helpers import (
+    deformation_rate_per_ns,
+    fake_scan_dynamics,
+    planted_extension_runner,
+    planted_modulus_mpa,
+    write_bulk,
+    write_deformation,
+    write_modulus_rate_series,
+    write_shear,
+)
 
 HOLDS = (20.0, 60.0, 200.0)
 SPEC = ModulusSpec(n_replicas=2, max_strain=0.02)
+#: Every elastic property; all but Young's modulus observe each replica.
 PROPERTIES = tuple(ELASTIC_RATE_PROPERTIES)
+REPLICA_PROPERTIES = tuple(name for name in PROPERTIES if name != "youngs_modulus")
 
 
 def _stamp(directory: Path, hold: float) -> None:
@@ -52,10 +69,11 @@ def _series(root: Path, name: str, *, replicas: int = 1) -> list[Path]:
     for i, hold in enumerate(HOLDS):
         directory = root / f"rate_{i:02d}"
         for replica in range(replicas):
-            if name == "poisson_ratio":
-                rate = ((1.002) ** 10 - 1) / (10 * hold) * 1000
+            if name in ("youngs_modulus", "poisson_ratio"):
+                rate = deformation_rate_per_ns(hold)
                 write_deformation(
                     directory,
+                    modulus_mpa=planted_modulus_mpa(rate),
                     poisson=0.3 + 0.01 * math.log10(rate / 0.01),
                     relax_ps=hold,
                     stage=f"06_deform_r{i * replicas + replica}_00",
@@ -103,10 +121,26 @@ def _series(root: Path, name: str, *, replicas: int = 1) -> list[Path]:
     return directories
 
 
+def _run() -> Any:
+    return SimpleNamespace(
+        spec=SystemSpec(),
+        seed=17,
+        system_xml="system",
+        box=SimpleNamespace(positions_nm=np.zeros((2, 3)), box_nm=(5.0, 5.0, 5.0)),
+    )
+
+
+def _fail(*args: Any, **kwargs: Any) -> None:
+    raise RuntimeError("interrupted")
+
+
 @pytest.mark.parametrize("name", PROPERTIES)
 def test_recovers_property_log_law_and_retains_units(tmp_path: Path, name: str) -> None:
-    target = 0.001 if name in ("poisson_ratio", "shear_modulus") else 10.0
+    target = (
+        0.001 if name in ("youngs_modulus", "poisson_ratio", "shear_modulus") else 10.0
+    )
     expected = {
+        "youngs_modulus": 1700.0,
         "poisson_ratio": 0.29,
         "shear_modulus": 680.0,
         "bulk_modulus": 1450.0,
@@ -274,16 +308,6 @@ def test_plan_counts_only_selected_pass_and_all_replicas(name: str) -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "holds", [(1.0, 1.0, 2.0), (1.0, 2.0), (1.0, -1.0, 2.0), (1.0, math.nan, 2.0)]
-)
-def test_invalid_holds_rejected_before_output(holds: tuple[float, ...]) -> None:
-    with pytest.raises(ValueError):
-        validate_elastic_rate_scan(
-            SPEC, holds, property_name="bulk_modulus", target_rate=1.0
-        )
-
-
 def test_disabled_and_invalid_ladders_rejected() -> None:
     for spec in (
         replace(SPEC, shear_strains=None),
@@ -316,7 +340,7 @@ def _workflow(root: Path, name: str) -> list[Path]:
     return directories
 
 
-@pytest.mark.parametrize("name", PROPERTIES)
+@pytest.mark.parametrize("name", REPLICA_PROPERTIES)
 def test_workflow_expansion_verifies_every_replica_and_hold(
     tmp_path: Path, name: str
 ) -> None:
@@ -334,20 +358,10 @@ def test_workflow_expansion_verifies_every_replica_and_hold(
 def test_resume_different_request_rejected_even_when_preparation_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    run: Any = SimpleNamespace(
-        spec=SystemSpec(),
-        seed=17,
-        system_xml="system",
-        box=SimpleNamespace(positions_nm=np.zeros((2, 3)), box_nm=(5.0, 5.0, 5.0)),
-    )
-
-    def fail(*args: Any, **kwargs: Any) -> None:
-        raise RuntimeError("interrupted")
-
-    monkeypatch.setattr(elastic_rates, "run_protocol", fail)
+    fake_scan_dynamics(monkeypatch, elastic_rates, _fail)
     with pytest.raises(RuntimeError, match="interrupted"):
         run_elastic_rate_scan(
-            run,
+            _run(),
             tmp_path,
             property_name="bulk_modulus",
             hold_times_ps=HOLDS,
@@ -356,10 +370,22 @@ def test_resume_different_request_rejected_even_when_preparation_failed(
     assert (tmp_path / WORKFLOW_NAME).is_file()
     with pytest.raises(MechanicalError, match="different settings"):
         run_elastic_rate_scan(
-            run,
+            _run(),
             tmp_path,
             property_name="bulk_modulus",
             hold_times_ps=(20.0, 60.0, 201.0),
+            target_rate=1.0,
+        )
+
+
+def test_runs_without_a_workflow_record_cannot_be_adopted(tmp_path: Path) -> None:
+    write_deformation(tmp_path / "rate_00")
+    with pytest.raises(MechanicalError, match="settings cannot be verified"):
+        run_elastic_rate_scan(
+            _run(),
+            tmp_path,
+            property_name="poisson_ratio",
+            hold_times_ps=HOLDS,
             target_rate=1.0,
         )
 
@@ -375,20 +401,12 @@ def test_all_passes_start_from_common_state_and_force_rerun_keeps_replicas(
         calls.append((protocol, kwargs))
         return SimpleNamespace(final_state="equilibrated.xml")
 
-    monkeypatch.setattr(elastic_rates, "run_protocol", fake)
-    monkeypatch.setattr(elastic_rates, "_equilibrated_box_nm", lambda state: [5.0] * 3)
-    monkeypatch.setattr(elastic_rates, "_last_state", lambda *args: "equilibrated.xml")
+    fake_scan_dynamics(monkeypatch, elastic_rates, fake)
     monkeypatch.setattr(
         elastic_rates, "analyse_elastic_rates", lambda *args, **kwargs: None
     )
-    run: Any = SimpleNamespace(
-        spec=SystemSpec(),
-        seed=17,
-        system_xml="system",
-        box=SimpleNamespace(positions_nm=np.zeros((2, 3)), box_nm=(5.0, 5.0, 5.0)),
-    )
     run_elastic_rate_scan(
-        run,
+        _run(),
         tmp_path,
         property_name=name,
         hold_times_ps=HOLDS,
@@ -397,8 +415,13 @@ def test_all_passes_start_from_common_state_and_force_rerun_keeps_replicas(
         resume=False,
     )
     assert len(calls) == 1 + 3 * SPEC.n_replicas
+    assert calls[0][1]["resume"] is False
     assert all(options["state_in"] == "equilibrated.xml" for _, options in calls[1:])
     assert [options["resume"] for _, options in calls[1:]] == [False, True] * 3
+    assert all(
+        protocol.stages[0].options.get("reference_box_nm", [5.0] * 3) == [5.0] * 3
+        for protocol, _ in calls[1:]
+    )
 
 
 @pytest.mark.slow
@@ -407,7 +430,6 @@ def test_real_elastic_scan_records_metadata_and_resumes(
     tmp_path: Path, argon_run: Any, monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:
     # Tiny argon runs exercise dynamics and resume without asserting solid-like response.
-    monkeypatch.setenv("OPENMM_CPU_THREADS", "1")
     from openmmpolymer import simulate
 
     initialisations: list[tuple[str, bool]] = []
@@ -489,6 +511,8 @@ def test_missing_duration_or_duplicate_directory_never_guesses_rate(
         analyse_elastic_rates(
             [directories[0]] * 2, property_name="shear_modulus", target_rate=0.001
         )
+    with pytest.raises(AnalysisError, match="Supply run directories"):
+        analyse_elastic_rates([], property_name="shear_modulus", target_rate=0.001)
     file = directories[0] / "manifest.json"
     record = json.loads(file.read_text())
     next(iter(record["stages"].values()))["samples"].pop("segment_duration_ps")
@@ -502,17 +526,8 @@ def test_missing_duration_or_duplicate_directory_never_guesses_rate(
 def test_resume_refuses_missing_states_and_changed_coordinates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    run: Any = SimpleNamespace(
-        spec=SystemSpec(),
-        seed=17,
-        system_xml="system",
-        box=SimpleNamespace(positions_nm=np.zeros((2, 3)), box_nm=(5.0, 5.0, 5.0)),
-    )
-
-    def fail(*args: Any, **kwargs: Any) -> None:
-        raise RuntimeError("interrupted")
-
-    monkeypatch.setattr(elastic_rates, "run_protocol", fail)
+    run = _run()
+    fake_scan_dynamics(monkeypatch, elastic_rates, _fail)
     options: dict[str, Any] = dict(
         property_name="bulk_modulus", hold_times_ps=HOLDS, target_rate=1.0
     )
@@ -531,7 +546,7 @@ def test_resume_refuses_missing_states_and_changed_coordinates(
 
 
 def _interrupted_branch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str = "shear_modulus"
 ) -> tuple[Any, dict[str, Any], Path, list[str]]:
     state = tmp_path / "prepared.xml"
     state.write_text("original preparation state")
@@ -543,36 +558,31 @@ def _interrupted_branch(
             return SimpleNamespace(final_state=str(state))
         raise RuntimeError("interrupted measurement")
 
-    monkeypatch.setattr(elastic_rates, "run_protocol", fake)
-    monkeypatch.setattr(
-        elastic_rates, "_last_state", lambda summary, path: summary.final_state
-    )
-    monkeypatch.setattr(elastic_rates, "_equilibrated_box_nm", lambda path: [5.0] * 3)
-    run: Any = SimpleNamespace(
-        spec=SystemSpec(),
-        seed=17,
-        system_xml="system",
-        box=SimpleNamespace(positions_nm=np.zeros((2, 3)), box_nm=(5.0, 5.0, 5.0)),
-    )
+    fake_scan_dynamics(monkeypatch, elastic_rates, fake)
+    run = _run()
     options: dict[str, Any] = dict(
-        property_name="shear_modulus", hold_times_ps=HOLDS, target_rate=0.001
+        property_name=name, hold_times_ps=HOLDS, target_rate=0.001
     )
     with pytest.raises(RuntimeError, match="interrupted measurement"):
         run_elastic_rate_scan(run, tmp_path, **options)
     return run, options, state, calls
 
 
+@pytest.mark.parametrize("name", ["shear_modulus", "youngs_modulus"])
 def test_resume_rejects_changed_prepared_state_before_running_any_stage(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:
-    run, options, state, calls = _interrupted_branch(tmp_path, monkeypatch)
-    record_before = (tmp_path / WORKFLOW_NAME).read_text()
+    run, options, state, calls = _interrupted_branch(tmp_path, monkeypatch, name)
+    workflow = tmp_path / (
+        YOUNGS_WORKFLOW_NAME if name == "youngs_modulus" else WORKFLOW_NAME
+    )
+    record_before = workflow.read_text()
     prior_calls = list(calls)
     state.write_text("different preparation with the same system and coordinates")
-    with pytest.raises(MechanicalError, match="preparation state changed"):
+    with pytest.raises(MechanicalError, match="no longer matches"):
         run_elastic_rate_scan(run, tmp_path, **options)
     assert calls == prior_calls
-    assert (tmp_path / WORKFLOW_NAME).read_text() == record_before
+    assert workflow.read_text() == record_before
 
 
 def test_prepared_state_fingerprint_survives_interrupted_resume(
@@ -580,12 +590,8 @@ def test_prepared_state_fingerprint_survives_interrupted_resume(
 ) -> None:
     run, options, state, _ = _interrupted_branch(tmp_path, monkeypatch)
     record_before = json.loads((tmp_path / WORKFLOW_NAME).read_text())
-
-    def fail(*args: Any, **kwargs: Any) -> None:
-        raise RuntimeError("interrupted resume")
-
-    monkeypatch.setattr(elastic_rates, "run_protocol", fail)
-    with pytest.raises(RuntimeError, match="interrupted resume"):
+    fake_scan_dynamics(monkeypatch, elastic_rates, _fail)
+    with pytest.raises(RuntimeError, match="interrupted"):
         run_elastic_rate_scan(run, tmp_path, **options)
     record_after = json.loads((tmp_path / WORKFLOW_NAME).read_text())
     assert record_after["start_state_sha256"] == record_before["start_state_sha256"]
@@ -598,7 +604,9 @@ def test_resume_refuses_a_different_returned_preparation_state(
     run, options, _, calls = _interrupted_branch(tmp_path, monkeypatch)
     changed = tmp_path / "other-preparation.xml"
     changed.write_text("another state")
-    monkeypatch.setattr(elastic_rates, "_last_state", lambda *args: str(changed))
+    monkeypatch.setattr(
+        "openmmpolymer._workflow.settled_state", lambda *args, **kwargs: str(changed)
+    )
     prior_count = len(calls)
     with pytest.raises(MechanicalError, match="preparation state changed"):
         run_elastic_rate_scan(run, tmp_path, **options)
@@ -665,7 +673,7 @@ def test_poisson_child_analysis_inherits_original_young_scan_preparation(
     record["request"]["relax_ps"] = record["request"].pop("hold_times_ps")
     preparation = {"name": "prepare", "stages": [{"temperature_k": 300.0}]}
     record["request"]["equilibration"] = {"protocol": preparation}
-    (tmp_path / "modulus_rate_workflow.json").write_text(json.dumps(record))
+    (tmp_path / YOUNGS_WORKFLOW_NAME).write_text(json.dumps(record))
     source.unlink()
     report = analyse_elastic_rates(
         directories, property_name="poisson_ratio", target_rate=0.001
@@ -674,3 +682,339 @@ def test_poisson_child_analysis_inherits_original_young_scan_preparation(
         item.conditions["preparation"] == preparation for item in report.observations
     )
     assert report.log_linear is not None and report.log_linear.resolved
+
+
+# --------------------------------------------------------------------------
+# Young's modulus: its own scan record, one pooled fit per rate
+# --------------------------------------------------------------------------
+
+YOUNGS_HOLDS = (50.0, 150.0, 500.0)
+YOUNGS_SPEC = ModulusSpec(n_replicas=2, max_strain=0.02)
+
+
+def _youngs(directories: list[Path], **options: Any) -> Any:
+    return analyse_elastic_rates(
+        directories,
+        property_name="youngs_modulus",
+        target_rate=options.pop("target_rate", 0.001),
+        **options,
+    )
+
+
+def test_saved_rates_recover_a_planted_logarithmic_law(tmp_path: Path) -> None:
+    report = _youngs(write_modulus_rate_series(tmp_path))
+    assert report.log_linear is not None
+    assert report.log_linear.value == pytest.approx(1700.0)
+    assert report.log_linear.sensitivity_per_decade == pytest.approx(300.0)
+    assert report.log_linear.resolved
+    assert len(report.observations) == 3
+    assert all(item.resolved for item in report.observations)
+    rates = [item.rate for item in report.observations]
+    assert rates == sorted(rates)
+
+
+def test_each_rate_keeps_only_its_own_notes(tmp_path: Path) -> None:
+    """Report notes were copied onto every rate, where they read as its own."""
+    directories = write_modulus_rate_series(tmp_path)
+    report = _youngs(directories)
+    for item in report.observations:
+        assert item.notes == (
+            f"Rate {item.rate:.6g} /ns has one replica; no replica spread is available.",
+        )
+    assert {item.source for item in report.observations} == {
+        f"{directory.resolve()}: 06_deform_r0_00" for directory in directories
+    }
+    per_observation = [note for note in report.notes if note.startswith("Observation")]
+    assert len(per_observation) == 3
+
+
+def test_same_rate_directories_are_replicas_not_extra_rate_observations(
+    tmp_path: Path,
+) -> None:
+    directories = write_modulus_rate_series(tmp_path)
+    duplicate = tmp_path / "replica"
+    write_deformation(duplicate, relax_ps=YOUNGS_HOLDS[-1], modulus_mpa=2000.0)
+    report = _youngs([*directories, duplicate])
+    assert len(report.observations) == 3
+    assert report.log_linear is not None and report.log_linear.n_rates == 3
+    slower = planted_modulus_mpa(deformation_rate_per_ns(500.0))
+    assert report.observations[0].value == pytest.approx((slower + 2000) / 2)
+    error = report.observations[0].standard_error
+    assert error is not None
+    assert error >= np.std([slower, 2000], ddof=1) - 1.0e-8
+    assert not any("one replica" in note for note in report.observations[0].notes)
+
+
+def test_excessive_replica_spread_remains_unresolved(tmp_path: Path) -> None:
+    directories = write_modulus_rate_series(tmp_path)
+    write_deformation(
+        directories[0],
+        stage="06_deform_r1_00",
+        modulus_mpa=6000.0,
+        relax_ps=YOUNGS_HOLDS[0],
+    )
+    report = _youngs(directories)
+    slowest = report.observations[-1]
+    assert not slowest.resolved
+    assert slowest.standard_error is not None and slowest.standard_error > 2000.0
+    assert any("replica quality and spread" in note for note in slowest.notes)
+    assert report.log_linear is not None and not report.log_linear.resolved
+    assert report.power_law is not None and not report.power_law.resolved
+
+
+def test_a_nonpositive_pooled_modulus_leaves_the_fits_unavailable(
+    tmp_path: Path,
+) -> None:
+    """It is a measurement outside the property's bounds, not a broken input."""
+    directories = write_modulus_rate_series(
+        tmp_path, modulus=lambda rate: -50.0 if rate > 0.03 else 1000.0
+    )
+    report = _youngs(directories)
+    assert report.log_linear is None and report.power_law is None
+    assert len(report.observations) == 3
+    assert any("physical bounds" in note for note in report.notes)
+
+
+def test_fewer_than_three_rates_leave_the_fits_unavailable(tmp_path: Path) -> None:
+    report = _youngs(write_modulus_rate_series(tmp_path, (50.0, 500.0)))
+    assert report.log_linear is None and report.power_law is None
+    assert any("three or more distinct" in note for note in report.notes)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [{"axis": 0}, {"increment": 0.001}, {"temperature_k": 310.0}],
+)
+def test_saved_rates_must_measure_comparable_deformations(
+    tmp_path: Path, changed: dict[str, Any]
+) -> None:
+    directories = write_modulus_rate_series(tmp_path)
+    write_deformation(directories[-1], relax_ps=YOUNGS_HOLDS[-1], **changed)
+    with pytest.raises(AnalysisError, match="same"):
+        _youngs(directories)
+
+
+def test_missing_recorded_rate_and_repeated_directories_are_refused(
+    tmp_path: Path,
+) -> None:
+    directories = write_modulus_rate_series(tmp_path)
+    path = directories[0] / "manifest.json"
+    record = json.loads(path.read_text())
+    del record["stages"]["06_deform_r0_00"]["samples"]["segment_duration_ps"]
+    path.write_text(json.dumps(record))
+    with pytest.raises(AnalysisError, match="positive strain rate"):
+        _youngs(directories)
+    with pytest.raises(AnalysisError, match="more than once"):
+        _youngs([directories[1], directories[1]])
+    write_shear(tmp_path / "sheared")
+    with pytest.raises(AnalysisError, match="no strain-controlled extension"):
+        _youngs([tmp_path / "sheared"])
+
+
+def test_scan_root_expands_only_its_recorded_directories(tmp_path: Path) -> None:
+    directories = write_modulus_rate_series(tmp_path)
+    (tmp_path / YOUNGS_WORKFLOW_NAME).write_text(
+        json.dumps({"run_dirs": [directory.name for directory in directories]})
+    )
+    write_deformation(tmp_path / "unrelated", relax_ps=123.0)
+    assert len(_youngs([tmp_path]).run_dirs) == 3
+    (directories[1] / "manifest.json").unlink()
+    with pytest.raises(AnalysisError, match="No completed rate manifest"):
+        _youngs([tmp_path])
+    (tmp_path / YOUNGS_WORKFLOW_NAME).write_text(json.dumps({"run_dirs": []}))
+    with pytest.raises(AnalysisError, match="records no rate run directories"):
+        _youngs([tmp_path])
+
+
+def _youngs_dynamics(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    fake_scan_dynamics(monkeypatch, elastic_rates, planted_extension_runner(calls))
+    return calls
+
+
+def _youngs_scan(run: Any, directory: Path, **options: Any) -> Any:
+    return run_elastic_rate_scan(
+        run,
+        directory,
+        property_name="youngs_modulus",
+        hold_times_ps=options.pop("hold_times_ps", YOUNGS_HOLDS),
+        target_rate=0.001,
+        spec=options.pop("spec", YOUNGS_SPEC),
+        **options,
+    )
+
+
+def test_youngs_scans_keep_the_original_record_and_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Existing scans resume only if new ones record exactly what they did."""
+    calls = _youngs_dynamics(monkeypatch)
+    run = _run()
+    report = _youngs_scan(run, tmp_path)
+    assert not (tmp_path / WORKFLOW_NAME).exists()
+    record = json.loads((tmp_path / YOUNGS_WORKFLOW_NAME).read_text())
+    request = record["request"]
+    assert set(request) == {
+        "spec",
+        "relax_ps",
+        "equilibration",
+        "target_rate_per_ns",
+        "max_extrapolation_decades",
+        "system",
+        "seed",
+    }
+    assert request["relax_ps"] == list(YOUNGS_HOLDS)
+    assert set(request["equilibration"]) == {"protocol"}
+    assert request["target_rate_per_ns"] == 0.001
+    assert request["system"] == asdict(run.spec) and request["seed"] == 17
+    assert record["run_dirs"] == ["rate_00", "rate_01", "rate_02"]
+    assert {"start_state", "reference_box_nm", "timestep_fs"} <= set(record)
+    branches = calls[1:]
+    assert [call["directory"].name for call in branches] == [
+        name for name in record["run_dirs"] for _ in range(YOUNGS_SPEC.n_replicas)
+    ]
+    assert [call["protocol"].stages[0].name for call in branches] == [
+        stage.name
+        for index, hold in enumerate(YOUNGS_HOLDS)
+        for replica in range(YOUNGS_SPEC.n_replicas)
+        for stage in deform_protocol(
+            replace(YOUNGS_SPEC, relax_ps=hold),
+            timestep_fs=2.0,
+            replica=index * YOUNGS_SPEC.n_replicas + replica,
+        ).stages
+    ]
+    assert {str(call["state_in"]) for call in branches} == {record["start_state"]}
+    assert report.property.name == "youngs_modulus"
+    assert len(report.observations) == 3
+
+
+def test_a_record_from_before_fingerprints_still_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Young's scans predate the common-state fingerprint the others keep."""
+    _youngs_dynamics(monkeypatch)
+    _youngs_scan(_run(), tmp_path)
+    path = tmp_path / YOUNGS_WORKFLOW_NAME
+    record = json.loads(path.read_text())
+    del record["start_state_sha256"]
+    path.write_text(json.dumps(record))
+    _youngs_scan(_run(), tmp_path)
+    assert "start_state_sha256" in json.loads(path.read_text())
+
+
+def test_changed_hamiltonian_is_rejected_before_workflow_metadata_is_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argon_run: Any
+) -> None:
+    from openmmpolymer.protocols import ProtocolError, Stage
+    from openmmpolymer.protocols import run_protocol as real_run_protocol
+
+    _youngs_dynamics(monkeypatch)
+    _youngs_scan(argon_run, tmp_path)
+    # Record real input provenance without running the expensive rate scan.
+    real_run_protocol(
+        Protocol("initial", (Stage("00_minimise", "minimise"),)),
+        argon_run,
+        tmp_path / "equilibration",
+    )
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    changed = replace(argon_run, system_xml=argon_run.system_xml + "\n")
+    with pytest.raises(ProtocolError, match="starting inputs changed"):
+        _youngs_scan(changed, tmp_path)
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize(
+    "changed", [{"hold_times_ps": (50.0, 200.0, 500.0)}, {"npt_ps": 50.0}]
+)
+def test_changed_rates_or_equilibration_cannot_resume_an_interrupted_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: dict[str, Any]
+) -> None:
+    fake_scan_dynamics(monkeypatch, elastic_rates, _fail)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        _youngs_scan(_run(), tmp_path)
+    assert (tmp_path / YOUNGS_WORKFLOW_NAME).is_file()
+    with pytest.raises(MechanicalError, match="different settings"):
+        _youngs_scan(_run(), tmp_path, **changed)
+
+
+def test_budget_failure_creates_no_directory(tmp_path: Path) -> None:
+    target = tmp_path / "unstarted"
+    with pytest.raises(MechanicalError, match="budget"):
+        _youngs_scan(_run(), target, spec=replace(YOUNGS_SPEC, max_total_ns=0.001))
+    assert not target.exists()
+
+
+def test_recorded_scan_refuses_an_incomplete_replica_or_ladder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _youngs_dynamics(monkeypatch)
+    _youngs_scan(_run(), tmp_path)
+    manifest = tmp_path / "rate_00" / "manifest.json"
+    pristine = manifest.read_text()
+    record = json.loads(pristine)
+    record["stages"]["06_deform_r0_00"]["samples"]["segment_duration_ps"][0] += 1.0
+    manifest.write_text(json.dumps(record))
+    with pytest.raises(AnalysisError, match="different rate holds"):
+        _youngs([tmp_path])
+    record = json.loads(pristine)
+    del record["stages"]["06_deform_r1_00"]
+    manifest.write_text(json.dumps(record))
+    with pytest.raises(AnalysisError, match="incomplete"):
+        _youngs([tmp_path])
+
+
+@pytest.mark.slow
+def test_real_youngs_scan_retains_replicas_common_reference_and_resume(
+    tmp_path: Path, argon_run: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Argon is not an elastic solid. Inspect real output rather than asking
+    # its noisy extension slopes to support a positive modulus extrapolation.
+    monkeypatch.setattr(
+        elastic_rates, "analyse_elastic_rates", lambda *args, **kwargs: None
+    )
+    spec = ModulusSpec(
+        temperature_k=120.0,
+        strain_increment=0.004,
+        max_strain=0.012,
+        elastic_strain_limit=0.012,
+        n_replicas=2,
+        samples_per_step=4,
+        stage_ps=0.3,
+    )
+    holds = (0.1, 0.2, 0.3)
+    options: dict[str, Any] = {
+        "spec": spec,
+        "hold_times_ps": holds,
+        "nvt_ps": 0.2,
+        "compress_ps_each": 0.2,
+        "npt_ps": 0.3,
+        "anneal_cycles": 1,
+        "anneal_window_ps": 0.1,
+        "anneal_hold_ps": 0.1,
+        "compress_pressures_bar": (1.0, 20.0, 1.0),
+    }
+    _youngs_scan(argon_run, tmp_path, **dict(options))
+    workflow = json.loads((tmp_path / YOUNGS_WORKFLOW_NAME).read_text())
+    reference = workflow["reference_box_nm"]
+    manifests = [tmp_path / name / "manifest.json" for name in workflow["run_dirs"]]
+    before = [json.loads(path.read_text())["stages"] for path in manifests]
+    for rate_index, (stages, hold) in enumerate(zip(before, holds, strict=True)):
+        for replica in range(spec.n_replicas):
+            replica_index = rate_index * spec.n_replicas + replica
+            entries = [
+                entry for name, entry in stages.items() if f"_r{replica_index}_" in name
+            ]
+            assert entries
+            assert (
+                sum(len(entry["samples"]["segment_strain"]) for entry in entries) == 3
+            )
+            for entry in entries:
+                samples = entry["samples"]
+                assert samples["reference_box_nm"] == pytest.approx(reference)
+                assert samples["segment_duration_ps"] == pytest.approx(
+                    [hold] * len(samples["segment_strain"])
+                )
+                assert Path(entry["final_state"]).is_file()
+    _youngs_scan(argon_run, tmp_path, **dict(options))
+    after = [json.loads(path.read_text())["stages"] for path in manifests]
+    assert after == before

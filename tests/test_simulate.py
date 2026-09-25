@@ -8,38 +8,94 @@ milliseconds.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import openmm as mm
 import pytest
+from openmm import unit
 
-from openmmpolymer.mdsystem import SystemSpec, make_barostat
+import openmmpolymer.simulate as simulate
+from openmmpolymer.forcefield import PolymerForceField
+from openmmpolymer.mdsystem import SystemSpec
+from openmmpolymer.packing import AVOGADRO, NM3_PER_CM3
 from openmmpolymer.simulate import (
     Segment,
     SimulationError,
     StageResult,
-    density_g_cm3,
+    _apply_positions,
+    _check_deformed_box,
+    _check_molecules,
+    _density_g_cm3,
+    _enthalpy_kj_mol,
+    _Live,
+    _open,
+    _positions_nm,
     heating_temperatures,
+    nonbonded_cutoff_nm,
     prepare_run,
     quench_temperatures,
     run_anneal,
     run_compress,
     run_deform,
     run_heat,
+    run_load,
     run_minimise,
     run_npt,
     run_nvt,
     run_production,
     run_pushoff,
     run_quench,
+    run_relax,
     run_segments,
     run_shear,
     safe_timestep_fs,
+    set_pressures,
     set_temperature,
     temperature_k_of,
 )
+from openmmpolymer.stress import STRESS_ESTIMATOR_VERSION, StressError, affine_scale
+
+from .helpers import argon_context, bare_simulation, rigid_rotor_system
+
+
+@pytest.fixture(scope="module")
+def minimised(tmp_path_factory: pytest.TempPathFactory) -> StageResult:
+    """The argon cell minimised once, for every stage here to start from.
+
+    At 120 K, near where these stages run, so the velocities the state carries
+    are close to the ones they ask for.
+    """
+    return run_minimise(
+        argon_context(64, 2.4),
+        tmp_path_factory.mktemp("minimised") / "00_minimise",
+        temperature_k=120.0,
+    )
+
+
+def _probe(
+    run: Any,
+    barostat: str | None = None,
+    *,
+    state_in: str | None = None,
+    new_velocities: bool = False,
+) -> Any:
+    """A stage's Simulation, built and placed the way every stage's is, unrun."""
+    return _open(
+        run,
+        "probe",
+        temperature_k=120.0,
+        timestep_fs=2.0,
+        friction_ps=1.0,
+        state_in=state_in,
+        new_velocities=new_velocities,
+        barostat=barostat,
+    ).simulation
 
 
 def test_prepare_run_measures_the_cell_mass(argon_run: Any) -> None:
@@ -55,22 +111,16 @@ def test_safe_timestep_is_quantised_and_derated() -> None:
     assert safe_timestep_fs(1200.0, spec) == 1.0
 
 
-def test_minimise_lowers_the_energy_and_leaves_a_state(argon_run: Any) -> None:
+def test_minimise_leaves_a_state_and_a_structure(minimised: StageResult) -> None:
     """The first thing a packed cell needs."""
-    result = run_minimise(argon_run, "00_minimise")
-    assert isinstance(result, StageResult)
-    assert Path(result.final_state).is_file()
-    assert Path(result.final_pdb or "").is_file()
-    assert np.isfinite(result.samples["potential_energy_kj_mol"][0])
-    assert result.mean_density_g_cm3 is not None
+    assert Path(minimised.final_state).is_file()
+    assert Path(minimised.final_pdb or "").is_file()
+    assert np.isfinite(minimised.samples["potential_energy_kj_mol"][0])
+    assert minimised.mean_density_g_cm3 is not None
 
 
-def test_minimise_refuses_a_cell_it_could_not_rescue(
-    argon_box: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_minimise_refuses_a_cell_it_could_not_rescue(argon_box: Any) -> None:
     """A cell with atoms on top of each other is not worth running."""
-    from openmmpolymer.forcefield import PolymerForceField
-
     box, system = argon_box
     box.positions_nm = np.zeros_like(box.positions_nm)
     run = prepare_run(
@@ -84,9 +134,10 @@ def test_minimise_refuses_a_cell_it_could_not_rescue(
         run_minimise(run, "00_minimise", max_iterations=1)
 
 
-def test_nvt_holds_the_volume_and_reaches_the_temperature(argon_run: Any) -> None:
+def test_nvt_holds_the_volume_and_reaches_the_temperature(
+    argon_run: Any, minimised: StageResult
+) -> None:
     """No barostat means no volume move, whatever else happens."""
-    minimised = run_minimise(argon_run, "00_minimise")
     before = argon_run.box.box_nm[0] ** 3
     result = run_nvt(
         argon_run,
@@ -97,21 +148,20 @@ def test_nvt_holds_the_volume_and_reaches_the_temperature(argon_run: Any) -> Non
     )
     volume = (
         argon_run.total_mass_g_mol
-        * 1.0e21
-        / (6.02214076e23 * (result.mean_density_g_cm3 or 1.0))
+        * NM3_PER_CM3
+        / (AVOGADRO * (result.mean_density_g_cm3 or 1.0))
     )
     assert volume == pytest.approx(before, rel=1e-6)
     assert result.mean_temperature_k == pytest.approx(120.0, abs=40.0)
 
 
-def test_npt_actually_moves_the_volume(argon_run: Any) -> None:
+def test_npt_actually_moves_the_volume(argon_run: Any, minimised: StageResult) -> None:
     """Adding a barostat to a System that already has a Context does nothing.
 
     This is the test for that: the stage builds its own Simulation precisely so
     the barostat is there before the Context is. Forty trial moves suffice;
     sustained compression would shrink this tiny cell below twice its cutoff.
     """
-    minimised = run_minimise(argon_run, "00_minimise")
     result = run_npt(
         argon_run,
         "01_npt",
@@ -126,71 +176,36 @@ def test_npt_actually_moves_the_volume(argon_run: Any) -> None:
     )
 
 
-def test_a_temperature_ramp_moves_the_thermostat_not_just_the_barostat(
-    argon_run: Any,
+@pytest.mark.parametrize("barostat", [None, "isotropic"])
+def test_a_temperature_change_moves_the_thermostat_not_just_the_barostat(
+    argon_run: Any, barostat: str | None
 ) -> None:
     """The failure this guards against produces a plausible, wrong density.
 
     ``context.setParameter("MonteCarloTemperature", T)`` feeds only the
-    barostat's Metropolis test. Without the integrator being set too, every
-    window integrates at the starting temperature.
+    barostat's Metropolis test; without the integrator being set too, every
+    window integrates at the starting temperature. Without a barostat there
+    is no parameter, and setting one would raise.
     """
-    import openmm as mm
-    from openmm import app, unit
-
-    system = mm.XmlSerializer.deserialize(argon_run.system_xml)
-    system.addForce(make_barostat("isotropic", 100.0, 1.0, 25, 9))
-    integrator = mm.LangevinMiddleIntegrator(
-        100.0 * unit.kelvin, 1.0 / unit.picosecond, 2.0 * unit.femtoseconds
-    )
-    simulation = app.Simulation(
-        argon_run.box.topology,
-        system,
-        integrator,
-        mm.Platform.getPlatformByName("CPU"),
-    )
-    simulation.context.setPositions(argon_run.box.positions)
-
-    set_temperature(simulation, 400.0, "isotropic")
+    simulation = _probe(argon_run, barostat)
+    set_temperature(simulation, 400.0, barostat)
     assert simulation.integrator.getTemperature().value_in_unit(
         unit.kelvin
     ) == pytest.approx(400.0)
-    assert simulation.context.getParameter("MonteCarloTemperature") == pytest.approx(
-        400.0
-    )
+    if barostat is not None:
+        assert simulation.context.getParameter(
+            "MonteCarloTemperature"
+        ) == pytest.approx(400.0)
 
 
-def test_set_temperature_without_a_barostat_touches_only_the_integrator(
-    argon_run: Any,
+def test_an_npt_state_loads_into_an_nvt_stage(
+    argon_run: Any, minimised: StageResult
 ) -> None:
-    """Setting the barostat parameter on a Context with none raises."""
-    import openmm as mm
-    from openmm import app, unit
-
-    system = mm.XmlSerializer.deserialize(argon_run.system_xml)
-    integrator = mm.LangevinMiddleIntegrator(
-        100.0 * unit.kelvin, 1.0 / unit.picosecond, 2.0 * unit.femtoseconds
-    )
-    simulation = app.Simulation(
-        argon_run.box.topology,
-        system,
-        integrator,
-        mm.Platform.getPlatformByName("CPU"),
-    )
-    simulation.context.setPositions(argon_run.box.positions)
-    set_temperature(simulation, 250.0, None)
-    assert simulation.integrator.getTemperature().value_in_unit(
-        unit.kelvin
-    ) == pytest.approx(250.0)
-
-
-def test_an_npt_state_loads_into_an_nvt_stage(argon_run: Any) -> None:
     """A state saved under NPT carries the barostat's global parameters.
 
     Restoring it with ``loadState`` into a Context that has no barostat raises,
     which would make every NPT-to-NVT transition a failure.
     """
-    minimised = run_minimise(argon_run, "00_minimise")
     npt = run_npt(
         argon_run,
         "01_npt",
@@ -208,9 +223,10 @@ def test_an_npt_state_loads_into_an_nvt_stage(argon_run: Any) -> None:
     assert nvt.steps > 0
 
 
-def test_pushoff_climbs_a_ladder_of_timesteps(argon_run: Any) -> None:
+def test_pushoff_climbs_a_ladder_of_timesteps(
+    argon_run: Any, minimised: StageResult
+) -> None:
     """Energy is drained rather than turned into velocity."""
-    minimised = run_minimise(argon_run, "00_minimise")
     result = run_pushoff(
         argon_run,
         "01_pushoff",
@@ -223,9 +239,10 @@ def test_pushoff_climbs_a_ladder_of_timesteps(argon_run: Any) -> None:
     assert Path(result.final_state).is_file()
 
 
-def test_compress_walks_the_pressure_ladder(argon_run: Any) -> None:
+def test_compress_walks_the_pressure_ladder(
+    argon_run: Any, minimised: StageResult
+) -> None:
     """A density is recorded at every rung, so the run can be read afterwards."""
-    minimised = run_minimise(argon_run, "00_minimise")
     result = run_compress(
         argon_run,
         "01_compress",
@@ -240,10 +257,9 @@ def test_compress_walks_the_pressure_ladder(argon_run: Any) -> None:
 
 
 def test_anneal_visits_the_top_and_the_bottom_of_every_cycle(
-    argon_run: Any,
+    argon_run: Any, minimised: StageResult
 ) -> None:
     """What 'melt it' means: repeated excursions above and back below."""
-    minimised = run_minimise(argon_run, "00_minimise")
     result = run_anneal(
         argon_run,
         "01_anneal",
@@ -261,11 +277,17 @@ def test_anneal_visits_the_top_and_the_bottom_of_every_cycle(
     assert result.temperature_k == pytest.approx(80.0)
 
 
-def test_quench_descends_and_records_a_density_per_temperature(
-    argon_run: Any,
+def test_quench_records_a_density_and_a_hold_per_temperature(
+    argon_run: Any, minimised: StageResult
 ) -> None:
-    """The specific-volume curve a glass transition is read off."""
-    minimised = run_minimise(argon_run, "00_minimise")
+    """The specific-volume curve a glass transition is read off.
+
+    Each hold's length is recorded because a stage's CSV knows only its total
+    time, so a ladder split across stages or resumed part-way through would
+    otherwise have its cooling rate worked out wrong rather than reported as
+    unknown. Waypoints are off unless asked for: one serialised state per
+    temperature is megabytes for a real cell.
+    """
     result = run_quench(
         argon_run,
         "01_quench",
@@ -276,21 +298,53 @@ def test_quench_descends_and_records_a_density_per_temperature(
         barostat_frequency=5,
         state_in=minimised.final_state,
     )
-    temperatures = result.samples["segment_temperature_k"]
-    assert temperatures == [150.0, 120.0, 90.0]
+    assert result.samples["segment_temperature_k"] == [150.0, 120.0, 90.0]
     assert len(result.samples["segment_density_g_cm3"]) == 3
-    assert temperatures == sorted(temperatures, reverse=True)
+    assert result.samples["segment_duration_ps"] == [0.4, 0.4, 0.4]
+    assert result.waypoints == ()
+    assert list(Path().glob("*waypoint*")) == []
 
 
-def test_quench_refuses_to_go_upwards(argon_run: Any) -> None:
-    """A quench cools; the other direction is an anneal."""
-    with pytest.raises(ValueError, match="a quench cools"):
-        run_quench(argon_run, "01_quench", t_start=100.0, t_end=200.0)
+def test_a_quench_waypoint_restarts_a_stage_where_it_was_written(
+    argon_run: Any, minimised: StageResult
+) -> None:
+    """What lets a finer second pass carry on from the middle of the first.
+
+    Written under one barostat and loaded into another, as a scan does.
+    """
+    quenched = run_quench(
+        argon_run,
+        "01_quench",
+        t_start=150.0,
+        t_end=90.0,
+        step_k=30.0,
+        hold_ps=0.4,
+        barostat_frequency=5,
+        waypoints=True,
+        state_in=minimised.final_state,
+    )
+    assert [Path(path).name for path in quenched.waypoints] == [
+        "01_quench_waypoint00_150K.state.xml",
+        "01_quench_waypoint01_120K.state.xml",
+        "01_quench_waypoint02_90K.state.xml",
+    ]
+    assert all(Path(path).is_file() for path in quenched.waypoints)
+
+    resumed = run_quench(
+        argon_run,
+        "02_quench",
+        temperatures_k=[120.0, 110.0],
+        hold_ps=0.4,
+        barostat_frequency=5,
+        state_in=quenched.waypoints[1],
+    )
+    assert resumed.samples["segment_temperature_k"] == [120.0, 110.0]
 
 
-def test_production_writes_a_trajectory_and_its_topology(argon_run: Any) -> None:
+def test_production_writes_a_trajectory_and_its_topology(
+    argon_run: Any, minimised: StageResult
+) -> None:
     """Neither XTC nor DCD carries a topology, so one is written beside it."""
-    minimised = run_minimise(argon_run, "00_minimise")
     run_production(
         argon_run,
         "01_production",
@@ -303,6 +357,23 @@ def test_production_writes_a_trajectory_and_its_topology(argon_run: Any) -> None
     )
     assert Path("01_production.xtc").is_file()
     assert Path("01_production_topology.pdb").is_file()
+
+
+def test_production_holds_the_pressure_asked_for_even_zero(
+    argon_run: Any, minimised: StageResult
+) -> None:
+    """``pressure_bar or 1.0`` quietly ran a requested 0 bar at 1 bar."""
+    result = run_production(
+        argon_run,
+        "01_production",
+        temperature_k=100.0,
+        duration_ps=0.2,
+        pressure_bar=0.0,
+        trajectory="none",
+        state_in=minimised.final_state,
+    )
+    saved = mm.XmlSerializer.deserialize(Path(result.final_state).read_text())
+    assert saved.getParameters()["MonteCarloPressure"] == 0.0
 
 
 def test_run_segments_needs_something_to_run(argon_run: Any) -> None:
@@ -325,13 +396,26 @@ def test_run_segments_checks_the_timestep_against_the_hottest_segment(
         )
 
 
-def test_the_numeric_csv_is_all_numbers(argon_run: Any) -> None:
+@pytest.mark.parametrize(
+    "runner", [run_nvt, run_deform, run_load, run_shear, run_relax]
+)
+@pytest.mark.parametrize("timestep_fs", [0.0, -1.0, float("nan")])
+def test_every_stage_refuses_a_timestep_that_is_not_positive(
+    argon_run: Any, runner: Callable[..., StageResult], timestep_fs: float
+) -> None:
+    """Checked before a Context is built, by every stage and not only some."""
+    with pytest.raises(ValueError, match="timestep_fs"):
+        runner(argon_run, timestep_fs=timestep_fs)
+
+
+def test_the_numeric_csv_is_all_numbers_and_the_log_has_the_rest(
+    argon_run: Any, minimised: StageResult
+) -> None:
     """Progress renders as '20.0%' and an unknown remaining time as '--'.
 
     Either in the data would stop the file being a table of numbers, so they
     go in the human log instead.
     """
-    minimised = run_minimise(argon_run, "00_minimise")
     result = run_nvt(
         argon_run,
         "01_nvt",
@@ -344,19 +428,6 @@ def test_the_numeric_csv_is_all_numbers(argon_run: Any) -> None:
     assert table.size > 0
     assert not np.isnan(np.asarray(table.tolist(), dtype=float)).any()
     assert "Density_gmL" in (table.dtype.names or ())
-
-
-def test_the_human_log_carries_the_progress_columns(argon_run: Any) -> None:
-    """The other half of the split."""
-    minimised = run_minimise(argon_run, "00_minimise")
-    run_nvt(
-        argon_run,
-        "01_nvt",
-        temperature_k=100.0,
-        duration_ps=1.0,
-        report_interval_ps=0.2,
-        state_in=minimised.final_state,
-    )
     header = Path("01_nvt.log").read_text().splitlines()[0]
     assert "Progress" in header
     assert "Speed" in header
@@ -364,9 +435,8 @@ def test_the_human_log_carries_the_progress_columns(argon_run: Any) -> None:
 
 def test_a_run_is_reproducible_from_its_seed(argon_box: Any) -> None:
     """Everything stochastic derives from one number."""
-    from openmmpolymer.forcefield import PolymerForceField
 
-    def densities(seed: int) -> list[float]:
+    def temperatures(seed: int) -> list[float]:
         box, system = argon_box
         run = prepare_run(
             box,
@@ -385,32 +455,17 @@ def test_a_run_is_reproducible_from_its_seed(argon_box: Any) -> None:
         )
         return result.samples["segment_mean_temperature_k"]
 
-    assert densities(5) == densities(5)
+    assert temperatures(5) == temperatures(5)
 
 
 def test_density_and_temperature_helpers_agree_with_openmm(argon_run: Any) -> None:
     """Both are computed here rather than read off a reporter."""
-    import openmm as mm
-    from openmm import app, unit
-
-    system = mm.XmlSerializer.deserialize(argon_run.system_xml)
-    integrator = mm.LangevinMiddleIntegrator(
-        300.0 * unit.kelvin, 1.0 / unit.picosecond, 1.0 * unit.femtoseconds
-    )
-    simulation = app.Simulation(
-        argon_run.box.topology,
-        system,
-        integrator,
-        mm.Platform.getPlatformByName("CPU"),
-    )
-    simulation.context.setPositions(argon_run.box.positions)
-    simulation.context.setVelocitiesToTemperature(300.0, 1)
-
-    expected = argon_run.total_mass_g_mol * 1.0e21 / (6.02214076e23 * 2.4**3)
-    assert density_g_cm3(simulation, argon_run.total_mass_g_mol) == pytest.approx(
+    simulation = _probe(argon_run)
+    expected = argon_run.total_mass_g_mol * NM3_PER_CM3 / (AVOGADRO * 2.4**3)
+    assert _density_g_cm3(simulation, argon_run.total_mass_g_mol) == pytest.approx(
         expected
     )
-    assert temperature_k_of(simulation) == pytest.approx(300.0, rel=0.35)
+    assert temperature_k_of(simulation) == pytest.approx(120.0, rel=0.35)
 
 
 # --------------------------------------------------------------------------
@@ -434,27 +489,27 @@ def test_a_ladder_that_does_not_divide_evenly_still_reaches_the_bottom() -> None
 
 
 @pytest.mark.parametrize(
-    ("start", "end", "step"),
+    ("start", "end", "step", "match"),
     [
-        (100.0, 100.0, 20.0),
-        (100.0, 200.0, 20.0),
-        (float("inf"), 100.0, 20.0),
-        (float("nan"), 100.0, 20.0),
-        (200.0, float("nan"), 20.0),
-        (200.0, float("-inf"), 20.0),
-        (200.0, 100.0, float("nan")),
-        (200.0, 100.0, float("inf")),
-        (200.0, 100.0, 0.0),
-        (200.0, 100.0, -1.0),
-        (200.0, 100.0, 1e-30),
-        (-2.0 + 2.0**-52, -3.0, 2.0**-52),
+        (100.0, 100.0, 20.0, "a quench cools"),
+        (100.0, 200.0, 20.0, "a quench cools"),
+        (float("inf"), 100.0, 20.0, "finite"),
+        (float("nan"), 100.0, 20.0, "finite"),
+        (200.0, float("nan"), 20.0, "finite"),
+        (200.0, float("-inf"), 20.0, "finite"),
+        (200.0, 100.0, float("nan"), "finite"),
+        (200.0, 100.0, float("inf"), "finite"),
+        (200.0, 100.0, 0.0, "greater than zero"),
+        (200.0, 100.0, -1.0, "greater than zero"),
+        (200.0, 100.0, 1e-30, "too small"),
+        (-2.0 + 2.0**-52, -3.0, 2.0**-52, "too small"),
     ],
 )
 def test_quench_ladder_rejects_invalid_arguments(
-    start: float, end: float, step: float
+    start: float, end: float, step: float, match: str
 ) -> None:
     """Invalid endpoints and steps must fail instead of hanging a quench."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=match):
         quench_temperatures(start, end, step)
 
 
@@ -475,24 +530,24 @@ def test_quench_rejects_nonpositive_physical_temperatures(
 
 
 @pytest.mark.parametrize(
-    "temperatures",
+    ("temperatures", "match"),
     [
-        [],
-        [100.0, 120.0],
-        [100.0, 100.0],
-        [float("nan")],
-        [float("inf")],
-        [0.0],
-        [-1.0],
-        [120.0, float("nan")],
-        [float("inf"), 120.0],
+        ([], "nothing to hold"),
+        ([100.0, 120.0], "has to descend"),
+        ([100.0, 100.0], "has to descend"),
+        ([float("nan")], "finite"),
+        ([float("inf")], "finite"),
+        ([0.0], "greater than zero"),
+        ([-1.0], "greater than zero"),
+        ([120.0, float("nan")], "finite"),
+        ([float("inf"), 120.0], "finite"),
     ],
 )
 def test_quench_rejects_an_invalid_explicit_ladder(
-    argon_run: Any, temperatures: list[float]
+    argon_run: Any, temperatures: list[float], match: str
 ) -> None:
     """A one-window chunk needs the same valid temperatures as a full ladder."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=match):
         run_quench(argon_run, temperatures_k=temperatures)
 
 
@@ -553,11 +608,10 @@ def test_heat_uses_the_hot_endpoint_to_validate_timestep(argon_run: Any) -> None
         run_heat(argon_run, t_start=100.0, t_end=900.0, timestep_fs=2.0)
 
 
-def test_heat_records_density_enthalpy_and_anisotropic_pressure(argon_run: Any) -> None:
+def test_heat_records_density_enthalpy_and_anisotropic_pressure(
+    argon_run: Any, minimised: StageResult
+) -> None:
     """The CPU integration exercises the complete heating and state path."""
-    import openmm as mm
-
-    minimised = run_minimise(argon_run, "00_minimise")
     result = run_heat(
         argon_run,
         "01_heat",
@@ -590,14 +644,14 @@ def test_heat_records_density_enthalpy_and_anisotropic_pressure(argon_run: Any) 
     assert len(resumed.samples["segment_enthalpy_kj_mol"]) == 1
 
 
-def test_enthalpy_includes_kinetic_energy_and_pv_over_retained_samples(
+def test_a_hold_keeps_every_observable_from_the_same_second_half(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The transient is discarded for every observable at the same times."""
-    from openmm import unit
+    """The transient is discarded for every observable at the same times.
 
-    import openmmpolymer.simulate as simulate
-
+    Enthalpy includes the kinetic energy and the pV work, and what the hold
+    was asked for is recorded beside what it ran at.
+    """
     simulation = SimpleNamespace(index=-1)
 
     def step(steps: int) -> None:
@@ -617,26 +671,45 @@ def test_enthalpy_includes_kinetic_energy_and_pv_over_retained_samples(
     simulation.step = step
     simulation.context = SimpleNamespace(getState=state)
     monkeypatch.setattr(
-        simulate, "density_g_cm3", lambda sim, mass: float(sim.index + 1)
+        simulate, "_density_g_cm3", lambda sim, mass: float(sim.index + 1)
     )
     monkeypatch.setattr(
         simulate, "temperature_k_of", lambda sim: 100.0 * (sim.index + 1)
     )
-    density, temperature, enthalpy = simulate._sample_segment(
-        simulation, 4, 1.0, 4, pressure_bar=2.0
+    run: Any = SimpleNamespace(total_mass_g_mol=1.0)
+    live = _Live(run, Path("fake"), simulation, 1.0, 0.0, "fake")
+    samples: dict[str, list[float]] = {
+        "segment_temperature_k": [],
+        "segment_mean_temperature_k": [],
+        "segment_density_g_cm3": [],
+        "segment_duration_ps": [],
+    }
+    enthalpies, density, temperature = live.hold(
+        samples,
+        300.0,
+        0.004,
+        4,
+        "blew up",
+        partial(_enthalpy_kj_mol, pressure_bar=2.0),
     )
-    assert density == pytest.approx(3.5)
-    assert temperature == pytest.approx(350.0)
-    assert enthalpy == pytest.approx(33.5 + 12.0 * 0.0602214076)
+    assert (density, temperature) == (3.5, 350.0)
+    assert np.mean(enthalpies) == pytest.approx(33.5 + 12.0 * 0.0602214076)
+    assert samples == {
+        "segment_temperature_k": [300.0],
+        "segment_mean_temperature_k": [350.0],
+        "segment_density_g_cm3": [3.5],
+        "segment_duration_ps": [0.004],
+    }
 
 
-def test_a_quench_can_be_given_its_temperatures_outright(argon_run: Any) -> None:
+def test_a_quench_can_be_given_its_temperatures_outright(
+    argon_run: Any, minimised: StageResult
+) -> None:
     """A chunked pass hands each stage a slice of one ladder, not endpoints.
 
     Deriving each chunk's endpoints from the grid is exactly the off-by-one
     that repeats or skips a temperature at every boundary.
     """
-    minimised = run_minimise(argon_run, "00_minimise")
     result = run_quench(
         argon_run,
         "01_quench",
@@ -648,134 +721,23 @@ def test_a_quench_can_be_given_its_temperatures_outright(argon_run: Any) -> None
     assert result.samples["segment_temperature_k"] == [140.0, 125.0, 110.0]
 
 
-def test_a_ladder_that_does_not_descend_is_refused(argon_run: Any) -> None:
-    """Handed a list, the guard still has to be there."""
-    with pytest.raises(ValueError, match="has to descend"):
-        run_quench(argon_run, "01_quench", temperatures_k=[100.0, 120.0])
-
-
-def test_an_empty_ladder_is_refused(argon_run: Any) -> None:
-    """There is nothing to hold, and it says what to give instead."""
-    with pytest.raises(ValueError, match="nothing to hold"):
-        run_quench(argon_run, "01_quench", temperatures_k=[])
-
-
-def test_a_stage_records_how_long_each_segment_was_held(argon_run: Any) -> None:
-    """A stage's CSV knows only its total time.
-
-    So a ladder split across stages, or resumed part-way through, would have
-    its cooling rate worked out wrong rather than reported as unknown.
-    """
-    minimised = run_minimise(argon_run, "00_minimise")
-    result = run_quench(
-        argon_run,
-        "01_quench",
-        t_start=150.0,
-        t_end=90.0,
-        step_k=30.0,
-        hold_ps=0.4,
-        barostat_frequency=5,
-        state_in=minimised.final_state,
-    )
-    assert result.samples["segment_duration_ps"] == [0.4, 0.4, 0.4]
-
-
-def test_a_quench_can_leave_a_waypoint_at_every_temperature(
-    argon_run: Any,
-) -> None:
-    """What lets a finer second pass carry on from the middle of the first."""
-    minimised = run_minimise(argon_run, "00_minimise")
-    result = run_quench(
-        argon_run,
-        "01_quench",
-        t_start=150.0,
-        t_end=90.0,
-        step_k=30.0,
-        hold_ps=0.4,
-        barostat_frequency=5,
-        waypoints=True,
-        state_in=minimised.final_state,
-    )
-    assert len(result.waypoints) == len(result.samples["segment_temperature_k"])
-    assert [Path(str(path)).name for path in result.waypoints] == [
-        "01_quench_waypoint00_150K.state.xml",
-        "01_quench_waypoint01_120K.state.xml",
-        "01_quench_waypoint02_90K.state.xml",
-    ]
-    assert all(Path(str(path)).is_file() for path in result.waypoints)
-
-
-def test_waypoints_are_off_unless_they_are_asked_for(argon_run: Any) -> None:
-    """One serialised state per temperature is megabytes for a real cell."""
-    minimised = run_minimise(argon_run, "00_minimise")
-    result = run_quench(
-        argon_run,
-        "01_quench",
-        t_start=150.0,
-        t_end=90.0,
-        step_k=30.0,
-        hold_ps=0.4,
-        barostat_frequency=5,
-        state_in=minimised.final_state,
-    )
-    assert result.waypoints == ()
-    assert list(Path().glob("*waypoint*")) == []
-
-
-def test_a_waypoint_restarts_a_stage_where_it_was_written(argon_run: Any) -> None:
-    """Written under a barostat and loaded into another one, as a scan does."""
-    import openmm as mm
-
-    minimised = run_minimise(argon_run, "00_minimise")
-    quenched = run_quench(
-        argon_run,
-        "01_quench",
-        t_start=150.0,
-        t_end=90.0,
-        step_k=30.0,
-        hold_ps=0.4,
-        barostat_frequency=5,
-        waypoints=True,
-        state_in=minimised.final_state,
-    )
-    waypoint = str(quenched.waypoints[1])
-    saved = mm.XmlSerializer.deserialize(Path(waypoint).read_text())
-
-    resumed = run_quench(
-        argon_run,
-        "02_quench",
-        temperatures_k=[120.0, 110.0],
-        hold_ps=0.4,
-        barostat_frequency=5,
-        state_in=waypoint,
-    )
-    started = mm.XmlSerializer.deserialize(Path("02_quench.state.xml").read_text())
-
-    assert resumed.samples["segment_temperature_k"] == [120.0, 110.0]
-    assert saved.getPeriodicBoxVectors() is not None
-    assert started.getPeriodicBoxVectors() is not None
-
-
 def test_the_readings_behind_a_segment_average_can_be_raised(
-    argon_run: Any, monkeypatch: pytest.MonkeyPatch
+    argon_run: Any, minimised: StageResult, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Ten readings, halved, leaves five behind each point on a curve.
 
     Thin for a segment whose whole purpose is a low-noise point, so a fine
     pass asks for more.
     """
-    import openmmpolymer.simulate as simulate
-
     calls = 0
-    real = simulate.density_g_cm3
+    real = simulate._density_g_cm3
 
     def counted(simulation: Any, total_mass_g_mol: float) -> float:
         nonlocal calls
         calls += 1
-        return float(real(simulation, total_mass_g_mol))
+        return real(simulation, total_mass_g_mol)
 
-    monkeypatch.setattr(simulate, "density_g_cm3", counted)
-    minimised = run_minimise(argon_run, "00_minimise")
+    monkeypatch.setattr(simulate, "_density_g_cm3", counted)
     run_nvt(
         argon_run,
         "01_nvt",
@@ -784,9 +746,8 @@ def test_the_readings_behind_a_segment_average_can_be_raised(
         samples_per_segment=25,
         state_in=minimised.final_state,
     )
-    # The last chunk is short whenever the step count does not divide, so
-    # the loop takes one more reading than it was asked for rather than a
-    # shorter final one.
+    # A step count that does not divide ends on a shorter chunk, which is one
+    # more reading than was asked for.
     assert calls == pytest.approx(25, abs=1)
 
 
@@ -808,55 +769,33 @@ def test_a_stage_can_be_told_to_draw_fresh_velocities(argon_run: Any) -> None:
     its positions, repeats the same trajectory, and the spread over the
     replicas is zero pretending to be an error bar.
     """
-    from openmm import unit
-
-    from openmmpolymer.simulate import _build_simulation, _initialise
-
     settled = run_npt(argon_run, "npt", temperature_k=120.0, duration_ps=0.4)
 
-    def velocities(reuse: bool) -> Any:
-        simulation = _build_simulation(
-            argon_run,
-            "probe" if reuse else "probe_fresh",
-            temperature_k=120.0,
-            timestep_fs=2.0,
-            friction_ps=1.0,
-            barostat=None,
-            pressure_bar=1.0,
-            barostat_frequency=25,
-        )
-        _initialise(
-            argon_run,
-            simulation,
-            "probe" if reuse else "probe_fresh",
-            settled.final_state,
-            120.0,
-            reuse_velocities=reuse,
-        )
-        return np.asarray(
+    def velocities(new: bool) -> Any:
+        simulation = _probe(argon_run, state_in=settled.final_state, new_velocities=new)
+        return (
             simulation.context.getState(getVelocities=True)
             .getVelocities(asNumpy=True)
             .value_in_unit(unit.nanometer / unit.picosecond)
         )
 
-    inherited, fresh = velocities(True), velocities(False)
-    assert not np.allclose(inherited, fresh)
+    assert not np.allclose(velocities(False), velocities(True))
+
+
+def test_a_state_saved_without_velocities_is_given_fresh_ones(
+    argon_run: Any, minimised: StageResult
+) -> None:
+    """A state from elsewhere need not carry any, and is not refused for it."""
+    context = _probe(argon_run, state_in=minimised.final_state).context
+    state = context.getState(getPositions=True)
+    Path("positions.xml").write_text(mm.XmlSerializer.serialize(state))
+    simulation = _probe(argon_run, state_in="positions.xml")
+    assert temperature_k_of(simulation) == pytest.approx(120.0, rel=0.35)
 
 
 def test_pressures_can_be_set_per_axis(argon_run: Any) -> None:
     """A uniaxial load is one axis held somewhere the other two are not."""
-    from openmmpolymer.simulate import _build_simulation, set_pressures
-
-    simulation = _build_simulation(
-        argon_run,
-        "aniso",
-        temperature_k=120.0,
-        timestep_fs=2.0,
-        friction_ps=1.0,
-        barostat="anisotropic",
-        pressure_bar=1.0,
-        barostat_frequency=25,
-    )
+    simulation = _probe(argon_run, "anisotropic")
     set_pressures(simulation, (1.0, 1.0, -20.0), "anisotropic")
     assert simulation.context.getParameter("MonteCarloPressureZ") == pytest.approx(
         -20.0
@@ -868,18 +807,7 @@ def test_three_different_pressures_are_refused_by_a_barostat_that_holds_one(
     argon_run: Any,
 ) -> None:
     """Applying the first of three to all of them would not be the run asked for."""
-    from openmmpolymer.simulate import _build_simulation, set_pressures
-
-    simulation = _build_simulation(
-        argon_run,
-        "iso",
-        temperature_k=120.0,
-        timestep_fs=2.0,
-        friction_ps=1.0,
-        barostat="isotropic",
-        pressure_bar=1.0,
-        barostat_frequency=25,
-    )
+    simulation = _probe(argon_run, "isotropic")
     with pytest.raises(ValueError, match="one pressure"):
         set_pressures(simulation, (1.0, 1.0, -20.0), "isotropic")
     set_pressures(simulation, (5.0, 5.0, 5.0), "isotropic")
@@ -899,60 +827,64 @@ def test_a_cell_that_has_shrunk_below_the_cutoff_is_refused(
     actually contract a cell past its cutoff takes far more dynamics than a
     fast test can spend, and what is being checked here is the arithmetic.
     """
-    from openmmpolymer.simulate import (
-        _build_simulation,
-        _check_deformed_box,
-        _initialise,
-        nonbonded_cutoff_nm,
-    )
-
-    simulation = _build_simulation(
-        argon_run,
-        "probe",
-        temperature_k=120.0,
-        timestep_fs=2.0,
-        friction_ps=1.0,
-        barostat=None,
-        pressure_bar=1.0,
-        barostat_frequency=25,
-    )
-    _initialise(argon_run, simulation, "probe", None, 120.0)
+    simulation = _probe(argon_run)
     cutoff = nonbonded_cutoff_nm(simulation.system)
     assert cutoff > 0.0
+    assert nonbonded_cutoff_nm(mm.System()) == 0.0
 
     # The fixture's cell is comfortably above twice the cutoff.
     _check_deformed_box("probe", simulation, cutoff, 0.0)
     # Pretending the cutoff is most of the box is the same arithmetic.
     with pytest.raises(SimulationError, match="cutoff"):
         _check_deformed_box("probe", simulation, 10.0, 0.05)
-
-
-def test_a_system_with_no_cutoff_is_not_checked_against_one(
-    argon_run: Any,
-) -> None:
-    """Zero means "nothing here has one", which is not a box of zero size."""
-    from openmmpolymer.simulate import _build_simulation, _check_deformed_box
-
-    simulation = _build_simulation(
-        argon_run,
-        "probe",
-        temperature_k=120.0,
-        timestep_fs=2.0,
-        friction_ps=1.0,
-        barostat=None,
-        pressure_bar=1.0,
-        barostat_frequency=25,
-    )
+    # Zero means "nothing here has one", which is not a box of zero size.
     _check_deformed_box("probe", simulation, 0.0, 0.0)
 
 
+def test_a_cell_openmm_groups_differently_from_the_packing_is_reported(
+    argon_run: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A merged pair of chains is a wrong molecular virial, silently."""
+    simulation = _probe(argon_run)
+    with caplog.at_level(logging.WARNING, logger="openmmpolymer.simulate"):
+        _check_molecules("probe", simulation, 64)
+        assert not caplog.records
+        _check_molecules("probe", simulation, 63)
+    assert "into 64 molecules, but 63 chains" in caplog.text
+
+
+def test_a_strain_leaves_every_constraint_satisfied() -> None:
+    """Scaling atoms stretches the bonds they share, and the repair undoes it.
+
+    Positions go back onto the constraint, and velocities lose the component
+    along it that the constraint does not allow - drawn at random here, so
+    they start with one.
+    """
+    simulation = bare_simulation(*rigid_rotor_system(30, 3.0))
+    drawn = np.random.default_rng(3).normal(0.0, 0.5, (60, 3))
+    simulation.context.setVelocities(drawn * unit.nanometer / unit.picosecond)
+    factors = (1.0, 1.0, 1.05)
+    vectors = simulation.context.getState().getPeriodicBoxVectors()
+    _apply_positions(
+        simulation,
+        affine_scale(_positions_nm(simulation), factors),
+        [vector * factor for vector, factor in zip(vectors, factors, strict=True)],
+    )
+    state = simulation.context.getState(getPositions=True, getVelocities=True)
+    positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+    velocities = state.getVelocities(asNumpy=True).value_in_unit(
+        unit.nanometer / unit.picosecond
+    )
+    bonds = positions[1::2] - positions[0::2]
+    along = np.einsum("ij,ij->i", velocities[1::2] - velocities[0::2], bonds)
+    assert np.linalg.norm(bonds, axis=1) == pytest.approx(0.109, rel=1e-6)
+    assert along == pytest.approx(0.0, abs=1e-6)
+
+
 def test_a_shear_past_the_reduced_form_is_refused_before_the_ladder_runs(
-    argon_run: Any,
+    argon_run: Any, minimised: StageResult
 ) -> None:
     """Checked against every rung up front, not discovered on the last one."""
-    from openmmpolymer.stress import StressError
-
-    minimised = run_minimise(argon_run, "min", temperature_k=120.0)
     with pytest.raises((SimulationError, StressError), match="reduced form"):
         run_shear(
             argon_run,
@@ -965,11 +897,10 @@ def test_a_shear_past_the_reduced_form_is_refused_before_the_ladder_runs(
         )
 
 
-def test_a_shear_records_the_corrected_stress_estimator(argon_run: Any) -> None:
+def test_a_shear_records_the_corrected_stress_estimator(
+    argon_run: Any, minimised: StageResult
+) -> None:
     """Analysis must distinguish new physical stresses from old box derivatives."""
-    from openmmpolymer.stress import STRESS_ESTIMATOR_VERSION
-
-    minimised = run_minimise(argon_run, "min", temperature_k=120.0)
     result = run_shear(
         argon_run,
         "shear",
@@ -984,10 +915,9 @@ def test_a_shear_records_the_corrected_stress_estimator(argon_run: Any) -> None:
 
 
 def test_a_deformation_records_a_reference_cell_and_an_axis(
-    argon_run: Any,
+    argon_run: Any, minimised: StageResult
 ) -> None:
     """Recorded rather than recomputed, so a resumed chunk shares the origin."""
-    minimised = run_minimise(argon_run, "min", temperature_k=120.0)
     result = run_deform(
         argon_run,
         "deform",
@@ -1005,10 +935,9 @@ def test_a_deformation_records_a_reference_cell_and_an_axis(
 
 
 def test_a_deformation_resumed_mid_ladder_keeps_the_original_origin(
-    argon_run: Any,
+    argon_run: Any, minimised: StageResult
 ) -> None:
     """The strain a second chunk reports is measured from the unstrained cell."""
-    minimised = run_minimise(argon_run, "min", temperature_k=120.0)
     first = run_deform(
         argon_run,
         "deform_a",
@@ -1038,3 +967,14 @@ def test_a_deformation_resumed_mid_ladder_keeps_the_original_origin(
     assert second.samples["segment_box_z_nm"][-1] / origin[2] - 1.0 == pytest.approx(
         second.samples["segment_strain"][-1]
     )
+
+
+@pytest.mark.parametrize("option", ["baseline_ps", "ramp_ps", "time_offset_ps"])
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_relax_refuses_a_time_that_is_negative_or_not_finite(
+    argon_run: Any, option: str, value: float
+) -> None:
+    """``< 0.0`` let NaN through, and an endless baseline is not a baseline."""
+    options: dict[str, Any] = {option: value}
+    with pytest.raises(ValueError, match="finite and zero or more"):
+        run_relax(argon_run, **options)

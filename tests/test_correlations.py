@@ -9,12 +9,14 @@ import numpy as np
 import pytest
 
 from openmmpolymer.correlations import (
+    MIN_WAVEVECTORS_PER_BIN,
+    peak_bins,
     radial_distribution,
     structure_factor,
 )
 from openmmpolymer.trajectory import AnalysisError
 
-from .helpers import _lattice, synthetic_ensemble
+from .helpers import lattice, synthetic_ensemble
 
 #: The simple cubic lattice the argon fixtures use: 64 sites, 0.6 nm apart, in
 #: a 2.4 nm cell. Its neighbour shells are exactly 6, 12 and 8 at 0.6,
@@ -27,7 +29,7 @@ LATTICE_EDGE_NM = 2.4
 def lattice_ensemble(n_chains: int = 64) -> Any:
     """The 64-site cubic lattice, split into *n_chains* equal molecules."""
     return synthetic_ensemble(
-        _lattice(64, LATTICE_EDGE_NM), n_chains=n_chains, box_nm=LATTICE_EDGE_NM
+        lattice(64, LATTICE_EDGE_NM), n_chains=n_chains, box_nm=LATTICE_EDGE_NM
     )
 
 
@@ -103,6 +105,19 @@ def test_the_default_radius_is_as_far_as_the_cell_allows() -> None:
     assert measured.r_max_nm == pytest.approx(LATTICE_EDGE_NM / 2)
 
 
+def test_the_default_radius_survives_the_kernels_float32_box() -> None:
+    """An NPT cell whose float32 half-edge rounds below the float64 one: the
+    distance kernel must not refuse the radius it was just handed. A hundred
+    atoms or more, because below that MDAnalysis never uses its grid search."""
+    edge = 2.7858951568603514
+    assert float(np.float32(edge)) / 2.0 < edge / 2.0
+    measured = radial_distribution(
+        synthetic_ensemble(lattice(216, edge), n_chains=216, box_nm=edge),
+        heavy_atoms_only=False,
+    )
+    assert measured.r_max_nm == pytest.approx(edge / 2)
+
+
 def test_a_radius_past_half_the_cell_is_refused() -> None:
     """Past it the convention counts one neighbour as two, and the distance
     kernel applies it anyway without complaining."""
@@ -119,7 +134,7 @@ def test_a_cell_of_one_molecule_has_no_intermolecular_pairs() -> None:
 def test_dropping_hydrogens_from_an_all_hydrogen_cell_is_refused() -> None:
     """It leaves nothing to measure, and an empty array is not an answer."""
     ensemble = synthetic_ensemble(
-        _lattice(64, LATTICE_EDGE_NM),
+        lattice(64, LATTICE_EDGE_NM),
         n_chains=32,
         box_nm=LATTICE_EDGE_NM,
         is_hydrogen=np.ones(2, dtype=bool),
@@ -132,7 +147,7 @@ def test_hydrogens_can_be_dropped() -> None:
     """A melt's hydrogens trace the same structure as the carbons they hang
     off, at four times the pair count."""
     ensemble = synthetic_ensemble(
-        _lattice(64, LATTICE_EDGE_NM),
+        lattice(64, LATTICE_EDGE_NM),
         n_chains=32,
         box_nm=LATTICE_EDGE_NM,
         is_hydrogen=np.array([False, True]),
@@ -157,7 +172,7 @@ def test_the_bins_span_zero_to_the_measured_radius() -> None:
 def test_the_frame_count_is_reported_alongside_the_answer() -> None:
     """A g(r) from one frame and one from five hundred have the same shape and
     very different standing."""
-    frames = np.repeat(_lattice(64, LATTICE_EDGE_NM)[None, :, :], 6, axis=0)
+    frames = np.repeat(lattice(64, LATTICE_EDGE_NM)[None, :, :], 6, axis=0)
     measured = radial_distribution(
         synthetic_ensemble(
             frames, n_chains=64, box_nm=LATTICE_EDGE_NM, interval_ps=1.0
@@ -217,7 +232,7 @@ def test_asking_for_more_wavevectors_than_will_be_summed_is_refused() -> None:
 def test_the_structure_factor_also_refuses_a_cell_with_no_heavy_atoms() -> None:
     """Same reason as the pair distribution: nothing left to sum over."""
     ensemble = synthetic_ensemble(
-        _lattice(64, LATTICE_EDGE_NM),
+        lattice(64, LATTICE_EDGE_NM),
         n_chains=32,
         box_nm=LATTICE_EDGE_NM,
         is_hydrogen=np.ones(2, dtype=bool),
@@ -275,7 +290,9 @@ def test_a_structure_factor_with_nothing_resolvable_reports_no_peak() -> None:
 
     q = np.array([0.5, 1.0, 1.5])
     counted = np.full(3, 50, dtype=np.int64)
-    assert _peak_above(q, np.array([5.0, 1.0, 1.0]), counted, 10.0, 20) == 0.0
+    usable = peak_bins(q, counted, 1, 10.0, 20)
+    assert not usable.any()
+    assert _peak_above(q, np.array([5.0, 1.0, 1.0]), usable) == 0.0
 
 
 def test_a_thinly_populated_bin_cannot_be_the_peak() -> None:
@@ -287,4 +304,39 @@ def test_a_thinly_populated_bin_cannot_be_the_peak() -> None:
     q = np.array([2.0, 4.0, 12.0])
     s_q = np.array([26.0, 4.0, 3.0])
     vectors = np.array([3, 6, 196], dtype=np.int64)
-    assert _peak_above(q, s_q, vectors, 1.9, 20) == pytest.approx(12.0)
+    usable = peak_bins(q, vectors, 1, 1.9, 20)
+    assert usable.tolist() == [False, False, True]
+    assert _peak_above(q, s_q, usable) == pytest.approx(12.0)
+
+
+def test_averaging_more_frames_does_not_make_a_thin_bin_a_peak() -> None:
+    """Three wavevectors a frame are three however many frames are summed.
+
+    A disordered crystal keeps a Bragg peak in a bin its cell fills with
+    three wavevectors, below the floor of twenty. Counted over eight frames
+    that bin holds twenty-four, and a guard on the total let it take the peak
+    from the bins that genuinely average - so the peak depended on how much
+    trajectory there was rather than on the structure.
+    """
+    disordered = lattice(64, LATTICE_EDGE_NM) + np.random.default_rng(3).normal(
+        0.0, 0.03, (64, 3)
+    )
+
+    def measured(n_frames: int) -> Any:
+        frames = np.repeat(disordered[None, :, :], n_frames, axis=0)
+        return structure_factor(
+            synthetic_ensemble(frames, n_chains=64, box_nm=LATTICE_EDGE_NM),
+            q_max_per_nm=12.0,
+            n_bins=48,
+            heavy_atoms_only=False,
+            stride=1,
+        )
+
+    one, eight = measured(1), measured(8)
+    thin = int(np.argmax(one.s_q))
+    assert one.q_per_nm[thin] == pytest.approx(
+        2 * math.pi / LATTICE_SPACING_NM, abs=0.25
+    )
+    assert one.n_vectors[thin] < MIN_WAVEVECTORS_PER_BIN <= eight.n_vectors[thin]
+    assert one.first_peak_per_nm != one.q_per_nm[thin]
+    assert eight.first_peak_per_nm == one.first_peak_per_nm

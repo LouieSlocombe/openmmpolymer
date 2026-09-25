@@ -1,13 +1,12 @@
-# Runtime and development environment for openmmpolymer. See the
-# Installation section of README.md.
+# Runtime and development environment for openmmpolymer:
 #
 #   conda env create -f build_tools/environment.yml
 #   conda activate openmmpolymer
 #   python -m pip install -e . --no-deps
 #
-# conda-forge is the only route that works: AmberTools is not a Python package
-# (and is what ships the `packmol` binary this package shells out to), and
-# openmmforcefields >= 0.16 has never been published to PyPI.
+# conda-forge is the only route that resolves: AmberTools is not a Python
+# package (and is what ships the `packmol` executable this package shells out
+# to), and openmmforcefields >= 0.16 has never been published to PyPI.
 name: openmmpolymer
 
 channels:
@@ -17,50 +16,29 @@ channels:
 dependencies:
   - python>=3.12
   - pip
-  - numpy>=2
+  - numpy>=2.5.3
   - openmm>=8.6.1
   - rdkit
   - parmed
-  # Supplies antechamber/parmchk2 for forcefill's gaff backend, and - this is
-  # why there is no separate `packmol` entry - the `packmol` executable that
-  # openmmpolymer.packing shells out to, at <env>/bin/packmol. conda-forge
-  # does publish packmol on its own, but its builds pin numpy < 2 and asking
-  # for both makes the environment unsolvable.
+  # antechamber and parmchk2 for forcefill's gaff backend, and the packmol
+  # executable. conda-forge's own packmol builds pin numpy < 2, so asking for
+  # it separately makes the environment unsolvable.
   - ambertools
   - openff-toolkit>=0.16
   - openmmforcefields>=0.16
-  # The graph-neural-network charge model. Without it, charges for anything
-  # longer than a ~DP 15 chain have to come from AM1-BCC, and sqm is the wall.
+  # The graph-neural-network charges: without them, anything longer than a
+  # DP 15 chain needs AM1-BCC, and sqm is the wall.
   - openff-nagl
   - openff-nagl-models
-  # The trajectory reader the analysis layer is built on. conda-forge spells it
-  # lowercase; PyPI and the import spell it MDAnalysis. >=2.10 because only
-  # build 1 of 2.10.0 has a py314 build, and CI runs 3.14. It brings netcdf4,
-  # h5py, gsd and pytng with it, because MDAnalysis.coordinates imports every
-  # reader eagerly.
+  # Lowercase on conda-forge. 2.10 is the first release built for Python 3.14.
   - mdanalysis>=2.10
-  # matplotlib-base rather than matplotlib: openmmpolymer.plots builds a
-  # matplotlib.figure.Figure directly and never touches pyplot, so no GUI
-  # toolkit is needed. ambertools already pulls this in transitively, which is
-  # exactly why it is named here - an accident is not a declaration.
-  - matplotlib-base
+  # The plots build a Figure directly and never touch pyplot, so no GUI toolkit.
+  - matplotlib-base>=3.8
   - pytest
   - pytest-cov
-  - python-build
-  # mypy is here because the CI test job runs it inside this environment,
-  # where the dependencies it needs types for are installed.
   - mypy
-  # For the hooks in .pre-commit-config.yaml. CI never runs pre-commit - the
-  # lint job calls ruff-action directly - so this is purely the local gate that
-  # stops a commit reaching that job already broken. `pre-commit install` in the
-  # checkout arms it; it builds its own pinned hook environments from there.
   - pre-commit
+  - python-build
+  - twine
   - pip:
       - forcefill>=1.0
-      # From pip rather than conda-forge so that the version matches the one
-      # CI's lint job pins: the feedstock lags, and ruff's formatter output
-      # shifts between releases, so a lagging local copy reformats files that
-      # CI then rejects. Keep this in step with the ruff-action version in
-      # .github/workflows/ci.yml, the rev in .pre-commit-config.yaml, and the
-      # dev dependency group in pyproject.toml.
-      - ruff>=0.16.8

@@ -9,83 +9,48 @@ layers - chain, force field, packing, protocol - are separately callable.
 heats an explicitly supplied crystal and serialized System: packing an
 amorphous melt from a monomer cannot provide a crystalline melting point.
 
-The flags a protocol accepts are a table rather than a chain of conditionals,
-because the alternative failed quietly: a flag that no factory took was parsed,
-ignored, and never reached the run. :data:`PROTOCOLS` names what each factory
-accepts, and a test checks those names against the factories themselves.
+The flags each protocol takes are a table, :data:`PROTOCOLS`, rather than a
+chain of conditionals, because the alternative failed quietly: a flag that no
+protocol took was parsed, ignored, and never reached the run. From the table
+every run is checked and priced before anything is built. Every flag is also
+part of what a rerun must repeat - :func:`main` records the parsed namespace
+beside the build - so no destination or default can change without leaving
+the runs already on disk unable to resume.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+import io
 import logging
 import math
-import shutil
-from collections.abc import Callable, Iterable, Sequence
-from contextlib import ExitStack
-from dataclasses import asdict, dataclass, replace
+import sys
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Sized
+from dataclasses import dataclass
+from functools import partial
 from importlib.metadata import version
 from pathlib import Path
-from tempfile import TemporaryDirectory
-from typing import Any, cast
+from typing import Any, NamedTuple
 
-from .breaking import (
-    BreakingError,
-    BreakingSpec,
-    analyse_breaking,
-    breaking_scan,
-    breaking_stages,
-    run_breaking_scan,
-    write_breaking_report,
-)
-from .chain import ChainResult, ChainSpec, build_chain
-from .charges import CHARGE_METHODS, assign_charges
-from .convergence import DEFAULT_WINDOW_FRACTIONS, analyse_convergence
-from .convergence_report import write_convergence_report
+from ._files import ReportFiles
+from ._workflow import chain_options
+from .chain import ChainResult, ChainSpec
+from .charges import CHARGE_METHODS
+from .convergence import DEFAULT_WINDOW_FRACTIONS
+from .convergence_report import analyse_convergence, write_convergence_report
 from .elasticity import deform_stages, load_stages, shear_stages
-from .elongation import (
-    ElongationError,
-    ElongationSpec,
-    analyse_elongation,
-    elongation_scan,
-    elongation_stages,
-    run_elongation_scan,
-    write_elongation_report,
-)
-from .forcefield import BACKENDS, PolymerForceField, build_polymer_forcefield
-from .mdsystem import (
-    PackedBox,
-    SystemSpec,
-    assemble_box,
-    check_target_density,
-    prepare_box,
-)
+from .forcefield import BACKENDS
 from .mechanical import (
-    MechanicalError,
     ModulusSpec,
     analyse_mechanics,
     mechanical_scan,
     run_modulus_scan,
     write_mechanical_report,
 )
-from .modulus_rate_report import write_modulus_rate_report
-from .modulus_rates import (
-    ModulusRateReport,
-    analyse_modulus_rates,
-    run_modulus_rate_scan,
-    validate_modulus_rate_scan,
-)
-from .packing import (
-    DEFAULT_PACKING_DENSITY,
-    box_edge_nm,
-    check_packing,
-    distribute_conformers,
-    pack_box,
-)
+from .melt import build_melt
+from .packing import DEFAULT_PACKING_DENSITY
 from .property_rates import (
     RATE_PROPERTIES,
-    RateScanSpec,
     analyse_property_rates,
     default_rate_spec,
     run_property_rate_scan,
@@ -94,28 +59,44 @@ from .property_rates import (
 from .protocols import (
     Protocol,
     ProtocolError,
-    _file_digest,
-    _run_identity,
-    _write_atomically,
     melt_quench,
     record_build_request,
     run_protocol,
     standard_melt_equilibration,
-    validate_run_inputs,
 )
-from .rate_dependence import RateReport
+from .rate_dependence import validate_rate_request
 from .rate_reports import write_rate_report
 from .relaxation import relax_stages
-from .simulate import RELAX_MODES, RunContext, prepare_run
+from .reporters import TrajectoryOptions
+from .simulate import RELAX_MODES, RunContext
 from .structure import analyse_structure, structure_stages, write_structure_report
+from .tensile import (
+    BreakingSpec,
+    ElongationSpec,
+    TensileSpec,
+    YieldSpec,
+    analyse_breaking,
+    analyse_elongation,
+    analyse_yield,
+    breaking_stages,
+    elongation_stages,
+    run_breaking_scan,
+    run_elongation_scan,
+    run_yield_scan,
+    tensile_scan,
+    write_breaking_report,
+    write_elongation_report,
+    write_yield_report,
+    yield_stages,
+)
 from .tg import (
-    ReportFiles,
     TgSpec,
-    analyse_run,
+    analyse_tg,
     cooling_rate_series,
+    nominal_fine_schedule,
     run_tg_scan,
     tg_coarse_scan,
-    write_report,
+    write_tg_report,
 )
 from .timeseries import (
     DSC_COOLING_RATE_K_PER_NS,
@@ -124,10 +105,10 @@ from .timeseries import (
     quench_stages,
 )
 from .tm import (
-    TmError,
     TmSpec,
     analyse_melting,
     heating_stages,
+    load_crystal,
     melting_scan,
     run_tm_scan,
     write_melting_report,
@@ -140,485 +121,442 @@ from .viscoelastic import (
     run_relaxation_scan,
     write_relaxation_report,
 )
-from .yielding import (
-    YieldError,
-    YieldSpec,
-    analyse_yield,
-    run_yield_scan,
-    write_yield_report,
-    yield_scan,
-    yield_stages,
-)
 
-log = logging.getLogger(__name__)
+#: What is reported as a usage error rather than a traceback: a request the
+#: library refuses before running anything. Every error it raises is a
+#: RuntimeError.
+_REFUSED = (OSError, ValueError, TypeError, RuntimeError)
+
+# --------------------------------------------------------------------------
+# The protocols, and the flags each one takes
+# --------------------------------------------------------------------------
+
+
+def _keywords(
+    arguments: argparse.Namespace, fields: Mapping[str, str]
+) -> dict[str, Any]:
+    """The flags *fields* names, as the keywords they are passed as.
+
+    A flag left unset is left out, so that the library's own default applies.
+    """
+    values = {keyword: getattr(arguments, dest) for dest, keyword in fields.items()}
+    return {keyword: value for keyword, value in values.items() if value is not None}
+
+
+def _npt_trajectory(interval_ps: float | None) -> dict[str, TrajectoryOptions]:
+    """The trajectory the melt's last stage keeps when --check-melt asks."""
+    if interval_ps is None:
+        return {}
+    return {"npt_trajectory": TrajectoryOptions("xtc", interval_ps=interval_ps)}
+
+
+def _settle(arguments: argparse.Namespace) -> dict[str, Any]:
+    """How a scan settles its melt first: how hot, and what it keeps."""
+    return {
+        "melt_temperature_k": arguments.melt_temperature,
+        **_npt_trajectory(arguments.check_melt),
+    }
+
+
+def _plain(
+    factory: Callable[..., Protocol],
+    *,
+    check_melt: float | None = None,
+    **keywords: Any,
+) -> Protocol:
+    """A plain protocol, made straight from its factory's keywords."""
+    return factory(**keywords, **_npt_trajectory(check_melt))
+
+
+#: The passes beside the extension, and the spec field that configures each.
+_PASSES = {
+    "load": "load_stresses_bar",
+    "bulk": "bulk_pressures_bar",
+    "shear": "shear_strains",
+}
+
+
+def _modulus_spec(*, skip: Sequence[str] = (), **fields: Any) -> ModulusSpec:
+    """The mechanical scan less the passes ``--skip`` names.
+
+    Naming a pass is clearer than handing the flag that configures it an
+    empty list.
+    """
+    return ModulusSpec(**{**fields, **{_PASSES[name]: None for name in skip}})
+
+
+def _stages_ps(protocol: Protocol, arguments: argparse.Namespace) -> float:
+    """A plain protocol lists every stage it runs itself."""
+    return protocol.total_duration_ps
+
+
+def _listed(
+    listing: Callable[[Any], Protocol],
+) -> Callable[[Any, argparse.Namespace], float]:
+    """Price a scan by the library's listing of every stage it runs."""
+    return lambda spec, arguments: listing(spec).total_duration_ps
+
+
+def _tg_ps(spec: TgSpec, arguments: argparse.Namespace) -> float:
+    """The coarse pass, and each fine pass as long as its window will be.
+
+    The window's place waits on the coarse fit, but not its size; each rate
+    of ``--cooling-rates`` holds each fine temperature for its own time.
+    """
+    holds = (
+        [spec.fine_hold_ps]
+        if arguments.cooling_rates is None
+        else [spec.fine_step_k / rate * 1000.0 for rate in arguments.cooling_rates]
+    )
+    fine = sum(nominal_fine_schedule(spec, hold_ps=hold).total_ps for hold in holds)
+    return tg_coarse_scan(spec).total_duration_ps + fine
+
+
+class _Job(NamedTuple):
+    """A protocol ready to run: its flags and settings, its cell, and where."""
+
+    arguments: argparse.Namespace
+    spec: Any
+    run: RunContext
+    output: Path
+    options: dict[str, Any]
+
+    def scan(self, scan: Callable[..., Any], **options: Any) -> Any:
+        """Run a ``run_*_scan`` on this cell, with these settings."""
+        return scan(self.run, self.output, spec=self.spec, **self.options, **options)
+
+    def report(
+        self,
+        report: Any,
+        lines: Callable[[Any], Iterable[str]],
+        write: Callable[..., ReportFiles],
+    ) -> None:
+        """Say what a scan found, and write its report where the scan ran."""
+        _emit(self.arguments, report, lines, write, None)
+
+
+def _run_protocol(job: _Job) -> None:
+    """Run a plain protocol and say what it did."""
+    summary = run_protocol(job.spec, job.run, job.output, **job.options)
+    print(
+        f"{summary.protocol}: {len(summary.results)} stages in "
+        f"{summary.wall_seconds / 60:.1f} min, manifest {summary.manifest_path}"
+    )
+    _print_chains(summary.chains)
+
+
+def _run_tg(job: _Job) -> None:
+    """Run a two-pass glass-transition scan, at one rate or several."""
+    arguments = job.arguments
+    rates = arguments.cooling_rates
+    if rates is None:
+        result = job.scan(run_tg_scan, tg_approx_k=arguments.tg_approx)
+        found = (
+            "no clear transition"
+            if result.temperature_k is None
+            else f"Tg = {result.temperature_k:.0f} K"
+        )
+        coarse = (
+            "nothing"
+            if result.approximate is None
+            else f"{result.approximate.temperature_k:.0f} K"
+        )
+        print(
+            f"tg: {found} at {result.fine_schedule.cooling_rate_k_per_ns:.2f} "
+            f"K/ns (coarse said {coarse}), started from the {result.restart} state"
+        )
+        _print_chains(result.fine_summary.chains)
+        return
+    transitions = job.scan(
+        cooling_rate_series, rates_k_per_ns=rates, tg_approx_k=arguments.tg_approx
+    )
+    for rate, fit in zip(rates, transitions, strict=True):
+        print(
+            f"tg: {fit.temperature_k:.0f} K at {rate:g} K/ns{_unresolved(fit.resolved)}"
+        )
+    extrapolation = cooling_rate_extrapolation(
+        transitions,
+        target_rate_k_per_ns=arguments.target_rate,
+        form=arguments.rate_form,
+    )
+    print(_extrapolation_line(extrapolation))
+
+
+def _run_tm(job: _Job) -> None:
+    """Heat the supplied crystal, then report its apparent melting interval."""
+    job.report(job.scan(run_tm_scan).report, _melting_lines, write_melting_report)
+
+
+def _run_modulus(job: _Job) -> None:
+    """Measure the elastic constants, and say what qualifies each one."""
+    _say(_modulus_lines(job.scan(run_modulus_scan)))
+
+
+def _run_breaking(job: _Job) -> None:
+    """Measure the apparent tensile strength, then report it."""
+    job.report(job.scan(run_breaking_scan), _breaking_lines, write_breaking_report)
+
+
+def _run_elongation(job: _Job) -> None:
+    """Measure the apparent elongation at break, then report it."""
+    job.report(
+        job.scan(run_elongation_scan), _elongation_lines, write_elongation_report
+    )
+
+
+def _run_yield(job: _Job) -> None:
+    """Measure the apparent offset yield strength, then report it."""
+    job.report(job.scan(run_yield_scan), _yield_lines, write_yield_report)
+
+
+def _run_relaxation(job: _Job) -> None:
+    """Strain the cell once, watch the stress decay, and say what it decayed to."""
+    _say(_relaxation_lines(job.scan(run_relaxation_scan)))
 
 
 @dataclass(frozen=True)
 class ProtocolEntry:
-    """A protocol the command line offers, and the flags it accepts.
+    """A protocol the command line offers, and how its flags become a run.
 
     Args:
-        factory: What builds the protocol.
-        options: The factory keywords this protocol accepts. Listed rather
-            than inferred so that a flag which reaches no factory is a test
-            failure rather than a setting that silently never arrives, which
-            is how t_end, step_k and hold_ps came to be unreachable.
+        spec: Makes the protocol's settings from the keywords *fields* names:
+            a spec, or for the two plain protocols the protocol itself.
+        fields: Each flag's destination, and the keyword it is passed as.
+        defaults: The flags whose defaults depend on the protocol, filled in
+            once parsing is done, so that an explicit flag always wins.
+        price: The dynamics the whole run holds, in ps, known before any of
+            it is built.
+        run: Runs the protocol on a prepared cell and says what it found.
+        rate_property: What a rate scan with this protocol measures unless
+            ``--rate-property`` names another.
+        settles: Whether the scan settles a melt on the way, taking the
+            equilibration's keywords to do it. The plain protocols and tg
+            take the same flags as settings of their own.
     """
 
-    factory: Callable[..., Protocol]
-    options: tuple[str, ...]
+    spec: Callable[..., Any]
+    fields: Mapping[str, str]
+    defaults: Mapping[str, float]
+    price: Callable[[Any, argparse.Namespace], float]
+    run: Callable[[_Job], None]
+    rate_property: str | None = None
+    settles: bool = False
+
+    def settings(self, arguments: argparse.Namespace) -> Any:
+        """The settings the flags ask for, checked as they are made."""
+        return self.spec(**_keywords(arguments, self.fields))
 
 
-#: Keywords whose argparse destination is spelled differently, because the
-#: flags were named before the factories were.
-_DESTS = {
-    "target_temperature_k": "temperature",
-    "melt_temperature_k": "melt_temperature",
-    "pressure_bar": "pressure",
-    # The modulus protocol has one temperature rather than a melt and a
-    # target, and it is the same -t flag.
-    "temperature_k": "temperature",
+#: Where a melt settles, for the protocols that settle one as their own work.
+_SETTLED = {
+    "temperature": "target_temperature_k",
+    "melt_temperature": "melt_temperature_k",
+    "pressure": "pressure_bar",
+    "check_melt": "check_melt",
 }
 
-#: Keywords every protocol factory takes.
-_COMMON = ("melt_temperature_k", "pressure_bar")
+#: Where a measurement is made, and the budget it is made within.
+_MEASURED = {
+    "temperature": "temperature_k",
+    "pressure": "pressure_bar",
+    "deform_axis": "axis",
+    "max_total_ns": "max_total_ns",
+}
 
-#: The temperature a run settles at. A two-pass scan settles at the melt
-#: temperature by construction, so it does not take one.
-_TARGET = ("target_temperature_k",)
-
-#: The cooling ladder.
-_QUENCH = ("t_start", "t_end", "step_k", "hold_ps")
-
-#: The second pass, and the two things that gate a whole scan.
-_TG = (
-    "fine_step_k",
-    "fine_hold_ps",
-    "fine_window_k",
-    "max_total_ns",
-    "check_melt",
-)
-
-
-#: The extension, and the three passes that can be skipped.
-_MECHANICS = (
-    "temperature_k",
-    "strain_increment",
-    "max_strain",
-    "relax_ps",
-    "elastic_strain_limit",
-    "replicas",
-    "deform_axis",
-    "load_stresses",
-    "bulk_pressures",
-    "shear_strains",
-    "skip",
-    "max_total_ns",
-)
+#: The ladder every tensile measurement walks, each under its own prefix.
+_LADDER = {
+    "strain_increment": "strain_increment",
+    "max_strain": "max_strain",
+    "relax_ps": "relax_ps",
+    "replicas": "n_replicas",
+    "samples_per_step": "samples_per_step",
+    "stage_ps": "stage_ps",
+    "trajectory_ps": "trajectory_ps",
+}
 
 
-#: Finite extension and the sustained stress drop used to qualify its peak.
-_BREAKING = (
-    "temperature_k",
-    "pressure_bar",
-    "deform_axis",
-    "breaking_strain_increment",
-    "breaking_max_strain",
-    "breaking_relax_ps",
-    "breaking_replicas",
-    "breaking_samples_per_step",
-    "breaking_stage_ps",
-    "breaking_trajectory_ps",
-    "failure_fraction",
-    "confirmation_steps",
-    "max_total_ns",
-)
+def _tensile(prefix: str, **criterion: str) -> dict[str, str]:
+    """A tensile measurement's flags: its own ladder's, then its criterion's."""
+    ladder = {f"{prefix}_{flag}": field for flag, field in _LADDER.items()}
+    return {**_MEASURED, **ladder, **criterion}
 
 
-#: Finite extension and the sustained stress drop defining apparent elongation at break.
-_ELONGATION = (
-    "temperature_k",
-    "pressure_bar",
-    "deform_axis",
-    "elongation_strain_increment",
-    "elongation_max_strain",
-    "elongation_relax_ps",
-    "elongation_replicas",
-    "elongation_samples_per_step",
-    "elongation_stage_ps",
-    "elongation_trajectory_ps",
-    "failure_fraction",
-    "confirmation_steps",
-    "max_total_ns",
-)
+_FAILURE = {
+    "failure_fraction": "failure_fraction",
+    "confirmation_steps": "confirmation_steps",
+}
 
+#: The defaults that depend on the protocol. A cooling ladder steps 20 K,
+#: held 200 ps, down to 200 K; a heating ladder 10 K, held 1000 ps, from 250 K
+#: to 650 K. A measurement is made at 450 K, a tensile one at 298.15 K.
+_COOLING = {"t_end": 200.0, "step_k": 20.0, "hold_ps": 200.0, "temperature": 450.0}
+_ROOM = {**_COOLING, "temperature": 298.15}
+_HEATING = {
+    "t_start": 250.0,
+    "t_end": 650.0,
+    "step_k": 10.0,
+    "hold_ps": 1000.0,
+    "temperature": 450.0,
+}
 
-#: Finite extension and the elastic fit defining an offset proof stress.
-_YIELD = (
-    "temperature_k",
-    "pressure_bar",
-    "deform_axis",
-    "yield_strain_increment",
-    "yield_max_strain",
-    "yield_relax_ps",
-    "yield_replicas",
-    "yield_samples_per_step",
-    "yield_stage_ps",
-    "yield_trajectory_ps",
-    "yield_offset_strain",
-    "yield_fit_min_strain",
-    "yield_fit_max_strain",
-    "max_total_ns",
-)
-
-
-#: The step strain, and the pass that checks it was small enough.
-_RELAXATION = (
-    "temperature_k",
-    "pressure_bar",
-    "relax_mode",
-    "deform_axis",
-    "step_strain",
-    "baseline_ps",
-    "relaxation_ps",
-    "relax_replicas",
-    "sample_every_ps",
-    "bins_per_decade",
-    "relax_stage_ps",
-    "linearity_strains",
-    "max_total_ns",
-)
-
-
-_TM = (
-    *_QUENCH,
-    "pressure_bar",
-    "tm_equilibration_ps",
-    "tm_stage_ps",
-    "tm_trajectory_ps",
-    "tm_barostat",
-    "min_points_per_branch",
-    "max_total_ns",
-)
-
-
-def _tm_spec(
-    *,
-    t_start: float = 250.0,
-    t_end: float = 650.0,
-    step_k: float = 10.0,
-    hold_ps: float = 1000.0,
-    pressure_bar: float = 1.0,
-    tm_equilibration_ps: float = 1000.0,
-    tm_stage_ps: float = 10_000.0,
-    tm_trajectory_ps: float | None = None,
-    tm_barostat: str = "anisotropic",
-    min_points_per_branch: int = 3,
-    max_total_ns: float | None = None,
-) -> TmSpec:
-    """Map the heating controls onto a crystalline melting scan."""
-    return TmSpec(
-        t_start_k=t_start,
-        t_end_k=t_end,
-        step_k=step_k,
-        hold_ps=hold_ps,
-        pressure_bar=pressure_bar,
-        equilibration_ps=tm_equilibration_ps,
-        stage_ps=tm_stage_ps,
-        trajectory_ps=tm_trajectory_ps,
-        barostat=tm_barostat,
-        min_points_per_branch=min_points_per_branch,
-        max_total_ns=max_total_ns,
-    )
-
-
-def _tm_protocol(**options: Any) -> Protocol:
-    """The complete heating ladder, including crystal equilibration."""
-    return melting_scan(_tm_spec(**options))
-
-
-def _relaxation_spec(
-    *,
-    temperature_k: float = 298.15,
-    pressure_bar: float = 1.0,
-    relax_mode: str = "tensile",
-    deform_axis: int = 2,
-    step_strain: float = 0.03,
-    baseline_ps: float = 1000.0,
-    relaxation_ps: float = 10_000.0,
-    relax_replicas: int = 4,
-    sample_every_ps: float = 0.05,
-    bins_per_decade: int = 20,
-    relax_stage_ps: float = 20_000.0,
-    linearity_strains: tuple[float, ...] | None = None,
-    max_total_ns: float | None = None,
-) -> RelaxationSpec:
-    """Turn the flat relaxation flags into the spec a scan takes."""
-    return RelaxationSpec(
-        temperature_k=temperature_k,
-        pressure_bar=pressure_bar,
-        mode=relax_mode,
-        axis=deform_axis,
-        step_strain=step_strain,
-        baseline_ps=baseline_ps,
-        relax_ps=relaxation_ps,
-        n_replicas=relax_replicas,
-        sample_every_ps=sample_every_ps,
-        bins_per_decade=bins_per_decade,
-        stage_ps=relax_stage_ps,
-        linearity_strains=linearity_strains,
-        max_total_ns=max_total_ns,
-    )
-
-
-def _relax_protocol(**options: Any) -> Protocol:
-    """The equilibration and one relaxation, so --dry-run can price it."""
-    return relaxation_scan(_relaxation_spec(**options))
-
-
-def _modulus_spec(
-    *,
-    temperature_k: float = 298.15,
-    pressure_bar: float = 1.0,
-    strain_increment: float = 0.002,
-    max_strain: float = 0.05,
-    relax_ps: float = 50.0,
-    elastic_strain_limit: float = 0.015,
-    replicas: int = 3,
-    deform_axis: int = 2,
-    load_stresses: tuple[float, ...] | None = None,
-    bulk_pressures: tuple[float, ...] | None = None,
-    shear_strains: tuple[float, ...] | None = None,
-    skip: Sequence[str] | None = None,
-    max_total_ns: float | None = None,
-) -> ModulusSpec:
-    """Turn the flat mechanics flags into the spec a scan takes.
-
-    A pass is skipped by naming it in ``--skip``, which is clearer than
-    passing an empty list to the flag that configures it.
-    """
-    dropped = set(skip or ())
-    defaults = ModulusSpec()
-    return ModulusSpec(
-        temperature_k=temperature_k,
-        pressure_bar=pressure_bar,
-        axis=deform_axis,
-        strain_increment=strain_increment,
-        max_strain=max_strain,
-        relax_ps=relax_ps,
-        elastic_strain_limit=elastic_strain_limit,
-        n_replicas=replicas,
-        load_stresses_bar=(
-            None if "load" in dropped else (load_stresses or defaults.load_stresses_bar)
-        ),
-        bulk_pressures_bar=(
-            None
-            if "bulk" in dropped
-            else (bulk_pressures or defaults.bulk_pressures_bar)
-        ),
-        shear_strains=(
-            None if "shear" in dropped else (shear_strains or defaults.shear_strains)
-        ),
-        max_total_ns=max_total_ns,
-    )
-
-
-def _modulus_protocol(**options: Any) -> Protocol:
-    """The equilibration and one extension, so --dry-run can price it."""
-    return mechanical_scan(_modulus_spec(**options))
-
-
-def _breaking_spec(
-    *,
-    temperature_k: float = 298.15,
-    pressure_bar: float = 1.0,
-    deform_axis: int = 2,
-    breaking_strain_increment: float = 0.01,
-    breaking_max_strain: float = 1.0,
-    breaking_relax_ps: float = 50.0,
-    breaking_replicas: int = 3,
-    breaking_samples_per_step: int = 250,
-    breaking_stage_ps: float = 1000.0,
-    breaking_trajectory_ps: float | None = None,
-    failure_fraction: float = 0.5,
-    confirmation_steps: int = 3,
-    max_total_ns: float | None = None,
-) -> BreakingSpec:
-    """Map the finite-extension controls onto the breaking workflow."""
-    return BreakingSpec(
-        temperature_k=temperature_k,
-        pressure_bar=pressure_bar,
-        axis=deform_axis,
-        strain_increment=breaking_strain_increment,
-        max_strain=breaking_max_strain,
-        relax_ps=breaking_relax_ps,
-        n_replicas=breaking_replicas,
-        samples_per_step=breaking_samples_per_step,
-        stage_ps=breaking_stage_ps,
-        trajectory_ps=breaking_trajectory_ps,
-        failure_fraction=failure_fraction,
-        confirmation_steps=confirmation_steps,
-        max_total_ns=max_total_ns,
-    )
-
-
-def _breaking_protocol(**options: Any) -> Protocol:
-    """Build the equilibration and every replica of the tensile ladder."""
-    spec = _breaking_spec(**options)
-    return _check_scan_budget(
-        breaking_scan(spec), spec.max_total_ns, "breaking", BreakingError
-    )
-
-
-def _elongation_spec(
-    *,
-    temperature_k: float = 298.15,
-    pressure_bar: float = 1.0,
-    deform_axis: int = 2,
-    elongation_strain_increment: float = 0.01,
-    elongation_max_strain: float = 1.0,
-    elongation_relax_ps: float = 50.0,
-    elongation_replicas: int = 3,
-    elongation_samples_per_step: int = 250,
-    elongation_stage_ps: float = 1000.0,
-    elongation_trajectory_ps: float | None = None,
-    failure_fraction: float = 0.5,
-    confirmation_steps: int = 3,
-    max_total_ns: float | None = None,
-) -> ElongationSpec:
-    """Map the finite-extension controls onto the elongation workflow."""
-    return ElongationSpec(
-        temperature_k=temperature_k,
-        pressure_bar=pressure_bar,
-        axis=deform_axis,
-        strain_increment=elongation_strain_increment,
-        max_strain=elongation_max_strain,
-        relax_ps=elongation_relax_ps,
-        n_replicas=elongation_replicas,
-        samples_per_step=elongation_samples_per_step,
-        stage_ps=elongation_stage_ps,
-        trajectory_ps=elongation_trajectory_ps,
-        failure_fraction=failure_fraction,
-        confirmation_steps=confirmation_steps,
-        max_total_ns=max_total_ns,
-    )
-
-
-def _elongation_protocol(**options: Any) -> Protocol:
-    """Build the equilibration and every replica of the tensile ladder."""
-    spec = _elongation_spec(**options)
-    return _check_scan_budget(
-        elongation_scan(spec), spec.max_total_ns, "elongation", ElongationError
-    )
-
-
-def _yield_spec(
-    *,
-    temperature_k: float = 298.15,
-    pressure_bar: float = 1.0,
-    deform_axis: int = 2,
-    yield_strain_increment: float = 0.002,
-    yield_max_strain: float = 0.3,
-    yield_relax_ps: float = 50.0,
-    yield_replicas: int = 3,
-    yield_samples_per_step: int = 250,
-    yield_stage_ps: float = 1000.0,
-    yield_trajectory_ps: float | None = None,
-    yield_offset_strain: float = 0.002,
-    yield_fit_min_strain: float = 0.0,
-    yield_fit_max_strain: float = 0.02,
-    max_total_ns: float | None = None,
-) -> YieldSpec:
-    """Map the tensile and proof-stress controls onto the yield workflow."""
-    return YieldSpec(
-        temperature_k=temperature_k,
-        pressure_bar=pressure_bar,
-        axis=deform_axis,
-        strain_increment=yield_strain_increment,
-        max_strain=yield_max_strain,
-        relax_ps=yield_relax_ps,
-        n_replicas=yield_replicas,
-        samples_per_step=yield_samples_per_step,
-        stage_ps=yield_stage_ps,
-        trajectory_ps=yield_trajectory_ps,
-        offset_strain=yield_offset_strain,
-        fit_min_strain=yield_fit_min_strain,
-        fit_max_strain=yield_fit_max_strain,
-        max_total_ns=max_total_ns,
-    )
-
-
-def _yield_protocol(**options: Any) -> Protocol:
-    """Validate equilibration and every tensile replica before building a cell."""
-    spec = _yield_spec(**options)
-    return _check_scan_budget(yield_scan(spec), spec.max_total_ns, "yield", YieldError)
-
-
-def _check_scan_budget(
-    protocol: Protocol,
-    max_total_ns: float | None,
-    name: str,
-    error_type: type[Exception],
-) -> Protocol:
-    """Reject a tensile schedule that exceeds its budget before building a cell."""
-    duration_ns = protocol.total_duration_ps / 1000.0
-    if max_total_ns is not None and duration_ns > max_total_ns:
-        raise error_type(
-            f"The {name} scan is {duration_ns:.3g} ns, over the "
-            f"{max_total_ns:g} ns budget. Shorten the scan or raise max_total_ns."
-        )
-    return protocol
-
-
-def _tg_spec(
-    *,
-    melt_temperature_k: float = 650.0,
-    pressure_bar: float = 1.0,
-    t_end: float = 150.0,
-    step_k: float = 25.0,
-    hold_ps: float = 1000.0,
-    fine_step_k: float = 5.0,
-    fine_hold_ps: float = 3000.0,
-    fine_window_k: float = 60.0,
-    max_total_ns: float | None = None,
-    check_melt: float | None = None,
-) -> TgSpec:
-    """Turn the flat cooling flags into the spec a two-pass scan takes."""
-    return TgSpec(
-        melt_temperature_k=melt_temperature_k,
-        t_floor_k=t_end,
-        coarse_step_k=step_k,
-        coarse_hold_ps=hold_ps,
-        window_k=fine_window_k,
-        fine_step_k=fine_step_k,
-        fine_hold_ps=fine_hold_ps,
-        pressure_bar=pressure_bar,
-        npt_trajectory_ps=check_melt,
-        max_total_ns=max_total_ns,
-    )
-
-
-def _tg_protocol(**options: Any) -> Protocol:
-    """The coarse half of a two-pass scan, so --dry-run can price it."""
-    return tg_coarse_scan(_tg_spec(**options))
-
-
-#: The protocols the command line offers.
+#: The protocols the command line offers. The flags' defaults apply, not the
+#: specs', and seven differ on purpose: a modulus or a relaxation is measured
+#: at 450 K rather than 298.15 K; tg settles its melt at 600 K rather than
+#: 650 K and screens it in 20 K steps held 200 ps down to 200 K rather than
+#: 25 K, 1000 ps and 150 K; and a tm fit keeps four points a branch, not three.
 PROTOCOLS = {
-    "equilibrate": ProtocolEntry(standard_melt_equilibration, _TARGET + _COMMON),
-    "melt-quench": ProtocolEntry(melt_quench, _TARGET + _COMMON + _QUENCH),
-    "tg": ProtocolEntry(_tg_protocol, _COMMON + _QUENCH[1:] + _TG),
-    "tm": ProtocolEntry(_tm_protocol, _TM),
-    "modulus": ProtocolEntry(_modulus_protocol, ("pressure_bar", *_MECHANICS)),
-    "breaking": ProtocolEntry(_breaking_protocol, _BREAKING),
-    "elongation": ProtocolEntry(_elongation_protocol, _ELONGATION),
-    "yield": ProtocolEntry(_yield_protocol, _YIELD),
-    "relax": ProtocolEntry(_relax_protocol, _RELAXATION),
+    "equilibrate": ProtocolEntry(
+        partial(_plain, standard_melt_equilibration),
+        _SETTLED,
+        _COOLING,
+        _stages_ps,
+        _run_protocol,
+    ),
+    "melt-quench": ProtocolEntry(
+        partial(_plain, melt_quench),
+        {
+            **_SETTLED,
+            "t_start": "t_start",
+            "t_end": "t_end",
+            "step_k": "step_k",
+            "hold_ps": "hold_ps",
+        },
+        _COOLING,
+        _stages_ps,
+        _run_protocol,
+    ),
+    "tg": ProtocolEntry(
+        TgSpec,
+        {
+            "melt_temperature": "melt_temperature_k",
+            "pressure": "pressure_bar",
+            "t_end": "t_floor_k",
+            "step_k": "coarse_step_k",
+            "hold_ps": "coarse_hold_ps",
+            "fine_step_k": "fine_step_k",
+            "fine_hold_ps": "fine_hold_ps",
+            "fine_window_k": "window_k",
+            "min_points_per_branch": "min_points_per_branch",
+            "check_melt": "npt_trajectory_ps",
+            "max_total_ns": "max_total_ns",
+        },
+        _COOLING,
+        _tg_ps,
+        _run_tg,
+        rate_property="glass_transition",
+    ),
+    "tm": ProtocolEntry(
+        TmSpec,
+        {
+            "t_start": "t_start_k",
+            "t_end": "t_end_k",
+            "step_k": "step_k",
+            "hold_ps": "hold_ps",
+            "pressure": "pressure_bar",
+            "tm_equilibration_ps": "equilibration_ps",
+            "tm_stage_ps": "stage_ps",
+            "tm_trajectory_ps": "trajectory_ps",
+            "tm_barostat": "barostat",
+            "min_points_per_branch": "min_points_per_branch",
+            "max_total_ns": "max_total_ns",
+        },
+        _HEATING,
+        _listed(melting_scan),
+        _run_tm,
+        rate_property="melting_temperature",
+    ),
+    "modulus": ProtocolEntry(
+        _modulus_spec,
+        {
+            **_MEASURED,
+            "strain_increment": "strain_increment",
+            "max_strain": "max_strain",
+            "relax_ps": "relax_ps",
+            "elastic_strain_limit": "elastic_strain_limit",
+            "replicas": "n_replicas",
+            "load_stresses": "load_stresses_bar",
+            "bulk_pressures": "bulk_pressures_bar",
+            "shear_strains": "shear_strains",
+            "skip": "skip",
+        },
+        _COOLING,
+        _listed(mechanical_scan),
+        _run_modulus,
+        rate_property="youngs_modulus",
+        settles=True,
+    ),
+    "breaking": ProtocolEntry(
+        BreakingSpec,
+        _tensile("breaking", **_FAILURE),
+        _ROOM,
+        _listed(tensile_scan),
+        _run_breaking,
+        rate_property="breaking_strength",
+        settles=True,
+    ),
+    "elongation": ProtocolEntry(
+        ElongationSpec,
+        _tensile("elongation", **_FAILURE),
+        _ROOM,
+        _listed(tensile_scan),
+        _run_elongation,
+        rate_property="elongation_at_break",
+        settles=True,
+    ),
+    "yield": ProtocolEntry(
+        YieldSpec,
+        _tensile(
+            "yield",
+            yield_offset_strain="offset_strain",
+            yield_fit_min_strain="fit_min_strain",
+            yield_fit_max_strain="fit_max_strain",
+        ),
+        _ROOM,
+        _listed(tensile_scan),
+        _run_yield,
+        rate_property="yield_strength",
+        settles=True,
+    ),
+    "relax": ProtocolEntry(
+        RelaxationSpec,
+        {
+            **_MEASURED,
+            "relax_mode": "mode",
+            "step_strain": "step_strain",
+            "baseline_ps": "baseline_ps",
+            "relaxation_ps": "relax_ps",
+            "relax_replicas": "n_replicas",
+            "sample_every_ps": "sample_every_ps",
+            "bins_per_decade": "bins_per_decade",
+            "relax_stage_ps": "stage_ps",
+            "linearity_strains": "linearity_strains",
+        },
+        _COOLING,
+        _listed(relaxation_scan),
+        _run_relaxation,
+        settles=True,
+    ),
 }
+
+#: The chain every melt protocol builds, from the flags that describe it.
+_CHAIN = {
+    "monomer": "monomer_smiles",
+    "degree_of_polymerization": "degree_of_polymerization",
+    "residue_name": "residue_name",
+    "tacticity": "tacticity",
+    "head_cap": "head_cap",
+    "tail_cap": "tail_cap",
+    "characteristic_ratio": "characteristic_ratio",
+    "seed": "seed",
+}
+
+# --------------------------------------------------------------------------
+# The parser
+# --------------------------------------------------------------------------
 
 
 class _ProtocolParser(argparse.ArgumentParser):
-    """Choose protocol-specific defaults after parsing every explicit flag."""
+    """Fill in the defaults that depend on the protocol, after every flag."""
 
     def parse_args(
         self,
@@ -626,74 +564,72 @@ class _ProtocolParser(argparse.ArgumentParser):
         namespace: Any = None,
     ) -> Any:
         arguments = super().parse_args(args, namespace)
-        defaults = {"t_end": 200.0, "step_k": 20.0, "hold_ps": 200.0}
-        if arguments.protocol == "tm":
-            defaults = {
-                "t_start": 250.0,
-                "t_end": 650.0,
-                "step_k": 10.0,
-                "hold_ps": 1000.0,
-            }
-        defaults["temperature"] = (
-            298.15
-            if arguments.protocol in ("breaking", "elongation", "yield")
-            else 450.0
-        )
-        for name, value in defaults.items():
+        for name, value in PROTOCOLS[arguments.protocol].defaults.items():
             if getattr(arguments, name) is None:
                 setattr(arguments, name, value)
         return arguments
 
 
-def _add_tensile_arguments(
-    group: argparse._ArgumentGroup,
-    prefix: str,
-    defaults: BreakingSpec | ElongationSpec | YieldSpec,
+def _flag(
+    group: argparse._ActionsContainer,
+    names: str | tuple[str, ...],
+    default: Any,
+    help: str,
+    **options: Any,
 ) -> None:
-    """Expose the common tensile controls using each workflow's own defaults."""
+    """Add a flag that takes its default's type, and whose help ends with it."""
+    if not isinstance(default, str):
+        options.setdefault("type", type(default))
     group.add_argument(
-        f"--{prefix}-strain-increment",
+        *((names,) if isinstance(names, str) else names),
+        default=default,
+        help=f"{help} (default: %(default)s)",
+        **options,
+    )
+
+
+def _tensile_flags(
+    group: argparse._ActionsContainer, prefix: str, defaults: TensileSpec
+) -> None:
+    """One tensile measurement's ladder flags, each defaulting to its spec's."""
+    flag = f"--{prefix}"
+    _flag(
+        group,
+        f"{flag}-strain-increment",
+        defaults.strain_increment,
+        "fractional extension of the current cell at each step",
+    )
+    _flag(
+        group,
+        f"{flag}-max-strain",
+        defaults.max_strain,
+        f"engineering strain to reach; {defaults.max_strain:g} means "
+        f"{100 * defaults.max_strain:g}%%",
+    )
+    _flag(
+        group, f"{flag}-relax-ps", defaults.relax_ps, "hold after each extension, in ps"
+    )
+    _flag(
+        group,
+        f"{flag}-replicas",
+        defaults.n_replicas,
+        "extensions from the equilibrated cell with fresh velocities",
+    )
+    _flag(
+        group,
+        f"{flag}-samples-per-step",
+        defaults.samples_per_step,
+        "stress readings per extension",
+    )
+    _flag(
+        group,
+        f"{flag}-stage-ps",
+        defaults.stage_ps,
+        "duration of each resumable extension chunk, in ps",
+    )
+    group.add_argument(
+        f"{flag}-trajectory-ps",
         type=float,
-        default=defaults.strain_increment,
-        help="fractional extension of the current cell at each step "
-        "(default: %(default)s)",
-    )
-    group.add_argument(
-        f"--{prefix}-max-strain",
-        type=float,
-        default=defaults.max_strain,
-        help=f"engineering strain to reach; {defaults.max_strain:g} means "
-        f"{100 * defaults.max_strain:g}%% (default: %(default)s)",
-    )
-    group.add_argument(
-        f"--{prefix}-relax-ps",
-        type=float,
-        default=defaults.relax_ps,
-        help="hold after each extension, in ps (default: %(default)s)",
-    )
-    group.add_argument(
-        f"--{prefix}-replicas",
-        type=int,
-        default=defaults.n_replicas,
-        help="extensions from the equilibrated cell with fresh velocities "
-        "(default: %(default)s)",
-    )
-    group.add_argument(
-        f"--{prefix}-samples-per-step",
-        type=int,
-        default=defaults.samples_per_step,
-        help="stress readings per extension (default: %(default)s)",
-    )
-    group.add_argument(
-        f"--{prefix}-stage-ps",
-        type=float,
-        default=defaults.stage_ps,
-        help="duration of each resumable extension chunk, in ps (default: %(default)s)",
-    )
-    group.add_argument(
-        f"--{prefix}-trajectory-ps",
-        type=float,
-        default=defaults.trajectory_ps,
         help="save extension coordinates every this many ps; omitted by default",
     )
 
@@ -707,33 +643,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "monomer",
         nargs="?",
-        default=None,
         help="monomer SMILES with two [*] attachment points, e.g. '[*]CC[*]'. "
         "Required unless --analyse or --protocol tm is given",
     )
-    parser.add_argument(
-        "-n",
-        "--degree-of-polymerization",
-        type=int,
-        default=20,
-        help="repeat units per chain (default: %(default)s)",
+    _flag(parser, ("-n", "--degree-of-polymerization"), 20, "repeat units per chain")
+    _flag(parser, ("-c", "--chains"), 30, "chains in the cell")
+    _flag(
+        parser,
+        ("-r", "--residue-name"),
+        "POL",
+        "residue name, at most three characters",
     )
     parser.add_argument(
-        "-c",
-        "--chains",
-        type=int,
-        default=30,
-        help="chains in the cell (default: %(default)s)",
-    )
-    parser.add_argument(
-        "-r",
-        "--residue-name",
-        default="POL",
-        help="residue name, at most three characters (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--head-cap",
-        help="head end-cap SMILES with one [*] attachment point",
+        "--head-cap", help="head end-cap SMILES with one [*] attachment point"
     )
     parser.add_argument(
         "--tail-cap",
@@ -749,126 +671,82 @@ def build_parser() -> argparse.ArgumentParser:
         "-t",
         "--temperature",
         type=float,
-        default=None,
-        help="target temperature in kelvin (default: 298.15 for breaking, elongation "
-        "and yield, "
-        "450 for other protocols)",
+        help="target temperature in kelvin (default: 298.15 for breaking, "
+        "elongation and yield, 450 for other protocols)",
     )
-    parser.add_argument(
-        "--melt-temperature",
-        type=float,
-        default=600.0,
-        help="temperature the chains are mobilised at (default: %(default)s)",
+    _flag(
+        parser, "--melt-temperature", 600.0, "temperature the chains are mobilised at"
     )
-    parser.add_argument(
-        "--pressure",
-        type=float,
-        default=1.0,
-        help="pressure in bar (default: %(default)s)",
-    )
-    parser.add_argument(
+    _flag(parser, "--pressure", 1.0, "pressure in bar")
+    _flag(
+        parser,
         "--pack-density",
-        type=float,
-        default=DEFAULT_PACKING_DENSITY,
-        help="density to pack at in g/cm3, before compression (default: %(default)s)",
+        DEFAULT_PACKING_DENSITY,
+        "density to pack at in g/cm3, before compression",
     )
-    parser.add_argument(
+    _flag(
+        parser,
         "--target-density",
-        type=float,
-        default=0.85,
-        help="density the cell is expected to reach, checked against the "
-        "cutoff before anything long starts (default: %(default)s)",
+        0.85,
+        "density the cell is expected to reach, checked against the cutoff "
+        "before anything long starts",
     )
-    parser.add_argument(
+    _flag(
+        parser,
         "--charge-method",
-        default="nagl",
+        "nagl",
+        "partial-charge method",
         choices=CHARGE_METHODS,
-        help="partial-charge method (default: %(default)s)",
     )
-    parser.add_argument(
+    _flag(
+        parser,
         "--backend",
-        default="smirnoff",
+        "smirnoff",
+        "forcefill parameterisation backend",
         choices=BACKENDS,
-        help="forcefill parameterisation backend (default: %(default)s)",
     )
-    parser.add_argument(
-        "--protocol",
-        default="equilibrate",
-        choices=sorted(PROTOCOLS),
-        help="what to run (default: %(default)s)",
-    )
+    _flag(parser, "--protocol", "equilibrate", "what to run", choices=sorted(PROTOCOLS))
     quench = parser.add_argument_group(
         "temperature ladder",
         "cooling for melt-quench/tg, heating from a crystal for tm",
     )
-    quench.add_argument(
-        "--t-start",
-        type=float,
-        default=None,
-        help="starting temperature (default: melt temperature; tm: 250 K)",
-    )
-    quench.add_argument(
-        "--t-end",
-        type=float,
-        default=None,
-        help="ending temperature (default: 200 K; tm: 650 K)",
-    )
-    quench.add_argument(
-        "--step-k",
-        type=float,
-        default=None,
-        help="temperature change per step (default: 20 K; tm: 10 K)",
-    )
-    quench.add_argument(
-        "--hold-ps",
-        type=float,
-        default=None,
-        help="time held at each temperature (default: 200 ps; tm: 1000 ps)",
-    )
-    quench.add_argument(
-        "--fine-step-k",
-        type=float,
-        default=5.0,
-        help="temperature drop per step in the tg fine pass (default: %(default)s)",
-    )
-    quench.add_argument(
-        "--fine-hold-ps",
-        type=float,
-        default=3000.0,
-        help="time held at each fine temperature (default: %(default)s)",
-    )
-    quench.add_argument(
+    # Their defaults depend on the protocol, so are filled in after parsing.
+    for flag, text in (
+        ("--t-start", "starting temperature (default: melt temperature; tm: 250 K)"),
+        ("--t-end", "ending temperature (default: 200 K; tm: 650 K)"),
+        ("--step-k", "temperature change per step (default: 20 K; tm: 10 K)"),
+        ("--hold-ps", "time held at each temperature (default: 200 ps; tm: 1000 ps)"),
+    ):
+        quench.add_argument(flag, type=float, help=text)
+    _flag(quench, "--fine-step-k", 5.0, "temperature drop per step in the tg fine pass")
+    _flag(quench, "--fine-hold-ps", 3000.0, "time held at each fine temperature")
+    _flag(
+        quench,
         "--fine-window-k",
-        type=float,
-        default=60.0,
-        help="half-width of the fine window around the coarse transition "
-        "(default: %(default)s)",
+        60.0,
+        "half-width of the fine window around the coarse transition",
     )
     quench.add_argument(
         "--tg-approx",
         type=float,
-        default=None,
         help="centre the fine window here instead of on the coarse fit",
     )
     quench.add_argument(
         "--cooling-rates",
         type=_rates,
-        default=None,
         help="comma-separated rates in K/ns to repeat the fine pass at, e.g. "
         "10,5,2; the transition is then extrapolated toward experiment",
     )
     quench.add_argument(
         "--max-total-ns",
         type=float,
-        default=None,
-        help="refuse to start a scan longer than this",
+        help="refuse to start a run longer than this many ns",
     )
     quench.add_argument(
         "--check-melt",
-        type=float,
+        type=_positive_float,
         nargs="?",
         const=10.0,
-        default=None,
         help="write a trajectory every N ps during equilibration so the melt "
         "can be shown to have relaxed (default interval 10 ps). This is "
         "frames of the whole cell - tens of megabytes - and without it the "
@@ -884,68 +762,56 @@ def build_parser() -> argparse.ArgumentParser:
     )
     melting.add_argument(
         "--system-xml",
-        help="serialized OpenMM System for --crystal-pdb, without a thermostat or barostat",
+        help="serialized OpenMM System for --crystal-pdb, without a thermostat "
+        "or barostat",
     )
     melting.add_argument(
         "--state-in",
         help="optional serialized OpenMM State for the same crystalline cell",
     )
-    melting.add_argument(
+    _flag(
+        melting,
         "--tm-equilibration-ps",
-        type=float,
-        default=1000.0,
-        help="equilibrate the crystal at --t-start for this long (default: %(default)s)",
+        1000.0,
+        "equilibrate the crystal at --t-start for this long",
     )
-    melting.add_argument(
-        "--tm-stage-ps",
-        type=float,
-        default=10_000.0,
-        help="maximum heating stage duration in ps (default: %(default)s)",
-    )
+    _flag(melting, "--tm-stage-ps", 10_000.0, "maximum heating stage duration in ps")
     melting.add_argument(
         "--tm-trajectory-ps",
         type=float,
-        default=None,
         help="optional trajectory interval in ps, to inspect loss of crystal order",
     )
-    melting.add_argument(
+    _flag(
+        melting,
         "--tm-barostat",
+        "anisotropic",
+        "pressure control for the crystal and heating",
         choices=("isotropic", "anisotropic"),
-        default="anisotropic",
-        help="pressure control for the crystal and heating (default: %(default)s)",
     )
-    parser.add_argument(
+    _flag(
+        parser,
         "--tacticity",
-        default="atactic",
+        "atactic",
+        "backbone stereochemistry",
         choices=("atactic", "isotactic", "syndiotactic"),
-        help="backbone stereochemistry (default: %(default)s)",
     )
     parser.add_argument(
-        "--platform",
-        default=None,
-        help="OpenMM platform (default: the fastest available)",
+        "--platform", help="OpenMM platform (default: the fastest available)"
     )
     parser.add_argument(
         "-o",
         "--output-dir",
-        default=None,
         help="where everything is written (default: run). With --analyse, "
         "where the report goes instead of <RUN_DIR>/analysis",
     )
     parser.add_argument(
         "--conformers",
         type=int,
-        default=None,
         help="distinct conformations to build; they are repeated to fill the "
         "cell (default: one per chain, which is the right thing and the "
         "slowest to pack)",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=0xF0,
-        help="master random seed (default: %(default)s)",
-    )
+    _flag(parser, "--seed", 0xF0, "master random seed")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -955,47 +821,34 @@ def build_parser() -> argparse.ArgumentParser:
         "mechanics",
         "the extension the modulus protocol walks, and the passes beside it",
     )
-    mechanics.add_argument(
-        "--strain-increment",
-        type=float,
-        default=0.002,
-        help="engineering strain added per step (default: %(default)s)",
-    )
-    mechanics.add_argument(
-        "--max-strain",
-        type=float,
-        default=0.05,
-        help="strain the ladder stops at (default: %(default)s)",
-    )
-    mechanics.add_argument(
+    _flag(mechanics, "--strain-increment", 0.002, "engineering strain added per step")
+    _flag(mechanics, "--max-strain", 0.05, "strain the ladder stops at")
+    _flag(
+        mechanics,
         "--relax-ps",
-        type=float,
-        default=50.0,
-        help="time to relax after each increment; the mean is over the "
-        "second half, so this is twice the averaging window "
-        "(default: %(default)s)",
+        50.0,
+        "time to relax after each increment; the mean is over the second "
+        "half, so this is twice the averaging window",
     )
     mechanics.add_argument(
         "--modulus-relax-times",
         type=_floats,
-        default=None,
-        help="comma-separated hold times in ps for a Young's modulus rate scan; "
-        "at least three distinct values, e.g. 50,150,500. Requires --protocol "
-        "modulus and --target-strain-rate; runs extension replicas at each rate",
+        help="the same as --rate-property youngs_modulus --rate-hold-times: "
+        "three or more distinct hold times in ps for a Young's modulus rate "
+        "scan, e.g. 50,150,500",
     )
     mechanics.add_argument(
         "--target-strain-rate",
         type=float,
-        default=None,
-        help="positive target rate in strain/ns for modulus extrapolation "
-        "(multiply a rate in s^-1 by 1e-9); also enables rate analysis of "
-        "--analyse directories or a saved modulus rate scan",
+        help="the same as --target-property-rate, for a property measured in "
+        "strain/ns (multiply a rate in s^-1 by 1e-9); without --rate-property "
+        "or a measurement --protocol, the property is youngs_modulus",
     )
-    mechanics.add_argument(
+    _flag(
+        mechanics,
         "--elastic-strain-limit",
-        type=float,
-        default=0.015,
-        help="strain the modulus is fitted up to (default: %(default)s)",
+        0.015,
+        "strain the modulus is fitted up to",
     )
     rate_analysis = parser.add_argument_group(
         "rate sensitivity",
@@ -1004,191 +857,165 @@ def build_parser() -> argparse.ArgumentParser:
     rate_analysis.add_argument(
         "--rate-property",
         choices=sorted(RATE_PROPERTIES),
-        default=None,
         help="property to compare; a new scan must use its matching --protocol",
     )
     rate_analysis.add_argument(
         "--rate-hold-times",
         type=_floats,
-        default=None,
-        help="three or more distinct hold times in ps; varies rate while keeping the same ladder and preparation",
+        help="three or more distinct hold times in ps; varies rate while keeping "
+        "the same ladder and preparation",
     )
     rate_analysis.add_argument(
         "--target-property-rate",
         type=float,
-        default=None,
-        help="positive target in the selected property's units: strain/ns, bar/ns, or K/ns",
+        help="positive target in the selected property's units: strain/ns, "
+        "bar/ns, or K/ns",
     )
     rate_analysis.add_argument(
         "--max-rate-extrapolation-decades",
         type=float,
         default=2.0,
-        help="largest extrapolation distance allowed to resolve (default: %(default)s); this is a reporting guard",
+        help="largest extrapolation distance allowed to resolve (default: "
+        "%(default)s); this is a reporting guard",
     )
-    rate_analysis.add_argument(
+    _flag(
+        rate_analysis,
         "--thermal-rate-replicas",
+        3,
+        "independent velocity replicas per thermal rate",
         type=_positive_int,
-        default=3,
-        help="independent velocity replicas per thermal rate (default: %(default)s)",
     )
-    mechanics.add_argument(
+    _flag(
+        mechanics,
         "--replicas",
-        type=int,
-        default=3,
-        help="extensions from the same cell with fresh velocities; their "
-        "spread is the error bar (default: %(default)s)",
+        3,
+        "extensions from the same cell with fresh velocities; their spread is "
+        "the error bar",
     )
-    mechanics.add_argument(
-        "--deform-axis",
-        type=int,
-        default=2,
-        choices=(0, 1, 2),
-        help="axis to stretch (default: %(default)s)",
-    )
+    _flag(mechanics, "--deform-axis", 2, "axis to stretch", choices=(0, 1, 2))
     mechanics.add_argument(
         "--load-stresses",
         type=_floats,
-        default=None,
         help="comma-separated stresses in bar for the constant-stress "
         "cross-check, e.g. 0,100,200,300",
     )
     mechanics.add_argument(
         "--bulk-pressures",
         type=_floats,
-        default=None,
         help="comma-separated pressures in bar for the bulk modulus, up and "
         "back down so the hysteresis is measurable",
     )
     mechanics.add_argument(
         "--shear-strains",
         type=_floats,
-        default=None,
         help="comma-separated shear strains for the shear modulus",
     )
     mechanics.add_argument(
         "--skip",
         nargs="*",
         default=(),
-        choices=("load", "bulk", "shear"),
+        choices=tuple(_PASSES),
         help="passes to leave out; the extension always runs",
     )
     breaking = parser.add_argument_group(
         "breaking strength",
         "finite tensile extension and the stress drop that qualifies its peak",
     )
-    _add_tensile_arguments(breaking, "breaking", BreakingSpec())
+    _tensile_flags(breaking, "breaking", BreakingSpec())
     elongation = parser.add_argument_group(
         "elongation at break",
         "engineering strain at the onset of a confirmed terminal stress drop",
     )
-    _add_tensile_arguments(elongation, "elongation", ElongationSpec())
+    _tensile_flags(elongation, "elongation", ElongationSpec())
     failure = parser.add_argument_group(
         "tensile failure criterion",
         "shared stress-drop criterion for breaking strength and elongation at break",
     )
-    failure.add_argument(
+    _flag(
+        failure,
         "--failure-fraction",
-        type=float,
-        default=0.5,
-        help="fraction of peak nominal stress below which the terminal "
-        "drop must remain (default: %(default)s)",
+        0.5,
+        "fraction of peak nominal stress below which the terminal drop must remain",
     )
-    failure.add_argument(
+    _flag(
+        failure,
         "--confirmation-steps",
-        type=int,
-        default=3,
-        help="consecutive terminal holds needed to confirm the stress drop "
-        "(default: %(default)s)",
+        3,
+        "consecutive terminal holds needed to confirm the stress drop",
     )
     yielding = parser.add_argument_group(
         "yield strength",
         "finite tensile extension and the offset line defining its proof stress",
     )
-    _add_tensile_arguments(yielding, "yield", YieldSpec())
-    yielding.add_argument(
+    _tensile_flags(yielding, "yield", YieldSpec())
+    _flag(
+        yielding,
         "--yield-offset-strain",
-        type=float,
-        default=0.002,
-        help="strain offset for the proof-stress line; 0.002 means 0.2%% "
-        "(default: %(default)s)",
+        0.002,
+        "strain offset for the proof-stress line; 0.002 means 0.2%%",
     )
-    yielding.add_argument(
+    _flag(
+        yielding,
         "--yield-fit-min-strain",
-        type=float,
-        default=0.0,
-        help="lower engineering strain for the initial elastic fit "
-        "(default: %(default)s)",
+        0.0,
+        "lower engineering strain for the initial elastic fit",
     )
-    yielding.add_argument(
+    _flag(
+        yielding,
         "--yield-fit-max-strain",
-        type=float,
-        default=0.02,
-        help="upper engineering strain for the initial elastic fit "
-        "(default: %(default)s)",
+        0.02,
+        "upper engineering strain for the initial elastic fit",
     )
     relaxation = parser.add_argument_group(
         "relaxation",
         "the step strain the relax protocol applies, and how the decay after "
         "it is sampled",
     )
-    relaxation.add_argument(
+    _flag(
+        relaxation,
         "--relax-mode",
-        default="tensile",
+        "tensile",
+        "whether the step is an extension or a shear; both measure G(t), and "
+        "a shear imposes no lateral contraction",
         choices=RELAX_MODES,
-        help="whether the step is an extension or a shear; both measure G(t), "
-        "and a shear imposes no lateral contraction (default: %(default)s)",
     )
-    relaxation.add_argument(
-        "--step-strain",
-        type=float,
-        default=0.03,
-        help="the strain applied all at once, then held (default: %(default)s)",
+    _flag(
+        relaxation, "--step-strain", 0.03, "the strain applied all at once, then held"
     )
-    relaxation.add_argument(
+    _flag(
+        relaxation,
         "--baseline-ps",
-        type=float,
-        default=1000.0,
-        help="time at the locked box before straining; its scatter is the "
-        "floor the decay is read against (default: %(default)s)",
+        1000.0,
+        "time at the locked box before straining; its scatter is the floor "
+        "the decay is read against",
     )
-    relaxation.add_argument(
+    _flag(
+        relaxation,
         "--relaxation-ps",
-        type=float,
-        default=10000.0,
-        help="how long the strain is held, per replica (default: %(default)s)",
+        10000.0,
+        "how long the strain is held, per replica",
     )
-    relaxation.add_argument(
+    _flag(
+        relaxation,
         "--relax-replicas",
-        type=int,
-        default=4,
-        help="independent runs from the same cell with fresh velocities. The "
-        "first knob to turn: the early bins hold one reading each, so "
-        "averaging replicas is what makes the fast end of the curve mean "
-        "anything (default: %(default)s)",
+        4,
+        "independent runs from the same cell with fresh velocities. The first "
+        "knob to turn: the early bins hold one reading each, so averaging "
+        "replicas is what makes the fast end of the curve mean anything",
     )
-    relaxation.add_argument(
-        "--sample-every-ps",
-        type=float,
-        default=0.05,
-        help="time between stress readings early on (default: %(default)s)",
+    _flag(
+        relaxation, "--sample-every-ps", 0.05, "time between stress readings early on"
     )
-    relaxation.add_argument(
-        "--bins-per-decade",
-        type=int,
-        default=20,
-        help="logarithmic time bins per decade (default: %(default)s)",
-    )
-    relaxation.add_argument(
+    _flag(relaxation, "--bins-per-decade", 20, "logarithmic time bins per decade")
+    _flag(
+        relaxation,
         "--relax-stage-ps",
-        type=float,
-        default=20000.0,
-        help="most relaxation one stage may hold before it is split for "
-        "resume (default: %(default)s)",
+        20000.0,
+        "most relaxation one stage may hold before it is split for resume",
     )
     relaxation.add_argument(
         "--linearity-strains",
         type=_floats,
-        default=None,
         help="comma-separated strains to repeat the whole measurement at, "
         "e.g. 0.01,0.05; inside the linear region the moduli coincide, and "
         "there is no other way to check from one strain alone",
@@ -1199,16 +1026,11 @@ def build_parser() -> argparse.ArgumentParser:
     analysis.add_argument(
         "--analyse",
         nargs="+",
-        default=None,
         metavar="RUN_DIR",
         help="report the transition from these finished run directories; the "
         "first owns the output. No monomer is needed",
     )
-    analysis.add_argument(
-        "--melt-stage",
-        default="05_npt",
-        help="the equilibration stage to check (default: %(default)s)",
-    )
+    _flag(analysis, "--melt-stage", "05_npt", "the equilibration stage to check")
     convergence = parser.add_argument_group(
         "time-window convergence", "check estimates as the observation window grows"
     )
@@ -1219,9 +1041,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     convergence.add_argument(
         "--convergence-stage",
-        default=None,
         metavar="STAGE",
-        help="saved stage to check (default: --structure-stage or the last available stage)",
+        help="saved stage to check (default: --structure-stage or the last "
+        "available stage)",
     )
     convergence.add_argument(
         "--window-fractions",
@@ -1229,34 +1051,36 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_WINDOW_FRACTIONS,
         help="increasing observed fractions ending at 1 (default: 0.25,0.5,0.75,1)",
     )
-    convergence.add_argument(
+    _flag(
+        convergence,
         "--convergence-tolerance",
-        type=float,
-        default=0.1,
-        help="maximum relative change to resolve window stability (default: %(default)s)",
+        0.1,
+        "maximum relative change to resolve window stability",
     )
-    convergence.add_argument(
+    _flag(
+        convergence,
         "--min-effective-samples",
-        type=float,
-        default=20.0,
-        help="minimum autocorrelation-adjusted count for scalar time traces (default: %(default)s)",
+        20.0,
+        "minimum autocorrelation-adjusted count for scalar time traces",
     )
-    convergence.add_argument(
+    _flag(
+        convergence,
         "--convergence-discard-fraction",
-        type=float,
-        default=0.1,
-        help="initial fraction discarded from stationary time traces (default: %(default)s)",
+        0.1,
+        "initial fraction discarded from stationary time traces",
     )
     analysis.add_argument(
         "--no-melt-check",
         action="store_true",
         help="skip the melt equilibration check",
     )
-    analysis.add_argument(
+    _flag(
+        analysis,
         "--rate-form",
-        default="log_linear",
+        "log_linear",
+        "which rate relation a --cooling-rates tg run headlines; --analyse "
+        "reports every one the rates can fit",
         choices=EXTRAPOLATION_FORMS,
-        help="which rate relation to headline (default: %(default)s)",
     )
     analysis.add_argument(
         "--target-rate",
@@ -1264,21 +1088,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=DSC_COOLING_RATE_K_PER_NS,
         help="cooling rate in K/ns to extrapolate to (default: 10 K/min)",
     )
-    analysis.add_argument(
+    _flag(
+        analysis,
         "--min-points-per-branch",
-        type=int,
-        default=4,
-        help="points each branch of the fit must keep (default: %(default)s)",
+        4,
+        "points each branch of the fit must keep",
     )
     analysis.add_argument(
-        "--rg",
-        type=float,
-        default=None,
-        help="radius of gyration in nm, overriding the manifest",
+        "--rg", type=float, help="radius of gyration in nm, overriding the manifest"
     )
     analysis.add_argument(
         "--structure-stage",
-        default=None,
         metavar="STAGE",
         help="the stage whose coordinates to measure (default: the last stage "
         "with a trajectory, else the last stage's closing snapshot)",
@@ -1286,7 +1106,6 @@ def build_parser() -> argparse.ArgumentParser:
     analysis.add_argument(
         "--backbone",
         type=_ints,
-        default=None,
         help="comma-separated backbone atom indices within one chain, e.g. "
         "0,1,4,5; overrides what the run recorded and the bond-graph inference",
     )
@@ -1307,28 +1126,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="write the record but no figures",
     )
-    analysis.add_argument(
-        "--figure-format",
-        default="png",
-        help="what to save figures as (default: %(default)s)",
-    )
+    _flag(analysis, "--figure-format", "png", "what to save figures as")
     parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="log what each step is doing",
+        "-v", "--verbose", action="store_true", help="log what each step is doing"
     )
     return parser
 
 
-def _floats(text: str) -> tuple[float, ...]:
-    """Parse a comma-separated list of numbers, at the front door."""
+def _split[T](
+    text: str, number: Callable[[str], T], kind: str, example: str
+) -> tuple[T, ...]:
+    """A comma-separated list, parsed at the front door."""
     try:
-        values = tuple(float(part) for part in text.split(",") if part.strip())
+        return tuple(number(part) for part in text.split(",") if part.strip())
     except ValueError as error:
         raise argparse.ArgumentTypeError(
-            f"{text!r} is not a comma-separated list of numbers, e.g. '0,100,200'."
+            f"{text!r} is not a comma-separated list of {kind}, e.g. {example!r}."
         ) from error
+
+
+def _floats(text: str) -> tuple[float, ...]:
+    """A comma-separated list of numbers."""
+    values = _split(text, float, "numbers", "0,100,200")
     if not values:
         raise argparse.ArgumentTypeError(
             f"{text!r} is empty. Leave the flag out for the default, or name "
@@ -1338,13 +1157,8 @@ def _floats(text: str) -> tuple[float, ...]:
 
 
 def _ints(text: str) -> tuple[int, ...]:
-    """Parse a comma-separated list of atom indices, at the front door."""
-    try:
-        values = tuple(int(part) for part in text.split(",") if part.strip())
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            f"{text!r} is not a comma-separated list of integers, e.g. '0,1,4,5'."
-        ) from error
+    """A comma-separated list of atom indices."""
+    values = _split(text, int, "integers", "0,1,4,5")
     if len(values) < 2:
         raise argparse.ArgumentTypeError(
             f"{text!r} names {len(values)} atom(s); a backbone of one atom has no "
@@ -1353,45 +1167,9 @@ def _ints(text: str) -> tuple[int, ...]:
     return values
 
 
-def _positive_float(text: str) -> float:
-    """An explicitly finite, positive numeric command-line value."""
-    try:
-        value = float(text)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("must be a positive finite number") from error
-    if not math.isfinite(value) or value <= 0:
-        raise argparse.ArgumentTypeError("must be a positive finite number")
-    return value
-
-
-def _build_characteristic_ratio(arguments: argparse.Namespace) -> float:
-    """Keep the polyethylene build default separate from recorded analysis values."""
-    return (
-        7.0
-        if arguments.characteristic_ratio is None
-        else float(arguments.characteristic_ratio)
-    )
-
-
-def _positive_int(text: str) -> int:
-    """Parse a count that has to be at least one, at the front door."""
-    try:
-        value = int(text)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(f"{text!r} is not an integer.") from error
-    if value < 1:
-        raise argparse.ArgumentTypeError(f"{text!r} is not a positive integer.")
-    return value
-
-
 def _rates(text: str) -> tuple[float, ...]:
-    """Parse a comma-separated list of cooling rates, at the front door."""
-    try:
-        rates = tuple(float(part) for part in text.split(",") if part.strip())
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            f"{text!r} is not a comma-separated list of numbers, e.g. '10,5,2'."
-        ) from error
+    """A comma-separated list of cooling rates."""
+    rates = _split(text, float, "numbers", "10,5,2")
     if len(rates) < 2:
         raise argparse.ArgumentTypeError(
             f"{text!r} gives {len(rates)} rate(s); a rate dependence needs at "
@@ -1404,343 +1182,157 @@ def _rates(text: str) -> tuple[float, ...]:
     return rates
 
 
-_RATE_PROTOCOLS = {
-    "youngs_modulus": "modulus",
-    "poisson_ratio": "modulus",
-    "shear_modulus": "modulus",
-    "bulk_modulus": "modulus",
-    "load_modulus": "modulus",
-    "yield_strength": "yield",
-    "yield_strain": "yield",
-    "breaking_strength": "breaking",
-    "elongation_at_break": "elongation",
-    "glass_transition": "tg",
-    "melting_temperature": "tm",
-}
-_PROTOCOL_RATE_DEFAULTS = {
-    "modulus": "youngs_modulus",
-    "yield": "yield_strength",
-    "breaking": "breaking_strength",
-    "elongation": "elongation_at_break",
-    "tg": "glass_transition",
-    "tm": "melting_temperature",
-}
+def _positive_float(text: str) -> float:
+    """An explicitly finite, positive number."""
+    try:
+        value = float(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive finite number") from error
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return value
+
+
+def _positive_int(text: str) -> int:
+    """A count that has to be at least one."""
+    try:
+        value = int(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer.") from error
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a positive integer.")
+    return value
+
+
+# --------------------------------------------------------------------------
+# Rate scans
+# --------------------------------------------------------------------------
+
+
+class _RateRequest(NamedTuple):
+    """A rate scan or analysis, resolved from the command line.
+
+    An analysis runs no dynamics and has no hold times.
+    """
+
+    property_name: str
+    target_rate: float
+    hold_times_ps: tuple[float, ...]
+
+
+#: The flags that ask for a rate scan, or for the analysis of one.
+_RATE_FLAGS = (
+    "rate_property",
+    "rate_hold_times",
+    "modulus_relax_times",
+    "target_property_rate",
+    "target_strain_rate",
+)
 
 
 def _property_rates_requested(arguments: argparse.Namespace) -> bool:
-    return any(
-        (
-            arguments.rate_property is not None,
-            arguments.rate_hold_times is not None,
-            arguments.target_property_rate is not None,
-            arguments.target_strain_rate is not None
-            and arguments.protocol in ("yield", "breaking", "elongation"),
-        )
+    return any(getattr(arguments, name) is not None for name in _RATE_FLAGS)
+
+
+def _either(new: Any, old: Any, flags: str) -> Any:
+    """A setting given by its flag or by the older one it replaced, never both ways."""
+    if new is not None and old is not None and new != old:
+        raise ValueError(f"{flags} give different values; pass one of them.")
+    return old if new is None else new
+
+
+def _rate_protocol(property_name: str) -> str:
+    """The protocol a rate scan of *property_name* varies the loading rate of.
+
+    It is the one whose own rate property is measured with the same settings.
+    """
+    settings = type(default_rate_spec(property_name))
+    return next(
+        name
+        for name, entry in PROTOCOLS.items()
+        if entry.rate_property is not None
+        and type(default_rate_spec(entry.rate_property)) is settings
     )
 
 
-def _property_rate_request(
-    arguments: argparse.Namespace,
-) -> tuple[str, float, RateScanSpec]:
-    """Resolve a physical rate unit before allowing any build or dynamics."""
-    property_name = arguments.rate_property or _PROTOCOL_RATE_DEFAULTS.get(
-        arguments.protocol
+def _property_rate_request(arguments: argparse.Namespace) -> _RateRequest:
+    """Resolve a physical rate unit before allowing any build or dynamics.
+
+    ``--modulus-relax-times`` and ``--target-strain-rate`` predate the other
+    properties. They stand for ``--rate-property youngs_modulus
+    --rate-hold-times`` and for ``--target-property-rate`` in strain/ns, and
+    the target alone still selects Young's modulus when neither a property
+    nor a measurement protocol does.
+    """
+    property_name = arguments.rate_property
+    if arguments.modulus_relax_times is not None:
+        if property_name not in (None, "youngs_modulus"):
+            raise ValueError(
+                "--modulus-relax-times sets Young's modulus holds; use "
+                f"--rate-hold-times for {property_name}."
+            )
+        property_name = "youngs_modulus"
+    property_name = (
+        property_name
+        or PROTOCOLS[arguments.protocol].rate_property
+        or ("youngs_modulus" if arguments.target_strain_rate is not None else None)
     )
     if property_name is None:
         raise ValueError(
             "Choose --rate-property for rate analysis, or a measurement --protocol for a scan."
         )
-    if arguments.modulus_relax_times is not None:
-        raise ValueError(
-            "Use --rate-hold-times with --rate-property; --modulus-relax-times belongs to the original Young's modulus interface."
-        )
-    if (
-        arguments.target_property_rate is not None
-        and arguments.target_strain_rate is not None
-    ):
-        raise ValueError(
-            "Specify one of --target-property-rate or --target-strain-rate."
-        )
-    target = arguments.target_property_rate
-    if target is None and arguments.target_strain_rate is not None:
-        if RATE_PROPERTIES[property_name].rate_unit != "strain/ns":
-            raise ValueError(
-                f"{property_name} uses {RATE_PROPERTIES[property_name].rate_unit}; use --target-property-rate."
-            )
-        target = arguments.target_strain_rate
-    if target is None or not math.isfinite(target) or target <= 0:
+    unit = RATE_PROPERTIES[property_name].rate_unit
+    if arguments.target_strain_rate is not None and unit != "strain/ns":
+        raise ValueError(f"{property_name} uses {unit}; use --target-property-rate.")
+    target = _either(
+        arguments.target_property_rate,
+        arguments.target_strain_rate,
+        "--target-property-rate and --target-strain-rate",
+    )
+    holds = _either(
+        arguments.rate_hold_times,
+        arguments.modulus_relax_times,
+        "--rate-hold-times and --modulus-relax-times",
+    )
+    if target is None:
         raise ValueError("A finite positive --target-property-rate is required.")
-    maximum = arguments.max_rate_extrapolation_decades
-    if not math.isfinite(maximum) or maximum < 0:
-        raise ValueError(
-            "--max-rate-extrapolation-decades must be finite and nonnegative."
-        )
-    protocol_name = _RATE_PROTOCOLS[property_name]
+    target, _ = validate_rate_request(target, arguments.max_rate_extrapolation_decades)
     if arguments.analyse:
-        if arguments.rate_hold_times is not None:
+        if holds is not None:
             raise ValueError(
-                "--rate-hold-times starts new dynamics and cannot be used with --analyse."
+                "--rate-hold-times and --modulus-relax-times start new dynamics "
+                "and cannot be used with --analyse."
             )
-        return property_name, float(target), default_rate_spec(property_name)
-    elif arguments.protocol != protocol_name or arguments.rate_hold_times is None:
+        return _RateRequest(property_name, target, ())
+    protocol = _rate_protocol(property_name)
+    if arguments.protocol != protocol or holds is None:
         raise ValueError(
-            f"{property_name} scans require --protocol {protocol_name} and --rate-hold-times."
+            f"{property_name} scans require --protocol {protocol} and --rate-hold-times."
         )
-    factories: dict[str, Callable[..., RateScanSpec]] = {
-        "modulus": _modulus_spec,
-        "yield": _yield_spec,
-        "breaking": _breaking_spec,
-        "elongation": _elongation_spec,
-        "tg": _tg_spec,
-        "tm": _tm_spec,
+    return _RateRequest(property_name, target, holds)
+
+
+# --------------------------------------------------------------------------
+# The driver
+# --------------------------------------------------------------------------
+
+#: What the build request leaves out: where things go, which device runs
+#: them, how much is said, and whether - or under what budget - dynamics
+#: start. None of them changes the physical system.
+_UNRECORDED = frozenset(
+    {
+        "output_dir",
+        "platform",
+        "dry_run",
+        "verbose",
+        "no_figures",
+        "figure_format",
+        "max_total_ns",
     }
-    spec = factories[protocol_name](
-        **_protocol_options(arguments, PROTOCOLS[protocol_name])
-    )
-    return property_name, float(target), spec
+)
 
-
-def _write_property_rate_result(
-    arguments: argparse.Namespace, report: RateReport, output_dir: Path | None = None
-) -> None:
-    """A unit-aware headline for each model, including unavailable predictions."""
-    property = report.property
-    for form in ("log_linear", "power_law"):
-        fit = getattr(report, form)
-        if fit is None:
-            print(f"{property.label}, {form}: unavailable (not resolved)", flush=True)
-            continue
-        uncertainty = (
-            f"{fit.standard_error:.3g}"
-            if math.isfinite(fit.standard_error)
-            else "unknown"
-        )
-        print(
-            f"{property.label}, {form}: {fit.value:.5g} +/- {uncertainty} {property.value_unit} (fit SE) at "
-            f"{fit.target_rate:.4g} {property.rate_unit}; {fit.n_rates} rates, extrapolated {fit.extrapolation_decades:.2f} decades"
-            f"{'' if fit.resolved else ' (not resolved)'}",
-            flush=True,
-        )
-        for note in fit.notes:
-            print(f"note ({form}): {note}", flush=True)
-    if report.log_linear is not None and report.power_law is not None:
-        print(
-            f"model difference at target: {abs(report.log_linear.value - report.power_law.value):.4g} {property.value_unit}",
-            flush=True,
-        )
-    for note in report.notes:
-        print(f"note: {note}", flush=True)
-    files = write_rate_report(
-        report,
-        output_dir if output_dir is not None else arguments.output_dir,
-        figures=not arguments.no_figures,
-        figure_format=arguments.figure_format,
-    )
-    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
-
-
-def _analyse_convergence(arguments: argparse.Namespace) -> int:
-    report = analyse_convergence(
-        arguments.analyse[0],
-        stage=arguments.convergence_stage or arguments.structure_stage,
-        backbone=arguments.backbone,
-        stride=arguments.stride,
-        window_fractions=arguments.window_fractions,
-        relative_tolerance=arguments.convergence_tolerance,
-        min_effective_samples=arguments.min_effective_samples,
-        discard_fraction=arguments.convergence_discard_fraction,
-    )
-    print(f"observation-window convergence: stage {report.stage}", flush=True)
-    statuses: list[tuple[str, bool, Sequence[str]]] = [
-        (name, result.resolved, result.notes) for name, result in report.results.items()
-    ]
-    if report.relaxation is not None:
-        statuses.extend(
-            (name, result.resolved, result.notes)
-            for name, result in report.relaxation.metrics.items()
-        )
-    if report.structural is not None:
-        statuses.extend(
-            (name, parameter.resolved, parameter.notes)
-            for name, parameter in report.structural.parameters.items()
-        )
-    for name, resolved, notes in statuses:
-        print(f"{name}: {'resolved' if resolved else 'unresolved'}", flush=True)
-        for note in notes:
-            print(f"  {note}", flush=True)
-    for note in report.notes:
-        print(f"note: {note}", flush=True)
-    files = write_convergence_report(
-        report,
-        arguments.output_dir,
-        figures=not arguments.no_figures,
-        figure_format=arguments.figure_format,
-    )
-    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
-    return 0
-
-
-def _build_cli_melt(
-    arguments: argparse.Namespace, build_dir: Path, cache_dir: Path
-) -> tuple[ChainResult, RunContext]:
-    """Prepare and validate a physical cell without starting dynamics."""
-    n_chains = int(arguments.chains)
-    n_conformers = min(int(arguments.conformers or n_chains), n_chains)
-    chain = build_chain(
-        ChainSpec(
-            monomer_smiles=cast(str, arguments.monomer),
-            degree_of_polymerization=int(arguments.degree_of_polymerization),
-            residue_name=cast(str, arguments.residue_name),
-            tacticity=cast(str, arguments.tacticity),
-            head_cap=cast("str | None", arguments.head_cap),
-            tail_cap=cast("str | None", arguments.tail_cap),
-            characteristic_ratio=_build_characteristic_ratio(arguments),
-            seed=int(arguments.seed),
-        ),
-        "chain",
-        n_conformers=n_conformers,
-        output_dir=build_dir,
-    )
-    print(
-        f"chain: {chain.n_atoms} atoms, {chain.molar_mass_g_mol:.1f} g/mol, "
-        f"{chain.embedder} embedder",
-        flush=True,
-    )
-
-    spec = SystemSpec()
-    edge = check_target_density(
-        [n_chains],
-        [chain.molar_mass_g_mol],
-        float(arguments.target_density),
-        spec,
-    )
-    print(
-        f"cell: {edge:.2f} nm at {arguments.target_density} g/cm3 once compressed",
-        flush=True,
-    )
-
-    if arguments.charge_method != "none":
-        assign_charges(chain.sdf_paths[0], cast(str, arguments.charge_method))
-    forcefield = build_polymer_forcefield(
-        chain.sdf_paths[0],
-        build_dir / "polymer_ff.xml",
-        residue_name=cast(str, arguments.residue_name),
-        backend=cast(str, arguments.backend),
-        cache_dir=cache_dir,
-        workdir=build_dir / "forcefill",
-    )
-    print(f"force field: {forcefield.forcefield_xml}", flush=True)
-
-    components = distribute_conformers(list(chain.pdb_paths), n_chains)
-    packed = pack_box(
-        components,
-        box_edge_nm(
-            [n_chains], [chain.molar_mass_g_mol], float(arguments.pack_density)
-        ),
-        build_dir / "packed.pdb",
-        seed=int(arguments.seed),
-        workdir=build_dir,
-    )
-    box = assemble_box(components, packed.packed_pdb, packed.box_nm)
-    check_packing(box.topology, box.positions_nm)
-    print(
-        f"packed: {box.n_molecules} chains, {box.topology.getNumAtoms()} atoms",
-        flush=True,
-    )
-
-    run = prepare_run(
-        prepare_box(box, forcefield),
-        forcefield,
-        spec,
-        platform=cast("str | None", arguments.platform),
-        seed=int(arguments.seed),
-    )
-    return chain, run
-
-
-def _prepare_cli_melt(
-    arguments: argparse.Namespace, output: Path
-) -> tuple[ChainResult, RunContext]:
-    """Stage repeat preparations so failed validation cannot alter old assets."""
-    build = output / "build"
-    record_path = build / "inputs.json"
-    previous = json.loads(record_path.read_text()) if record_path.is_file() else None
-    if previous is not None:
-        for name, digest in previous["artifacts"].items():
-            path = build / name
-            if not path.is_file() or _file_digest(path) != digest:
-                raise ProtocolError(
-                    f"Existing build artifact {name!r} changed or is missing. "
-                    "Restore it or use a fresh output directory."
-                )
-    repeated = build.exists()
-    with ExitStack() as stack:
-        if repeated:
-            temporary = Path(
-                stack.enter_context(
-                    TemporaryDirectory(prefix=".build-check-", dir=output)
-                )
-            )
-            working = temporary / "build"
-            cache = temporary / "cache"
-            if (output / "cache").is_dir():
-                shutil.copytree(output / "cache", cache)
-        else:
-            working = build
-            cache = output / "cache"
-        chain, run = _build_cli_melt(arguments, working, cache)
-        inputs = {
-            "run": _run_identity(run),
-            "chain": {
-                key: value
-                for key, value in asdict(chain).items()
-                if key not in {"sdf_paths", "pdb_paths"}
-            },
-        }
-        # JSON normalization makes tuple-valued chain metadata comparable.
-        inputs = json.loads(json.dumps(inputs, allow_nan=False))
-        if repeated and (previous is None or previous["inputs"] != inputs):
-            raise ProtocolError(
-                "Prepared chemistry, force field or packed coordinates changed, "
-                "or the existing build lacks verified inputs. The original build "
-                "was preserved; use a fresh output directory."
-            )
-        for directory in (output, output / "equilibration"):
-            validate_run_inputs(run, directory)
-        if not repeated:
-            artifacts = [
-                *chain.sdf_paths,
-                *chain.pdb_paths,
-                run.forcefield.forcefield_xml,
-                str(working / "packed.pdb"),
-            ]
-            record = {
-                "inputs": inputs,
-                "artifacts": {
-                    str(
-                        Path(path).resolve().relative_to(working.resolve())
-                    ): _file_digest(path)
-                    for path in artifacts
-                },
-            }
-            _write_atomically(record_path, json.dumps(record, indent=2) + "\n")
-        else:
-            # Everything needed for dynamics is now in memory. Returned file
-            # references point at the verified persistent originals.
-            chain = replace(
-                chain,
-                sdf_paths=tuple(
-                    str(build / Path(path).name) for path in chain.sdf_paths
-                ),
-                pdb_paths=tuple(
-                    str(build / Path(path).name) for path in chain.pdb_paths
-                ),
-            )
-            run.forcefield = replace(
-                run.forcefield,
-                forcefield_xml=str(build / Path(run.forcefield.forcefield_xml).name),
-            )
-        return chain, run
+#: The dependencies whose versions can change a rebuilt Hamiltonian.
+_RUNTIME = ("openmm", "rdkit", "forcefill", "openff-toolkit", "numpy")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1758,911 +1350,217 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=logging.INFO if arguments.verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        # A long run's progress has to reach a redirected log as it happens.
+        sys.stdout.reconfigure(line_buffering=True)
 
     if arguments.convergence:
         if not arguments.analyse or len(arguments.analyse) != 1:
             parser.error("--convergence requires exactly one --analyse directory")
-        if (
-            _property_rates_requested(arguments)
-            or arguments.target_strain_rate is not None
-            or arguments.modulus_relax_times is not None
-        ):
+        if _property_rates_requested(arguments):
             parser.error("run --convergence separately from imposed-rate analysis")
         try:
-            return _analyse_convergence(arguments)
-        except (OSError, ValueError, AnalysisError) as error:
+            windows = analyse_convergence(
+                arguments.analyse[0],
+                stage=arguments.convergence_stage or arguments.structure_stage,
+                backbone=arguments.backbone,
+                stride=arguments.stride,
+                window_fractions=arguments.window_fractions,
+                relative_tolerance=arguments.convergence_tolerance,
+                min_effective_samples=arguments.min_effective_samples,
+                discard_fraction=arguments.convergence_discard_fraction,
+            )
+            _emit(
+                arguments,
+                windows,
+                _convergence_lines,
+                write_convergence_report,
+                arguments.output_dir,
+            )
+        except _REFUSED as error:
             parser.error(str(error))
+        return 0
 
-    property_request: tuple[str, float, RateScanSpec] | None = None
+    rates = None
     if _property_rates_requested(arguments):
         try:
-            property_request = _property_rate_request(arguments)
-            property_name, target, rate_spec = property_request
+            rates = _property_rate_request(arguments)
             if arguments.analyse:
-                report = analyse_property_rates(
+                saved = analyse_property_rates(
                     arguments.analyse,
-                    property_name=property_name,
-                    target_rate=target,
+                    property_name=rates.property_name,
+                    target_rate=rates.target_rate,
                     strain_limit=arguments.elastic_strain_limit,
                     max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
                 )
-                _write_property_rate_result(arguments, report)
-                return 0
-            plan = validate_property_rate_scan(
-                rate_spec,
-                arguments.rate_hold_times,
-                property_name=property_name,
-                target_rate=target,
-                n_replicas=arguments.thermal_rate_replicas,
-                max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
-            )
-            print(
-                f"{property_name} rate scan: {plan.total_ns:.3g} ns total including preparation and all replicas",
-                flush=True,
-            )
-        except (OSError, ValueError, TypeError, RuntimeError) as error:
-            parser.error(str(error))
-
-    if property_request is None and arguments.modulus_relax_times is not None:
-        if arguments.analyse or arguments.protocol != "modulus":
-            parser.error("--modulus-relax-times requires a new --protocol modulus scan")
-        if arguments.target_strain_rate is None:
-            parser.error("--modulus-relax-times requires --target-strain-rate")
-    if property_request is None and arguments.target_strain_rate is not None:
-        if (
-            not math.isfinite(arguments.target_strain_rate)
-            or arguments.target_strain_rate <= 0.0
-        ):
-            parser.error("--target-strain-rate must be finite and positive (strain/ns)")
-        if not arguments.analyse and arguments.modulus_relax_times is None:
-            parser.error(
-                "--target-strain-rate requires --modulus-relax-times or --analyse"
-            )
-    if arguments.analyse:
-        if arguments.target_strain_rate is not None:
-            try:
-                modulus_report = analyse_modulus_rates(
-                    arguments.analyse,
-                    target_rate_per_ns=arguments.target_strain_rate,
-                    strain_limit=arguments.elastic_strain_limit,
+                _emit(
+                    arguments,
+                    saved,
+                    _rate_lines,
+                    write_rate_report,
+                    arguments.output_dir,
                 )
-            except (OSError, ValueError, AnalysisError) as error:
-                parser.error(str(error))
-            _write_modulus_rate_result(arguments, modulus_report)
-            return 0
+                return 0
+        except _REFUSED as error:
+            parser.error(str(error))
+    if arguments.analyse:
         if arguments.protocol == "modulus" and len(arguments.analyse) > 1:
             parser.error(
                 "analysing multiple modulus rates requires --target-strain-rate"
             )
         return _analyse(arguments)
-    if arguments.protocol == "tm":
+
+    crystalline = arguments.protocol == "tm"
+    if crystalline:
         if arguments.monomer is not None:
             parser.error("tm starts from --crystal-pdb, not a monomer SMILES")
         if arguments.crystal_pdb is None or arguments.system_xml is None:
             parser.error("tm requires both --crystal-pdb and --system-xml")
-        try:
-            tm_spec = _tm_spec(**_protocol_options(arguments, PROTOCOLS["tm"]))
-            # Validate the complete scan before reading coordinates or creating files.
-            if property_request is None:
-                melting_scan(tm_spec)
-            crystal_run = _prepared_crystal(arguments)
-        except (OSError, ValueError, TmError) as error:
-            parser.error(str(error))
-        if arguments.dry_run:
-            print(
-                "dry run: crystal and heating schedule validated; no dynamics",
-                flush=True,
+        if arguments.check_melt is not None:
+            parser.error("--check-melt watches a melt settle; tm heats a crystal")
+    else:
+        if any((arguments.crystal_pdb, arguments.system_xml, arguments.state_in)):
+            parser.error(
+                "--crystal-pdb, --system-xml and --state-in require --protocol tm"
             )
-            return 0
-        if property_request is not None:
-            property_name, target, rate_spec = property_request
-            report = run_property_rate_scan(
-                crystal_run,
-                Path(arguments.output_dir or "run"),
-                property_name=property_name,
-                target_rate=target,
-                spec=rate_spec,
-                hold_times_ps=arguments.rate_hold_times,
+        if arguments.monomer is None:
+            parser.error("a monomer SMILES is required unless --analyse is given")
+    entry = PROTOCOLS[arguments.protocol]
+    # Everything is checked and priced before a file is read or written.
+    try:
+        chain = None if crystalline else ChainSpec(**_keywords(arguments, _CHAIN))
+        spec = entry.settings(arguments)
+        if rates is None:
+            total_ns = entry.price(spec, arguments) / 1000.0
+            cost = f"{arguments.protocol} run: {total_ns:.3g} ns of dynamics in total"
+            budget = arguments.max_total_ns
+            if budget is not None and total_ns > budget:
+                raise ValueError(
+                    f"The {arguments.protocol} run is {total_ns:.3g} ns, over the "
+                    f"{budget:g} ns budget. Shorten it or raise --max-total-ns."
+                )
+        else:
+            total_ns = validate_property_rate_scan(
+                spec,
+                rates.hold_times_ps,
+                property_name=rates.property_name,
+                target_rate=rates.target_rate,
                 n_replicas=arguments.thermal_rate_replicas,
                 max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
-                state_in=arguments.state_in,
-                crystalline=True,
+            ).total_ns
+            cost = (
+                f"{rates.property_name} rate scan: {total_ns:.3g} ns total "
+                "including preparation and all replicas"
             )
-            _write_property_rate_result(
-                arguments, report, Path(arguments.output_dir or "run") / "analysis"
-            )
-            return 0
-        result = run_tm_scan(
-            crystal_run,
-            Path(arguments.output_dir or "run"),
-            spec=tm_spec,
-            state_in=arguments.state_in,
-            crystalline=True,
-        )
-        print(_melting_line(result), flush=True)
-        for note in result.report.notes:
-            print(f"note: {note}", flush=True)
-        files = write_melting_report(
-            result.report,
-            figures=not arguments.no_figures,
-            figure_format=cast(str, arguments.figure_format),
-        )
-        print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
-        return 0
-    if any((arguments.crystal_pdb, arguments.system_xml, arguments.state_in)):
-        parser.error("--crystal-pdb, --system-xml and --state-in require --protocol tm")
-    if arguments.monomer is None:
-        parser.error("a monomer SMILES is required unless --analyse is given")
-    if property_request is None and arguments.protocol == "breaking":
-        try:
-            _breaking_protocol(**_protocol_options(arguments, PROTOCOLS["breaking"]))
-        except (ValueError, BreakingError) as error:
-            parser.error(str(error))
-    if property_request is None and arguments.protocol == "elongation":
-        try:
-            _elongation_protocol(
-                **_protocol_options(arguments, PROTOCOLS["elongation"])
-            )
-        except (ValueError, ElongationError) as error:
-            parser.error(str(error))
-    if property_request is None and arguments.protocol == "yield":
-        try:
-            _yield_protocol(**_protocol_options(arguments, PROTOCOLS["yield"]))
-        except (ValueError, YieldError) as error:
-            parser.error(str(error))
-    if arguments.modulus_relax_times is not None:
-        try:
-            plan = validate_modulus_rate_scan(
-                _modulus_spec(**_protocol_options(arguments, PROTOCOLS["modulus"])),
-                arguments.modulus_relax_times,
-                target_rate_per_ns=arguments.target_strain_rate,
-            )
-        except (ValueError, MechanicalError) as error:
-            parser.error(str(error))
-        print(
-            f"modulus rate scan: {len(plan.schedules)} rates, "
-            f"{plan.n_replicas} replicas each, {plan.total_ns:.3g} ns total "
-            "including equilibration",
-            flush=True,
-        )
+    except _REFUSED as error:
+        parser.error(str(error))
+    print(cost)
 
-    output = Path(cast("str | None", arguments.output_dir) or "run")
-    n_chains = int(arguments.chains)
-    n_conformers = min(int(arguments.conformers or n_chains), n_chains)
-    # Guard the preparation too: rebuilding into a completed run can overwrite
-    # its chemistry before the dynamics runner has a chance to reject resume.
+    output = Path(arguments.output_dir or "run")
+    if chain is None:
+        try:
+            run = load_crystal(
+                arguments.crystal_pdb,
+                arguments.system_xml,
+                state_in=arguments.state_in,
+                platform=arguments.platform,
+                seed=arguments.seed,
+            )
+        except _REFUSED as error:
+            parser.error(str(error))
+        options: dict[str, Any] = {"state_in": arguments.state_in, "crystalline": True}
+    else:
+        built, run = _build(parser, arguments, chain, output)
+        options = chain_options(
+            built.backbone, built.n_atoms, chain.characteristic_ratio
+        )
+        if entry.settles:
+            options.update(_settle(arguments))
+    if arguments.dry_run:
+        print(
+            "dry run: crystal and heating schedule validated; no dynamics"
+            if crystalline
+            else "dry run: stopping before dynamics"
+        )
+        return 0
+
+    if rates is None:
+        entry.run(_Job(arguments, spec, run, output, options))
+        return 0
+    report = run_property_rate_scan(
+        run,
+        output,
+        property_name=rates.property_name,
+        target_rate=rates.target_rate,
+        spec=spec,
+        hold_times_ps=rates.hold_times_ps,
+        n_replicas=arguments.thermal_rate_replicas,
+        max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
+        **options,
+    )
+    _emit(arguments, report, _rate_lines, write_rate_report, output / "analysis")
+    return 0
+
+
+def _build(
+    parser: argparse.ArgumentParser,
+    arguments: argparse.Namespace,
+    chain: ChainSpec,
+    output: Path,
+) -> tuple[ChainResult, RunContext]:
+    """Record what was asked for, then build the melt or check a rebuild.
+
+    The request is recorded first: a rebuild into a finished run could
+    otherwise overwrite its chemistry before anything refused to resume it.
+    """
     request = {
-        key: value
-        for key, value in vars(arguments).items()
-        if key
-        not in {
-            "output_dir",
-            "platform",
-            "dry_run",
-            "verbose",
-            "no_figures",
-            "figure_format",
-            "max_total_ns",
-        }
+        key: value for key, value in vars(arguments).items() if key not in _UNRECORDED
     }
-    request["conformers"] = n_conformers
-    request["characteristic_ratio"] = _build_characteristic_ratio(arguments)
-    request["runtime_versions"] = {
-        package: version(package)
-        for package in ("openmm", "rdkit", "forcefill", "openff-toolkit", "numpy")
-    }
+    request["conformers"] = min(
+        arguments.conformers or arguments.chains, arguments.chains
+    )
+    request["characteristic_ratio"] = chain.characteristic_ratio
+    request["runtime_versions"] = {package: version(package) for package in _RUNTIME}
     try:
         record_build_request(output, request)
+        return build_melt(
+            chain,
+            arguments.chains,
+            output,
+            target_density_g_cm3=arguments.target_density,
+            n_conformers=arguments.conformers or None,
+            charge_method=arguments.charge_method,
+            backend=arguments.backend,
+            pack_density_g_cm3=arguments.pack_density,
+            platform=arguments.platform,
+            progress=print,
+        )
     except ProtocolError as error:
         parser.error(str(error))
-    output.mkdir(parents=True, exist_ok=True)
-
-    try:
-        chain, run = _prepare_cli_melt(arguments, output)
-    except ProtocolError as error:
-        parser.error(str(error))
-    if arguments.dry_run:
-        print("dry run: stopping before dynamics", flush=True)
-        return 0
-
-    if property_request is not None:
-        property_name, target, rate_spec = property_request
-        report = run_property_rate_scan(
-            run,
-            output,
-            property_name=property_name,
-            target_rate=target,
-            spec=rate_spec,
-            hold_times_ps=arguments.rate_hold_times,
-            n_replicas=arguments.thermal_rate_replicas,
-            max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
-            chain_backbone=chain.backbone,
-            atoms_per_chain=chain.n_atoms,
-            expected_characteristic_ratio=_build_characteristic_ratio(arguments),
-        )
-        _write_property_rate_result(arguments, report, output / "analysis")
-        return 0
-    name = cast(str, arguments.protocol)
-    entry = PROTOCOLS[name]
-    options = _protocol_options(arguments, entry)
-    if name == "tg":
-        return _run_tg_scan(arguments, run, output, chain, options)
-    if name == "modulus":
-        return _run_modulus_scan(arguments, run, output, chain, options)
-    if name == "breaking":
-        return _run_breaking_scan(arguments, run, output, chain, options)
-    if name == "elongation":
-        return _run_elongation_scan(arguments, run, output, chain, options)
-    if name == "yield":
-        return _run_yield_scan(arguments, run, output, chain, options)
-    if name == "relax":
-        return _run_relaxation_scan(arguments, run, output, chain, options)
-
-    summary = run_protocol(
-        entry.factory(**options),
-        run,
-        output,
-        chain_backbone=chain.backbone,
-        atoms_per_chain=chain.n_atoms,
-        expected_characteristic_ratio=_build_characteristic_ratio(arguments),
-    )
-    print(
-        f"{summary.protocol}: {len(summary.results)} stages in "
-        f"{summary.wall_seconds / 60:.1f} min, manifest {summary.manifest_path}",
-        flush=True,
-    )
-    _print_chains(summary.chains)
-    return 0
 
 
-def _prepared_crystal(arguments: argparse.Namespace) -> RunContext:
-    """Load a crystal without repacking it or rebuilding its force field."""
-    import numpy as np
-    import openmm as mm
-    from openmm import app, unit
-
-    try:
-        pdb = app.PDBFile(arguments.crystal_pdb)
-        system = mm.XmlSerializer.deserialize(Path(arguments.system_xml).read_text())
-    except Exception as error:
-        raise ValueError(
-            f"Could not read the prepared crystal and System: {error}"
-        ) from error
-    if not isinstance(system, mm.System):
-        raise ValueError("--system-xml must contain a serialized OpenMM System")
-    if system.getNumParticles() != pdb.topology.getNumAtoms():
-        raise ValueError("Crystal PDB and System must contain the same number of atoms")
-    if any("Barostat" in type(force).__name__ for force in system.getForces()):
-        raise ValueError("The supplied System must not contain a barostat")
-    if any(isinstance(force, mm.AndersenThermostat) for force in system.getForces()):
-        raise ValueError(
-            "The supplied System must not contain an Andersen thermostat; "
-            "the heating scan controls temperature with its Langevin integrator"
-        )
-    if not system.usesPeriodicBoundaryConditions():
-        raise ValueError("The supplied System must use periodic boundary conditions")
-    vectors = pdb.topology.getPeriodicBoxVectors()
-    if vectors is None:
-        raise ValueError("Crystal PDB must contain periodic box vectors (CRYST1)")
-    matrix = np.asarray(vectors.value_in_unit(unit.nanometer), dtype=float)
-    if not np.all(np.isfinite(matrix)) or np.linalg.det(matrix) <= 0:
-        raise ValueError("Crystal PDB must have finite, positive-volume box vectors")
-    positions = np.asarray(pdb.positions.value_in_unit(unit.nanometer), dtype=float)
-    if not np.all(np.isfinite(positions)):
-        raise ValueError("Crystal PDB coordinates must be finite")
-    system.setDefaultPeriodicBoxVectors(*vectors)
-    if arguments.state_in is not None:
-        try:
-            state = mm.XmlSerializer.deserialize(Path(arguments.state_in).read_text())
-            if not isinstance(state, mm.State):
-                raise ValueError("--state-in must contain a serialized OpenMM State")
-            saved_positions = np.asarray(
-                state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
-                dtype=float,
-            )
-            saved_vectors = np.asarray(
-                state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer),
-                dtype=float,
-            )
-        except Exception as error:
-            raise ValueError(
-                f"Could not read the crystalline starting State: {error}"
-            ) from error
-        if saved_positions.shape != positions.shape or not np.all(
-            np.isfinite(saved_positions)
-        ):
-            raise ValueError(
-                "Starting State must have finite positions for every crystal atom"
-            )
-        if not np.all(np.isfinite(saved_vectors)) or np.linalg.det(saved_vectors) <= 0:
-            raise ValueError(
-                "Starting State must have finite, positive-volume box vectors"
-            )
-    box = PackedBox(
-        topology=pdb.topology,
-        positions_nm=positions,
-        box_nm=cast(
-            tuple[float, float, float],
-            tuple(float(value) for value in np.linalg.norm(matrix, axis=1)),
-        ),
-        n_molecules=_crystal_molecule_count(pdb.topology),
-    )
-    # The supplied System owns its parameters. This descriptor is provenance,
-    # never passed to app.ForceField; masses and constraints are left untouched.
-    forcefield = PolymerForceField(
-        forcefield_xml=str(Path(arguments.system_xml).resolve()),
-        base_forcefield=(),
-        residue_name="",
-        backend="prepared-system",
-    )
-    return prepare_run(
-        box,
-        forcefield,
-        SystemSpec(constraints="none", hydrogen_mass_amu=None),
-        platform=arguments.platform,
-        seed=arguments.seed,
-        system=system,
-    )
+# --------------------------------------------------------------------------
+# Reports
+# --------------------------------------------------------------------------
 
 
-def _crystal_molecule_count(topology: Any) -> int:
-    """Count bonded components and validate the molecule layout used by reports."""
-    n_atoms = topology.getNumAtoms()
-    if n_atoms == 0:
-        raise ValueError("Crystal PDB must contain atoms")
-    neighbours: list[list[int]] = [[] for _ in range(n_atoms)]
-    for left, right in topology.bonds():
-        neighbours[left.index].append(right.index)
-        neighbours[right.index].append(left.index)
-    visited: set[int] = set()
-    components: list[list[int]] = []
-    for start in range(n_atoms):
-        if start in visited:
-            continue
-        visited.add(start)
-        pending = [start]
-        component = []
-        while pending:
-            atom = pending.pop()
-            component.append(atom)
-            for neighbour in neighbours[atom]:
-                if neighbour not in visited:
-                    visited.add(neighbour)
-                    pending.append(neighbour)
-        components.append(component)
-    if any(len(component) != len(components[0]) for component in components):
-        raise ValueError(
-            "Crystal PDB must contain molecules with equal atom counts; "
-            "check its bonds/CONECT records against the System"
-        )
-    if any(
-        max(component) - min(component) + 1 != len(component)
-        for component in components
-    ):
-        raise ValueError(
-            "Crystal PDB molecules must occupy contiguous atom blocks; "
-            "reorder both the PDB and System consistently"
-        )
-    return len(components)
-
-
-def _protocol_options(
-    arguments: argparse.Namespace, entry: ProtocolEntry
-) -> dict[str, Any]:
-    """Collect the flags this protocol's factory actually takes."""
-    return {name: getattr(arguments, _DESTS.get(name, name)) for name in entry.options}
-
-
-def _print_chains(chains: Any) -> None:
-    """Report the final chain dimensions, when they were measured."""
-    if chains is None:
-        return
-    print(
-        f"chains: Rg {chains.mean_radius_of_gyration_nm:.3f} nm, "
-        f"C {chains.characteristic_ratio:.2f} "
-        f"({'consistent' if chains.consistent else 'not relaxed'})",
-        flush=True,
-    )
-
-
-def _run_tg_scan(
+def _emit(
     arguments: argparse.Namespace,
-    run: Any,
-    output: Path,
-    chain: Any,
-    options: dict[str, Any],
-) -> int:
-    """Run a two-pass glass-transition scan, at one rate or several."""
-    spec = _tg_spec(**options)
-    common = {
-        "spec": spec,
-        "tg_approx_k": arguments.tg_approx,
-        "chain_backbone": chain.backbone,
-        "atoms_per_chain": chain.n_atoms,
-        "expected_characteristic_ratio": _build_characteristic_ratio(arguments),
-    }
-    rates = cast("tuple[float, ...] | None", arguments.cooling_rates)
-    if rates is None:
-        result = run_tg_scan(run, output, **common)
-        found = (
-            "no clear transition"
-            if result.temperature_k is None
-            else f"Tg = {result.temperature_k:.0f} K"
-        )
-        coarse = (
-            "nothing"
-            if result.approximate is None
-            else f"{result.approximate.temperature_k:.0f} K"
-        )
-        print(
-            f"tg: {found} at {result.fine_schedule.cooling_rate_k_per_ns:.2f} "
-            f"K/ns (coarse said {coarse}), started from the "
-            f"{result.restart} state",
-            flush=True,
-        )
-        _print_chains(result.fine_summary.chains)
-        return 0
-
-    transitions = cooling_rate_series(run, output, rates_k_per_ns=rates, **common)
-    for rate, fit in zip(rates, transitions, strict=True):
-        print(
-            f"tg: {fit.temperature_k:.0f} K at {rate:g} K/ns"
-            f"{'' if fit.resolved else ' (not resolved)'}",
-            flush=True,
-        )
-    extrapolation = cooling_rate_extrapolation(
-        transitions,
-        target_rate_k_per_ns=float(arguments.target_rate),
-        form=cast(str, arguments.rate_form),
-    )
-    print(_extrapolation_line(extrapolation), flush=True)
-    return 0
-
-
-def _extrapolation_line(extrapolation: Any) -> str:
-    """One line for a rate extrapolation, caveat included."""
-    return (
-        f"{extrapolation.form}: {extrapolation.temperature_k:.0f} K at "
-        f"{extrapolation.target_rate_k_per_ns:.3g} K/ns, "
-        f"{extrapolation.sensitivity_k_per_decade:.1f} K per decade over "
-        f"{extrapolation.n_rates} rates - extrapolated "
-        f"{extrapolation.extrapolation_decades:.1f} decades"
-        f"{'' if extrapolation.resolved else ', not resolved'}"
-    )
-
-
-def _run_modulus_scan(
-    arguments: argparse.Namespace,
-    run: Any,
-    output: Path,
-    chain: Any,
-    options: dict[str, Any],
-) -> int:
-    """Measure the elastic constants, and say what qualifies each one."""
-    if arguments.modulus_relax_times is not None:
-        report = run_modulus_rate_scan(
-            run,
-            output,
-            relax_ps=arguments.modulus_relax_times,
-            target_rate_per_ns=arguments.target_strain_rate,
-            spec=_modulus_spec(**options),
-            chain_backbone=chain.backbone,
-            atoms_per_chain=chain.n_atoms,
-            expected_characteristic_ratio=_build_characteristic_ratio(arguments),
-        )
-        _write_modulus_rate_result(arguments, report, output / "analysis")
-        return 0
-    result = run_modulus_scan(
-        run,
-        output,
-        spec=_modulus_spec(**options),
-        chain_backbone=chain.backbone,
-        atoms_per_chain=chain.n_atoms,
-        expected_characteristic_ratio=_build_characteristic_ratio(arguments),
-    )
-    for line in _modulus_lines(result):
-        print(line, flush=True)
-    _print_chains(None)
-    return 0
-
-
-def _write_modulus_rate_result(
-    arguments: argparse.Namespace,
-    report: ModulusRateReport,
-    output_dir: Path | None = None,
+    report: Any,
+    lines: Callable[[Any], Iterable[str]],
+    write: Callable[..., ReportFiles],
+    output_dir: str | Path | None,
 ) -> None:
-    """Keep each model's target, uncertainty and extrapolation distance visible."""
-    for fit in (report.log_linear, report.power_law):
-        print(
-            f"{fit.form}: E = {fit.modulus_mpa:.4g} +/- "
-            f"{fit.standard_error_mpa:.3g} MPa (fit SE) at "
-            f"{fit.target_rate_per_ns:.3g} strain/ns, {fit.temperature_k:.1f} K; "
-            f"{fit.sensitivity_mpa_per_decade:.3g} MPa per decade at "
-            f"{fit.reference_rate_per_ns:.3g} strain/ns; "
-            f"{fit.n_rates} measured rates, extrapolated "
-            f"{fit.extrapolation_decades:.2f} decades"
-            f"{'' if fit.resolved else ' (not resolved)'}",
-            flush=True,
-        )
-        for note in fit.notes:
-            print(f"note ({fit.form}): {note}", flush=True)
-    print(
-        "model difference at target: "
-        f"{abs(report.log_linear.modulus_mpa - report.power_law.modulus_mpa):.4g} MPa",
-        flush=True,
-    )
-    printed_notes = set(report.log_linear.notes) | set(report.power_law.notes)
-    for note in report.notes:
-        if note not in printed_notes:
-            print(f"note: {note}", flush=True)
-    files = write_modulus_rate_report(
+    """Print what a report found and its notes, then write it and say where."""
+    _say(lines(report))
+    _say(f"note: {note}" for note in report.notes)
+    files = write(
         report,
-        output_dir if output_dir is not None else arguments.output_dir,
+        output_dir,
         figures=not arguments.no_figures,
         figure_format=arguments.figure_format,
     )
-    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
-
-
-def _modulus_lines(result: Any) -> list[str]:
-    """One line per constant, each carrying what qualifies it."""
-    lines: list[str] = []
-    if result.youngs is None:
-        return ["modulus: nothing was deformed"]
-    spread = (
-        ""
-        if result.replica_spread_mpa is None
-        else f" +/- {result.replica_spread_mpa:.0f} over {len(result.replicas)}"
-    )
-    rate = result.schedule.strain_rate_per_ns
-    lines.append(
-        f"E = {result.youngs.modulus_mpa:.0f} MPa{spread} at {rate:.3g} "
-        f"strain/ns, {result.youngs.temperature_k:.0f} K"
-        f"{'' if result.resolved else ' (not resolved)'}"
-    )
-    return lines + _additional_modulus_lines(result)
-
-
-def _additional_modulus_lines(result: Any) -> list[str]:
-    """Format the elastic cross-checks shared by fresh scans and saved reports."""
-    lines: list[str] = []
-    if result.poisson is not None:
-        lines.append(
-            f"nu = {result.poisson.ratio:.3f}"
-            f"{'' if result.poisson.resolved else ' (not resolved)'}"
-        )
-    for label, fit in (("K", result.bulk), ("G", result.shear)):
-        if fit is not None:
-            lines.append(
-                f"{label} = {fit.modulus_mpa:.0f} +/- "
-                f"{fit.standard_error_mpa:.2g} MPa (fit SE)"
-                f"{'' if fit.resolved else ' (not resolved)'}"
-            )
-    if result.load_modulus is not None:
-        lines.append(
-            f"constant-stress cross-check: "
-            f"E = {result.load_modulus.modulus_mpa:.0f} MPa"
-        )
-    if result.consistency is not None:
-        lines.append(_consistency_line(result.consistency))
-    return lines
-
-
-def _consistency_line(check: Any) -> str:
-    """One line for the over-determination check."""
-    gaps = ", ".join(
-        f"{name} {100.0 * gap:.0f}%"
-        for name, gap in (("K", check.bulk_gap), ("G", check.shear_gap))
-        if math.isfinite(gap)
-    )
-    if not gaps:
-        return (
-            f"E and nu imply K = {check.bulk_implied_mpa:.0f}, "
-            f"G = {check.shear_implied_mpa:.0f} MPa - nothing measured to "
-            "check them against"
-        )
-    return (
-        f"E and nu imply K = {check.bulk_implied_mpa:.0f}, "
-        f"G = {check.shear_implied_mpa:.0f} MPa; measured differ by {gaps}"
-        f"{'' if check.consistent else ' - not consistent'}"
-    )
-
-
-def _breaking_lines(report: Any) -> list[str]:
-    """Keep an unconfirmed peak distinct from an apparent tensile strength."""
-    if report.strength_mpa is None or not report.resolved:
-        lines = ["breaking: apparent tensile strength not resolved"]
-    else:
-        spread = (
-            ""
-            if report.replica_spread_mpa is None
-            else f" +/- {report.replica_spread_mpa:.3g} over {len(report.replicas)} replicas"
-        )
-        lines = [
-            f"breaking: apparent ultimate nominal tensile strength = "
-            f"{report.strength_mpa:.4g} MPa{spread}"
-        ]
-    for index, result in enumerate(report.replicas):
-        rate = (
-            "unknown strain rate"
-            if result.strain_rate_per_ns is None
-            else f"{result.strain_rate_per_ns:.3g} strain/ns"
-        )
-        lines.append(
-            f"  replica {index}: peak {result.peak_stress_mpa:.4g} MPa at "
-            f"strain {result.strain_at_peak:.4g}, {result.temperature_k:.0f} K, "
-            f"{rate}{'' if result.resolved else ' (not resolved)'}"
-        )
-        if result.failure_strain is not None:
-            lines.append(
-                f"    stress drop at strain {result.failure_strain:.4g}, "
-                f"stress {result.failure_stress_mpa:.4g} MPa"
-            )
-    return lines
-
-
-def _write_tensile_result(
-    arguments: argparse.Namespace,
-    report: Any,
-    lines: Sequence[str],
-    writer: Callable[..., ReportFiles],
-) -> None:
-    """Print and save a tensile report consistently after a scan or a reread."""
-    for line in lines:
-        print(line, flush=True)
-    for note in report.notes:
-        print(f"note: {note}", flush=True)
-    files = writer(
-        report,
-        arguments.output_dir if arguments.analyse else None,
-        formats=() if arguments.no_figures else (cast(str, arguments.figure_format),),
-    )
-    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
-
-
-def _write_breaking_result(arguments: argparse.Namespace, report: Any) -> None:
-    """Print and save the same result for a run and a later analysis."""
-    _write_tensile_result(
-        arguments, report, _breaking_lines(report), write_breaking_report
-    )
-
-
-def _run_breaking_scan(
-    arguments: argparse.Namespace,
-    run: Any,
-    output: Path,
-    chain: Any,
-    options: dict[str, Any],
-) -> int:
-    """Measure the apparent tensile strength and write its report."""
-    report = run_breaking_scan(
-        run,
-        output,
-        spec=_breaking_spec(**options),
-        chain_backbone=chain.backbone,
-        atoms_per_chain=chain.n_atoms,
-        expected_characteristic_ratio=_build_characteristic_ratio(arguments),
-    )
-    _write_breaking_result(arguments, report)
-    return 0
-
-
-def _elongation_lines(report: Any) -> list[str]:
-    """Report the confirmed break strain separately from the stress maximum."""
-    if report.elongation_percent is None or not report.resolved:
-        lines = ["elongation: apparent elongation at break not resolved"]
-    else:
-        spread = (
-            ""
-            if report.replica_spread_percent is None
-            else f" +/- {report.replica_spread_percent:.3g} percentage points "
-            f"over {len(report.replicas)} replicas"
-        )
-        lines = [
-            f"elongation: apparent elongation at break = "
-            f"{report.elongation_percent:.4g}%{spread}"
-        ]
-    for index, result in zip(report.replica_indices, report.replicas, strict=True):
-        rate = (
-            "unknown strain rate"
-            if result.strain_rate_per_ns is None
-            else f"{result.strain_rate_per_ns:.3g} strain/ns"
-        )
-        elongation = (
-            f"{result.elongation_percent:.4g}% at engineering strain "
-            f"{result.strain_at_break:.4g}"
-            if result.resolved
-            and result.elongation_percent is not None
-            and result.strain_at_break is not None
-            else "not resolved"
-        )
-        lines.append(
-            f"  replica {index}: elongation at break {elongation}, "
-            f"{result.temperature_k:.0f} K, {rate}"
-        )
-        lines.append(
-            f"    peak {result.peak_stress_mpa:.4g} MPa at "
-            f"strain {result.strain_at_peak:.4g}"
-        )
-        if result.resolved and result.break_stress_mpa is not None:
-            lines.append(f"    stress at break {result.break_stress_mpa:.4g} MPa")
-    return lines
-
-
-def _write_elongation_result(arguments: argparse.Namespace, report: Any) -> None:
-    """Print and save the same result for a run and a later analysis."""
-    _write_tensile_result(
-        arguments, report, _elongation_lines(report), write_elongation_report
-    )
-
-
-def _run_elongation_scan(
-    arguments: argparse.Namespace,
-    run: Any,
-    output: Path,
-    chain: Any,
-    options: dict[str, Any],
-) -> int:
-    """Measure apparent elongation at break and write its report."""
-    report = run_elongation_scan(
-        run,
-        output,
-        spec=_elongation_spec(**options),
-        chain_backbone=chain.backbone,
-        atoms_per_chain=chain.n_atoms,
-        expected_characteristic_ratio=_build_characteristic_ratio(arguments),
-    )
-    _write_elongation_result(arguments, report)
-    return 0
-
-
-def _yield_lines(report: Any) -> list[str]:
-    """Print the proof stress together with its offset, temperature and rate."""
-    if report.strength_mpa is None or not report.resolved:
-        lines = ["yield: apparent offset yield strength not resolved"]
-    else:
-        spread = (
-            ""
-            if report.replica_spread_mpa is None
-            else f" +/- {report.replica_spread_mpa:.3g} over {len(report.replicas)} replicas"
-        )
-        lines = [
-            f"yield: apparent offset yield strength = "
-            f"{report.strength_mpa:.4g} MPa{spread}"
-        ]
-    for index, result in zip(report.replica_indices, report.replicas, strict=True):
-        rate = (
-            "unknown strain rate"
-            if result.strain_rate_per_ns is None
-            else f"{result.strain_rate_per_ns:.3g} strain/ns"
-        )
-        strength = (
-            f"{result.strength_mpa:.4g} MPa at strain {result.yield_strain:.4g}"
-            if result.resolved
-            and result.strength_mpa is not None
-            and result.yield_strain is not None
-            else "not resolved"
-        )
-        lines.append(
-            f"  replica {index}: {100.0 * result.offset_strain:g}% offset "
-            f"proof stress {strength}, {result.temperature_k:.0f} K, {rate}"
-        )
-        if result.modulus_mpa is not None:
-            lines.append(
-                f"    initial elastic slope {result.modulus_mpa:.4g} MPa "
-                f"over strain {result.fit_min_strain:g} to {result.fit_max_strain:g}"
-            )
-    return lines
-
-
-def _write_yield_result(arguments: argparse.Namespace, report: Any) -> None:
-    """Print and save the same proof-stress report after a run or a reread."""
-    _write_tensile_result(arguments, report, _yield_lines(report), write_yield_report)
-
-
-def _run_yield_scan(
-    arguments: argparse.Namespace,
-    run: Any,
-    output: Path,
-    chain: Any,
-    options: dict[str, Any],
-) -> int:
-    """Measure apparent offset yield strength and write its report."""
-    report = run_yield_scan(
-        run,
-        output,
-        spec=_yield_spec(**options),
-        chain_backbone=chain.backbone,
-        atoms_per_chain=chain.n_atoms,
-        expected_characteristic_ratio=_build_characteristic_ratio(arguments),
-    )
-    _write_yield_result(arguments, report)
-    return 0
-
-
-def _run_relaxation_scan(
-    arguments: argparse.Namespace,
-    run: Any,
-    output: Path,
-    chain: Any,
-    options: dict[str, Any],
-) -> int:
-    """Strain the cell once, watch the stress decay, and say what it decayed to."""
-    result = run_relaxation_scan(
-        run,
-        output,
-        spec=_relaxation_spec(**options),
-        chain_backbone=chain.backbone,
-        atoms_per_chain=chain.n_atoms,
-        expected_characteristic_ratio=_build_characteristic_ratio(arguments),
-    )
-    for line in _relaxation_lines(result):
-        print(line, flush=True)
-    return 0
-
-
-def _relaxation_lines(result: Any) -> list[str]:
-    """One line per fitted quantity, each carrying what qualifies it.
-
-    Takes either a :class:`~openmmpolymer.viscoelastic.RelaxationResult` from a
-    scan or a :class:`~openmmpolymer.viscoelastic.RelaxationReport` from
-    ``--analyse``. They carry the same measurements, and only the scan carries
-    an overall verdict: deciding whether a run resolved needs the replica
-    spread and the baseline weighed together, which is the driver's job and not
-    something reading a directory back should invent. So the verdict is asked
-    for rather than assumed, and left off when there is none.
-    """
-    if result.mean is None:
-        return ["relax: nothing was strained"]
-    mean = result.mean
-    spread = (
-        ""
-        if result.replica_spread_mpa is None
-        else f" +/- {result.replica_spread_mpa:.3g} over {len(result.curves)}"
-    )
-    resolved = getattr(result, "resolved", None)
-    lines = [
-        f"G(0) = {mean.initial_modulus_mpa:.4g} MPa{spread} at "
-        f"{mean.step_strain:+.3f} strain, {mean.temperature_k:.0f} K, over "
-        f"{mean.decades:.1f} decades"
-        f"{'' if resolved is not False else ' (not resolved)'}"
-    ]
-    if result.kww is not None:
-        lines.append(
-            f"KWW: beta = {result.kww.beta:.3f}, tau = {result.kww.tau_ps:.4g} ps, "
-            f"<tau> = {result.kww.mean_tau_ps:.4g} ps"
-            f"{'' if result.kww.resolved else ' (not resolved)'}"
-        )
-    if result.prony is not None:
-        lines.append(
-            f"Prony: G_inf = {result.prony.equilibrium_mpa:.4g} MPa over "
-            f"{result.prony.n_active} of {result.prony.n_terms} terms"
-            f"{'' if result.prony.plateau_reached else ' - still decaying'}"
-        )
-    if result.linearity is not None:
-        lines.append(
-            f"linearity: strains {[round(v, 4) for v in result.linearity.strains]} "
-            f"differ by {100.0 * result.linearity.gap:.0f}%"
-            f"{'' if result.linearity.linear else ' - outside the linear region'}"
-        )
-    return lines
-
-
-def _analyse_relaxation(arguments: argparse.Namespace, run_dir: Path) -> None:
-    """Report the relaxation modulus, and write it out."""
-    report = analyse_relaxation(run_dir)
-    for line in _relaxation_lines(report):
-        print(line, flush=True)
-    for note in report.notes:
-        print(f"note: {note}", flush=True)
-
-    files = write_relaxation_report(
-        report,
-        arguments.output_dir,
-        figures=not arguments.no_figures,
-        figure_format=cast(str, arguments.figure_format),
-    )
-    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
+    print(f"wrote {files.json} and {len(files.figures)} figure(s)")
 
 
 def _has_stages(run_dir: Path, find: Any) -> bool:
@@ -2690,118 +1588,401 @@ def _analyse(arguments: argparse.Namespace) -> int:
     first = directories[0]
     quenched = _has_stages(first, quench_stages)
     heated = _has_stages(first, heating_stages)
-    broken = _has_stages(first, breaking_stages)
-    elongated = _has_stages(first, elongation_stages)
-    yielded = _has_stages(first, yield_stages)
-    deformed = any(
+    tensile = [
+        (analyse, lines, write)
+        for find, analyse, lines, write in (
+            (breaking_stages, analyse_breaking, _breaking_lines, write_breaking_report),
+            (
+                elongation_stages,
+                analyse_elongation,
+                _elongation_lines,
+                write_elongation_report,
+            ),
+            (yield_stages, analyse_yield, _yield_lines, write_yield_report),
+        )
+        if _has_stages(first, find)
+    ]
+    # A tensile ladder deforms the cell too, but measures no elastic constant.
+    deformed = not tensile and any(
         _has_stages(first, find) for find in (deform_stages, load_stages, shear_stages)
     )
     relaxed = _has_stages(first, relax_stages)
     structured = not arguments.no_structure and _has_stages(first, structure_stages)
-    if not any(
-        (quenched, heated, broken, elongated, yielded, deformed, relaxed, structured)
-    ):
+    if not (quenched or heated or tensile or deformed or relaxed or structured):
         print(
             f"nothing in {first} was a quench, a heating scan, a deformation or a relaxation, "
             "and no stage left coordinates to measure, so there is nothing to "
-            "report",
-            flush=True,
+            "report"
         )
         return 1
 
+    def emit(report: Any, lines: Callable[[Any], Iterable[str]], write: Any) -> None:
+        _emit(arguments, report, lines, write, arguments.output_dir)
+
     if quenched:
-        _analyse_tg(arguments, directories)
+        tg = analyse_tg(
+            first,
+            extra_run_dirs=directories[1:],
+            melt_stage=None if arguments.no_melt_check else arguments.melt_stage,
+            min_points_per_branch=arguments.min_points_per_branch,
+            target_rate_k_per_ns=arguments.target_rate,
+            radius_of_gyration_nm=arguments.rg,
+        )
+        emit(tg, _tg_lines, write_tg_report)
     if heated:
-        _analyse_melting(arguments, first)
-    if broken:
-        _write_breaking_result(arguments, analyse_breaking(first))
-    if elongated:
-        _write_elongation_result(arguments, analyse_elongation(first))
-    if yielded:
-        _write_yield_result(arguments, analyse_yield(first))
-    if deformed and not (broken or elongated or yielded):
-        _analyse_mechanics(arguments, first)
+        melting = analyse_melting(
+            first, min_points_per_branch=arguments.min_points_per_branch
+        )
+        emit(melting, _melting_lines, write_melting_report)
+    for analyse, lines, write in tensile:
+        emit(analyse(first), lines, write)
+    if deformed:
+        emit(analyse_mechanics(first), _modulus_lines, write_mechanical_report)
     if relaxed:
-        _analyse_relaxation(arguments, first)
+        emit(analyse_relaxation(first), _relaxation_lines, write_relaxation_report)
     if structured:
-        _analyse_structure(arguments, first)
+        structure = analyse_structure(
+            first,
+            stage=arguments.structure_stage,
+            backbone=arguments.backbone,
+            expected_characteristic_ratio=arguments.characteristic_ratio,
+            stride=arguments.stride,
+        )
+        emit(structure, _structure_lines, write_structure_report)
     return 0
 
 
-def _melting_line(result: Any) -> str:
-    """Report the finite heating bracket without implying equilibrium Tm."""
-    transition = getattr(result, "transition", result)
-    if not transition.resolved or transition.temperature_k is None:
-        return "tm: no clear melting transition (not resolved)"
-    low, high = transition.bracket_k
+def _say(lines: Iterable[str]) -> None:
+    for line in lines:
+        print(line)
+
+
+def _unresolved(resolved: bool) -> str:
+    """The caveat a number carries when what measured it did not resolve."""
+    return "" if resolved else " (not resolved)"
+
+
+def _print_chains(chains: Any) -> None:
+    """Report the final chain dimensions, when they were measured."""
+    if chains is not None:
+        print(
+            f"chains: Rg {chains.mean_radius_of_gyration_nm:.3f} nm, "
+            f"C {chains.characteristic_ratio:.2f} "
+            f"({'consistent' if chains.consistent else 'not relaxed'})"
+        )
+
+
+def _convergence_lines(report: Any) -> Iterator[str]:
+    """Whether each estimate settled as the observation window grew."""
+    yield f"observation-window convergence: stage {report.stage}"
+    groups = [
+        report.results,
+        {} if report.relaxation is None else report.relaxation.metrics,
+        {} if report.structural is None else report.structural.parameters,
+    ]
+    for results in groups:
+        for name, result in results.items():
+            yield f"{name}: {'resolved' if result.resolved else 'unresolved'}"
+            yield from (f"  {note}" for note in result.notes)
+
+
+def _rate_lines(report: Any) -> Iterator[str]:
+    """A unit-aware headline for each model, including unavailable predictions."""
+    quantity = report.property
+    for form in ("log_linear", "power_law"):
+        fit = getattr(report, form)
+        if fit is None:
+            yield f"{quantity.label}, {form}: unavailable (not resolved)"
+            continue
+        uncertainty = (
+            f"{fit.standard_error:.3g}"
+            if math.isfinite(fit.standard_error)
+            else "unknown"
+        )
+        yield (
+            f"{quantity.label}, {form}: {fit.value:.5g} +/- {uncertainty} "
+            f"{quantity.value_unit} (fit SE) at {fit.target_rate:.4g} "
+            f"{quantity.rate_unit}; {fit.n_rates} rates, extrapolated "
+            f"{fit.extrapolation_decades:.2f} decades{_unresolved(fit.resolved)}"
+        )
+        yield from (f"note ({form}): {note}" for note in fit.notes)
+    if report.log_linear is not None and report.power_law is not None:
+        difference = abs(report.log_linear.value - report.power_law.value)
+        yield f"model difference at target: {difference:.4g} {quantity.value_unit}"
+
+
+def _cooling_rate(rate_k_per_ns: float | None) -> str:
+    return "rate unknown" if rate_k_per_ns is None else f"{rate_k_per_ns:.2f} K/ns"
+
+
+def _tg_lines(report: Any) -> Iterator[str]:
+    """The quenches read, the melt they started from, and what they found."""
+    yield "quenches: " + ", ".join(
+        f"{curve.stage} ({curve.temperature_step_k:.0f} K steps, "
+        f"{_cooling_rate(curve.cooling_rate_k_per_ns)})"
+        for curve in report.curves
+    )
+    melt = report.melt
+    if melt is not None:
+        settled = "volume settled" if melt.volume_settled else "volume still drifting"
+        moved = "chains moved" if melt.chains_moved else "chains have not"
+        yield f"melt {melt.stage}: {settled}; {moved}"
+        yield from (f"  unchecked: {reason}" for reason in melt.unchecked)
+    for label, transition in (("coarse", report.coarse), ("fine", report.fine)):
+        if transition is not None:
+            yield _transition_line(label, transition)
+    for extrapolation in (report.log_linear, report.vft):
+        if extrapolation is not None:
+            yield _extrapolation_line(extrapolation)
+
+
+def _transition_line(label: str, fit: Any) -> str:
+    """One line for a fitted transition, with both expansivities."""
+    rate = _cooling_rate(fit.cooling_rate_k_per_ns)
+    if not fit.resolved:
+        return f"{label}: no clear transition at {rate}"
     return (
-        f"tm: apparent Tm = {transition.temperature_k:g} K "
-        f"(heating bracket {low:g}-{high:g} K)"
+        f"{label}: Tg = {fit.temperature_k:.0f} K at {rate}, aV "
+        f"{fit.melt_expansivity_per_k:.2e} / {fit.glass_expansivity_per_k:.2e} per K"
     )
 
 
-def _analyse_melting(arguments: argparse.Namespace, run_dir: Path) -> None:
-    """Read the density and enthalpy discontinuity of a recorded heating scan."""
-    report = analyse_melting(
-        run_dir, min_points_per_branch=int(arguments.min_points_per_branch)
+def _extrapolation_line(extrapolation: Any) -> str:
+    """One line for a rate extrapolation, caveat included."""
+    return (
+        f"{extrapolation.form}: {extrapolation.temperature_k:.0f} K at "
+        f"{extrapolation.target_rate_k_per_ns:.3g} K/ns, "
+        f"{extrapolation.sensitivity_k_per_decade:.1f} K per decade over "
+        f"{extrapolation.n_rates} rates - extrapolated "
+        f"{extrapolation.extrapolation_decades:.1f} decades"
+        f"{'' if extrapolation.resolved else ', not resolved'}"
     )
-    print(_melting_line(report), flush=True)
-    for note in report.notes:
-        print(f"note: {note}", flush=True)
-    files = write_melting_report(
-        report,
-        arguments.output_dir,
-        figures=not arguments.no_figures,
-        figure_format=cast(str, arguments.figure_format),
+
+
+def _melting_lines(report: Any) -> Iterator[str]:
+    """The finite heating bracket, without implying an equilibrium Tm."""
+    transition = report.transition
+    if not transition.resolved or transition.temperature_k is None:
+        yield "tm: no clear melting transition (not resolved)"
+    else:
+        low, high = transition.bracket_k
+        yield (
+            f"tm: apparent Tm = {transition.temperature_k:g} K "
+            f"(heating bracket {low:g}-{high:g} K)"
+        )
+
+
+def _modulus_lines(report: Any) -> list[str]:
+    """One line per elastic constant, each carrying what qualifies it."""
+    lines = []
+    youngs = report.youngs
+    if youngs is not None:
+        spread = _replica_spread(report.replica_spread_mpa, report.replicas, ".0f")
+        rate = youngs.strain_rate_per_ns
+        speed = "rate unknown" if rate is None else f"{rate:.3g} strain/ns"
+        lines.append(
+            f"E = {youngs.modulus_mpa:.0f} MPa{spread} at {speed}, "
+            f"{youngs.temperature_k:.0f} K{_unresolved(report.resolved)}"
+        )
+    if report.poisson is not None:
+        lines.append(
+            f"nu = {report.poisson.ratio:.3f}{_unresolved(report.poisson.resolved)}"
+        )
+    for label, fit in (("K", report.bulk), ("G", report.shear)):
+        if fit is not None:
+            lines.append(
+                f"{label} = {fit.modulus_mpa:.0f} +/- "
+                f"{fit.standard_error_mpa:.2g} MPa (fit SE){_unresolved(fit.resolved)}"
+            )
+    if report.load_modulus is not None:
+        lines.append(
+            "constant-stress cross-check: "
+            f"E = {report.load_modulus.modulus_mpa:.0f} MPa"
+        )
+    if report.consistency is not None:
+        lines.append(_consistency_line(report.consistency))
+    return lines or ["modulus: nothing was deformed"]
+
+
+def _consistency_line(check: Any) -> str:
+    """One line for the over-determination check."""
+    implied = (
+        f"E and nu imply K = {check.bulk_implied_mpa:.0f}, "
+        f"G = {check.shear_implied_mpa:.0f} MPa"
     )
-    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
-
-
-def _analyse_structure(arguments: argparse.Namespace, run_dir: Path) -> None:
-    """Report the structure and dynamics, and write them out."""
-    report = analyse_structure(
-        run_dir,
-        stage=arguments.structure_stage,
-        backbone=arguments.backbone,
-        expected_characteristic_ratio=arguments.characteristic_ratio,
-        stride=int(arguments.stride),
+    gaps = ", ".join(
+        f"{name} {100.0 * gap:.0f}%"
+        for name, gap in (("K", check.bulk_gap), ("G", check.shear_gap))
+        if math.isfinite(gap)
     )
-    for line in _structure_lines(report):
-        print(line, flush=True)
-    for note in report.notes:
-        print(f"note: {note}", flush=True)
-
-    files = write_structure_report(
-        report,
-        arguments.output_dir,
-        figures=not arguments.no_figures,
-        figure_format=cast(str, arguments.figure_format),
+    if not gaps:
+        return f"{implied} - nothing measured to check them against"
+    return (
+        f"{implied}; measured differ by {gaps}"
+        f"{'' if check.consistent else ' - not consistent'}"
     )
-    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
 
 
-def _structure_lines(report: Any) -> list[str]:
+def _strain_rate(rate_per_ns: float | None) -> str:
+    if rate_per_ns is None:
+        return "unknown strain rate"
+    return f"{rate_per_ns:.3g} strain/ns"
+
+
+def _replica_spread(
+    spread: float | None, replicas: Sized, digits: str = ".3g", unit: str = ""
+) -> str:
+    if spread is None:
+        return ""
+    return f" +/- {spread:{digits}}{unit} over {len(replicas)} replicas"
+
+
+def _breaking_lines(report: Any) -> Iterator[str]:
+    """Keep an unconfirmed peak distinct from an apparent tensile strength."""
+    if report.strength_mpa is None or not report.resolved:
+        yield "breaking: apparent tensile strength not resolved"
+    else:
+        yield (
+            "breaking: apparent ultimate nominal tensile strength = "
+            f"{report.strength_mpa:.4g} MPa"
+            f"{_replica_spread(report.replica_spread_mpa, report.replicas)}"
+        )
+    for index, result in zip(report.replica_indices, report.replicas, strict=True):
+        yield (
+            f"  replica {index}: peak {result.peak_stress_mpa:.4g} MPa at "
+            f"strain {result.strain_at_peak:.4g}, {result.temperature_k:.0f} K, "
+            f"{_strain_rate(result.strain_rate_per_ns)}{_unresolved(result.resolved)}"
+        )
+        if result.failure_strain is not None:
+            yield (
+                f"    stress drop at strain {result.failure_strain:.4g}, "
+                f"stress {result.failure_stress_mpa:.4g} MPa"
+            )
+
+
+def _elongation_lines(report: Any) -> Iterator[str]:
+    """Report the confirmed break strain separately from the stress maximum."""
+    if report.elongation_percent is None or not report.resolved:
+        yield "elongation: apparent elongation at break not resolved"
+    else:
+        spread = _replica_spread(
+            report.replica_spread_percent, report.replicas, unit=" percentage points"
+        )
+        yield (
+            "elongation: apparent elongation at break = "
+            f"{report.elongation_percent:.4g}%{spread}"
+        )
+    for index, result in zip(report.replica_indices, report.replicas, strict=True):
+        elongation = (
+            f"{result.elongation_percent:.4g}% at engineering strain "
+            f"{result.strain_at_break:.4g}"
+            if result.resolved
+            and result.elongation_percent is not None
+            and result.strain_at_break is not None
+            else "not resolved"
+        )
+        yield (
+            f"  replica {index}: elongation at break {elongation}, "
+            f"{result.temperature_k:.0f} K, {_strain_rate(result.strain_rate_per_ns)}"
+        )
+        yield (
+            f"    peak {result.peak_stress_mpa:.4g} MPa at "
+            f"strain {result.strain_at_peak:.4g}"
+        )
+        if result.resolved and result.break_stress_mpa is not None:
+            yield f"    stress at break {result.break_stress_mpa:.4g} MPa"
+
+
+def _yield_lines(report: Any) -> Iterator[str]:
+    """Print the proof stress together with its offset, temperature and rate."""
+    if report.strength_mpa is None or not report.resolved:
+        yield "yield: apparent offset yield strength not resolved"
+    else:
+        yield (
+            "yield: apparent offset yield strength = "
+            f"{report.strength_mpa:.4g} MPa"
+            f"{_replica_spread(report.replica_spread_mpa, report.replicas)}"
+        )
+    for index, result in zip(report.replica_indices, report.replicas, strict=True):
+        strength = (
+            f"{result.strength_mpa:.4g} MPa at strain {result.yield_strain:.4g}"
+            if result.resolved
+            and result.strength_mpa is not None
+            and result.yield_strain is not None
+            else "not resolved"
+        )
+        yield (
+            f"  replica {index}: {100.0 * result.offset_strain:g}% offset "
+            f"proof stress {strength}, {result.temperature_k:.0f} K, "
+            f"{_strain_rate(result.strain_rate_per_ns)}"
+        )
+        if result.modulus_mpa is not None:
+            yield (
+                f"    initial elastic slope {result.modulus_mpa:.4g} MPa "
+                f"over strain {result.fit_min_strain:g} to {result.fit_max_strain:g}"
+            )
+
+
+def _relaxation_lines(report: Any) -> list[str]:
+    """One line per fitted quantity, each carrying what qualifies it.
+
+    Takes the :class:`~openmmpolymer.viscoelastic.RelaxationReport` a scan
+    returns or ``--analyse`` reads back; both carry the overall verdict.
+    """
+    mean = report.mean
+    if mean is None:
+        return ["relax: nothing was strained"]
+    spread = _replica_spread(report.replica_spread_mpa, report.curves)
+    lines = [
+        f"G(0) = {mean.initial_modulus_mpa:.4g} MPa{spread} at "
+        f"{mean.step_strain:+.3f} strain, {mean.temperature_k:.0f} K, over "
+        f"{mean.decades:.1f} decades{_unresolved(report.resolved)}"
+    ]
+    kww = report.kww
+    if kww is not None:
+        lines.append(
+            f"KWW: beta = {kww.beta:.3f}, tau = {kww.tau_ps:.4g} ps, "
+            f"<tau> = {kww.mean_tau_ps:.4g} ps{_unresolved(kww.resolved)}"
+        )
+    prony = report.prony
+    if prony is not None:
+        lines.append(
+            f"Prony: G_inf = {prony.equilibrium_mpa:.4g} MPa over "
+            f"{prony.n_active} of {prony.n_terms} terms"
+            f"{'' if prony.plateau_reached else ' - still decaying'}"
+        )
+    linearity = report.linearity
+    if linearity is not None:
+        lines.append(
+            f"linearity: strains {[round(v, 4) for v in linearity.strains]} "
+            f"differ by {100.0 * linearity.gap:.0f}%"
+            f"{'' if linearity.linear else ' - outside the linear region'}"
+        )
+    return lines
+
+
+def _structure_lines(report: Any) -> Iterator[str]:
     """One line per measurement, each carrying its own caveat."""
     frames = (
         "single snapshot"
         if report.is_snapshot
         else f"{report.n_frames} frames at {report.interval_ps:g} ps"
     )
-    lines = [
+    yield (
         f"structure: stage {report.stage} ({frames}), {report.n_chains} chains "
         f"of {report.atoms_per_chain} atoms"
-    ]
+    )
     if report.backbone is None:
-        lines.append("backbone: unknown, so no chain measurements")
+        yield "backbone: unknown, so no chain measurements"
     else:
         origin = report.backbone_source + (
             "" if report.backbone_file is None else f" from {report.backbone_file}"
         )
-        lines.append(f"backbone: {len(report.backbone)} atoms, {origin}")
+        yield f"backbone: {len(report.backbone)} atoms, {origin}"
 
     distribution = report.distribution
     if distribution is not None:
-        lines.append(
+        yield (
             f"g(r): first peak {distribution.first_peak_height:.2f} at "
             f"{distribution.first_peak_nm:.3f} nm, {distribution.n_pairs:,} "
             f"intermolecular pairs over {distribution.n_frames} frame(s)"
@@ -2809,14 +1990,12 @@ def _structure_lines(report: Any) -> list[str]:
     structure = report.structure
     if structure is not None:
         if structure.first_peak_per_nm > 0.0:
-            lines.append(
+            yield (
                 f"S(q): peak at {structure.first_peak_per_nm:.1f} /nm; nothing "
                 f"below {structure.q_min_per_nm:.1f} /nm is resolvable in this cell"
             )
         else:
-            lines.append(
-                f"S(q): no resolvable peak above {structure.q_min_per_nm:.1f} /nm"
-            )
+            yield f"S(q): no resolvable peak above {structure.q_min_per_nm:.1f} /nm"
 
     conformation = report.conformation
     if conformation is not None:
@@ -2835,21 +2014,20 @@ def _structure_lines(report: Any) -> list[str]:
                 if conformation.settled.equilibrated
                 else ", <R^2> still moving"
             )
-        lines.append(line)
+        yield line
 
-    persistence = report.persistence
-    if persistence is not None:
-        lines.append(_persistence_line(persistence))
+    if report.persistence is not None:
+        yield _persistence_line(report.persistence)
 
     displacement = report.displacement
     if displacement is not None:
         if displacement.diffusion_coefficient_cm2_s is None:
-            lines.append(
+            yield (
                 f"MSD: slope {displacement.log_slope:.2f}, not diffusive, so no "
                 "diffusion coefficient"
             )
         else:
-            lines.append(
+            yield (
                 f"MSD: slope {displacement.log_slope:.2f}, "
                 f"D = {displacement.diffusion_coefficient_cm2_s:.3e} cm2/s"
             )
@@ -2857,23 +2035,20 @@ def _structure_lines(report: Any) -> list[str]:
     relaxation = report.relaxation
     if relaxation is not None:
         if relaxation.relaxation_time_ps is None:
-            lines.append(
+            yield (
                 f"end-to-end: not decorrelated in {relaxation.trajectory_ps:.0f} "
                 "ps; the relaxation time is longer than the run"
             )
         else:
-            lines.append(
-                f"end-to-end: relaxes in {relaxation.relaxation_time_ps:.0f} ps"
-            )
+            yield f"end-to-end: relaxes in {relaxation.relaxation_time_ps:.0f} ps"
 
     recorded = report.recorded_chains
     if recorded is not None:
-        lines.append(
+        yield (
             "manifest recorded at the end of the run: "
             f"<R^2> = {recorded.mean_squared_end_to_end_nm2:.3f} nm2, "
             f"Rg = {recorded.mean_radius_of_gyration_nm:.3f} nm"
         )
-    return lines
 
 
 def _persistence_line(persistence: Any) -> str:
@@ -2891,109 +2066,6 @@ def _persistence_line(persistence: Any) -> str:
     if not persistence.decayed:
         line += " - never decayed to 1/e within the chain, so this is an extrapolation"
     return line
-
-
-def _analyse_mechanics(arguments: argparse.Namespace, run_dir: Path) -> None:
-    """Report the elastic constants, and write them out."""
-    report = analyse_mechanics(run_dir)
-    if report.youngs is not None:
-        rate = report.youngs.strain_rate_per_ns
-        print(
-            f"E = {report.youngs.modulus_mpa:.0f} MPa"
-            + (
-                ""
-                if report.replica_spread_mpa is None
-                else f" +/- {report.replica_spread_mpa:.0f} over "
-                f"{len(report.replicas)} replicas"
-            )
-            + (" at rate unknown" if rate is None else f" at {rate:.3g} strain/ns")
-            + f", {report.youngs.temperature_k:.0f} K"
-            + ("" if report.youngs.resolved else " (not resolved)"),
-            flush=True,
-        )
-    for line in _additional_modulus_lines(report):
-        print(line, flush=True)
-    for note in report.notes:
-        print(f"note: {note}", flush=True)
-
-    files = write_mechanical_report(
-        report,
-        arguments.output_dir,
-        figures=not arguments.no_figures,
-        figure_format=cast(str, arguments.figure_format),
-    )
-    print(
-        f"wrote {files.json} and {len(files.figures)} figure(s)",
-        flush=True,
-    )
-
-
-def _analyse_tg(arguments: argparse.Namespace, directories: Sequence[Path]) -> None:
-    """Report the glass transition from finished run directories."""
-    report = analyse_run(
-        directories[0],
-        extra_run_dirs=directories[1:],
-        melt_stage=None if arguments.no_melt_check else arguments.melt_stage,
-        min_points_per_branch=int(arguments.min_points_per_branch),
-        target_rate_k_per_ns=float(arguments.target_rate),
-        radius_of_gyration_nm=arguments.rg,
-    )
-    print(
-        "quenches: "
-        + ", ".join(
-            f"{curve.stage} ({curve.temperature_step_k:.0f} K steps, "
-            + (
-                "rate unknown"
-                if curve.cooling_rate_k_per_ns is None
-                else f"{curve.cooling_rate_k_per_ns:.2f} K/ns"
-            )
-            + ")"
-            for curve in report.curves
-        ),
-        flush=True,
-    )
-    if report.melt is not None:
-        settled = (
-            "volume settled" if report.melt.volume_settled else "volume still drifting"
-        )
-        moved = "chains moved" if report.melt.chains_moved else "chains have not"
-        print(f"melt {report.melt.stage}: {settled}; {moved}", flush=True)
-        for reason in report.melt.unchecked:
-            print(f"  unchecked: {reason}", flush=True)
-    for label, transition in (("coarse", report.coarse), ("fine", report.fine)):
-        if transition is not None:
-            print(_transition_line(label, transition), flush=True)
-    for extrapolation in (report.log_linear, report.vft):
-        if extrapolation is not None:
-            print(_extrapolation_line(extrapolation), flush=True)
-    for note in report.notes:
-        print(f"note: {note}", flush=True)
-
-    files = write_report(
-        report,
-        arguments.output_dir,
-        figures=not arguments.no_figures,
-        figure_format=cast(str, arguments.figure_format),
-    )
-    print(
-        f"wrote {files.json} and {len(files.figures)} figure(s)",
-        flush=True,
-    )
-
-
-def _transition_line(label: str, fit: Any) -> str:
-    """One line for a fitted transition, with both expansivities."""
-    rate = (
-        "rate unknown"
-        if fit.cooling_rate_k_per_ns is None
-        else f"{fit.cooling_rate_k_per_ns:.2f} K/ns"
-    )
-    if not fit.resolved:
-        return f"{label}: no clear transition at {rate}"
-    return (
-        f"{label}: Tg = {fit.temperature_k:.0f} K at {rate}, aV "
-        f"{fit.melt_expansivity_per_k:.2e} / {fit.glass_expansivity_per_k:.2e} per K"
-    )
 
 
 if __name__ == "__main__":

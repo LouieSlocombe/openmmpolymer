@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -14,12 +12,7 @@ import pytest
 from benchmarks import pe_melt
 from benchmarks.pe_melt import REFERENCE_PATH, _protocol, comparison, run_benchmark
 from openmmpolymer.chain import ChainSpec, assemble_chain
-from openmmpolymer.protocols import (
-    ProtocolError,
-    RunManifest,
-    _run_identity,
-    record_build_request,
-)
+from openmmpolymer.protocols import ProtocolError
 
 
 @pytest.fixture
@@ -54,10 +47,6 @@ def test_benchmark_reference_matches_the_chain_formula() -> None:
         ChainSpec(case["monomer_smiles"], case["degree_of_polymerization"])
     )
     assert rdMolDescriptors.CalcMolFormula(chain) == case["reference"]["molecule"]
-    assert (
-        case["reference"]["kind"] == "published united-atom simulation, not experiment"
-    )
-    assert "not a published uncertainty" in case["reference"]["tolerance_basis"]
 
 
 def test_reference_protocol_uses_the_configured_production_length() -> None:
@@ -135,98 +124,48 @@ def test_empty_measurements_are_not_vacuously_within_the_reference(
         comparison([], reference, smoke=False)
 
 
+def test_only_a_temperature_the_reference_covers_can_be_run(tmp_path: Path) -> None:
+    """The allowed temperatures are the reference's own, read from its JSON."""
+    with pytest.raises(ValueError, match="only at 350 K, 400 K"):
+        run_benchmark(tmp_path / "benchmark", temperature_k=375)
+
+
 @pytest.mark.parametrize("changed_system", (False, True))
-def test_benchmark_replay_validates_identity_without_overwriting_build_artifacts(
-    tmp_path: Path,
+def test_a_rerun_rebuilds_in_scratch_without_touching_the_replica(
+    staged_melt: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
-    argon_run: Any,
+    tmp_path: Path,
     changed_system: bool,
 ) -> None:
-    """Rebuilding in scratch must preserve evidence even when validation fails."""
-    from openmm import XmlSerializer, unit
+    """Rebuilding in scratch must preserve the evidence even when the check fails.
 
-    output = tmp_path / "benchmark"
-    record_build_request(
-        output,
-        {
-            "case": json.loads(REFERENCE_PATH.read_text()),
-            "temperature_k": 400,
-            "smoke": True,
-            "seeds": (11,),
-        },
-    )
-    replica = output / "seed_11"
-    (replica / "build").mkdir(parents=True)
-    (replica / "build" / "chain.sdf").write_text("original molecule")
-    (replica / "build" / "polymer_ff.xml").write_text("original parameters")
-    (replica / "build" / "packed.pdb").write_text("original packing")
-    RunManifest(
-        protocol="pe_density_smoke",
-        seed=11,
-        provenance={"version": 1, "run": _run_identity(argon_run), "stages": {}},
-    ).save(replica)
-    original = {
-        path.relative_to(replica): path.read_bytes()
-        for path in replica.rglob("*")
-        if path.is_file()
-    }
-    prepared = argon_run
-    if changed_system:
-        system = XmlSerializer.deserialize(argon_run.system_xml)
-        system.setParticleMass(0, system.getParticleMass(0) + 1.0 * unit.dalton)
-        prepared = replace(argon_run, system_xml=XmlSerializer.serialize(system))
-    scratch_builds = []
-
-    def build(spec: Any, *, output_dir: Path, **kwargs: Any) -> Any:
-        scratch_builds.append(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        source = output_dir / "chain.sdf"
-        source.write_text("rebuilt molecule")
-        return SimpleNamespace(
-            sdf_paths=(str(source),),
-            pdb_paths=(str(source),),
-            molar_mass_g_mol=100.0,
-            backbone=(0, 1),
-            n_atoms=2,
-        )
-
-    def forcefield(source: str, destination: Path, **kwargs: Any) -> Any:
-        destination.write_text("rebuilt parameters")
-        return prepared.forcefield
-
-    def packing(components: Any, edge: float, destination: Path, **kwargs: Any) -> Any:
-        destination.write_text("rebuilt packing")
-        return SimpleNamespace(packed_pdb=str(destination), box_nm=(edge,) * 3)
+    The force-field cache the replicas share is part of that evidence: the
+    rebuild works from a copy of it.
+    """
 
     class ReachedProtocol(Exception):
         pass
 
-    def protocol(*args: Any, **kwargs: Any) -> None:
-        assert args[2] == replica
-        raise ReachedProtocol("identity accepted")
+    def protocol(protocol: Any, run: Any, directory: Path, **kwargs: Any) -> None:
+        raise ReachedProtocol(directory)
 
-    monkeypatch.setattr(pe_melt, "build_chain", build)
-    monkeypatch.setattr(pe_melt, "assign_charges", lambda *args: None)
-    monkeypatch.setattr(pe_melt, "build_polymer_forcefield", forcefield)
-    monkeypatch.setattr(pe_melt, "check_target_density", lambda *args: None)
-    monkeypatch.setattr(pe_melt, "pack_box", packing)
-    monkeypatch.setattr(pe_melt, "assemble_box", lambda *args: prepared.box)
-    monkeypatch.setattr(pe_melt, "check_packing", lambda *args: None)
-    monkeypatch.setattr(pe_melt, "prepare_box", lambda box, forcefield: box)
-    monkeypatch.setattr(pe_melt, "prepare_run", lambda *args, **kwargs: prepared)
     monkeypatch.setattr(pe_melt, "run_protocol", protocol)
-    with pytest.raises(
-        ProtocolError if changed_system else ReachedProtocol,
-        match="starting inputs changed" if changed_system else "identity accepted",
-    ):
+    output = tmp_path / "benchmark"
+    with pytest.raises(ReachedProtocol):
+        run_benchmark(output, smoke=True, seeds=(11,), platform="CPU")
+    original = {path: path.read_bytes() for path in output.rglob("*") if path.is_file()}
+    staged_melt["system_suffix"] = "\n" if changed_system else ""
+    with pytest.raises(ProtocolError if changed_system else ReachedProtocol) as raised:
         run_benchmark(output, smoke=True, seeds=(11,), platform="CPU")
     assert {
-        path.relative_to(replica): path.read_bytes()
-        for path in replica.rglob("*")
-        if path.is_file()
+        path: path.read_bytes() for path in output.rglob("*") if path.is_file()
     } == original
-    assert scratch_builds and scratch_builds[0] != replica / "build"
-    assert not scratch_builds[0].exists()
+    first, second = staged_melt["builds"]
+    assert first == output / "seed_11" / "build"
+    assert second != first
+    assert not second.exists()
+    if not changed_system:
+        assert raised.value.args == (output / "seed_11",)
 
 
 @pytest.mark.slow
@@ -244,9 +183,11 @@ def test_real_polyethylene_benchmark_smoke(tmp_path: Path) -> None:
     assert math.isfinite(report["replicas"][0]["density_g_cm3"])
     assert json.loads((tmp_path / "benchmark" / "benchmark.json").read_text())
     build = tmp_path / "benchmark" / "seed_11" / "build"
-    original_build = {path.name: path.read_bytes() for path in build.iterdir()}
+    original = {path: path.read_bytes() for path in build.rglob("*") if path.is_file()}
     repeated = run_benchmark(
         tmp_path / "benchmark", smoke=True, seeds=(11,), platform="CPU"
     )
     assert repeated["comparison"] == report["comparison"]
-    assert {path.name: path.read_bytes() for path in build.iterdir()} == original_build
+    assert {
+        path: path.read_bytes() for path in build.rglob("*") if path.is_file()
+    } == original

@@ -5,8 +5,8 @@ something - how long the ladder is, which pass is skipped, what a resume
 refuses, how replicas are grouped - is tested against manifests written by
 hand, because those are arithmetic over recorded numbers and running
 dynamics to reach them would hide what is being checked. The plumbing that
-has to survive a real Context is tested once, on an argon cell, which runs
-the whole workflow in a couple of seconds.
+has to survive a real Context is tested on an argon cell, which runs the
+whole workflow in a couple of seconds.
 
 Argon is a liquid at these settings, so it has no shear modulus and its
 Young's modulus is meaningless. That is deliberate: the argon tests assert
@@ -28,8 +28,6 @@ import numpy as np
 import pytest
 
 from openmmpolymer.elasticity import MAX_CONSISTENCY_GAP
-from openmmpolymer.forcefield import PolymerForceField
-from openmmpolymer.mdsystem import PackedBox
 from openmmpolymer.mechanical import (
     BULK_STEM,
     DEFORM_STEM,
@@ -41,15 +39,20 @@ from openmmpolymer.mechanical import (
     analyse_mechanics,
     deform_protocol,
     deform_schedule,
+    equilibration_protocol,
     extra_stages,
     mechanical_scan,
     run_modulus_scan,
     write_mechanical_report,
 )
-from openmmpolymer.simulate import prepare_run
 from openmmpolymer.trajectory import AnalysisError
 
-from .helpers import argon_system, write_bulk, write_deformation, write_shear
+from .helpers import (
+    QUICK_EQUILIBRATION,
+    write_bulk,
+    write_deformation,
+    write_shear,
+)
 
 #: Settings that put the whole scan inside a couple of seconds on argon. The
 #: cell has no elastic constants worth the name, so nothing here asserts one.
@@ -70,37 +73,14 @@ QUICK = ModulusSpec(
     shear_ps_each=0.3,
 )
 
-#: The equilibration, shortened to match, and gentle for the same reason
-#: the Tg tests are: a kilobar squeezes a small argon cell past its cutoff.
-QUICK_EQUILIBRATION: dict[str, Any] = {
-    "nvt_ps": 0.2,
-    "compress_ps_each": 0.2,
-    "npt_ps": 0.3,
-    "anneal_cycles": 1,
-    "anneal_window_ps": 0.1,
-    "anneal_hold_ps": 0.1,
-    "compress_pressures_bar": (1.0, 20.0, 1.0),
-}
-
-
-@pytest.fixture
-def argon_scan_run() -> Any:
-    """An argon cell big enough to survive an NPT equilibration and a strain."""
-    system, topology, positions = argon_system(216, 2.8)
-    box = PackedBox(
-        topology=topology,
-        positions_nm=positions,
-        box_nm=(2.8, 2.8, 2.8),
-        n_molecules=216,
-    )
-    return prepare_run(
-        box,
-        PolymerForceField("unused.xml", (), "AR", "smirnoff"),
-        platform="CPU",
-        seed=11,
-        system=system,
-    )
-
+#: One extension and nothing else, for the tests about what an extension does.
+ONE_EXTENSION = replace(
+    QUICK,
+    n_replicas=1,
+    load_stresses_bar=None,
+    bulk_pressures_bar=None,
+    shear_strains=None,
+)
 
 # --------------------------------------------------------------------------
 # Schedules and what a scan costs
@@ -185,38 +165,38 @@ def test_each_pass_can_be_skipped_on_its_own() -> None:
         assert len(stages) == 2
 
 
-def test_a_scan_over_its_budget_stops_before_it_writes_anything(
-    argon_scan_run: Any,
+def test_the_listing_prices_every_replica_and_every_pass() -> None:
+    """What a dry run quotes is what the scan runs, or the budget means nothing."""
+    listing = mechanical_scan(QUICK, **QUICK_EQUILIBRATION)
+    settle = equilibration_protocol(QUICK, **QUICK_EQUILIBRATION)
+    extras = extra_stages(QUICK, timestep_fs=2.0)
+    names = [stage.name for stage in listing.stages]
+
+    assert names[: len(settle.stages)] == [stage.name for stage in settle.stages]
+    assert {name.split("_")[2] for name in names if name.startswith(DEFORM_STEM)} == {
+        "r0",
+        "r1",
+    }
+    assert names[-len(extras) :] == [LOAD_STEM, BULK_STEM, SHEAR_STEM]
+    assert listing.total_duration_ps == pytest.approx(
+        settle.total_duration_ps
+        + QUICK.n_replicas * deform_schedule(QUICK).total_ps
+        + sum(stage.duration_ps for stage in extras)
+    )
+
+
+def test_a_scan_over_its_budget_stops_before_it_creates_anything(
+    argon_run: Any,
 ) -> None:
-    """The refusal has to come before the first stage, not after."""
+    """The refusal has to come before the first stage - and the first file."""
     with pytest.raises(MechanicalError, match="max_total_ns"):
         run_modulus_scan(
-            argon_scan_run,
+            argon_run,
             "run",
             spec=replace(QUICK, max_total_ns=1.0e-6),
             **QUICK_EQUILIBRATION,
         )
-    assert not Path("run/manifest.json").exists()
-
-
-def test_the_cost_is_reported_before_anything_runs(
-    argon_scan_run: Any, caplog: pytest.LogCaptureFixture
-) -> None:
-    """So a scan that is too expensive is visible rather than discovered."""
-    with caplog.at_level(logging.INFO, logger="openmmpolymer.mechanical"):
-        run_modulus_scan(
-            argon_scan_run,
-            "run",
-            spec=replace(
-                QUICK,
-                n_replicas=1,
-                load_stresses_bar=None,
-                bulk_pressures_bar=None,
-                shear_strains=None,
-            ),
-            **QUICK_EQUILIBRATION,
-        )
-    assert "still to run" in caplog.text
+    assert not Path("run").exists()
 
 
 # --------------------------------------------------------------------------
@@ -224,45 +204,22 @@ def test_the_cost_is_reported_before_anything_runs(
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("initial_resume", [True, False])
-def test_the_whole_scan_runs_and_then_resumes_without_repeating_itself(
-    argon_scan_run: Any,
-    initial_resume: bool,
+def test_one_extension_moves_the_box_by_exactly_the_strain_it_records(
+    argon_scan_run: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The load-bearing one: every pass, the branching, and resume."""
-    first = run_modulus_scan(
-        argon_scan_run, "run", spec=QUICK, resume=initial_resume, **QUICK_EQUILIBRATION
-    )
-    manifest = json.loads(Path("run/manifest.json").read_text())
-    for stem in (LOAD_STEM, BULK_STEM, SHEAR_STEM):
-        assert stem in manifest["stages"]
-    assert len(first.replicas) == 2
-    assert "05_npt" in manifest["stages"]
-    assert first.replica_spread_mpa is not None
+    """Strain is bookkeeping, and bookkeeping should be exact.
 
-    before = Path("run/manifest.json").read_bytes()
-    second = run_modulus_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
-    assert second.youngs is not None and first.youngs is not None
-    assert second.youngs.modulus_mpa == pytest.approx(first.youngs.modulus_mpa)
-    assert Path("run/manifest.json").read_bytes() == before
+    The driven axis is held at the strain while the lateral two stay at
+    pressure - the uniaxial-strain ensemble. The cost is reported before any
+    of it runs. And a resume that asks for something else is refused, or the
+    modulus belongs to a ladder nobody walked.
+    """
+    with caplog.at_level(logging.INFO, logger="openmmpolymer.mechanical"):
+        run_modulus_scan(
+            argon_scan_run, "run", spec=ONE_EXTENSION, **QUICK_EQUILIBRATION
+        )
+    assert "still to run" in caplog.text
 
-
-def test_the_box_moves_by_exactly_the_strain_that_was_recorded(
-    argon_scan_run: Any,
-) -> None:
-    """Strain is bookkeeping, and bookkeeping should be exact."""
-    run_modulus_scan(
-        argon_scan_run,
-        "run",
-        spec=replace(
-            QUICK,
-            n_replicas=1,
-            load_stresses_bar=None,
-            bulk_pressures_bar=None,
-            shear_strains=None,
-        ),
-        **QUICK_EQUILIBRATION,
-    )
     manifest = json.loads(Path("run/manifest.json").read_text())
     samples = next(
         recorded["samples"]
@@ -274,77 +231,59 @@ def test_the_box_moves_by_exactly_the_strain_that_was_recorded(
         samples["segment_box_z_nm"], samples["segment_strain"], strict=True
     ):
         assert length / reference - 1.0 == pytest.approx(strain, abs=1e-12)
+    assert np.asarray(samples["segment_box_x_nm"], dtype=np.float64).std() > 0.0
+
+    with pytest.raises(MechanicalError, match="different settings"):
+        run_modulus_scan(
+            argon_scan_run,
+            "run",
+            spec=replace(ONE_EXTENSION, relax_ps=0.5),
+            **QUICK_EQUILIBRATION,
+        )
 
 
-def test_the_lateral_axes_move_while_the_driven_one_is_held(
+@pytest.mark.parametrize("initial_resume", [True, False])
+def test_the_whole_scan_runs_and_then_resumes_without_repeating_itself(
     argon_scan_run: Any,
+    initial_resume: bool,
 ) -> None:
-    """The uniaxial-strain ensemble: scaleZ False, the other two at pressure."""
-    run_modulus_scan(
-        argon_scan_run,
-        "run",
-        spec=replace(
-            QUICK,
-            n_replicas=1,
-            load_stresses_bar=None,
-            bulk_pressures_bar=None,
-            shear_strains=None,
-        ),
-        **QUICK_EQUILIBRATION,
+    """The load-bearing one: every pass, the branching, and resume.
+
+    The replicas have to be given different velocities, or two runs from one
+    configuration are one run and their spread is a lie.
+    """
+    first = run_modulus_scan(
+        argon_scan_run, "run", spec=QUICK, resume=initial_resume, **QUICK_EQUILIBRATION
     )
     manifest = json.loads(Path("run/manifest.json").read_text())
-    samples = next(
-        recorded["samples"]
-        for name, recorded in manifest["stages"].items()
-        if name.startswith(DEFORM_STEM)
-    )
-    lateral = np.asarray(samples["segment_box_x_nm"], dtype=np.float64)
-    assert lateral.std() > 0.0
+    for stem in (LOAD_STEM, BULK_STEM, SHEAR_STEM):
+        assert stem in manifest["stages"]
+    assert "05_npt" in manifest["stages"]
+    assert len(first.replicas) == 2
+    assert first.replicas[0].modulus_mpa != first.replicas[1].modulus_mpa
+    assert first.replica_spread_mpa is not None
+    assert first.replica_spread_mpa > 0.0
+
+    before = Path("run/manifest.json").read_bytes()
+    second = run_modulus_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
+    assert second.youngs is not None and first.youngs is not None
+    assert second.youngs.modulus_mpa == pytest.approx(first.youngs.modulus_mpa)
+    assert Path("run/manifest.json").read_bytes() == before
 
 
-def test_replicas_are_given_different_velocities(argon_scan_run: Any) -> None:
-    """Or three runs from one configuration are one run, and the spread is a lie."""
-    result = run_modulus_scan(
-        argon_scan_run,
-        "run",
-        spec=replace(
-            QUICK,
-            load_stresses_bar=None,
-            bulk_pressures_bar=None,
-            shear_strains=None,
-        ),
-        **QUICK_EQUILIBRATION,
-    )
-    assert len(result.replicas) == 2
-    assert result.replicas[0].modulus_mpa != result.replicas[1].modulus_mpa
-    assert result.replica_spread_mpa is not None
-    assert result.replica_spread_mpa > 0.0
-
-
-def test_every_pass_starts_from_the_same_equilibrated_cell(
+def test_every_pass_starts_from_the_equilibrated_cell_even_on_a_resume(
     argon_scan_run: Any,
 ) -> None:
-    """A cell that has just been stretched is not the next measurement's cell."""
-    run_modulus_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
-    record = json.loads((Path("run") / WORKFLOW_NAME).read_text())
-    assert Path(record["start_state"]).name.startswith("05_npt")
-    assert len(record["reference_box_nm"]) == 3
+    """A cell that has just been stretched is not the next measurement's cell.
 
-
-def test_a_resumed_scan_still_starts_from_the_equilibrated_cell(
-    argon_scan_run: Any,
-) -> None:
-    """The case the test above cannot see, and the one that matters.
-
-    On a fresh run the equilibration's stages are the only ones that have
-    run, so anything that looks for "the last state" finds the right one. On a
-    resume they are all skipped and the manifest - which is in run order -
-    already holds every deformation after them, so looking backwards through
-    it lands on the end of a strained pass instead. Both halves of the scan
-    then go wrong: passes that had not finished would branch from a cell that
-    was already at the top of the ladder, and the strain origin read off that
-    state is a stretched cell, so every strain still to be recorded would be
-    measured against the wrong length.
+    The resume is the case that matters. On a fresh run the equilibration's
+    stages are the only ones that have run, so anything that looks for "the
+    last state" finds the right one. On a resume they are all skipped and the
+    manifest - which is in run order - already holds every deformation after
+    them, so looking backwards through it lands on the end of a strained pass
+    instead. Both halves of the scan then go wrong: passes that had not
+    finished would branch from a cell that was already at the top of the
+    ladder, and the strain origin read off that state is a stretched cell.
 
     Asserted on the box rather than only on the file name, because the cubic
     shape is what says it is the equilibrated cell and not a deformed one -
@@ -358,31 +297,11 @@ def test_a_resumed_scan_still_starts_from_the_equilibrated_cell(
     run_modulus_scan(argon_scan_run, "run", spec=spec, **QUICK_EQUILIBRATION)
     resumed = json.loads((Path("run") / WORKFLOW_NAME).read_text())
 
-    assert Path(resumed["start_state"]).name.startswith("05_npt")
+    for record in (fresh, resumed):
+        assert Path(record["start_state"]).name.startswith("05_npt")
     assert resumed["reference_box_nm"] == pytest.approx(fresh["reference_box_nm"])
     origin = resumed["reference_box_nm"]
     assert origin == pytest.approx([origin[0]] * 3)
-
-
-def test_a_resume_that_asks_for_something_else_is_refused(
-    argon_scan_run: Any,
-) -> None:
-    """Or the modulus belongs to a ladder nobody walked."""
-    spec = replace(
-        QUICK,
-        n_replicas=1,
-        load_stresses_bar=None,
-        bulk_pressures_bar=None,
-        shear_strains=None,
-    )
-    run_modulus_scan(argon_scan_run, "run", spec=spec, **QUICK_EQUILIBRATION)
-    with pytest.raises(MechanicalError, match="different settings"):
-        run_modulus_scan(
-            argon_scan_run,
-            "run",
-            spec=replace(spec, relax_ps=0.5),
-            **QUICK_EQUILIBRATION,
-        )
 
 
 # --------------------------------------------------------------------------
@@ -403,6 +322,21 @@ def test_replicas_are_grouped_by_their_stems(tmp_path: Path) -> None:
     assert len(report.curves) == 2
     assert len(report.replicas) == 2
     assert report.youngs is not None
+
+
+@pytest.mark.parametrize(("second_mpa", "agree"), [(1100.0, True), (2000.0, False)])
+def test_replicas_that_disagree_leave_the_modulus_unresolved(
+    tmp_path: Path, second_mpa: float, agree: bool
+) -> None:
+    """A pooled fit that resolves is still not a modulus to quote when the
+    replicas behind it disagree by more than MAX_REPLICA_SPREAD of it."""
+    for replica, modulus in enumerate((1000.0, second_mpa)):
+        write_deformation(
+            tmp_path, modulus_mpa=modulus, stage=f"{DEFORM_STEM}_r{replica}_00"
+        )
+    report = analyse_mechanics(tmp_path, strain_limit=0.05)
+    assert report.youngs is not None and report.youngs.resolved
+    assert report.resolved is agree
 
 
 def test_a_skipped_bulk_pass_is_not_found_in_the_equilibration(
@@ -508,6 +442,7 @@ def test_the_report_writes_a_record_and_its_figures(tmp_path: Path) -> None:
     assert record["shear"]["modulus_mpa"] == pytest.approx(741.0)
     assert record["consistency"]["bulk_gap"] < MAX_CONSISTENCY_GAP
     assert record["consistency"]["consistent"]
+    assert record["resolved"] is True
     assert files.figures
     assert all(Path(path).is_file() for path in files.figures)
 

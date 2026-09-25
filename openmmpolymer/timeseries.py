@@ -40,12 +40,26 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 
 import numpy as np
 import numpy.typing as npt
 
-from .trajectory import AnalysisError
+from ._fitting import (
+    TINY,
+    fit_line,
+    separable_fit,
+    standard_error,
+    statistical_inefficiency,
+)
+from ._validation import require_choice, require_integer, require_positive
+from .trajectory import (
+    AnalysisError,
+    load_manifest,
+    stage_names,
+    stage_record,
+    stages_holding,
+)
 
 log = logging.getLogger(__name__)
 
@@ -69,12 +83,12 @@ CSV_FIELDS = {
 MIN_INDEPENDENT_SAMPLES = 10.0
 
 #: Fractional drift across the retained window that still counts as settled,
-#: unless the window's own standard error is larger.
+#: unless twice the window's own standard error is larger.
 MAX_RELATIVE_DRIFT = 0.01
 
-#: How far into a series the settling point may sit. Past halfway there is
-#: more discarded than kept, and the run was too short whatever the numbers
-#: say.
+#: How far into a series the settling point may be looked for. Past halfway
+#: there is more discarded than kept, and the run was too short whatever the
+#: numbers say.
 MAX_START_FRACTION = 0.5
 
 #: Candidate settling points tried. The optimum is broad, so a coarse grid
@@ -87,10 +101,6 @@ _START_CANDIDATES = 50
 #: with a kink fitted to it, which is what any two-line fit of a straight line
 #: returns.
 MAX_GLASS_MELT_SLOPE_RATIO = 0.8
-
-#: Guards a relative quantity whose scale is zero, for a series that never
-#: moves - a constant density, or an energy held at exactly zero.
-_TINY = 1.0e-30
 
 #: A standard calorimeter scan, 10 K/min, in the K/ns this package works in.
 #: The rate an experimental glass transition is measured at, and so the rate
@@ -167,20 +177,22 @@ class Equilibration:
         start_ps: Time that row sits at.
         n_samples: Rows in the retained window.
         n_independent_samples: Rows divided by the statistical inefficiency -
-            how many genuinely uncorrelated samples the window is worth.
+            how many genuinely uncorrelated samples the window is worth,
+            whatever unit the series is in.
         correlation_time_ps: The series' own correlation time.
-        relative_standard_error: Standard error of the window's mean, as a
-            fraction of its scale.
+        relative_standard_error: Standard error of the window's mean over
+            those independent samples, as a fraction of its scale.
         relative_drift: Change across the window from a straight-line fit, as
             a fraction of its scale.
-        equilibrated: Whether the window settled early enough, holds at least
-            :data:`MIN_INDEPENDENT_SAMPLES` independent samples, and drifts by
-            no more than :data:`MAX_RELATIVE_DRIFT` or its own standard error,
-            whichever is larger. This is one observable. It says that *this*
-            quantity stopped drifting faster than its own noise, not that the
-            system is equilibrated - a melt's density settles in a few hundred
-            picoseconds while its chains need tens of nanoseconds, and no
-            amount of converged density says anything about them.
+        equilibrated: Whether the window holds at least
+            :data:`MIN_INDEPENDENT_SAMPLES` independent samples and drifts by
+            no more than :data:`MAX_RELATIVE_DRIFT` or twice its own standard
+            error, whichever is larger. This is one observable. It says that
+            *this* quantity stopped drifting faster than its own noise, not
+            that the system is equilibrated - a melt's density settles in a
+            few hundred picoseconds while its chains need tens of
+            nanoseconds, and no amount of converged density says anything
+            about them.
     """
 
     start_index: int
@@ -314,7 +326,7 @@ class GlassTransition:
         data never went, and that deserves to propagate rather than look like
         a measurement.
         """
-        if abs(self.specific_volume_cm3_g) < _TINY:
+        if abs(self.specific_volume_cm3_g) < TINY:
             return math.nan
         return slope_cm3_g_k / self.specific_volume_cm3_g
 
@@ -365,6 +377,27 @@ class CoolingRateExtrapolation:
     n_parameters: int
     extrapolation_decades: float
     resolved: bool
+
+    @overload
+    def predict(self, rate_k_per_ns: float) -> float: ...
+
+    @overload
+    def predict(
+        self, rate_k_per_ns: npt.NDArray[np.float64]
+    ) -> npt.NDArray[np.float64]: ...
+
+    def predict(
+        self, rate_k_per_ns: float | npt.NDArray[np.float64]
+    ) -> float | npt.NDArray[np.float64]:
+        """The transition the fitted relation puts at a cooling rate, or several.
+
+        Evaluating it anywhere resolves nothing: how far a rate sits from the
+        measured ones is what :attr:`extrapolation_decades` is for.
+        """
+        transition = _transition_at(
+            self.form, self.parameters, np.asarray(rate_k_per_ns, dtype=np.float64)
+        )
+        return float(transition) if np.ndim(transition) == 0 else transition
 
     def wlf_constants(self, reference_k: float) -> tuple[float, float]:
         """The WLF constants this VFT fit is the same relation as.
@@ -496,7 +529,7 @@ def equilibration(
         window = series[start:]
         if window.size < 3:
             continue
-        inefficiency = _statistical_inefficiency(window)
+        inefficiency = statistical_inefficiency(window)
         effective = window.size / inefficiency
         if effective > best_effective:
             best_start = int(start)
@@ -505,35 +538,34 @@ def equilibration(
 
     window = series[best_start:]
     scale = _scale_of(window)
-    spacing = _spacing_ps(times)
     drift = _relative_drift(times[best_start:], window, scale)
-    standard_error = float(np.std(window) / np.sqrt(best_effective)) / scale
+    error = standard_error(window, best_effective) / scale
     return Equilibration(
         start_index=best_start,
         start_ps=float(times[best_start]),
         n_samples=int(window.size),
         n_independent_samples=float(best_effective),
-        correlation_time_ps=max(0.0, (best_inefficiency - 1.0) / 2.0) * spacing,
-        relative_standard_error=standard_error,
+        correlation_time_ps=(
+            max(0.0, (best_inefficiency - 1.0) / 2.0) * _spacing_ps(times)
+        ),
+        relative_standard_error=error,
         relative_drift=drift,
         equilibrated=(
-            best_start <= series.size * MAX_START_FRACTION
-            and best_effective >= MIN_INDEPENDENT_SAMPLES
-            and drift <= max(MAX_RELATIVE_DRIFT, 2.0 * standard_error)
+            best_effective >= MIN_INDEPENDENT_SAMPLES
+            and drift <= max(MAX_RELATIVE_DRIFT, 2.0 * error)
         ),
     )
 
 
-def _recorded_ladder(recorded: dict[str, Any]) -> tuple[list[float], list[float]]:
+def _recorded_ladder(samples: dict[str, Any]) -> tuple[list[float], list[float]]:
     """A stage's temperatures and densities, or two empty lists."""
-    samples = recorded.get("samples") or {}
     return (
         list(samples.get("segment_temperature_k") or ()),
         list(samples.get("segment_density_g_cm3") or ()),
     )
 
 
-def _is_quench(recorded: dict[str, Any]) -> bool:
+def _is_quench(samples: dict[str, Any]) -> bool:
     """Whether a stage cooled, from the temperatures it recorded.
 
     Every stage records a temperature and a density per segment, so holding a
@@ -542,7 +574,7 @@ def _is_quench(recorded: dict[str, Any]) -> bool:
     quench a quench is that it visited more than one temperature and every one
     was colder than the last.
     """
-    temperatures, densities = _recorded_ladder(recorded)
+    temperatures, densities = _recorded_ladder(samples)
     if len(temperatures) < 2 or not densities:
         return False
     return all(cooler < hotter for hotter, cooler in itertools.pairwise(temperatures))
@@ -551,11 +583,10 @@ def _is_quench(recorded: dict[str, Any]) -> bool:
 def quench_stages(run_dir: str | Path) -> tuple[str, ...]:
     """Name every stage in a run that cooled the cell down a ladder.
 
-    Found by what a stage recorded rather than by what it was called, so a
-    run that quenched twice - a coarse scan to locate the transition and a
-    fine one to resolve it - is read without anything having to agree in
-    advance on the names. Which is the coarse one is then a question for the
-    data: :attr:`QuenchCurve.temperature_step_k` tells them apart.
+    A run that quenched twice - a coarse scan to locate the transition and a
+    fine one to resolve it - gives both, and which is the coarse one is then
+    a question for the data: :attr:`QuenchCurve.temperature_step_k` tells
+    them apart.
 
     Args:
         run_dir: A directory :func:`~openmmpolymer.protocols.run_protocol`
@@ -567,22 +598,11 @@ def quench_stages(run_dir: str | Path) -> tuple[str, ...]:
     Raises:
         AnalysisError: There is no manifest, or nothing in it held a ladder.
     """
-    from .protocols import RunManifest
-
-    directory = Path(run_dir)
-    manifest = RunManifest.load(directory)
-    if manifest is None:
-        raise AnalysisError(f"No manifest in {directory}.")
-    found = tuple(
-        name for name, recorded in manifest.stages.items() if _is_quench(recorded)
+    return stages_holding(
+        run_dir,
+        _is_quench,
+        "that it stepped down a ladder of temperatures, so nothing there was a quench",
     )
-    if not found:
-        raise AnalysisError(
-            f"No stage in {directory} stepped down a ladder of temperatures, "
-            "so nothing there was a quench. It records: "
-            f"{', '.join(manifest.stages) or 'nothing'}."
-        )
-    return found
 
 
 def quench_curve(
@@ -608,28 +628,18 @@ def quench_curve(
         AnalysisError: There is no manifest, a named stage is not in it, or
             one recorded no per-temperature densities.
     """
-    from .protocols import RunManifest
-
     directory = Path(run_dir)
-    manifest = RunManifest.load(directory)
-    if manifest is None:
-        raise AnalysisError(f"No manifest in {directory}.")
-    names = [stage] if isinstance(stage, str) else list(stage)
-    if not names:
-        raise AnalysisError("No stage was named, so there is no curve to read.")
+    manifest = load_manifest(directory)
+    names = stage_names(stage)
 
     temperatures: list[float] = []
     densities: list[float] = []
     holds: list[float] = []
     csv_paths: list[Any] = []
     for name in names:
-        recorded = manifest.stages.get(name)
-        if recorded is None:
-            raise AnalysisError(
-                f"The manifest in {directory} has no stage {name!r}. It "
-                f"records: {', '.join(manifest.stages) or 'nothing'}."
-            )
-        step_temperatures, step_densities = _recorded_ladder(recorded)
+        recorded = stage_record(manifest, name, directory)
+        samples = recorded.get("samples") or {}
+        step_temperatures, step_densities = _recorded_ladder(samples)
         if not step_temperatures or not step_densities:
             raise AnalysisError(
                 f"Stage {name!r} recorded no per-temperature densities, so it "
@@ -638,7 +648,7 @@ def quench_curve(
             )
         temperatures.extend(step_temperatures)
         densities.extend(step_densities)
-        holds.extend((recorded.get("samples") or {}).get("segment_duration_ps") or ())
+        holds.extend(samples.get("segment_duration_ps") or ())
         csv_paths.append(recorded.get("csv"))
 
     temperature = np.asarray(temperatures, dtype=np.float64)
@@ -683,8 +693,6 @@ def glass_transition(
         AnalysisError: The curve is too short to give both branches
             *min_points_per_branch* points.
     """
-    from ._validation import require_integer
-
     per_branch = require_integer(min_points_per_branch, name="min_points_per_branch")
     temperature = curve.temperature_k
     volume = curve.specific_volume_cm3_g
@@ -697,10 +705,10 @@ def glass_transition(
 
     best: tuple[float, int, tuple[float, float], tuple[float, float]] | None = None
     for break_index in range(per_branch, temperature.size - per_branch + 1):
-        glass, glass_residual = _fit_line(
+        glass, glass_residual = fit_line(
             temperature[:break_index], volume[:break_index]
         )
-        melt, melt_residual = _fit_line(temperature[break_index:], volume[break_index:])
+        melt, melt_residual = fit_line(temperature[break_index:], volume[break_index:])
         total = glass_residual + melt_residual
         if best is None or total < best[0]:
             best = (total, break_index, glass, melt)
@@ -711,7 +719,7 @@ def glass_transition(
     melt_slope, melt_intercept = melt
 
     separation = melt_slope - glass_slope
-    if abs(separation) < _TINY:
+    if abs(separation) < TINY:
         crossing = float(temperature[break_index - 1])
         resolved = False
     else:
@@ -782,8 +790,6 @@ def cooling_rate_extrapolation(
         AnalysisError: There are too few transitions for the form, one has no
             recorded cooling rate, or two were measured at the same rate.
     """
-    from ._validation import require_choice, require_positive
-
     require_choice(form, EXTRAPOLATION_FORMS, name="form")
     target = require_positive(target_rate_k_per_ns, None, name="target_rate_k_per_ns")
     n_parameters = _FORM_PARAMETERS[form]
@@ -832,15 +838,11 @@ def cooling_rate_extrapolation(
 
     if form == "log_linear":
         parameters, total = _fit_log_linear(rate, transition)
-        temperature = parameters["a_k"] + parameters["b_k_per_decade"] * math.log10(
-            target
-        )
         sensitivity = parameters["b_k_per_decade"]
         physical = sensitivity > 0.0
     else:
         parameters, total, degenerate = _fit_vft(rate, transition)
         gap = parameters["ln_r0"] - math.log(target)
-        temperature = parameters["t0_k"] + parameters["b_k"] / gap
         sensitivity = math.log(10.0) * parameters["b_k"] / gap**2
         physical = parameters["b_k"] > 0.0 and not degenerate
 
@@ -850,7 +852,7 @@ def cooling_rate_extrapolation(
         cooling_rate_k_per_ns=rate,
         transition_k=transition,
         target_rate_k_per_ns=target,
-        temperature_k=float(temperature),
+        temperature_k=float(_transition_at(form, parameters, np.asarray(target))),
         sensitivity_k_per_decade=float(sensitivity),
         parameters=parameters,
         residual_k=float(np.sqrt(total / rate.size)),
@@ -869,24 +871,18 @@ def cooling_rate_extrapolation(
 def _fit_log_linear(
     rate_k_per_ns: npt.NDArray[np.float64], transition_k: npt.NDArray[np.float64]
 ) -> tuple[dict[str, float], float]:
-    """Fit ``Tg = a + b log10(R)``, reusing the straight-line fit above."""
-    (slope, intercept), total = _fit_line(np.log10(rate_k_per_ns), transition_k)
+    """Fit ``Tg = a + b log10(R)``, a straight line in log rate."""
+    (slope, intercept), total = fit_line(np.log10(rate_k_per_ns), transition_k)
     return {"a_k": intercept, "b_k_per_decade": slope}, total
 
 
 def _fit_vft(
     rate_k_per_ns: npt.NDArray[np.float64], transition_k: npt.NDArray[np.float64]
 ) -> tuple[dict[str, float], float, bool]:
-    """Fit ``Tg = T0 + B / (ln R0 - ln R)`` with numpy alone.
+    """Fit ``Tg = T0 + B / (ln R0 - ln R)``, which is linear in T0 and B.
 
-    Three parameters and no scipy, but the problem separates: for any fixed
-    ``ln R0`` the relation is linear in ``T0`` and ``B``, so a three-parameter
-    nonlinear fit collapses to a one-dimensional search with an exact
-    least-squares solve inside it. ``ln R0`` is searched as a log gap above
-    the fastest measured rate, which keeps ``ln(R0/R) > 0`` for every point
-    without a constraint. A coarse sweep and three zoom rounds is some three
-    hundred solves of a tiny system: deterministic, derivative-free, and with
-    no way to fail to converge.
+    ``ln R0`` is searched as a log gap above the fastest measured rate, which
+    keeps ``ln(R0/R) > 0`` for every point without a constraint.
 
     Returns the parameters, the sum of squared residuals, and whether the
     optimum ran to an end of the bracket - which means the fit has degenerated
@@ -894,37 +890,32 @@ def _fit_vft(
     """
     log_rate = np.log(rate_k_per_ns)
     fastest = float(log_rate.max())
-
-    def solve(gap_log: float) -> tuple[float, float, float]:
-        ln_r0 = fastest + math.exp(gap_log)
-        design = np.vstack([1.0 / (ln_r0 - log_rate), np.ones_like(log_rate)]).T
-        solution, *_ = np.linalg.lstsq(design, transition_k, rcond=None)
-        # Computed rather than taken from lstsq, which returns an empty
-        # residual array for an exactly-determined system.
-        residual = transition_k - design @ solution
-        return float(solution[0]), float(solution[1]), float(residual @ residual)
-
-    lower, upper = _VFT_GAP_BRACKET
-    grid = np.linspace(lower, upper, 181)
-    best_gap, best = lower, solve(lower)
-    for _ in range(4):
-        for candidate in grid:
-            trial = solve(float(candidate))
-            if trial[2] < best[2]:
-                best_gap, best = float(candidate), trial
-        span = float(grid[1] - grid[0])
-        grid = np.linspace(max(lower, best_gap - span), min(upper, best_gap + span), 41)
-
-    b_k, t0_k, total = best
-    degenerate = best_gap <= lower + 1.0e-9 or best_gap >= upper - 1.0e-9
-    if degenerate:
+    gap, b_k, t0_k, total, edge = separable_fit(
+        lambda gap: 1.0 / (fastest + math.exp(gap) - log_rate),
+        transition_k,
+        _VFT_GAP_BRACKET,
+    )
+    if edge:
         log.info(
             "The VFT search ran to the edge of its bracket, so these data are "
             "a straight line in log rate and R0 is unbounded. Report the "
             "log-linear fit instead."
         )
-    parameters = {"t0_k": t0_k, "b_k": b_k, "ln_r0": fastest + math.exp(best_gap)}
-    return parameters, total, degenerate
+    parameters = {"t0_k": t0_k, "b_k": b_k, "ln_r0": fastest + math.exp(gap)}
+    return parameters, total, bool(edge)
+
+
+def _transition_at(
+    form: str, parameters: dict[str, float], rate_k_per_ns: npt.NDArray[np.float64]
+) -> npt.NDArray[np.float64]:
+    """The transition a fitted relation puts at each cooling rate."""
+    if form == "log_linear":
+        return parameters["a_k"] + parameters["b_k_per_decade"] * np.log10(
+            rate_k_per_ns
+        )
+    return parameters["t0_k"] + parameters["b_k"] / (
+        parameters["ln_r0"] - np.log(rate_k_per_ns)
+    )
 
 
 def _extrapolation_decades(
@@ -965,39 +956,13 @@ def _is_transition(
     return lower <= crossing_k <= upper
 
 
-def _statistical_inefficiency(values: npt.NDArray[np.float64]) -> float:
-    """Return ``1 + 2 * sum(C(t))``, the samples one sample is worth.
-
-    The autocorrelation comes from an FFT, and the sum is truncated at its
-    first non-positive term: past that point the estimator is noise, and
-    summing the noise is how a correlation time ends up longer than the run.
-    """
-    n = values.size
-    centred = values - values.mean()
-    variance = float(centred @ centred) / n
-    if variance <= _TINY:
-        return 1.0
-    size = 1 << int(np.ceil(np.log2(2 * n)))
-    spectrum = np.fft.rfft(centred, size)
-    correlation = np.fft.irfft(spectrum * np.conjugate(spectrum), size)[:n].real
-    correlation /= n * variance
-
-    total = 0.0
-    for lag in range(1, n):
-        term = float(correlation[lag])
-        if term <= 0.0:
-            break
-        total += term * (1.0 - lag / n)
-    return max(1.0, 1.0 + 2.0 * total)
-
-
 def _scale_of(values: npt.NDArray[np.float64]) -> float:
     """A scale to make a drift or an error relative to.
 
     The mean, unless the series straddles zero - a total energy can - in which
     case its spread is the only meaningful scale.
     """
-    return max(abs(float(values.mean())), float(np.std(values)), _TINY)
+    return max(abs(float(values.mean())), float(np.std(values)), TINY)
 
 
 def _spacing_ps(times: npt.NDArray[np.float64]) -> float:
@@ -1014,25 +979,10 @@ def _relative_drift(
     if values.size < 2:
         return 0.0
     span = float(times[-1] - times[0])
-    if abs(span) < _TINY:
+    if abs(span) < TINY:
         return 0.0
     slope = float(np.polyfit(times, values, 1)[0])
     return abs(slope * span) / scale
-
-
-def _fit_line(
-    x: npt.NDArray[np.float64], y: npt.NDArray[np.float64]
-) -> tuple[tuple[float, float], float]:
-    """Least-squares line through *x*, *y*, with its sum of squared residuals."""
-    design = np.vstack([x, np.ones_like(x)]).T
-    solution, residuals, *_ = np.linalg.lstsq(design, y, rcond=None)
-    slope, intercept = float(solution[0]), float(solution[1])
-    if residuals.size:
-        total = float(residuals[0])
-    else:
-        predicted = design @ solution
-        total = float(((y - predicted) ** 2).sum())
-    return (slope, intercept), total
 
 
 def _hold_of(

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import math
 import shutil
 from pathlib import Path
 from typing import Any
@@ -21,7 +20,7 @@ from openmmpolymer.structure import (
 )
 from openmmpolymer.trajectory import AnalysisError
 
-from .helpers import _write_manifest, synthetic_ensemble, write_polymer_snapshot
+from .helpers import synthetic_ensemble, write_manifest, write_polymer_snapshot
 
 ROD_SQUARE_NM2 = (4 * 0.153) ** 2
 
@@ -93,16 +92,19 @@ def test_a_stage_with_a_trajectory_is_readable(dimer_run_directory: Path) -> Non
 
 def test_a_stage_that_left_no_files_is_not_readable(tmp_path: Path) -> None:
     """A manifest entry with nothing on disk behind it is not coordinates."""
-    _write_manifest(tmp_path, {"05_npt": {"name": "05_npt", "samples": {}}})
+    write_manifest(tmp_path, {"05_npt": {"name": "05_npt", "samples": {}}})
     with pytest.raises(AnalysisError, match="left coordinates"):
         structure_stages(tmp_path)
 
 
-def test_a_directory_with_no_manifest_is_refused_in_the_usual_words(
+def test_a_directory_with_no_manifest_or_no_stages_is_refused_in_the_usual_words(
     tmp_path: Path,
 ) -> None:
-    """The refusal is the one stage_files already gives, not a new one."""
+    """The refusals are the ones stage_files already gives, not new ones."""
     with pytest.raises(AnalysisError, match="No manifest"):
+        structure_stages(tmp_path)
+    write_manifest(tmp_path, {})
+    with pytest.raises(AnalysisError, match="no completed stages"):
         structure_stages(tmp_path)
 
 
@@ -180,18 +182,6 @@ def test_analysis_uses_saved_polymer_dimensions_unless_overridden(
     assert report.conformation.mean.expected_characteristic_ratio == expected
 
 
-def test_a_workflow_record_supplies_the_backbone(tmp_path: Path) -> None:
-    """The scans write chain_backbone beside the manifest; it is read back."""
-    write_polymer_snapshot(tmp_path)
-    (tmp_path / "tg_workflow.json").write_text(
-        json.dumps({"chain_backbone": [4, 3, 2, 1, 0]})
-    )
-    report = analyse_structure(tmp_path)
-    assert report.backbone == (4, 3, 2, 1, 0)
-    assert report.backbone_source == "workflow"
-    assert report.backbone_file == "tg_workflow.json"
-
-
 def test_the_manifest_supplies_the_backbone_when_it_records_one(
     tmp_path: Path,
 ) -> None:
@@ -253,33 +243,22 @@ def test_a_backbone_given_wrongly_is_not_guessed_past(tmp_path: Path) -> None:
     assert not any("inferred" in note for note in report.notes)
 
 
-def test_a_bad_workflow_record_is_noted_and_inference_carries_on(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("recorded", "note"),
+    [([0, 99], "manifest.json was not used"), ("abc", "not a list of atom indices")],
+)
+def test_a_bad_recorded_backbone_is_noted_and_inference_carries_on(
+    tmp_path: Path, recorded: Any, note: str
 ) -> None:
+    """A recorded path that does not fit is not a reason to stop reading."""
     write_polymer_snapshot(tmp_path)
-    (tmp_path / "mechanical_workflow.json").write_text(
-        json.dumps({"chain_backbone": [0, 99]})
-    )
+    path = tmp_path / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["chains"] = {"backbone": recorded}
+    path.write_text(json.dumps(manifest))
     report = analyse_structure(tmp_path)
     assert report.backbone_source == "inferred"
-    assert any("mechanical_workflow.json was not used" in note for note in report.notes)
-
-
-def test_a_workflow_record_that_is_not_a_list_is_noted(tmp_path: Path) -> None:
-    write_polymer_snapshot(tmp_path)
-    (tmp_path / "tg_workflow.json").write_text(json.dumps({"chain_backbone": "abc"}))
-    report = analyse_structure(tmp_path)
-    assert report.backbone_source == "inferred"
-    assert any("not a list of atom indices" in note for note in report.notes)
-
-
-def test_a_workflow_file_that_cannot_be_read_is_skipped(tmp_path: Path) -> None:
-    """A half-written record is not a reason to stop reading the run."""
-    write_polymer_snapshot(tmp_path)
-    (tmp_path / "tg_workflow.json").write_text("{not json")
-    (tmp_path / "viscoelastic_workflow.json").write_text(json.dumps({"other": 1}))
-    report = analyse_structure(tmp_path)
-    assert report.backbone_source == "inferred"
+    assert any(note in text for text in report.notes)
 
 
 def test_a_structure_without_bond_records_leaves_the_backbone_unknown(
@@ -393,7 +372,8 @@ def test_the_report_writes_a_record_and_its_figures(tmp_path: Path) -> None:
     report = analyse_structure(tmp_path, backbone=(0, 1, 2, 3, 4))
     files = write_structure_report(report, tmp_path / "analysis")
 
-    record = json.loads(Path(files.json).read_text())
+    # Strict JSON: parse_constant refuses the NaN and Infinity tokens outright.
+    record = json.loads(Path(files.json).read_text(), parse_constant=_refuse)
     assert record["openmmpolymer"]
     assert record["stage"] == "05_npt"
     assert record["stage_source"] == "last_snapshot"
@@ -408,7 +388,8 @@ def test_the_report_writes_a_record_and_its_figures(tmp_path: Path) -> None:
     )
     assert record["conformation"]["settled"] is None
     assert record["persistence"]["decayed"] is False
-    assert math.isinf(record["persistence"]["persistence_length_nm"])
+    # An unbounded persistence length is undefined, which strict JSON spells null.
+    assert record["persistence"]["persistence_length_nm"] is None
     assert record["radial_distribution"]["n_frames"] == 1
     assert record["structure_factor"]["n_frames"] == 1
     assert record["displacement"] is None
@@ -454,3 +435,7 @@ def test_a_trajectory_report_draws_the_dynamics(dimer_run_directory: Path) -> No
     record = json.loads(Path(files.json).read_text())
     assert record["displacement"]["n_origins"] == 10
     assert record["relaxation"]["decorrelated"] in (True, False)
+
+
+def _refuse(token: str) -> None:
+    raise ValueError(f"{token} is not JSON")

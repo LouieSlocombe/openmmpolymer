@@ -11,7 +11,7 @@ import pytest
 
 from openmmpolymer import __main__ as cli
 
-from .helpers import _write_manifest, state_data_csv
+from .helpers import state_data_csv, write_manifest
 
 
 def _state_run(directory: Path) -> None:
@@ -23,7 +23,7 @@ def _state_run(directory: Path) -> None:
     ]
     csv = directory / "hold.csv"
     csv.write_text(state_data_csv(rows))
-    _write_manifest(
+    write_manifest(
         directory, {"hold": {"name": "hold", "csv": str(csv), "samples": {}}}
     )
 
@@ -89,15 +89,12 @@ def test_saved_convergence_cli_writes_strict_json_and_status(
     ],
 )
 def test_invalid_convergence_controls_cannot_reach_dynamics_or_write_output(
-    controls: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    controls: list[str], no_build: list[Any]
 ) -> None:
-    def unexpected(*args: Any, **kwargs: Any) -> Any:
-        pytest.fail("saved convergence analysis attempted a new build")
-
-    monkeypatch.setattr(cli, "build_chain", unexpected)
     with pytest.raises(SystemExit, match="2"):
         cli.main(["--convergence", "-o", "new", *controls])
-    assert not (tmp_path / "new").exists()
+    assert not no_build
+    assert not Path("new").exists()
 
 
 def test_convergence_defaults_output_to_saved_analysis(tmp_path: Path) -> None:

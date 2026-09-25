@@ -4,12 +4,10 @@ Rates are kelvin per nanosecond, never strain rates. Glass transitions use
 one fixed cooling ladder; melting uses a supplied crystal and one fixed
 heating ladder. Both empirical extrapolations remain finite-rate estimates.
 In particular, a heating extrapolation does not establish equilibrium melting.
-The existing two-pass Tg scan and its log-linear/VFT analysis are unchanged.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from collections.abc import Sequence
@@ -19,25 +17,25 @@ from typing import Any
 
 import numpy as np
 
-from ._rate_scan import (
-    state_digest,
-    validate_extrapolation_limit,
+from ._files import file_sha256, write_json
+from ._validation import require_integer
+from ._workflow import (
+    chain_options,
+    require_distinct,
+    resumable_record,
+    run_fingerprint,
+    settled_state,
+    start_fingerprint,
     validate_hold_times,
-    write_workflow,
 )
-from ._validation import require_integer, require_positive
-from .protocols import (
-    Protocol,
-    RunManifest,
-    Stage,
-    run_protocol,
-    validate_run_inputs,
-)
+from .mdsystem import ensemble_controls
+from .protocols import Protocol, RunManifest, Stage, run_protocol
 from .rate_dependence import (
     RateObservation,
     RateProperty,
     RateReport,
     analyse_rate_observations,
+    validate_rate_request,
 )
 from .reporters import TrajectoryOptions
 from .simulate import RunContext, safe_timestep_fs
@@ -101,11 +99,6 @@ def _property(property_name: str) -> RateProperty:
         ) from error
 
 
-def _analysis_options(target_rate: float, max_extrapolation_decades: float) -> None:
-    require_positive(target_rate, None, name="target_rate")
-    validate_extrapolation_limit(max_extrapolation_decades)
-
-
 def _thermal_protocol(
     temperatures: tuple[float, ...], hold: float, spec: TgSpec | TmSpec
 ) -> Protocol:
@@ -161,7 +154,7 @@ def validate_thermal_rate_scan(
     initial temperature is nevertheless held in every measurement history.
     """
     _property(property_name)
-    _analysis_options(target_rate, max_extrapolation_decades)
+    validate_rate_request(target_rate, max_extrapolation_decades)
     n_replicas = require_integer(n_replicas, name="n_replicas")
     holds = validate_hold_times(hold_times_ps)
     if property_name == "glass_transition":
@@ -204,16 +197,15 @@ def validate_thermal_rate_scan(
 
 
 def _check_system(run: RunContext) -> None:
+    """Refuse a System that would fight the stages' own thermostat and barostat."""
     import openmm as mm
 
-    system = mm.XmlSerializer.deserialize(run.system_xml)
-    if any(
-        "Barostat" in type(force).__name__ or isinstance(force, mm.AndersenThermostat)
-        for force in system.getForces()
-    ):
+    controls = ensemble_controls(mm.XmlSerializer.deserialize(run.system_xml))
+    if controls:
         raise ThermalRateError(
             "The supplied System must contain no barostat or Andersen thermostat; "
-            "the thermal stages provide their own temperature and pressure control."
+            "the thermal stages provide their own temperature and pressure "
+            f"control. It carries {', '.join(controls)}."
         )
 
 
@@ -282,7 +274,7 @@ def run_thermal_rate_scan(
     n_replicas = plan.n_replicas
     _check_system(run)
     timestep = safe_timestep_fs(max(plan.temperatures_k), run.spec)
-    entries = []
+    entries: list[dict[str, Any]] = []
     for rate_index, protocol in enumerate(plan.protocols):
         for replica in range(n_replicas):
             actual = _replica_protocol(protocol, rate_index, replica, timestep)
@@ -294,6 +286,9 @@ def run_thermal_rate_scan(
                     "protocol": asdict(actual),
                 }
             )
+    chains = chain_options(
+        chain_backbone, atoms_per_chain, expected_characteristic_ratio
+    )
     request = json.loads(
         json.dumps(
             {
@@ -304,20 +299,12 @@ def run_thermal_rate_scan(
                 "equilibration": asdict(plan.equilibration),
                 "target_rate": target_rate,
                 "max_extrapolation_decades": max_extrapolation_decades,
-                "system_spec": asdict(run.spec),
-                "system_sha256": hashlib.sha256(run.system_xml.encode()).hexdigest(),
-                "coordinates_sha256": hashlib.sha256(
-                    np.asarray(run.box.positions_nm, dtype=np.float64).tobytes()
-                ).hexdigest(),
-                "box_nm": list(run.box.box_nm),
-                "seed": run.seed,
-                "state_sha256": None if state_in is None else state_digest(state_in),
+                **run_fingerprint(run, spec_key="system_spec"),
+                "state_sha256": None if state_in is None else file_sha256(state_in),
                 "crystalline_supplied": crystalline
                 if property_name == "melting_temperature"
                 else None,
-                "chain_backbone": chain_backbone,
-                "atoms_per_chain": atoms_per_chain,
-                "expected_characteristic_ratio": expected_characteristic_ratio,
+                **chains,
             },
             allow_nan=False,
             default=str,
@@ -325,36 +312,22 @@ def run_thermal_rate_scan(
     )
     directory = Path(output_dir).resolve()
     workflow = directory / WORKFLOW_NAME
-    previous: dict[str, Any] = {}
-    if workflow.is_file():
-        previous = json.loads(workflow.read_text())
-        if previous.get("request") != request:
-            raise ThermalRateError(
-                "Thermal rate settings or starting inputs changed; use a fresh directory."
-            )
-    elif directory.exists() and any(directory.rglob("manifest.json")):
-        raise ThermalRateError(
-            "Existing runs lack the thermal rate workflow record; use a fresh directory."
-        )
-    if resume:
-        validate_run_inputs(run, directory / "equilibration")
+    record = resumable_record(
+        run,
+        workflow,
+        request,
+        [entry["directory"] for entry in entries],
+        resume=resume,
+        error=ThermalRateError,
+    )
     directory.mkdir(parents=True, exist_ok=True)
-    record = {
-        "request": request,
-        "entries": entries,
-        "temperatures_k": plan.temperatures_k,
-        "total_ns": plan.total_ns,
-    }
-    if resume and "start_state_sha256" in previous:
-        record.update(
-            {name: previous[name] for name in ("start_state", "start_state_sha256")}
-        )
-    write_workflow(workflow, record)
-    chains: dict[str, Any] = {
-        "chain_backbone": chain_backbone,
-        "atoms_per_chain": atoms_per_chain,
-        "expected_characteristic_ratio": expected_characteristic_ratio,
-    }
+    record.update(
+        request=request,
+        entries=entries,
+        temperatures_k=plan.temperatures_k,
+        total_ns=plan.total_ns,
+    )
+    write_json(workflow, record)
     settled = run_protocol(
         plan.equilibration,
         run,
@@ -363,16 +336,14 @@ def run_thermal_rate_scan(
         state_in=state_in,
         **chains,
     )
-    start = Path(settled.final_state)
-    if not start.is_file():
-        raise ThermalRateError("The common preparation did not save a final state.")
-    fingerprint = state_digest(start)
-    if resume and record.get("start_state_sha256", fingerprint) != fingerprint:
-        raise ThermalRateError(
-            "The common preparation state changed; use a fresh directory."
-        )
-    record.update(start_state=str(start), start_state_sha256=fingerprint)
-    write_workflow(workflow, record)
+    start = settled_state(
+        settled, directory / "equilibration", error=ThermalRateError, verb="branch"
+    )
+    record.update(
+        start_state=start,
+        start_state_sha256=start_fingerprint(start, record, error=ThermalRateError),
+    )
+    write_json(workflow, record)
     for rate_index, protocol in enumerate(plan.protocols):
         for replica in range(n_replicas):
             run_protocol(
@@ -439,36 +410,30 @@ def _directories(
     run_dirs: Sequence[str | Path], property_name: str
 ) -> list[tuple[Path, dict[str, Any] | None, dict[str, Any] | None]]:
     result: list[tuple[Path, dict[str, Any] | None, dict[str, Any] | None]] = []
-    seen: set[Path] = set()
     for value in run_dirs:
         directory = Path(value).resolve()
         workflow = directory / WORKFLOW_NAME
-        if workflow.is_file():
-            record = json.loads(workflow.read_text())
-            if record.get("request", {}).get("property_name") != property_name:
-                raise AnalysisError(
-                    f"{workflow} measures a different thermal property."
-                )
-            entries = record.get("entries", [])
-            expected = len(record["request"].get("hold_times_ps", [])) * record[
-                "request"
-            ].get("n_replicas", 0)
-            if not entries or len(entries) != expected:
-                raise AnalysisError(f"{workflow} records an incomplete thermal series.")
-            for entry in entries:
-                candidate = (directory / entry["directory"]).resolve()
-                if not candidate.is_relative_to(directory):
-                    raise AnalysisError(f"{workflow} has a directory outside its scan.")
-                _check_completed(candidate, entry)
-                result.append((candidate, record, entry))
-        else:
+        if not workflow.is_file():
             result.append((directory, None, None))
-    for directory, _, _ in result:
-        if directory in seen:
-            raise AnalysisError(f"{directory} was supplied more than once.")
-        seen.add(directory)
-    if not result:
-        raise AnalysisError("Supply saved thermal rate run directories.")
+            continue
+        record = json.loads(workflow.read_text())
+        if record.get("request", {}).get("property_name") != property_name:
+            raise AnalysisError(f"{workflow} measures a different thermal property.")
+        entries = record.get("entries", [])
+        expected = len(record["request"].get("hold_times_ps", [])) * record[
+            "request"
+        ].get("n_replicas", 0)
+        if not entries or len(entries) != expected:
+            raise AnalysisError(f"{workflow} records an incomplete thermal series.")
+        for entry in entries:
+            candidate = (directory / entry["directory"]).resolve()
+            if not candidate.is_relative_to(directory):
+                raise AnalysisError(f"{workflow} has a directory outside its scan.")
+            _check_completed(candidate, entry)
+            result.append((candidate, record, entry))
+    require_distinct(
+        [directory for directory, _, _ in result], what="thermal histories"
+    )
     return result
 
 
@@ -524,7 +489,7 @@ def analyse_thermal_rates(
     a melting bracket remains a finite-grid bracket, never a standard error.
     """
     property_ = _property(property_name)
-    _analysis_options(target_rate, max_extrapolation_decades)
+    validate_rate_request(target_rate, max_extrapolation_decades)
     directories = _directories(run_dirs, property_name)
     observations: list[RateObservation] = []
     notes: list[str] = [
@@ -661,9 +626,6 @@ def analyse_thermal_rates(
         property=property_,
         target_rate=target_rate,
         max_extrapolation_decades=max_extrapolation_decades,
+        run_dirs=[str(directory) for directory, _, _ in directories],
     )
-    return replace(
-        report,
-        notes=tuple(notes) + report.notes,
-        run_dirs=tuple(str(directory) for directory, _, _ in directories),
-    )
+    return replace(report, notes=tuple(notes) + report.notes)
