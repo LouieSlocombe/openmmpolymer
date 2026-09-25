@@ -68,15 +68,12 @@ def methanol_sdf(tmp_path: Path) -> str:
     return str(path)
 
 
-# Observed loading a NAGL model, which reads a torch archive:
-#   PytestUnraisableExceptionWarning: Exception ignored while finalizing file
-#   <_io.FileIO name='.../openff-gnn-am1bcc-1.0.0.pt' mode='rb' closefd=True>
-# A file handle the model loader leaves to the garbage collector. Scoped to
-# the test that loads a model rather than relaxed globally, so the suite-wide
-# "warnings are errors" stays as it is.
+# openff.nagl_models._dynamic_fetch._get_sha256 leaves the model file unclosed.
+# Filter its ResourceWarning before pytest wraps it as an unraisable exception:
+# the wrapper wording differs between Python 3.12 and 3.14. Keep the exception
+# scoped to NAGL AM1-BCC model files in this test; other warnings remain errors.
 @pytest.mark.filterwarnings(
-    "ignore:Exception ignored while finalizing file"
-    ":pytest.PytestUnraisableExceptionWarning"
+    r"ignore:unclosed file .*openff-gnn-am1bcc-.*\.pt['\"]>:ResourceWarning"
 )
 @pytest.mark.forcefield
 def test_nagl_charges_a_molecule_with_a_released_model(methanol_sdf: str) -> None:
