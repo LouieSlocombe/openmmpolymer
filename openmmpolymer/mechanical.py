@@ -43,14 +43,15 @@ import numpy as np
 from ._files import ReportFiles, write_json
 from ._validation import require_axis, require_integer
 from ._workflow import (
+    StrainSchedule,
     check_request,
+    deformation_stages,
     equilibrate,
     equilibration_at,
     group_by_stem,
     optional,
     remaining_ps,
     require_positive_fields,
-    resume_chunks,
     run_branches,
     sample_spread,
     scan_listing,
@@ -216,7 +217,7 @@ DEFAULT_SPEC = ModulusSpec()
 
 
 @dataclass(frozen=True)
-class ModulusSchedule:
+class ModulusSchedule(StrainSchedule):
     """One extension's ladder, and what it costs.
 
     Args:
@@ -224,25 +225,6 @@ class ModulusSchedule:
         increment: Engineering strain added per step.
         relax_ps: Time held at each.
     """
-
-    n_steps: int
-    increment: float
-    relax_ps: float
-
-    @property
-    def max_strain(self) -> float:
-        """The strain the ladder reaches, compounding each increment."""
-        return float((1.0 + self.increment) ** self.n_steps - 1.0)
-
-    @property
-    def total_ps(self) -> float:
-        """How much dynamics the whole ladder is."""
-        return self.relax_ps * self.n_steps
-
-    @property
-    def strain_rate_per_ns(self) -> float:
-        """The rate the ladder amounts to, in strain per nanosecond."""
-        return self.max_strain / self.total_ps * 1000.0
 
 
 @dataclass(frozen=True)
@@ -300,11 +282,8 @@ def deform_schedule(spec: ModulusSpec) -> ModulusSchedule:
     increments, because that is what the deformation actually does: each
     increment scales a cell that the last one already scaled.
     """
-    steps = math.ceil(math.log1p(spec.max_strain) / math.log1p(spec.strain_increment))
-    return ModulusSchedule(
-        n_steps=max(1, int(steps)),
-        increment=spec.strain_increment,
-        relax_ps=spec.relax_ps,
+    return ModulusSchedule.reaching(
+        spec.max_strain, spec.strain_increment, spec.relax_ps
     )
 
 
@@ -332,28 +311,17 @@ def deform_protocol(
     Returns:
         The protocol.
     """
-    schedule = deform_schedule(spec)
-    stages = [
-        Stage(
-            f"{DEFORM_STEM}_r{replica}_{index:02d}",
-            "deform",
-            {
-                "temperature_k": spec.temperature_k,
-                "pressure_bar": spec.pressure_bar,
-                "axis": spec.axis,
-                "strain_increment": spec.strain_increment,
-                "n_steps": len(steps),
-                "relax_ps": spec.relax_ps,
-                "strain_start": (1.0 + spec.strain_increment) ** steps.start - 1.0,
-                "samples_per_step": spec.samples_per_step,
-                "timestep_fs": timestep_fs,
-                "new_velocities": index == 0,
-            },
-        )
-        for index, steps in enumerate(
-            resume_chunks(schedule.n_steps, spec.relax_ps, spec.stage_ps)
-        )
-    ]
+    stages = deformation_stages(
+        deform_schedule(spec),
+        stem=f"{DEFORM_STEM}_r{replica}",
+        chunk_digits=2,
+        stage_ps=spec.stage_ps,
+        temperature_k=spec.temperature_k,
+        pressure_bar=spec.pressure_bar,
+        axis=spec.axis,
+        samples_per_step=spec.samples_per_step,
+        timestep_fs=timestep_fs,
+    )
     return Protocol(PROTOCOL_NAME, with_reference_box(stages, reference_box_nm))
 
 

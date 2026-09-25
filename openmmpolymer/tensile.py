@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, fields, replace
@@ -48,6 +47,8 @@ import numpy as np
 from ._files import ReportFiles, json_value, write_json
 from ._validation import require_axis, require_finite, require_integer, require_positive
 from ._workflow import (
+    StrainSchedule,
+    deformation_stages,
     equilibrated_box_nm,
     run_fingerprint,
     sample_spread,
@@ -58,12 +59,10 @@ from .plots import plot_breaking_strength, plot_elongation_at_break, plot_yield_
 from .protocols import (
     Protocol,
     RunManifest,
-    Stage,
     run_protocol,
     standard_melt_equilibration,
     validate_run_inputs,
 )
-from .reporters import TrajectoryOptions
 from .simulate import RunContext, safe_timestep_fs
 from .strength import (
     BreakingStrength,
@@ -209,27 +208,8 @@ class YieldSpec(TensileSpec):
 
 
 @dataclass(frozen=True)
-class TensileSchedule:
+class TensileSchedule(StrainSchedule):
     """One replica's compounded strain ladder and simulated duration."""
-
-    n_steps: int
-    increment: float
-    relax_ps: float
-
-    @property
-    def max_strain(self) -> float:
-        """Actual final engineering strain, including the last full increment."""
-        return float((1.0 + self.increment) ** self.n_steps - 1.0)
-
-    @property
-    def total_ps(self) -> float:
-        """Total duration of the holds."""
-        return self.n_steps * self.relax_ps
-
-    @property
-    def strain_rate_per_ns(self) -> float:
-        """Average engineering strain rate; the logarithmic rate is constant."""
-        return self.max_strain / self.total_ps * 1000.0
 
 
 @dataclass(frozen=True)
@@ -454,8 +434,9 @@ def _measurement(spec: TensileSpec) -> TensileMeasurement[Any]:
 
 def tensile_schedule(spec: TensileSpec) -> TensileSchedule:
     """Price one replica's ladder with the increments the engine applies."""
-    steps = math.ceil(math.log1p(spec.max_strain) / math.log1p(spec.strain_increment))
-    return TensileSchedule(steps, spec.strain_increment, spec.relax_ps)
+    return TensileSchedule.reaching(
+        spec.max_strain, spec.strain_increment, spec.relax_ps
+    )
 
 
 def tensile_protocol(
@@ -474,30 +455,20 @@ def tensile_protocol(
     measurement = _measurement(spec)
     require_integer(replica, minimum=0, name="replica")
     require_positive(timestep_fs, None, name="timestep_fs")
-    n_steps = tensile_schedule(spec).n_steps
-    per_chunk = int(spec.stage_ps // spec.relax_ps)
-    stages: list[Stage] = []
-    for chunk, done in enumerate(range(0, n_steps, per_chunk)):
-        options: dict[str, Any] = {
-            "temperature_k": spec.temperature_k,
-            "pressure_bar": spec.pressure_bar,
-            "axis": spec.axis,
-            "strain_increment": spec.strain_increment,
-            "n_steps": min(per_chunk, n_steps - done),
-            "relax_ps": spec.relax_ps,
-            "strain_start": (1.0 + spec.strain_increment) ** done - 1.0,
-            "samples_per_step": spec.samples_per_step,
-            "timestep_fs": timestep_fs,
-            "new_velocities": chunk == 0,
-        }
-        if reference_box_nm is not None:
-            options["reference_box_nm"] = list(reference_box_nm)
-        if spec.trajectory_ps is not None:
-            options["trajectory"] = TrajectoryOptions("xtc", spec.trajectory_ps)
-        stages.append(
-            Stage(f"{measurement.stem}_r{replica}_{chunk:03d}", "deform", options)
-        )
-    return Protocol(measurement.name, tuple(stages))
+    stages = deformation_stages(
+        tensile_schedule(spec),
+        stem=f"{measurement.stem}_r{replica}",
+        chunk_digits=3,
+        stage_ps=spec.stage_ps,
+        temperature_k=spec.temperature_k,
+        pressure_bar=spec.pressure_bar,
+        axis=spec.axis,
+        samples_per_step=spec.samples_per_step,
+        timestep_fs=timestep_fs,
+        reference_box_nm=reference_box_nm,
+        trajectory_ps=spec.trajectory_ps,
+    )
+    return Protocol(measurement.name, stages)
 
 
 def _equilibration(spec: TensileSpec, options: dict[str, Any]) -> Protocol:

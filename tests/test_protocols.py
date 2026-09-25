@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Sequence
 from dataclasses import replace
 from functools import wraps
 from pathlib import Path
@@ -14,7 +15,7 @@ import numpy as np
 import openmm as mm
 import pytest
 
-from openmmpolymer import protocols
+from openmmpolymer import protocols, simulate
 from openmmpolymer._files import file_sha256
 from openmmpolymer.mdsystem import SystemSpec
 from openmmpolymer.protocols import (
@@ -37,6 +38,8 @@ from openmmpolymer.protocols import (
 from openmmpolymer.reporters import TrajectoryOptions
 from openmmpolymer.simulate import (
     DEFAULT_COMPRESSION_BAR,
+    Segment,
+    StageResult,
     heating_temperatures,
     quench_temperatures,
     run_heat,
@@ -612,6 +615,120 @@ def test_heat_is_registered_and_its_endpoint_ladder_duration_is_counted() -> Non
     assert custom.duration_ps == pytest.approx(40.0)
     chunk = Stage("02_heat", "heat", {"temperatures_k": [200.0], "hold_ps": 10.0})
     assert chunk.duration_ps == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize(
+    ("kind", "options", "temperatures", "durations"),
+    [
+        ("quench", {}, list(range(600, 199, -20)), [200.0] * 21),
+        ("heat", {}, list(range(200, 601, 20)), [200.0] * 21),
+        (
+            "quench",
+            {"t_start": 150.0, "t_end": 90.0, "step_k": 40.0, "hold_ps": 0.7},
+            [150.0, 110.0, 90.0],
+            [0.7] * 3,
+        ),
+        (
+            "heat",
+            {"t_start": 100.0, "t_end": 175.0, "step_k": 30.0, "hold_ps": 0.7},
+            [100.0, 130.0, 160.0, 175.0],
+            [0.7] * 4,
+        ),
+        (
+            "quench",
+            {"temperatures_k": np.array([120.0]), "t_start": -1.0, "hold_ps": 0.7},
+            [120.0],
+            [0.7],
+        ),
+        (
+            "heat",
+            {"temperatures_k": [120.0], "t_end": -1.0, "hold_ps": 0.7},
+            [120.0],
+            [0.7],
+        ),
+        ("compress", {}, [600.0] * 7, [100.0] * 7),
+        (
+            "compress",
+            {"pressures_bar": [1.0, 5.0, 1.0], "duration_ps_each": 0.7},
+            [600.0] * 3,
+            [0.7] * 3,
+        ),
+        (
+            "anneal",
+            {"n_cycles": 2, "ramp_windows": 2, "window_ps": 0.3, "hold_ps": 0.7},
+            [450.0, 600.0, 600.0, 450.0, 300.0, 300.0] * 2,
+            [0.3, 0.3, 0.7, 0.3, 0.3, 0.7] * 2,
+        ),
+        (
+            "anneal",
+            {"n_cycles": 2, "ramp_windows": 0, "hold_ps": 0.7},
+            [600.0, 300.0] * 2,
+            [0.7] * 4,
+        ),
+    ],
+)
+def test_duration_counts_the_segments_handed_to_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    options: dict[str, Any],
+    temperatures: list[float],
+    durations: list[float],
+) -> None:
+    """Endpoint clipping, explicit chunks and annealing holds keep their order."""
+    executed: list[Segment] = []
+
+    @wraps(simulate.run_segments)
+    def record_segments(
+        run: Any,
+        name: str,
+        segments: Sequence[Segment],
+        output_prefix: str | Path,
+        **kwargs: Any,
+    ) -> StageResult:
+        executed.extend(segments)
+        return StageResult(name, 0, 0.0, "unused.state.xml")
+
+    monkeypatch.setattr(simulate, "run_segments", record_segments)
+    STAGE_RUNNERS[kind](None, **options)
+    assert [segment.temperature_k for segment in executed] == temperatures
+    assert [segment.duration_ps for segment in executed] == durations
+    assert Stage("test", kind, options).duration_ps == pytest.approx(sum(durations))
+    if kind == "compress":
+        assert [segment.pressure_bar for segment in executed] == list(
+            options.get("pressures_bar", DEFAULT_COMPRESSION_BAR)
+        )
+
+
+@pytest.mark.parametrize("kind", ["heat", "quench"])
+@pytest.mark.parametrize(
+    "temperatures",
+    [[], [100.0, 100.0], [float("nan")], [float("inf")], [0.0]],
+)
+def test_invalid_explicit_ladders_fail_in_budgets_and_execution(
+    kind: str, temperatures: list[float]
+) -> None:
+    """An empty explicit ladder must never fall back to the default ramp."""
+    options = {"temperatures_k": temperatures}
+    with pytest.raises(ValueError) as estimate_error:
+        _ = Stage("test", kind, options).duration_ps
+    with pytest.raises(ValueError) as execution_error:
+        STAGE_RUNNERS[kind](None, **options)
+    assert str(estimate_error.value) == str(execution_error.value)
+
+
+@pytest.mark.parametrize(
+    ("kind", "options"),
+    [("compress", {"pressures_bar": []}), ("anneal", {"n_cycles": 0})],
+)
+def test_empty_schedules_fail_in_budgets_and_execution(
+    kind: str, options: dict[str, Any]
+) -> None:
+    """No dynamics to execute is an invalid stage, rather than a zero cost."""
+    with pytest.raises(ValueError, match="no segments") as estimate_error:
+        _ = Stage("test", kind, options).duration_ps
+    with pytest.raises(ValueError, match="no segments") as execution_error:
+        STAGE_RUNNERS[kind](None, **options)
+    assert str(estimate_error.value) == str(execution_error.value)
 
 
 def test_heating_samples_are_retained_in_a_resumable_manifest(

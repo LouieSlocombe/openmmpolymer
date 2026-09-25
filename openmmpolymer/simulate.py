@@ -1134,6 +1134,22 @@ def run_npt(
 DEFAULT_COMPRESSION_BAR = (1.0, 100.0, 500.0, 1000.0, 500.0, 100.0, 1.0)
 
 
+def _compress_segments(
+    *,
+    temperature_k: float,
+    pressures_bar: Sequence[float],
+    duration_ps_each: float,
+) -> list[Segment]:
+    """Build the pressure holds used by execution and duration estimates."""
+    segments = [
+        Segment(temperature_k, duration_ps_each, pressure, label=f"{pressure:g} bar")
+        for pressure in pressures_bar
+    ]
+    if not segments:
+        raise ValueError("pressures_bar is empty, so there are no segments to run.")
+    return segments
+
+
 def run_compress(
     run: RunContext,
     output_prefix: str | Path = "03_compress",
@@ -1167,10 +1183,11 @@ def run_compress(
     Returns:
         What the stage did, with a density per rung.
     """
-    segments = [
-        Segment(temperature_k, duration_ps_each, pressure, label=f"{pressure:g} bar")
-        for pressure in pressures_bar
-    ]
+    segments = _compress_segments(
+        temperature_k=temperature_k,
+        pressures_bar=pressures_bar,
+        duration_ps_each=duration_ps_each,
+    )
     result = run_segments(
         run,
         Path(output_prefix).name,
@@ -1181,6 +1198,44 @@ def run_compress(
     )
     result.samples["segment_pressure_bar"] = list(pressures_bar)
     return result
+
+
+def _anneal_segments(
+    *,
+    t_low: float,
+    t_high: float,
+    n_cycles: int,
+    ramp_windows: int,
+    window_ps: float,
+    hold_ps: float,
+    pressure_bar: float,
+) -> list[Segment]:
+    """Build every ramp window and endpoint hold in an annealing cycle."""
+    segments: list[Segment] = []
+    for cycle in range(n_cycles):
+        for direction, label in ((1, "heat"), (-1, "cool")):
+            ends = (t_low, t_high) if direction == 1 else (t_high, t_low)
+            for window in range(1, ramp_windows + 1):
+                temperature = ends[0] + (ends[1] - ends[0]) * window / ramp_windows
+                segments.append(
+                    Segment(
+                        temperature,
+                        window_ps,
+                        pressure_bar,
+                        label=f"cycle {cycle + 1} {label}",
+                    )
+                )
+            segments.append(
+                Segment(
+                    ends[1],
+                    hold_ps,
+                    pressure_bar,
+                    label=f"cycle {cycle + 1} hold {ends[1]:.0f} K",
+                )
+            )
+    if not segments:
+        raise ValueError("The annealing schedule has no segments to run.")
+    return segments
 
 
 def run_anneal(
@@ -1220,28 +1275,15 @@ def run_anneal(
     Returns:
         What the stage did, with a density per temperature visited.
     """
-    segments: list[Segment] = []
-    for cycle in range(n_cycles):
-        for direction, label in ((1, "heat"), (-1, "cool")):
-            ends = (t_low, t_high) if direction == 1 else (t_high, t_low)
-            for window in range(1, ramp_windows + 1):
-                temperature = ends[0] + (ends[1] - ends[0]) * window / ramp_windows
-                segments.append(
-                    Segment(
-                        temperature,
-                        window_ps,
-                        pressure_bar,
-                        label=f"cycle {cycle + 1} {label}",
-                    )
-                )
-            segments.append(
-                Segment(
-                    ends[1],
-                    hold_ps,
-                    pressure_bar,
-                    label=f"cycle {cycle + 1} hold {ends[1]:.0f} K",
-                )
-            )
+    segments = _anneal_segments(
+        t_low=t_low,
+        t_high=t_high,
+        n_cycles=n_cycles,
+        ramp_windows=ramp_windows,
+        window_ps=window_ps,
+        hold_ps=hold_ps,
+        pressure_bar=pressure_bar,
+    )
     return run_segments(
         run,
         Path(output_prefix).name,
@@ -1318,6 +1360,31 @@ def _temperature_ladder(
     return ladder
 
 
+def _quench_segments(
+    *,
+    t_start: float,
+    t_end: float,
+    step_k: float,
+    hold_ps: float,
+    pressure_bar: float,
+    temperatures_k: Sequence[float] | None,
+) -> list[Segment]:
+    """Build a physical cooling ladder, including explicit resumable chunks."""
+    temperatures = (
+        quench_temperatures(
+            require_positive(t_start, None, name="t_start"),
+            require_positive(t_end, None, name="t_end"),
+            step_k,
+        )
+        if temperatures_k is None
+        else _temperature_ladder(temperatures_k, ascending=False)
+    )
+    return [
+        Segment(value, hold_ps, pressure_bar, label=f"{value:.0f} K")
+        for value in temperatures
+    ]
+
+
 def run_quench(
     run: RunContext,
     output_prefix: str | Path = "06_quench",
@@ -1364,20 +1431,14 @@ def run_quench(
         ValueError: The temperatures are not finite and positive, or the ramp
             does not descend.
     """
-    temperatures = (
-        quench_temperatures(
-            require_positive(t_start, None, name="t_start"),
-            require_positive(t_end, None, name="t_end"),
-            step_k,
-        )
-        if temperatures_k is None
-        else _temperature_ladder(temperatures_k, ascending=False)
+    segments = _quench_segments(
+        t_start=t_start,
+        t_end=t_end,
+        step_k=step_k,
+        hold_ps=hold_ps,
+        pressure_bar=pressure_bar,
+        temperatures_k=temperatures_k,
     )
-
-    segments = [
-        Segment(value, hold_ps, pressure_bar, label=f"{value:.0f} K")
-        for value in temperatures
-    ]
     return run_segments(
         run,
         Path(output_prefix).name,
@@ -1413,6 +1474,29 @@ def heating_temperatures(t_start: float, t_end: float, step_k: float) -> list[fl
         index += 1
     temperatures.append(t_end)
     return temperatures
+
+
+def _heat_segments(
+    *,
+    t_start: float,
+    t_end: float,
+    step_k: float,
+    hold_ps: float,
+    pressure_bar: float,
+    temperatures_k: Sequence[float] | None,
+) -> list[Segment]:
+    """Build a heating ladder with the same validation for budgets and runs."""
+    temperatures = (
+        heating_temperatures(t_start, t_end, step_k)
+        if temperatures_k is None
+        else _temperature_ladder(temperatures_k, ascending=True)
+    )
+    hold_ps = require_positive(hold_ps, None, name="hold_ps")
+    pressure_bar = require_positive(pressure_bar, None, name="pressure_bar")
+    return [
+        Segment(value, hold_ps, pressure_bar, label=f"{value:.0f} K")
+        for value in temperatures
+    ]
 
 
 def run_heat(
@@ -1455,18 +1539,15 @@ def run_heat(
         ``E_potential + E_kinetic + P V`` for the whole simulated cell in
         OpenMM kJ/mol units, averaged over the second half of each hold.
     """
-    temperatures = (
-        heating_temperatures(t_start, t_end, step_k)
-        if temperatures_k is None
-        else _temperature_ladder(temperatures_k, ascending=True)
+    segments = _heat_segments(
+        t_start=t_start,
+        t_end=t_end,
+        step_k=step_k,
+        hold_ps=hold_ps,
+        pressure_bar=pressure_bar,
+        temperatures_k=temperatures_k,
     )
-    hold_ps = require_positive(hold_ps, None, name="hold_ps")
-    pressure_bar = require_positive(pressure_bar, None, name="pressure_bar")
     require_choice(barostat, tuple(BAROSTATS), name="barostat")
-    segments = [
-        Segment(value, hold_ps, pressure_bar, label=f"{value:.0f} K")
-        for value in temperatures
-    ]
     kwargs["measure_enthalpy"] = True
     return run_segments(
         run,

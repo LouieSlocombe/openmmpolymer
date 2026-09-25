@@ -21,10 +21,10 @@ import json
 import logging
 import math
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 import numpy as np
 import numpy.typing as npt
@@ -41,6 +41,7 @@ from .protocols import (
     standard_melt_equilibration,
     validate_run_inputs,
 )
+from .reporters import TrajectoryOptions
 from .trajectory import AnalysisError
 
 if TYPE_CHECKING:
@@ -182,6 +183,84 @@ def resume_chunks(n_items: int, item_ps: float, stage_ps: float) -> list[range]:
     return [
         range(start, min(start + size, n_items)) for start in range(0, n_items, size)
     ]
+
+
+@dataclass(frozen=True)
+class StrainSchedule:
+    """A compounded extension's increments, holds and nominal strain rate."""
+
+    n_steps: int
+    increment: float
+    relax_ps: float
+
+    @classmethod
+    def reaching(cls, max_strain: float, increment: float, relax_ps: float) -> Self:
+        """Reach a target with full increments, including any final overshoot."""
+        steps = math.ceil(math.log1p(max_strain) / math.log1p(increment))
+        return cls(max(1, steps), increment, relax_ps)
+
+    def strain_after(self, n_steps: int) -> float:
+        """Engineering strain after *n_steps* increments from the reference cell."""
+        return float((1.0 + self.increment) ** n_steps - 1.0)
+
+    @property
+    def max_strain(self) -> float:
+        """The strain reached by the last full increment."""
+        return self.strain_after(self.n_steps)
+
+    @property
+    def total_ps(self) -> float:
+        """Total duration of the holds."""
+        return self.relax_ps * self.n_steps
+
+    @property
+    def strain_rate_per_ns(self) -> float:
+        """Average engineering strain rate, in strain per nanosecond."""
+        return self.max_strain / self.total_ps * 1000.0
+
+
+def deformation_stages(
+    schedule: StrainSchedule,
+    *,
+    stem: str,
+    chunk_digits: int,
+    stage_ps: float,
+    temperature_k: float,
+    pressure_bar: float,
+    axis: int,
+    samples_per_step: int,
+    timestep_fs: float,
+    reference_box_nm: Sequence[float] | None = None,
+    trajectory_ps: float | None = None,
+) -> tuple[Stage, ...]:
+    """Split one extension into chunks with continuous strain and velocities.
+
+    The caller supplies its existing stage stem and suffix width: names seed
+    the random streams and identify resumable output. Only the first chunk
+    draws velocities; every chunk measures strain from the same reference.
+    """
+    stages: list[Stage] = []
+    for index, steps in enumerate(
+        resume_chunks(schedule.n_steps, schedule.relax_ps, stage_ps)
+    ):
+        options: dict[str, Any] = {
+            "temperature_k": temperature_k,
+            "pressure_bar": pressure_bar,
+            "axis": axis,
+            "strain_increment": schedule.increment,
+            "n_steps": len(steps),
+            "relax_ps": schedule.relax_ps,
+            "strain_start": schedule.strain_after(steps.start),
+            "samples_per_step": samples_per_step,
+            "timestep_fs": timestep_fs,
+            "new_velocities": index == 0,
+        }
+        if reference_box_nm is not None:
+            options["reference_box_nm"] = list(reference_box_nm)
+        if trajectory_ps is not None:
+            options["trajectory"] = TrajectoryOptions("xtc", trajectory_ps)
+        stages.append(Stage(f"{stem}_{index:0{chunk_digits}d}", "deform", options))
+    return tuple(stages)
 
 
 def with_reference_box(

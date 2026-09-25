@@ -39,8 +39,10 @@ from .reporters import TrajectoryOptions
 from .simulate import (
     RunContext,
     StageResult,
-    heating_temperatures,
-    quench_temperatures,
+    _anneal_segments,
+    _compress_segments,
+    _heat_segments,
+    _quench_segments,
     run_anneal,
     run_compress,
     run_deform,
@@ -117,29 +119,36 @@ class Stage:
     def duration_ps(self) -> float:
         """How much dynamics this stage asks for, from the options it was given."""
         options = _stage_options(self)
-        if self.kind == "heat":
-            ladder = options.get("temperatures_k")
-            if ladder is None:
-                ladder = heating_temperatures(
-                    float(options["t_start"]),
-                    float(options["t_end"]),
-                    float(options["step_k"]),
-                )
-            return float(options["hold_ps"]) * len(ladder)
-        if self.kind == "quench":
-            ladder = options.get("temperatures_k") or quench_temperatures(
-                float(options["t_start"]),
-                float(options["t_end"]),
-                float(options["step_k"]),
+        if self.kind in {"heat", "quench"}:
+            build = _heat_segments if self.kind == "heat" else _quench_segments
+            segments = build(
+                t_start=options["t_start"],
+                t_end=options["t_end"],
+                step_k=options["step_k"],
+                hold_ps=options["hold_ps"],
+                pressure_bar=options["pressure_bar"],
+                temperatures_k=options["temperatures_k"],
             )
-            return float(options["hold_ps"]) * len(ladder)
-        if self.kind == "anneal":
-            ramp_ps = int(options["ramp_windows"]) * float(options["window_ps"])
-            return (
-                int(options["n_cycles"]) * 2.0 * (ramp_ps + float(options["hold_ps"]))
+        elif self.kind == "anneal":
+            segments = _anneal_segments(
+                t_low=options["t_low"],
+                t_high=options["t_high"],
+                n_cycles=options["n_cycles"],
+                ramp_windows=options["ramp_windows"],
+                window_ps=options["window_ps"],
+                hold_ps=options["hold_ps"],
+                pressure_bar=options["pressure_bar"],
             )
-        if self.kind == "compress":
-            return float(options["duration_ps_each"]) * len(options["pressures_bar"])
+        elif self.kind == "compress":
+            segments = _compress_segments(
+                temperature_k=options["temperature_k"],
+                pressures_bar=options["pressures_bar"],
+                duration_ps_each=options["duration_ps_each"],
+            )
+        else:
+            segments = None
+        if segments is not None:
+            return sum((segment.duration_ps for segment in segments), 0.0)
         if self.kind == "deform":
             return float(options["relax_ps"]) * int(options["n_steps"])
         if self.kind == "load":
@@ -186,8 +195,8 @@ class Protocol:
 
         Approximate on purpose - it is for telling a user whether they asked
         for nanoseconds or microseconds, not for scheduling - but it counts
-        every stage. Three kinds state their time as a ladder rather than a
-        duration, and a budget that silently omits the most expensive stage in
+        every stage. Ladder stages state their time as individual holds, and
+        a budget that silently omits the most expensive stage in
         a protocol is worse than no budget, because it gets believed.
         """
         return sum(stage.duration_ps for stage in self.stages)
