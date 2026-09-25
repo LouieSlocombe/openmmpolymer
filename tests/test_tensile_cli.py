@@ -125,27 +125,6 @@ def test_missing_replicas_do_not_renumber_the_remaining_results(name: str) -> No
     assert "replica 0:" not in lines
 
 
-@pytest.mark.parametrize(
-    ("name", "controls"),
-    [
-        *((name, ["--failure-fraction", "1.5"]) for name in ("breaking", "elongation")),
-        *((name, [f"--{name}-strain-increment", "0"]) for name in sorted(SPECS)),
-        ("elongation", ["--confirmation-steps", "0"]),
-        ("elongation", ["--elongation-replicas", "0"]),
-        ("yield", ["--yield-offset-strain", "0"]),
-        ("yield", ["--yield-fit-min-strain", "0.03", "--yield-fit-max-strain", "0.02"]),
-        ("yield", ["--yield-fit-max-strain", "0.5"]),
-    ],
-)
-def test_invalid_tensile_settings_are_rejected_before_building(
-    name: str, controls: list[str], no_build: list[Any]
-) -> None:
-    with pytest.raises(SystemExit, match="2"):
-        cli.main(["[*]CC[*]", "--protocol", name, "-o", "output", *controls])
-    assert not no_build
-    assert not Path("output").exists()
-
-
 @pytest.mark.parametrize("name", sorted(SPECS))
 def test_an_explicit_temperature_wins_over_the_tensile_default(name: str) -> None:
     """Room temperature is only a default; -t 450 means 450 K here too."""

@@ -277,8 +277,19 @@ def test_anneal_visits_the_top_and_the_bottom_of_every_cycle(
     assert result.temperature_k == pytest.approx(80.0)
 
 
+@pytest.mark.parametrize(
+    ("options", "temperatures"),
+    [
+        ({"t_start": 150.0, "t_end": 90.0, "step_k": 30.0}, [150.0, 120.0, 90.0]),
+        ({"temperatures_k": [140.0, 125.0, 110.0]}, [140.0, 125.0, 110.0]),
+    ],
+    ids=["endpoints", "explicit-chunk"],
+)
 def test_quench_records_a_density_and_a_hold_per_temperature(
-    argon_run: Any, minimised: StageResult
+    argon_run: Any,
+    minimised: StageResult,
+    options: dict[str, Any],
+    temperatures: list[float],
 ) -> None:
     """The specific-volume curve a glass transition is read off.
 
@@ -291,14 +302,12 @@ def test_quench_records_a_density_and_a_hold_per_temperature(
     result = run_quench(
         argon_run,
         "01_quench",
-        t_start=150.0,
-        t_end=90.0,
-        step_k=30.0,
         hold_ps=0.4,
         barostat_frequency=5,
         state_in=minimised.final_state,
+        **options,
     )
-    assert result.samples["segment_temperature_k"] == [150.0, 120.0, 90.0]
+    assert result.samples["segment_temperature_k"] == temperatures
     assert len(result.samples["segment_density_g_cm3"]) == 3
     assert result.samples["segment_duration_ps"] == [0.4, 0.4, 0.4]
     assert result.waypoints == ()
@@ -487,19 +496,27 @@ def test_density_and_temperature_helpers_agree_with_openmm(
 # --------------------------------------------------------------------------
 
 
-def test_the_ladder_helper_reproduces_the_one_a_quench_runs() -> None:
-    """The cost estimate, the chunker and the stage all count from this."""
-    ladder = quench_temperatures(650.0, 150.0, 25.0)
-
-    assert len(ladder) == 21
-    assert ladder[0] == 650.0
-    assert ladder[-1] == 150.0
-    assert ladder == sorted(ladder, reverse=True)
-
-
-def test_a_ladder_that_does_not_divide_evenly_still_reaches_the_bottom() -> None:
-    """The floor is a temperature someone chose, not a rounding artefact."""
-    assert quench_temperatures(100.0, 30.0, 90.0) == [100.0, 30.0]
+@pytest.mark.parametrize(
+    ("ladder", "start", "end", "step", "expected"),
+    [
+        (quench_temperatures, 650.0, 150.0, 25.0, list(range(650, 149, -25))),
+        (quench_temperatures, 100.0, 30.0, 90.0, [100.0, 30.0]),
+        # Nominal schedule costs use relative offsets, including negative rungs.
+        (quench_temperatures, 10.0, -10.0, 5.0, [10.0, 5.0, 0.0, -5.0, -10.0]),
+        (heating_temperatures, 100.0, 175.0, 30.0, [100.0, 130.0, 160.0, 175.0]),
+        (heating_temperatures, 100.0, 110.0, 30.0, [100.0, 110.0]),
+        (heating_temperatures, 100.0, 160.0, 30.0, [100.0, 130.0, 160.0]),
+    ],
+)
+def test_temperature_ladders_include_both_endpoints(
+    ladder: Callable[[float, float, float], list[float]],
+    start: float,
+    end: float,
+    step: float,
+    expected: list[float],
+) -> None:
+    """Budgeting and execution share clipped endpoints and the exact rung order."""
+    assert ladder(start, end, step) == expected
 
 
 @pytest.mark.parametrize(
@@ -527,11 +544,6 @@ def test_quench_ladder_rejects_invalid_arguments(
         quench_temperatures(start, end, step)
 
 
-def test_quench_ladder_accepts_offsets_for_nominal_schedule_costs() -> None:
-    """A nominal fine schedule counts relative rungs before its window is known."""
-    assert quench_temperatures(10.0, -10.0, 5.0) == [10.0, 5.0, 0.0, -5.0, -10.0]
-
-
 @pytest.mark.parametrize("endpoint", ["t_start", "t_end"])
 @pytest.mark.parametrize("value", [0.0, -100.0, -1e100])
 def test_quench_rejects_nonpositive_physical_temperatures(
@@ -543,33 +555,44 @@ def test_quench_rejects_nonpositive_physical_temperatures(
         run_quench(argon_run, **options)
 
 
+@pytest.mark.parametrize("runner", [run_quench, run_heat])
 @pytest.mark.parametrize(
     ("temperatures", "match"),
     [
         ([], "nothing to hold"),
-        ([100.0, 120.0], "has to descend"),
-        ([100.0, 100.0], "has to descend"),
+        ([100.0, 100.0], "has to"),
         ([float("nan")], "finite"),
         ([float("inf")], "finite"),
         ([0.0], "greater than zero"),
         ([-1.0], "greater than zero"),
         ([120.0, float("nan")], "finite"),
         ([float("inf"), 120.0], "finite"),
+        ([0.0, 100.0], "greater than zero"),
     ],
 )
-def test_quench_rejects_an_invalid_explicit_ladder(
-    argon_run: Any, temperatures: list[float], match: str
+def test_temperature_stages_reject_invalid_explicit_ladders(
+    argon_run: Any,
+    runner: Callable[..., StageResult],
+    temperatures: list[float],
+    match: str,
 ) -> None:
-    """A one-window chunk needs the same valid temperatures as a full ladder."""
+    """Chunks require finite, positive, distinct temperatures, even for one hold."""
     with pytest.raises(ValueError, match=match):
-        run_quench(argon_run, temperatures_k=temperatures)
+        runner(argon_run, temperatures_k=temperatures)
 
 
-def test_heating_ladder_includes_both_endpoints() -> None:
-    """The cost and stage must agree even when the final interval is short."""
-    assert heating_temperatures(100.0, 175.0, 30.0) == [100.0, 130.0, 160.0, 175.0]
-    assert heating_temperatures(100.0, 110.0, 30.0) == [100.0, 110.0]
-    assert heating_temperatures(100.0, 160.0, 30.0) == [100.0, 130.0, 160.0]
+@pytest.mark.parametrize(
+    ("runner", "temperatures", "direction"),
+    [(run_quench, [100.0, 120.0], "descend"), (run_heat, [120.0, 100.0], "ascend")],
+)
+def test_explicit_temperature_ladders_follow_the_stage_direction(
+    argon_run: Any,
+    runner: Callable[..., StageResult],
+    temperatures: list[float],
+    direction: str,
+) -> None:
+    with pytest.raises(ValueError, match=f"has to {direction}"):
+        runner(argon_run, temperatures_k=temperatures)
 
 
 @pytest.mark.parametrize(
@@ -591,18 +614,6 @@ def test_heating_ladder_rejects_invalid_arguments(
     """Nonfinite or nonprogressing input must fail before entering dynamics."""
     with pytest.raises(ValueError):
         heating_temperatures(start, end, step)
-
-
-@pytest.mark.parametrize(
-    "temperatures",
-    [[], [120.0, 100.0], [100.0, 100.0], [100.0, float("nan")], [0.0, 100.0]],
-)
-def test_heat_rejects_an_invalid_explicit_ladder(
-    argon_run: Any, temperatures: list[float]
-) -> None:
-    """An explicit chunk has the same finite, positive, ascending rules."""
-    with pytest.raises(ValueError):
-        run_heat(argon_run, temperatures_k=temperatures)
 
 
 @pytest.mark.parametrize("option", ["hold_ps", "pressure_bar"])
@@ -742,25 +753,6 @@ def test_a_hold_keeps_every_observable_from_the_same_second_half(
     assert samples["segment_mean_temperature_k"] == pytest.approx(
         [expected_temperature] * 2
     )
-
-
-def test_a_quench_can_be_given_its_temperatures_outright(
-    argon_run: Any, minimised: StageResult
-) -> None:
-    """A chunked pass hands each stage a slice of one ladder, not endpoints.
-
-    Deriving each chunk's endpoints from the grid is exactly the off-by-one
-    that repeats or skips a temperature at every boundary.
-    """
-    result = run_quench(
-        argon_run,
-        "01_quench",
-        temperatures_k=[140.0, 125.0, 110.0],
-        hold_ps=0.4,
-        barostat_frequency=5,
-        state_in=minimised.final_state,
-    )
-    assert result.samples["segment_temperature_k"] == [140.0, 125.0, 110.0]
 
 
 def test_the_readings_behind_a_segment_average_can_be_raised(

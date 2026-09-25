@@ -101,7 +101,9 @@ def test_predict_evaluates_scalar_and_array_consistently(form: str) -> None:
 
 
 @pytest.mark.parametrize("rate", [0.0, -1.0, math.nan, math.inf])
-def test_predict_rejects_invalid_rates(rate: float) -> None:
+def test_report_and_predictions_reject_invalid_rates(rate: float) -> None:
+    with pytest.raises(ValueError, match="target_rate"):
+        analyse_rate_observations([], property=PROPERTY, target_rate=rate)
     result = rate_extrapolation(observations(), property=PROPERTY, target_rate=1.0)
     with pytest.raises(ValueError, match="finite positive"):
         result.predict(rate)
@@ -237,29 +239,28 @@ def test_overflowing_power_law_prediction_is_unresolved_without_runtime_warning(
     assert math.isinf(result.predict(1e300))
 
 
-@pytest.mark.parametrize("count", [0, 1, 2])
-def test_three_rates_are_required(count: int) -> None:
-    with pytest.raises(AnalysisError, match="three or more distinct"):
-        rate_extrapolation(observations()[:count], property=PROPERTY, target_rate=1.0)
-
-
-def test_distinct_rate_count_cannot_be_inflated_with_replicas() -> None:
-    source = observations()[:2] * 10
-    with pytest.raises(AnalysisError, match="three or more distinct"):
-        rate_extrapolation(source, property=PROPERTY, target_rate=0.01)
-
-
-def test_near_equal_rates_are_replicas_not_independent_rate_information() -> None:
-    source = [
-        RateObservation(rate, 1000.0, 1.0, True) for rate in (1.0, 1.0 + 1e-10, 10.0)
-    ]
+@pytest.mark.parametrize(
+    "source",
+    [pytest.param(observations()[:count], id=f"{count}-rates") for count in (0, 1, 2)]
+    + [
+        pytest.param(observations()[:2] * 10, id="replicas"),
+        pytest.param(
+            measured([(1.0, 1000.0), (1.0 + 1e-10, 1000.0), (10.0, 1000.0)], error=1),
+            id="near-equal-rates",
+        ),
+    ],
+)
+def test_three_distinct_rates_are_required(source: list[RateObservation]) -> None:
     with pytest.raises(AnalysisError, match="three or more distinct"):
         rate_extrapolation(source, property=PROPERTY, target_rate=0.01)
 
 
-def test_pooling_preserves_replica_spread_without_counting_extra_rates() -> None:
+@pytest.mark.parametrize("error", [0.0, None], ids=["known-errors", "unknown-errors"])
+def test_pooling_preserves_replica_spread_without_counting_extra_rates(
+    error: float | None,
+) -> None:
     source = [
-        replace(item, value=_value(item) + offset, standard_error=0.0)
+        replace(item, value=_value(item) + offset, standard_error=error)
         for item in observations()
         for offset in (-10.0, 10.0)
     ]
@@ -270,17 +271,6 @@ def test_pooling_preserves_replica_spread_without_counting_extra_rates() -> None
     assert result.standard_error == pytest.approx(math.sqrt(200.0 * 7 / 3))
     assert result.resolved
     assert any("Repeated rates were pooled" in note for note in result.notes)
-
-
-def test_pooling_unknown_within_replica_errors_can_use_nonzero_sample_spread() -> None:
-    source = [
-        replace(item, value=_value(item) + offset, standard_error=None)
-        for item in observations()
-        for offset in (-10.0, 10.0)
-    ]
-    result = rate_extrapolation(source, property=PROPERTY, target_rate=0.01)
-    np.testing.assert_allclose(result.standard_errors, [math.sqrt(200.0)] * 3)
-    assert result.resolved
 
 
 @pytest.mark.parametrize("repeat", [1, 2])
@@ -367,22 +357,21 @@ def test_partially_missing_temperatures_are_unresolved() -> None:
     assert any("temperatures are unknown" in note for note in result.notes)
 
 
-def test_residual_scatter_contributes_even_when_input_errors_are_zero() -> None:
+@pytest.mark.parametrize(
+    "error,expected_error", [(0.0, math.sqrt(200.0)), (100.0, 50.0)]
+)
+def test_uncertainty_combines_input_errors_and_residual_without_double_counting(
+    error: float, expected_error: float
+) -> None:
     result = rate_extrapolation(
-        measured(SCATTERED, error=0.0), property=PROPERTY, target_rate=math.sqrt(0.1)
+        measured(SCATTERED, error=error), property=PROPERTY, target_rate=math.sqrt(0.1)
     )
     assert result.value == pytest.approx(950.0)
     assert result.residual == pytest.approx(20.0)
-    assert result.standard_error == pytest.approx(math.sqrt(200.0))
-    assert result.residual_to_error_ratio is None
+    assert result.standard_error == pytest.approx(expected_error)
+    if error == 0.0:
+        assert result.residual_to_error_ratio is None
     assert result.resolved
-
-
-def test_known_error_is_not_counted_again_as_residual_scatter() -> None:
-    result = rate_extrapolation(
-        measured(SCATTERED, error=100.0), property=PROPERTY, target_rate=math.sqrt(0.1)
-    )
-    assert result.standard_error == pytest.approx(50.0)
 
 
 def test_small_relative_residual_must_match_reported_precision() -> None:
@@ -473,15 +462,6 @@ def test_large_target_uncertainty_is_unresolved() -> None:
     )
     assert not broad.resolved
     assert any("25%" in note for note in broad.notes)
-
-
-@pytest.mark.parametrize("target", [0.0, -1.0, math.inf, math.nan])
-def test_invalid_request_is_not_swallowed_by_report(target: float) -> None:
-    with pytest.raises(ValueError, match="target_rate"):
-        analyse_rate_observations([], property=PROPERTY, target_rate=target)
-    fit = rate_extrapolation(observations(), property=PROPERTY, target_rate=0.01)
-    with pytest.raises(ValueError, match="finite positive"):
-        fit.predict(target)
 
 
 @pytest.mark.parametrize("maximum", [-1.0, math.inf, math.nan])

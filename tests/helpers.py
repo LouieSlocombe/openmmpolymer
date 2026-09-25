@@ -56,6 +56,15 @@ DIMER_FFXML = """<ForceField>
 """
 
 
+def snapshot_files(directory: Path) -> dict[Path, bytes]:
+    """Capture a tree's relative paths and contents for non-destructive-run checks."""
+    return {
+        path.relative_to(directory): path.read_bytes()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+
+
 def build_dimer_pdb(path: Path, *, separation_nm: float = 0.153) -> str:
     """Write a one-residue, two-atom PDB with the bond recorded.
 

@@ -19,15 +19,9 @@ from openmmpolymer.chain import ChainSpec
 from openmmpolymer.melt import build_melt
 from openmmpolymer.protocols import Protocol, ProtocolError, Stage, run_protocol
 
+from .helpers import snapshot_files
+
 PE = ChainSpec(monomer_smiles="[*]CC[*]", residue_name="PE")
-
-
-def _files(root: Path) -> dict[str, bytes]:
-    return {
-        str(path.relative_to(root)): path.read_bytes()
-        for path in root.rglob("*")
-        if path.is_file()
-    }
 
 
 def _build(directory: Path = Path("run"), **options: Any) -> Any:
@@ -69,9 +63,9 @@ def test_a_rebuild_is_checked_in_scratch_and_the_originals_are_used(
     included, which the rebuild must not write to.
     """
     _build()
-    before = _files(Path("run"))
+    before = snapshot_files(Path("run"))
     chain, run = _build(platform="CPU")
-    assert _files(Path("run")) == before
+    assert snapshot_files(Path("run")) == before
     scratch = staged_melt["builds"][1]
     assert scratch.name == "build"
     assert scratch.parent.name.startswith(".build-check-")
@@ -85,7 +79,7 @@ def test_a_changed_or_failed_rebuild_cannot_overwrite_the_originals(
     staged_melt: dict[str, Any], failure: str
 ) -> None:
     _build()
-    before = _files(Path("run"))
+    before = snapshot_files(Path("run"))
     if failure == "different_system":
         staged_melt["system_suffix"] = "\n"
         expected: type[Exception] = ProtocolError
@@ -94,7 +88,7 @@ def test_a_changed_or_failed_rebuild_cannot_overwrite_the_originals(
         expected = RuntimeError
     with pytest.raises(expected):
         _build()
-    assert _files(Path("run")) == before
+    assert snapshot_files(Path("run")) == before
     assert not list(Path("run").glob(".build-check-*"))
 
 
@@ -129,10 +123,10 @@ def test_a_rebuild_must_match_the_runs_already_started(
         replace(argon_run, seed=99),
         run_dir,
     )
-    before = _files(Path("run"))
+    before = snapshot_files(Path("run"))
     with pytest.raises(ProtocolError, match="starting inputs changed"):
         _build()
-    assert _files(Path("run")) == before
+    assert snapshot_files(Path("run")) == before
 
 
 @pytest.mark.forcefield
@@ -163,12 +157,12 @@ def test_a_real_melt_builds_and_rebuilds_to_the_same_cell(tmp_path: Path) -> Non
     assert run.box.n_molecules == 8
     assert run.box.topology.getNumAtoms() == 8 * 26
 
-    before = _files(tmp_path)
+    before = snapshot_files(tmp_path)
     again, rerun = build_melt(spec, 8, tmp_path, **settings)
-    assert _files(tmp_path) == before
+    assert snapshot_files(tmp_path) == before
     assert again == chain
     assert rerun.system_xml == run.system_xml
 
     with pytest.raises(ProtocolError, match="changed"):
         build_melt(replace(spec, seed=12), 8, tmp_path, **settings)
-    assert _files(tmp_path) == before
+    assert snapshot_files(tmp_path) == before

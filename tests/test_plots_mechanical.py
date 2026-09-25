@@ -103,6 +103,7 @@ def test_a_stress_strain_figure_draws_the_fit_and_its_window() -> None:
 def test_a_stress_strain_figure_says_when_a_rate_was_not_recorded() -> None:
     """Rather than leaving the caveat off the figure entirely."""
     figure = plot_stress_strain(linear_curve(rate=None))
+    assert len(figure.axes) == 2
     assert "rate not recorded" in figure.axes[0].get_title()
 
 
@@ -116,34 +117,20 @@ def test_an_unresolved_fit_is_labelled_as_one() -> None:
     assert any("unresolved" in label for label in labels)
 
 
-def test_a_stress_strain_figure_needs_no_fit() -> None:
-    """The curve alone is a figure; the fit is an overlay."""
-    assert len(plot_stress_strain(linear_curve()).axes) == 2
-
-
-def test_a_moduli_figure_draws_the_measured_against_the_implied(
-    tmp_path: Path,
+@pytest.mark.parametrize("complete", [False, True], ids=["youngs-only", "all-moduli"])
+def test_moduli_figure_draws_available_measurements(
+    tmp_path: Path, complete: bool
 ) -> None:
-    """The gap between the bars and the markers is the whole point of it."""
     write_deformation(tmp_path, modulus_mpa=2000.0, poisson=0.35)
-    write_bulk(tmp_path, stage="08_bulk", modulus_mpa=2222.0)
-    write_shear(tmp_path, modulus_mpa=741.0)
-    report = analyse_mechanics(tmp_path, strain_limit=0.05)
-    figure = plot_moduli(report)
-    axis = figure.axes[0]
-    assert [text.get_text() for text in axis.get_xticklabels()] == ["E", "K", "G"]
+    if complete:
+        write_bulk(tmp_path, stage="08_bulk", modulus_mpa=2222.0)
+        write_shear(tmp_path, modulus_mpa=741.0)
+    axis = plot_moduli(analyse_mechanics(tmp_path, strain_limit=0.05)).axes[0]
+    expected = ["E", "K", "G"] if complete else ["E"]
+    assert [text.get_text() for text in axis.get_xticklabels()] == expected
     assert axis.get_ylabel() == "Modulus (MPa)"
-    assert "consistent" in axis.get_title()
-
-
-def test_a_moduli_figure_survives_a_report_with_only_a_modulus_in_it(
-    tmp_path: Path,
-) -> None:
-    """A run that skipped the other passes still gets a figure."""
-    write_deformation(tmp_path)
-    report = analyse_mechanics(tmp_path, strain_limit=0.05)
-    axis = plot_moduli(report).axes[0]
-    assert [text.get_text() for text in axis.get_xticklabels()] == ["E"]
+    if complete:
+        assert "consistent" in axis.get_title()
 
 
 # --------------------------------------------------------------------------
@@ -154,7 +141,9 @@ def test_a_moduli_figure_survives_a_report_with_only_a_modulus_in_it(
 def test_strength_figure_plots_nominal_stress_and_marks_the_sampled_peak() -> None:
     """At finite strain the nominal and Cauchy maxima need not agree."""
     curve = failure_curve()
-    axis = plot_breaking_strength(curve, breaking_strength(curve)).axes[0]
+    result = breaking_strength(curve)
+    assert result.resolved
+    axis = plot_breaking_strength(curve, result).axes[0]
     lines = {line.get_label(): line for line in axis.get_lines()}
     measured = lines["nominal tensile stress"]
     np.testing.assert_allclose(measured.get_xdata(), curve.strain)
@@ -171,16 +160,9 @@ def test_strength_figure_plots_nominal_stress_and_marks_the_sampled_peak() -> No
     assert "298 K" in axis.get_title()
     assert "Apparent tensile strength = 100.0 MPa" in axis.get_title()
 
-
-def test_strength_figure_shades_the_failure_interval_and_marks_the_drop() -> None:
-    """The reported failure is bracketed by samples, not a precise crossing."""
-    curve = failure_curve()
-    result = breaking_strength(curve)
-    assert result.resolved
     assert result.failure_bracket is not None
     assert result.failure_strain is not None
     assert result.failure_stress_mpa is not None
-    axis = plot_breaking_strength(curve, result).axes[0]
     assert [patch.get_label() for patch in axis.patches] == ["failure strain bracket"]
     assert span_extent(axis, axis.patches[0]) == pytest.approx(result.failure_bracket)
     drop = next(
@@ -188,20 +170,6 @@ def test_strength_figure_shades_the_failure_interval_and_marks_the_drop() -> Non
     )
     np.testing.assert_allclose(drop.get_xdata(), [result.failure_strain])
     np.testing.assert_allclose(drop.get_ydata(), [result.failure_stress_mpa])
-
-
-def test_a_rising_curve_reports_no_strength_or_failure_bracket() -> None:
-    """An endpoint maximum remains a sample, even with a missing strain rate."""
-    curve = failure_curve(failed=False, rate=None)
-    result = breaking_strength(curve)
-    assert not result.resolved
-    axis = plot_breaking_strength(curve, result).axes[0]
-    assert "Apparent tensile strength not resolved" in axis.get_title()
-    assert "rate not recorded" in axis.get_title()
-    assert not axis.patches
-    labels = axis.get_legend_handles_labels()[1]
-    assert any(label.startswith("sampled peak") for label in labels)
-    assert "sustained stress drop" not in labels
 
 
 def test_elongation_figure_uses_percent_and_marks_break_separately_from_peak() -> None:
@@ -230,16 +198,27 @@ def test_elongation_figure_uses_percent_and_marks_break_separately_from_peak() -
     assert "Apparent elongation at break = 50.0%" in axis.get_title()
 
 
-def test_unresolved_elongation_has_no_break_marker_or_bracket() -> None:
-    """A rising curve is rendered without assigning break to its final hold."""
+@pytest.mark.parametrize("elongation", [False, True], ids=["strength", "elongation"])
+def test_rising_curve_has_no_failure_marker_or_bracket(elongation: bool) -> None:
     curve = failure_curve(failed=False, rate=None)
-    axis = plot_elongation_at_break(curve, elongation_at_break(curve)).axes[0]
-    assert "Apparent elongation at break not resolved" in axis.get_title()
+    if elongation:
+        result = elongation_at_break(curve)
+        assert not result.resolved
+        axis = plot_elongation_at_break(curve, result).axes[0]
+        title = "Apparent elongation at break not resolved"
+        marker = "onset of sustained stress drop"
+    else:
+        strength = breaking_strength(curve)
+        assert not strength.resolved
+        axis = plot_breaking_strength(curve, strength).axes[0]
+        title = "Apparent tensile strength not resolved"
+        marker = "sustained stress drop"
+    assert title in axis.get_title()
     assert "rate not recorded" in axis.get_title()
     assert not axis.patches
     labels = axis.get_legend_handles_labels()[1]
     assert any(label.startswith("sampled peak") for label in labels)
-    assert "onset of sustained stress drop" not in labels
+    assert marker not in labels
 
 
 # --------------------------------------------------------------------------
@@ -250,7 +229,9 @@ def test_unresolved_elongation_has_no_break_marker_or_bracket() -> None:
 def test_yield_figure_plots_nominal_response_and_the_offset_construction() -> None:
     """The displayed lines use nominal stress and preserve the fitted intercept."""
     curve = yield_curve()
-    axis = plot_yield_strength(curve, yield_strength(curve)).axes[0]
+    result = yield_strength(curve)
+    assert result.resolved
+    axis = plot_yield_strength(curve, result).axes[0]
     lines = {line.get_label(): line for line in axis.get_lines()}
     measured = lines["nominal tensile stress"]
     np.testing.assert_allclose(measured.get_xdata(), curve.strain)
@@ -270,13 +251,6 @@ def test_yield_figure_plots_nominal_response_and_the_offset_construction() -> No
     assert "298 K" in axis.get_title()
     assert "0.2% offset yield strength = 23.3 MPa" in axis.get_title()
 
-
-def test_yield_figure_distinguishes_interpolation_from_the_sampling_bracket() -> None:
-    """A yield point lies inside the sampled interval that establishes it."""
-    curve = yield_curve()
-    result = yield_strength(curve)
-    assert result.resolved
-    axis = plot_yield_strength(curve, result).axes[0]
     patches = {patch.get_label(): patch for patch in axis.patches}
     assert span_extent(axis, patches["elastic fit window"]) == pytest.approx(
         [0.0, 0.02], abs=1e-15

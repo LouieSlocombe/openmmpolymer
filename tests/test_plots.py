@@ -278,18 +278,10 @@ def test_every_figure_renders_headless_without_pyplot(
 # --------------------------------------------------------------------------
 
 
-def test_the_state_data_figure_has_one_panel_per_quantity(state_data: Any) -> None:
-    """Temperature, density, potential energy and box volume."""
+def test_state_data_panels_plot_the_recorded_quantities(state_data: StateData) -> None:
     figure = plot_state_data(state_data)
     assert len(figure.axes) == 4
     assert figure.axes[-1].get_xlabel() == "Time (ps)"
-
-
-def test_the_state_data_figure_plots_the_numbers_it_was_given(
-    state_data: Any,
-) -> None:
-    """The failure this catches is a helper plotting the wrong column."""
-    figure = plot_state_data(state_data)
     plotted = figure.axes[1].get_lines()[0].get_xydata()
     assert plotted[:, 0] == pytest.approx(state_data.time_ps)
     assert plotted[:, 1] == pytest.approx(state_data.density_g_cm3)
@@ -314,36 +306,20 @@ def test_the_quench_figure_carries_its_cooling_rate_in_the_title(
     assert "cooling rate unknown" in figure.axes[0].get_title()
 
 
-def test_the_quench_figure_draws_both_fitted_branches(curve: Any) -> None:
-    """Reading a break off a curve means seeing the two lines it breaks between."""
-    figure = plot_quench_curve(curve, transition=glass_transition(curve))
-    axis = figure.axes[0]
+def test_quench_fit_branches_meet_at_the_reported_transition(
+    curve: QuenchCurve,
+) -> None:
+    transition = glass_transition(curve)
+    axis = plot_quench_curve(curve, transition=transition).axes[0]
     labels = axis.get_legend_handles_labels()[1]
     assert "glass fit" in labels
     assert "melt fit" in labels
     assert any("Tg" in label for label in labels)
-
-
-def test_the_fitted_branches_pass_through_the_transition(curve: Any) -> None:
-    """Drawn from the crossing volume, so both lines have to meet there."""
-    transition = glass_transition(curve)
-    figure = plot_quench_curve(curve, transition=transition)
-    lines = figure.axes[0].get_lines()
-    for line in lines[1:3]:
+    for line in axis.get_lines()[1:3]:
         x, y = line.get_xydata().T
         at_crossing = np.interp(transition.temperature_k, x, y)
         assert at_crossing == pytest.approx(transition.specific_volume_cm3_g, rel=1e-6)
-
-
-def test_the_quench_title_reports_both_expansion_coefficients(curve: Any) -> None:
-    """On a second line, not in the legend: the legend names the two branches.
-
-    A dilatometry paper quotes aV, and this is where it becomes visible
-    without going back to the dataclass.
-    """
-    figure = plot_quench_curve(curve, transition=glass_transition(curve))
-    title = figure.axes[0].get_title()
-
+    title = axis.get_title()
     assert "aV" in title
     assert "melt" in title and "glass" in title
     assert "\n" in title
@@ -362,33 +338,15 @@ def test_an_unresolved_transition_is_said_so_without_coefficients(
     assert "no clear transition" in figure.axes[0].get_title()
 
 
-def test_the_cooling_rate_figure_plots_one_point_per_measured_rate() -> None:
-    """Three quenches, three markers, on a log axis because rates span decades."""
-    figure = plot_cooling_rate(cooling_rate_extrapolation(log_linear_transitions()))
-    axis = figure.axes[0]
+def test_cooling_rate_figure_marks_measurements_and_unresolved_extrapolation() -> None:
+    fit = cooling_rate_extrapolation(log_linear_transitions())
+    axis = plot_cooling_rate(fit).axes[0]
     measured = next(line for line in axis.get_lines() if line.get_label() == "measured")
-
     assert axis.get_xscale() == "log"
     assert len(measured.get_xdata()) == 3
-
-
-def test_the_cooling_rate_figure_shades_the_decades_it_reached_across() -> None:
-    """The gap the number was carried over is something the eye can see.
-
-    The same device the structure factor uses for the region a cell cannot
-    resolve: if the data does not reach there, the figure says so.
-    """
-    fit = cooling_rate_extrapolation(log_linear_transitions())
-    assert plot_cooling_rate(fit).axes[0].patches
-
-
-def test_an_unresolved_extrapolation_says_so_on_the_figure() -> None:
-    """Ten decades to an experimental rate, so this is the usual case."""
-    fit = cooling_rate_extrapolation(log_linear_transitions())
-    title = plot_cooling_rate(fit).axes[0].get_title()
-
-    assert "not resolved" in title
-    assert "decades" in title
+    assert axis.patches
+    assert "not resolved" in axis.get_title()
+    assert "decades" in axis.get_title()
 
 
 def test_the_cooling_rate_figure_draws_the_curve_the_fit_predicts() -> None:
@@ -468,28 +426,27 @@ def test_a_conformation_with_no_measured_ratio_draws_no_reference_line() -> None
     assert len(plot_conformation(series).axes[0].get_lines()) == 1
 
 
-def test_the_correlations_figure_marks_the_ideal_gas_line() -> None:
-    """A g(r) is read against one, so the eye needs it drawn."""
-    figure = plot_correlations(
-        radial_distribution(lattice_cell(), n_bins=60, heavy_atoms_only=False)
+@pytest.mark.parametrize("with_structure", [False, True], ids=["rdf", "rdf-and-sq"])
+def test_correlations_panels_show_reference_lines_and_resolution(
+    with_structure: bool,
+) -> None:
+    cell = lattice_cell()
+    structure = (
+        structure_factor(cell, q_max_per_nm=20.0, n_bins=40, heavy_atoms_only=False)
+        if with_structure
+        else None
     )
-    assert len(figure.axes) == 1
+    figure = plot_correlations(
+        radial_distribution(cell, n_bins=60, heavy_atoms_only=False),
+        structure=structure,
+    )
+    assert len(figure.axes) == 1 + with_structure
     assert figure.axes[0].get_xlabel() == "r (nm)"
     assert len(figure.axes[0].get_lines()) == 2
-
-
-def test_the_structure_factor_gets_its_own_panel_and_its_resolution_floor() -> None:
-    """The shaded region is where the cell cannot hold a wave at all."""
-    figure = plot_correlations(
-        radial_distribution(lattice_cell(), n_bins=60, heavy_atoms_only=False),
-        structure=structure_factor(
-            lattice_cell(), q_max_per_nm=20.0, n_bins=40, heavy_atoms_only=False
-        ),
-    )
-    assert len(figure.axes) == 2
-    assert figure.axes[1].get_xlabel() == "q (1/nm)"
-    assert "cannot resolve" in figure.axes[1].get_title()
-    assert len(figure.axes[1].patches) == 1
+    if with_structure:
+        assert figure.axes[1].get_xlabel() == "q (1/nm)"
+        assert "cannot resolve" in figure.axes[1].get_title()
+        assert len(figure.axes[1].patches) == 1
 
 
 def test_the_dynamics_figure_is_logarithmic_with_a_slope_one_guide(
@@ -592,43 +549,38 @@ def test_an_extrapolated_persistence_length_says_so() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_a_relaxation_figure_draws_the_decay_and_what_stands_behind_it() -> None:
-    """Two panels. The lower one is the point: the readings per bin fall to
-    one at the fast end, which is where the curve looks smoothest."""
-    figure = plot_relaxation(decay())
-    assert len(figure.axes) == 2
-    assert figure.axes[0].get_ylabel() == "|G(t)| (MPa)"
-    assert figure.axes[0].get_xscale() == "log"
-    assert figure.axes[0].get_yscale() == "log"
-    assert figure.axes[1].get_ylabel() == "Readings per bin"
-    assert "+0.030" in figure.axes[0].get_title()
-    assert "298 K" in figure.axes[0].get_title()
-
-
-def test_a_relaxation_figure_shades_the_floor_the_decay_vanishes_into() -> None:
-    """A decay that has run into its own baseline noise should look like one
-    rather than reading as a plateau."""
-    figure = plot_relaxation(decay(floor=5.0))
-    labels = [text.get_text() for text in figure.axes[0].get_legend().get_texts()]
-    assert any("below the baseline noise" in label for label in labels)
-
-
-def test_a_relaxation_figure_labels_both_fits_with_their_verdicts() -> None:
-    """An unresolved fit drawn without saying so is worse than no fit."""
-    curve = decay()
-    figure = plot_relaxation(curve, kww=fit_kww(curve), prony=fit_prony(curve))
-    labels = " ".join(
-        text.get_text() for text in figure.axes[0].get_legend().get_texts()
+@pytest.mark.parametrize("overlay", ["none", "fits", "replicas"])
+def test_relaxation_panels_show_decay_samples_and_optional_fits(
+    overlay: str,
+) -> None:
+    curve = decay(floor=5.0 if overlay == "none" else 1.0)
+    replicas = (
+        [decay(modulus_mpa=value) for value in (900.0, 1100.0)]
+        if overlay == "replicas"
+        else []
     )
-    assert "KWW" in labels and "beta" in labels
-    assert "Prony" in labels and "G_inf" in labels
-
-
-def test_a_relaxation_figure_draws_the_replicas_behind_the_mean() -> None:
-    """The spread between them is the error bar, so it should be visible."""
-    curves = [decay(modulus_mpa=value) for value in (900.0, 1100.0)]
-    figure = plot_relaxation(decay(), replicas=curves)
-    assert len(figure.axes[0].get_lines()) >= 3
+    figure = plot_relaxation(
+        curve,
+        kww=fit_kww(curve) if overlay == "fits" else None,
+        prony=fit_prony(curve) if overlay == "fits" else None,
+        replicas=replicas,
+    )
+    assert len(figure.axes) == 2
+    axis = figure.axes[0]
+    assert axis.get_ylabel() == "|G(t)| (MPa)"
+    assert axis.get_xscale() == "log"
+    assert axis.get_yscale() == "log"
+    assert figure.axes[1].get_ylabel() == "Readings per bin"
+    assert "+0.030" in axis.get_title()
+    assert "298 K" in axis.get_title()
+    labels = " ".join(axis.get_legend_handles_labels()[1])
+    assert "below the baseline noise" in labels
+    if overlay == "fits":
+        assert "KWW" in labels and "beta" in labels
+        assert "Prony" in labels and "G_inf" in labels
+    for line, replica in zip(axis.get_lines()[: len(replicas)], replicas, strict=True):
+        np.testing.assert_allclose(line.get_xdata(), replica.time_ps)
+        np.testing.assert_allclose(line.get_ydata(), replica.modulus_mpa)
 
 
 def test_a_spectrum_figure_marks_what_lies_past_the_end_of_the_run() -> None:

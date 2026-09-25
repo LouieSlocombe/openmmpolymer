@@ -47,6 +47,7 @@ from openmmpolymer.trajectory import AnalysisError
 from .helpers import (
     PLANTED_TENSILE,
     QUICK_EQUILIBRATION,
+    snapshot_files,
     write_deformation,
     write_tensile_scan,
 )
@@ -146,10 +147,6 @@ PLANTED = {
         "modulus_mpa": [1000.0, 1200.0],
     },
 }
-
-
-def _files(directory: Path) -> dict[str, bytes]:
-    return {path.name: path.read_bytes() for path in directory.iterdir()}
 
 
 def _interrupt(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
@@ -298,7 +295,7 @@ def test_planted_replicas_are_read_separately_and_averaged(
     write_deformation(tmp_path, stage="06_deform_r0_00")
     other = "breaking" if name == "yield" else "yield"
     write_deformation(tmp_path, stage=f"06_{other}_r0_000")
-    before = _files(tmp_path)
+    before = snapshot_files(tmp_path)
     report = API[name].analyse(tmp_path)
     assert report.resolved
     assert report.replica_indices == (0, 1)
@@ -311,7 +308,7 @@ def test_planted_replicas_are_read_separately_and_averaged(
     assert report.replicas[0].strain_rate_per_ns == pytest.approx(
         tensile_schedule(spec).strain_rate_per_ns
     )
-    assert _files(tmp_path) == before
+    assert snapshot_files(tmp_path) == before
 
 
 @pytest.mark.parametrize("name", MEASUREMENTS)
@@ -659,11 +656,11 @@ def test_a_resume_cannot_mix_new_predecessors_with_saved_descendants(
         seed=11,
         stages={stage: {"final_state": str(state)} for stage in names},
     ).save("run")
-    before = _files(Path("run"))
+    before = snapshot_files(Path("run"))
     with pytest.raises(API[name].error, match=f"Cannot resume: .*{message}"):
         API[name].run(argon_scan_run, "run", spec=spec, **QUICK_EQUILIBRATION)
     assert len(calls) == 1
-    assert _files(Path("run")) == before
+    assert snapshot_files(Path("run")) == before
 
 
 @pytest.mark.slow

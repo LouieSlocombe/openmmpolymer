@@ -14,6 +14,8 @@ from benchmarks.pe_melt import REFERENCE_PATH, _protocol, comparison, run_benchm
 from openmmpolymer.chain import ChainSpec, assemble_chain
 from openmmpolymer.protocols import ProtocolError
 
+from .helpers import snapshot_files
+
 
 @pytest.fixture
 def reference() -> dict[str, Any]:
@@ -153,13 +155,11 @@ def test_a_rerun_rebuilds_in_scratch_without_touching_the_replica(
     output = tmp_path / "benchmark"
     with pytest.raises(ReachedProtocol):
         run_benchmark(output, smoke=True, seeds=(11,), platform="CPU")
-    original = {path: path.read_bytes() for path in output.rglob("*") if path.is_file()}
+    original = snapshot_files(output)
     staged_melt["system_suffix"] = "\n" if changed_system else ""
     with pytest.raises(ProtocolError if changed_system else ReachedProtocol) as raised:
         run_benchmark(output, smoke=True, seeds=(11,), platform="CPU")
-    assert {
-        path: path.read_bytes() for path in output.rglob("*") if path.is_file()
-    } == original
+    assert snapshot_files(output) == original
     first, second = staged_melt["builds"]
     assert first == output / "seed_11" / "build"
     assert second != first
@@ -183,11 +183,9 @@ def test_real_polyethylene_benchmark_smoke(tmp_path: Path) -> None:
     assert math.isfinite(report["replicas"][0]["density_g_cm3"])
     assert json.loads((tmp_path / "benchmark" / "benchmark.json").read_text())
     build = tmp_path / "benchmark" / "seed_11" / "build"
-    original = {path: path.read_bytes() for path in build.rglob("*") if path.is_file()}
+    original = snapshot_files(build)
     repeated = run_benchmark(
         tmp_path / "benchmark", smoke=True, seeds=(11,), platform="CPU"
     )
     assert repeated["comparison"] == report["comparison"]
-    assert {
-        path: path.read_bytes() for path in build.rglob("*") if path.is_file()
-    } == original
+    assert snapshot_files(build) == original

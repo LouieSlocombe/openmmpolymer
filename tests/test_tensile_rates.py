@@ -32,6 +32,26 @@ from .helpers import (
 BREAKING_SPEC = PLANTED_TENSILE["breaking"]
 
 
+@pytest.fixture
+def fake_dynamics(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Record branch calls and save the shared state needed for resume checks."""
+    calls: list[dict[str, Any]] = []
+
+    def dynamics(protocol: Protocol, run: Any, directory: Path, **kwargs: Any) -> Any:
+        calls.append({"protocol": protocol, "seed": run.seed, **kwargs})
+        directory.mkdir(parents=True, exist_ok=True)
+        state = directory / "state.xml"
+        state.write_text("original common state")
+        RunManifest(protocol=protocol.name, seed=run.seed).save(directory)
+        return SimpleNamespace(final_state=str(state))
+
+    fake_scan_dynamics(monkeypatch, tensile_rates, dynamics, box_nm=(2.4,) * 3)
+    monkeypatch.setattr(
+        tensile_rates, "analyse_tensile_rates", lambda *args, **kwargs: None
+    )
+    return calls
+
+
 @pytest.mark.parametrize(
     "property_name",
     ["yield_strength", "yield_strain", "breaking_strength", "elongation_at_break"],
@@ -63,40 +83,30 @@ def test_each_event_has_correct_units_and_preserves_replicas(
     )
 
 
-def test_missing_yield_replica_is_not_silently_dropped_from_rate_fit(
+@pytest.mark.parametrize("missing_replica", [0, 1])
+def test_missing_yield_replica_blocks_fits_and_preserves_survivor_index(
     tmp_path: Path,
+    missing_replica: int,
 ) -> None:
     directories = write_tensile_rate_series(tmp_path, "yield_strength")
     path = directories[1] / "manifest.json"
     record = json.loads(path.read_text())
     record["stages"] = {
-        name: stage for name, stage in record["stages"].items() if "_r1_" not in name
+        name: stage
+        for name, stage in record["stages"].items()
+        if f"_r{missing_replica}_" not in name
     }
     path.write_text(json.dumps(record))
     report = analyse_tensile_rates(
         directories, property_name="yield_strength", target_rate=0.1
     )
-    assert any(not item.resolved for item in report.observations)
     assert report.log_linear is None or not report.log_linear.resolved
     assert report.power_law is None or not report.power_law.resolved
-
-
-def test_surviving_yield_replica_retains_its_recorded_index(tmp_path: Path) -> None:
-    directories = write_tensile_rate_series(tmp_path, "yield_strength")
-    path = directories[1] / "manifest.json"
-    record = json.loads(path.read_text())
-    record["stages"] = {
-        name: stage for name, stage in record["stages"].items() if "_r0_" not in name
-    }
-    path.write_text(json.dumps(record))
-    report = analyse_tensile_rates(
-        directories, property_name="yield_strength", target_rate=0.1
-    )
     surviving = [
         item for item in report.observations if str(directories[1]) in item.source
     ]
     assert len(surviving) == 1
-    assert surviving[0].source.endswith(":replica_1")
+    assert surviving[0].source.endswith(f":replica_{1 - missing_replica}")
     assert not surviving[0].resolved
 
 
@@ -150,21 +160,9 @@ def test_budget_covers_common_preparation_and_every_replica() -> None:
 
 
 def test_shared_start_independent_rate_seeds_and_resume_guard(
-    tmp_path: Path, argon_run: Any, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, argon_run: Any, fake_dynamics: list[dict[str, Any]]
 ) -> None:
-    calls: list[dict[str, Any]] = []
-
-    def dynamics(protocol: Protocol, run: Any, directory: Path, **kwargs: Any) -> Any:
-        calls.append({"protocol": protocol, "seed": run.seed, **kwargs})
-        directory.mkdir(parents=True, exist_ok=True)
-        state = directory / "state.xml"
-        state.write_text("test state")
-        return SimpleNamespace(final_state=str(state))
-
-    fake_scan_dynamics(monkeypatch, tensile_rates, dynamics, box_nm=(2.4,) * 3)
-    monkeypatch.setattr(
-        tensile_rates, "analyse_tensile_rates", lambda *args, **kwargs: None
-    )
+    calls = fake_dynamics
     spec = replace(BREAKING_SPEC, n_replicas=2)
     options: dict[str, Any] = dict(
         spec=spec,
@@ -350,23 +348,10 @@ def test_legacy_tensile_preparation_absence_is_reported(tmp_path: Path) -> None:
 def test_tensile_shared_state_is_checked_before_any_resume_write(
     tmp_path: Path,
     argon_run: Any,
-    monkeypatch: pytest.MonkeyPatch,
+    fake_dynamics: list[dict[str, Any]],
     damage: str,
 ) -> None:
-    calls: list[str] = []
-
-    def dynamics(protocol: Protocol, run: Any, directory: Path, **kwargs: Any) -> Any:
-        calls.append(protocol.name)
-        directory.mkdir(parents=True, exist_ok=True)
-        final = directory / "state.xml"
-        final.write_text("original common state")
-        RunManifest(protocol=protocol.name, seed=run.seed).save(directory)
-        return SimpleNamespace(final_state=str(final))
-
-    fake_scan_dynamics(monkeypatch, tensile_rates, dynamics, box_nm=(2.4,) * 3)
-    monkeypatch.setattr(
-        tensile_rates, "analyse_tensile_rates", lambda *args, **kwargs: None
-    )
+    calls = fake_dynamics
     options: dict[str, Any] = {
         "property_name": "breaking_strength",
         "spec": BREAKING_SPEC,

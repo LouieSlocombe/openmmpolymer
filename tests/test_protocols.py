@@ -45,7 +45,7 @@ from openmmpolymer.simulate import (
     run_heat,
 )
 
-from .helpers import argon_context
+from .helpers import argon_context, snapshot_files
 
 #: A protocol short enough to run in a test but shaped like a real one.
 QUICK = Protocol(
@@ -139,7 +139,11 @@ def test_stage_names_must_differ() -> None:
 
 def test_the_standard_protocol_runs_the_documented_order() -> None:
     """Minimise, relieve the packing, mobilise, compress, anneal, settle."""
-    protocol = standard_melt_equilibration()
+    protocol = standard_melt_equilibration(
+        target_temperature_k=380.0, nvt_ps=100.0, npt_ps=200.0
+    )
+    assert protocol.stages[-1].options["temperature_k"] == 380.0
+    assert protocol.total_duration_ps > 0
     assert [stage.kind for stage in protocol.stages] == [
         "minimise",
         "pushoff",
@@ -150,12 +154,6 @@ def test_the_standard_protocol_runs_the_documented_order() -> None:
     ]
 
 
-def test_the_standard_protocol_ends_at_the_target_temperature() -> None:
-    """Whatever it was melted at, it finishes where it was asked to."""
-    protocol = standard_melt_equilibration(target_temperature_k=380.0)
-    assert protocol.stages[-1].options["temperature_k"] == 380.0
-
-
 def test_melt_quench_is_the_standard_protocol_plus_a_quench() -> None:
     """The cooling curve is the only thing it adds."""
     base = standard_melt_equilibration()
@@ -164,69 +162,61 @@ def test_melt_quench_is_the_standard_protocol_plus_a_quench() -> None:
     assert quenched.stages[-1].kind == "quench"
 
 
-def test_total_duration_adds_up_the_dynamics_asked_for() -> None:
-    """Enough to tell nanoseconds from microseconds before starting."""
-    assert standard_melt_equilibration(nvt_ps=100.0, npt_ps=200.0).total_duration_ps > 0
-
-
-def test_running_a_protocol_writes_a_manifest(quick_run: RunSummary) -> None:
-    """The record of what happened, and the basis of picking it up again."""
+def test_protocol_records_stages_cell_and_output_files(quick_run: RunSummary) -> None:
     manifest = json.loads(Path(quick_run.manifest_path).read_text())
-
     assert manifest["protocol"] == "quick"
     assert manifest["seed"] == 11
-    assert set(manifest["stages"]) == {"00_minimise", "01_nvt", "02_npt"}
+    assert set(manifest["stages"]) == {stage.name for stage in QUICK.stages}
     assert manifest["versions"]["openmm"]
     assert manifest["system"]["nonbonded_cutoff_nm"] == SystemSpec().nonbonded_cutoff_nm
-
-
-def test_the_manifest_records_what_each_stage_actually_did(
-    quick_run: RunSummary,
-) -> None:
-    """The temperature asked for and the one reached are different numbers."""
-    entry = json.loads(Path(quick_run.manifest_path).read_text())["stages"]["01_nvt"]
-    assert entry["steps"] > 0
-    assert entry["mean_temperature_k"] == pytest.approx(100.0, abs=40.0)
-    assert Path(entry["final_state"]).is_file()
-
-
-def test_stages_write_into_the_run_directory(quick_run: RunSummary) -> None:
-    """One directory holds the whole run, in the order it ran."""
-    written = sorted(path.name for path in Path(quick_run.run_dir).glob("*.state.xml"))
-    assert written == ["00_minimise.state.xml", "01_nvt.state.xml", "02_npt.state.xml"]
-
-
-def test_the_manifest_records_what_was_in_the_cell(quick_run: RunSummary) -> None:
-    """SystemSpec records the settings a run was given but not the thing it was
-    given them for, so analysis of a finished run had to infer the block
-    structure every measurement indexes by."""
-    manifest = RunManifest.load(Path(quick_run.run_dir))
-    assert manifest is not None
-    assert manifest.box == {
+    assert manifest["box"] == {
         "n_molecules": 64,
         "atoms_per_chain": 1,
         "box_nm": [2.4, 2.4, 2.4],
     }
 
+    # Record both the requested temperature and what the dynamics reached.
+    entry = manifest["stages"]["01_nvt"]
+    assert entry["steps"] > 0
+    assert entry["mean_temperature_k"] == pytest.approx(100.0, abs=40.0)
+    assert Path(entry["final_state"]).is_file()
+    assert sorted(
+        path.name for path in Path(quick_run.run_dir).glob("*.state.xml")
+    ) == [f"{stage.name}.state.xml" for stage in QUICK.stages]
+    loaded = RunManifest.load(quick_run.run_dir)
+    assert loaded is not None
+    assert loaded.box == manifest["box"]
 
-def test_a_resumed_run_skips_what_is_already_done(argon_run: Any) -> None:
-    """The point of the manifest."""
-    first = run_protocol(QUICK, argon_run, "run")
+
+@pytest.mark.parametrize(
+    ("completed", "damage", "resume", "skipped"),
+    [
+        pytest.param(3, None, True, 3, id="completed"),
+        pytest.param(2, None, True, 2, id="partial"),
+        pytest.param(3, "missing", True, 1, id="missing-state"),
+        pytest.param(3, "altered", True, 1, id="altered-state"),
+        pytest.param(3, None, False, 0, id="forced-rerun"),
+    ],
+)
+def test_resume_runs_only_unfinished_or_invalidated_stages(
+    argon_run: Any, completed: int, damage: str | None, resume: bool, skipped: int
+) -> None:
+    first = run_protocol(
+        replace(QUICK, stages=QUICK.stages[:completed]), argon_run, "run"
+    )
     assert first.skipped == ()
+    if damage:
+        path = Path("run/01_nvt.state.xml")
+        if damage == "missing":
+            path.unlink()
+        else:
+            path.write_text(path.read_text() + "\n")
 
-    second = run_protocol(QUICK, argon_run, "run")
-    assert second.skipped == ("00_minimise", "01_nvt", "02_npt")
-    assert second.results == ()
-
-
-def test_a_resumed_run_carries_on_from_where_it_stopped(argon_run: Any) -> None:
-    """Half a protocol, then the rest of it."""
-    half = Protocol(name="quick", stages=QUICK.stages[:2])
-    run_protocol(half, argon_run, "run")
-
-    resumed = run_protocol(QUICK, argon_run, "run")
-    assert resumed.skipped == ("00_minimise", "01_nvt")
-    assert [result.name for result in resumed.results] == ["02_npt"]
+    result = run_protocol(QUICK, argon_run, "run", resume=resume)
+    assert result.skipped == tuple(stage.name for stage in QUICK.stages[:skipped])
+    assert [stage.name for stage in result.results] == [
+        stage.name for stage in QUICK.stages[skipped:]
+    ]
 
 
 def test_explicit_forwarded_defaults_match_the_original_request(argon_run: Any) -> None:
@@ -241,23 +231,6 @@ def test_explicit_forwarded_defaults_match_the_original_request(argon_run: Any) 
         "run",
     )
     assert resumed.results == ()
-
-
-def test_resume_can_be_turned_off(argon_run: Any) -> None:
-    """Forcing a rerun has to be possible, or a changed setting is stuck."""
-    run_protocol(QUICK, argon_run, "run")
-    again = run_protocol(QUICK, argon_run, "run", resume=False)
-    assert again.skipped == ()
-    assert len(again.results) == 3
-
-
-def test_a_stage_whose_state_has_gone_is_run_again(argon_run: Any) -> None:
-    """A manifest entry is not enough; the state it points at has to be there."""
-    run_protocol(QUICK, argon_run, "run")
-    Path("run/01_nvt.state.xml").unlink()
-    resumed = run_protocol(QUICK, argon_run, "run")
-    assert resumed.skipped == ("00_minimise",)
-    assert [result.name for result in resumed.results] == ["01_nvt", "02_npt"]
 
 
 def test_a_resumed_run_reads_each_state_once(
@@ -284,12 +257,6 @@ def test_a_resumed_run_reads_each_state_once(
     ]
 
 
-def _saved_artifacts(directory: Path) -> dict[str, bytes]:
-    return {
-        str(path): path.read_bytes() for path in directory.rglob("*") if path.is_file()
-    }
-
-
 @pytest.mark.parametrize(
     "option,value", [("temperature_k", 120.0), ("duration_ps", 3.0)]
 )
@@ -297,14 +264,14 @@ def test_changed_stage_settings_are_rejected_without_overwriting_artifacts(
     argon_run: Any, option: str, value: float
 ) -> None:
     run_protocol(QUICK, argon_run, "run")
-    before = _saved_artifacts(Path("run"))
+    before = snapshot_files(Path("run"))
     changed = replace(
         QUICK.stages[1], options={**QUICK.stages[1].options, option: value}
     )
     protocol = replace(QUICK, stages=(QUICK.stages[0], changed, QUICK.stages[2]))
     with pytest.raises(ProtocolError, match="settings or starting state changed"):
         run_protocol(protocol, argon_run, "run")
-    assert _saved_artifacts(Path("run")) == before
+    assert snapshot_files(Path("run")) == before
 
 
 @pytest.mark.parametrize(
@@ -315,7 +282,7 @@ def test_changed_initial_inputs_are_rejected_without_overwriting_the_manifest(
 ) -> None:
     protocol = Protocol("initial", (QUICK.stages[0],))
     run_protocol(protocol, argon_run, "run")
-    before = _saved_artifacts(Path("run"))
+    before = snapshot_files(Path("run"))
     if change == "seed":
         argon_run = replace(argon_run, seed=99)
     elif change == "spec":
@@ -340,21 +307,21 @@ def test_changed_initial_inputs_are_rejected_without_overwriting_the_manifest(
         )
     with pytest.raises(ProtocolError, match="starting inputs changed"):
         run_protocol(protocol, argon_run, "run")
-    assert _saved_artifacts(Path("run")) == before
+    assert snapshot_files(Path("run")) == before
 
 
 def test_changing_protocol_name_or_stage_order_cannot_reuse_old_results(
     argon_run: Any,
 ) -> None:
     run_protocol(QUICK, argon_run, "run")
-    before = _saved_artifacts(Path("run"))
+    before = snapshot_files(Path("run"))
     for changed in (
         replace(QUICK, name="other"),
         replace(QUICK, stages=tuple(reversed(QUICK.stages))),
     ):
         with pytest.raises(ProtocolError, match="Cannot resume"):
             run_protocol(changed, argon_run, "run")
-        assert _saved_artifacts(Path("run")) == before
+        assert snapshot_files(Path("run")) == before
 
 
 def test_external_starting_state_is_checked_by_content(argon_run: Any) -> None:
@@ -363,21 +330,12 @@ def test_external_starting_state_is_checked_by_content(argon_run: Any) -> None:
     )
     protocol = Protocol("branch", (QUICK.stages[1],))
     run_protocol(protocol, argon_run, "branch", state_in=initial.final_state)
-    before = _saved_artifacts(Path("branch"))
+    before = snapshot_files(Path("branch"))
     path = Path(initial.final_state)
     path.write_text(path.read_text() + "\n")
     with pytest.raises(ProtocolError, match="starting state changed"):
         run_protocol(protocol, argon_run, "branch", state_in=initial.final_state)
-    assert _saved_artifacts(Path("branch")) == before
-
-
-def test_altered_completed_state_reruns_its_descendants(argon_run: Any) -> None:
-    run_protocol(QUICK, argon_run, "run")
-    path = Path("run/01_nvt.state.xml")
-    path.write_text(path.read_text() + "\n")
-    resumed = run_protocol(QUICK, argon_run, "run")
-    assert resumed.skipped == ("00_minimise",)
-    assert [result.name for result in resumed.results] == ["01_nvt", "02_npt"]
+    assert snapshot_files(Path("branch")) == before
 
 
 def test_separate_branches_resume_and_upstream_reruns_invalidate_all_branches(
@@ -415,10 +373,10 @@ def test_branch_only_resume_cannot_start_from_an_invalidated_parent(
     run_protocol(branch, argon_run, "run", state_in=initial.final_state)
     path = Path(initial.final_state)
     path.write_text(path.read_text() + "\n")
-    before = _saved_artifacts(Path("run"))
+    before = snapshot_files(Path("run"))
     with pytest.raises(ProtocolError, match="upstream preparation"):
         run_protocol(branch, argon_run, "run", state_in=initial.final_state)
-    assert _saved_artifacts(Path("run")) == before
+    assert snapshot_files(Path("run")) == before
 
 
 def test_invalidated_descendants_stay_invalid_when_upstream_rerun_fails(
@@ -447,11 +405,11 @@ def test_legacy_manifest_is_readable_but_requires_explicit_rerun(
     data = json.loads(path.read_text())
     data.pop("provenance")
     path.write_text(json.dumps(data))
-    before = _saved_artifacts(Path("run"))
+    before = snapshot_files(Path("run"))
     assert RunManifest.load("run") is not None
     with pytest.raises(ProtocolError, match="legacy manifest"):
         run_protocol(QUICK, argon_run, "run")
-    assert _saved_artifacts(Path("run")) == before
+    assert snapshot_files(Path("run")) == before
     assert run_protocol(QUICK, argon_run, "run", resume=False).skipped == ()
 
 
@@ -462,10 +420,10 @@ def test_build_request_guards_assets_before_cli_rebuilds(tmp_path: Path) -> None
     asset = tmp_path / "build/chain.pdb"
     asset.write_text("original build")
     check_build_request(tmp_path, {**request, "caps": ["H", "H"]})
-    before = _saved_artifacts(tmp_path)
+    before = snapshot_files(tmp_path)
     with pytest.raises(ProtocolError, match="inputs changed"):
         record_build_request(tmp_path, {**request, "seed": 8})
-    assert _saved_artifacts(tmp_path) == before
+    assert snapshot_files(tmp_path) == before
 
 
 def test_build_request_rejects_unverified_existing_artifacts(tmp_path: Path) -> None:
@@ -699,34 +657,33 @@ def test_duration_counts_the_segments_handed_to_execution(
         )
 
 
-@pytest.mark.parametrize("kind", ["heat", "quench"])
 @pytest.mark.parametrize(
-    "temperatures",
-    [[], [100.0, 100.0], [float("nan")], [float("inf")], [0.0]],
+    ("kind", "options", "match"),
+    [
+        *[
+            pytest.param(
+                kind, {"temperatures_k": temperatures}, None, id=f"{kind}-{name}"
+            )
+            for kind in ("heat", "quench")
+            for name, temperatures in (
+                ("empty", []),
+                ("repeated", [100.0, 100.0]),
+                ("nan", [float("nan")]),
+                ("infinite", [float("inf")]),
+                ("zero", [0.0]),
+            )
+        ],
+        ("compress", {"pressures_bar": []}, "no segments"),
+        ("anneal", {"n_cycles": 0}, "no segments"),
+    ],
 )
-def test_invalid_explicit_ladders_fail_in_budgets_and_execution(
-    kind: str, temperatures: list[float]
+def test_invalid_schedules_fail_identically_in_budgets_and_execution(
+    kind: str, options: dict[str, Any], match: str | None
 ) -> None:
-    """An empty explicit ladder must never fall back to the default ramp."""
-    options = {"temperatures_k": temperatures}
-    with pytest.raises(ValueError) as estimate_error:
+    """An empty explicit schedule cannot fall back to the default or cost zero."""
+    with pytest.raises(ValueError, match=match) as estimate_error:
         _ = Stage("test", kind, options).duration_ps
-    with pytest.raises(ValueError) as execution_error:
-        STAGE_RUNNERS[kind](None, **options)
-    assert str(estimate_error.value) == str(execution_error.value)
-
-
-@pytest.mark.parametrize(
-    ("kind", "options"),
-    [("compress", {"pressures_bar": []}), ("anneal", {"n_cycles": 0})],
-)
-def test_empty_schedules_fail_in_budgets_and_execution(
-    kind: str, options: dict[str, Any]
-) -> None:
-    """No dynamics to execute is an invalid stage, rather than a zero cost."""
-    with pytest.raises(ValueError, match="no segments") as estimate_error:
-        _ = Stage("test", kind, options).duration_ps
-    with pytest.raises(ValueError, match="no segments") as execution_error:
+    with pytest.raises(ValueError, match=match) as execution_error:
         STAGE_RUNNERS[kind](None, **options)
     assert str(estimate_error.value) == str(execution_error.value)
 
@@ -758,29 +715,6 @@ def test_heating_samples_are_retained_in_a_resumable_manifest(
     reloaded = RunManifest.load(tmp_path)
     assert reloaded is not None
     assert reloaded.stages["01_heat"]["samples"] == samples
-
-
-def test_the_total_duration_counts_an_anneal_and_a_compression_too() -> None:
-    """Both state their time as a ladder, and both used to count as zero."""
-    only_anneal = Protocol(
-        name="anneal",
-        stages=(
-            Stage(
-                "00_anneal",
-                "anneal",
-                {"n_cycles": 2, "ramp_windows": 4, "window_ps": 10.0, "hold_ps": 5.0},
-            ),
-        ),
-    )
-    assert only_anneal.total_duration_ps == pytest.approx(2 * 2 * (4 * 10.0 + 5.0))
-
-    only_compress = Protocol(
-        name="compress",
-        stages=(Stage("00_compress", "compress", {"duration_ps_each": 50.0}),),
-    )
-    assert only_compress.total_duration_ps == pytest.approx(
-        50.0 * len(DEFAULT_COMPRESSION_BAR)
-    )
 
 
 def test_the_anneal_cycles_to_the_target_unless_told_otherwise() -> None:
@@ -830,37 +764,34 @@ def test_a_quench_can_start_somewhere_other_than_the_melt_temperature() -> None:
     )
 
 
-# --------------------------------------------------------------------------
-# The mechanical stage kinds
-# --------------------------------------------------------------------------
-
-
-def test_every_mechanical_stage_prices_itself() -> None:
-    """A stage missing from the cost estimate is a stage that gets believed.
-
-    All three are long, so a --dry-run that left them out would under-report
-    the most expensive part of the run.
-    """
-    cases = (
-        (Stage("d", "deform", {"n_steps": 25, "relax_ps": 50.0}), 1250.0),
+@pytest.mark.parametrize(
+    ("kind", "options", "duration"),
+    [
+        ("deform", {"n_steps": 25, "relax_ps": 50.0}, 1250.0),
         (
-            Stage(
-                "l",
-                "load",
-                {"stresses_bar": (0.0, 100.0, 200.0), "duration_ps_each": 1000.0},
-            ),
+            "load",
+            {"stresses_bar": (0.0, 100.0, 200.0), "duration_ps_each": 1000.0},
             3000.0,
         ),
+        ("shear", {"strains": (0.005, 0.01), "duration_ps_each": 200.0}, 400.0),
         (
-            Stage("s", "shear", {"strains": (0.005, 0.01), "duration_ps_each": 200.0}),
-            400.0,
+            "anneal",
+            {"n_cycles": 2, "ramp_windows": 4, "window_ps": 10.0, "hold_ps": 5.0},
+            180.0,
         ),
+        ("compress", {"duration_ps_each": 50.0}, 50.0 * len(DEFAULT_COMPRESSION_BAR)),
+    ],
+)
+def test_stage_and_protocol_duration_count_every_hold(
+    kind: str, options: dict[str, Any], duration: float
+) -> None:
+    stage = Stage("measurement", kind, options)
+    assert stage.duration_ps == pytest.approx(duration)
+    assert Protocol("measurement", (stage,)).total_duration_ps == pytest.approx(
+        duration
     )
-    for stage, expected in cases:
-        assert stage.duration_ps == pytest.approx(expected)
 
 
 def test_a_mechanical_stage_takes_its_runners_defaults() -> None:
     """Priced from the runner's own signature, so the two cannot drift."""
-    duration = Stage("d", "deform", {}).duration_ps
-    assert duration > 0.0
+    assert Stage("d", "deform", {}).duration_ps > 0.0

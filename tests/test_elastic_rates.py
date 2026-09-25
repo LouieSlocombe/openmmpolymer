@@ -32,10 +32,12 @@ from openmmpolymer.protocols import Protocol
 from openmmpolymer.trajectory import AnalysisError
 
 from .helpers import (
+    QUICK_EQUILIBRATION,
     deformation_rate_per_ns,
     fake_scan_dynamics,
     planted_extension_runner,
     planted_modulus_mpa,
+    snapshot_files,
     write_bulk,
     write_deformation,
     write_modulus_rate_series,
@@ -503,24 +505,31 @@ def test_workflow_refuses_changed_recorded_settings(
         )
 
 
+@pytest.mark.parametrize(
+    "name,message",
+    [
+        ("shear_modulus", "recorded positive durations"),
+        ("youngs_modulus", "positive strain rate"),
+    ],
+)
 def test_missing_duration_or_duplicate_directory_never_guesses_rate(
     tmp_path: Path,
+    name: str,
+    message: str,
 ) -> None:
-    directories = _series(tmp_path, "shear_modulus")
+    directories = _series(tmp_path, name)
     with pytest.raises(AnalysisError, match="more than once"):
         analyse_elastic_rates(
-            [directories[0]] * 2, property_name="shear_modulus", target_rate=0.001
+            [directories[0]] * 2, property_name=name, target_rate=0.001
         )
     with pytest.raises(AnalysisError, match="Supply run directories"):
-        analyse_elastic_rates([], property_name="shear_modulus", target_rate=0.001)
+        analyse_elastic_rates([], property_name=name, target_rate=0.001)
     file = directories[0] / "manifest.json"
     record = json.loads(file.read_text())
     next(iter(record["stages"].values()))["samples"].pop("segment_duration_ps")
     file.write_text(json.dumps(record))
-    with pytest.raises(AnalysisError, match="recorded positive durations"):
-        analyse_elastic_rates(
-            directories, property_name="shear_modulus", target_rate=0.001
-        )
+    with pytest.raises(AnalysisError, match=message):
+        analyse_elastic_rates(directories, property_name=name, target_rate=0.001)
 
 
 def test_resume_refuses_missing_states_and_changed_coordinates(
@@ -794,18 +803,7 @@ def test_saved_rates_must_measure_comparable_deformations(
         _youngs(directories)
 
 
-def test_missing_recorded_rate_and_repeated_directories_are_refused(
-    tmp_path: Path,
-) -> None:
-    directories = write_modulus_rate_series(tmp_path)
-    path = directories[0] / "manifest.json"
-    record = json.loads(path.read_text())
-    del record["stages"]["06_deform_r0_00"]["samples"]["segment_duration_ps"]
-    path.write_text(json.dumps(record))
-    with pytest.raises(AnalysisError, match="positive strain rate"):
-        _youngs(directories)
-    with pytest.raises(AnalysisError, match="more than once"):
-        _youngs([directories[1], directories[1]])
+def test_youngs_rates_require_strain_controlled_extension(tmp_path: Path) -> None:
     write_shear(tmp_path / "sheared")
     with pytest.raises(AnalysisError, match="no strain-controlled extension"):
         _youngs([tmp_path / "sheared"])
@@ -952,11 +950,11 @@ def test_changed_hamiltonian_is_rejected_before_workflow_metadata_is_overwritten
         argon_run,
         tmp_path / "equilibration",
     )
-    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    before = snapshot_files(tmp_path)
     changed = replace(argon_run, system_xml=argon_run.system_xml + "\n")
     with pytest.raises(ProtocolError, match="starting inputs changed"):
         _youngs_scan(changed, tmp_path)
-    assert {path: path.read_bytes() for path in before} == before
+    assert snapshot_files(tmp_path) == before
 
 
 @pytest.mark.parametrize(
@@ -1021,15 +1019,9 @@ def test_real_youngs_scan_retains_replicas_common_reference_and_resume(
     options: dict[str, Any] = {
         "spec": spec,
         "hold_times_ps": holds,
-        "nvt_ps": 0.2,
-        "compress_ps_each": 0.2,
-        "npt_ps": 0.3,
-        "anneal_cycles": 1,
-        "anneal_window_ps": 0.1,
-        "anneal_hold_ps": 0.1,
-        "compress_pressures_bar": (1.0, 20.0, 1.0),
+        **QUICK_EQUILIBRATION,
     }
-    _youngs_scan(argon_run, tmp_path, **dict(options))
+    _youngs_scan(argon_run, tmp_path, **options)
     workflow = json.loads((tmp_path / YOUNGS_WORKFLOW_NAME).read_text())
     reference = workflow["reference_box_nm"]
     manifests = [tmp_path / name / "manifest.json" for name in workflow["run_dirs"]]
@@ -1051,6 +1043,6 @@ def test_real_youngs_scan_retains_replicas_common_reference_and_resume(
                     [hold] * len(samples["segment_strain"])
                 )
                 assert Path(entry["final_state"]).is_file()
-    _youngs_scan(argon_run, tmp_path, **dict(options))
+    _youngs_scan(argon_run, tmp_path, **options)
     after = [json.loads(path.read_text())["stages"] for path in manifests]
     assert after == before

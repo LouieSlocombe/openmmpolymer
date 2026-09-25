@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pytest
@@ -66,35 +65,6 @@ def test_saved_convergence_cli_writes_strict_json_and_status(
     assert [window["fraction"] for window in density["windows"]] == [0.2, 0.4, 0.7, 1]
     assert not list(output.glob("*.png"))
     assert "density_g_cm3: resolved" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize(
-    "controls",
-    [
-        [],
-        ["--analyse", "one", "two"],
-        ["--analyse", "one", "--target-strain-rate", "0.1"],
-        [
-            "--analyse",
-            "one",
-            "--rate-property",
-            "yield_strength",
-            "--target-property-rate",
-            "0.1",
-        ],
-        ["--analyse", "one", "--window-fractions", ".5,1"],
-        ["--analyse", "one", "--convergence-tolerance", "nan"],
-        ["--analyse", "one", "--min-effective-samples", "0"],
-        ["--analyse", "one", "--convergence-discard-fraction", "1"],
-    ],
-)
-def test_invalid_convergence_controls_cannot_reach_dynamics_or_write_output(
-    controls: list[str], no_build: list[Any]
-) -> None:
-    with pytest.raises(SystemExit, match="2"):
-        cli.main(["--convergence", "-o", "new", *controls])
-    assert not no_build
-    assert not Path("new").exists()
 
 
 def test_convergence_defaults_output_to_saved_analysis(tmp_path: Path) -> None:

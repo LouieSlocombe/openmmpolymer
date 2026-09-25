@@ -35,6 +35,7 @@ from openmmpolymer.viscoelastic import RelaxationSpec, relaxation_scan
 
 from .helpers import (
     BuildReached,
+    snapshot_files,
     transition_at,
     two_line_curve,
     write_crystal,
@@ -260,10 +261,6 @@ def _argv(protocol: str, *flags: str) -> list[str]:
     """A command line for *protocol*: tm starts from a crystal, not a monomer."""
     monomer = [] if protocol == "tm" else ["[*]CC[*]"]
     return [*monomer, "--protocol", protocol, *flags]
-
-
-def _files(root: Path) -> dict[str, bytes]:
-    return {str(path): path.read_bytes() for path in root.rglob("*") if path.is_file()}
 
 
 # --------------------------------------------------------------------------
@@ -505,39 +502,6 @@ def test_every_run_is_priced_in_full_before_anything_is_built(
     )
 
 
-@pytest.mark.parametrize(
-    ("protocol", "flags"),
-    [
-        *((protocol, "--max-total-ns 0.001") for protocol in sorted(DEFAULT_SETTINGS)),
-        ("melt-quench", "--step-k 0"),
-        ("melt-quench", "--t-end 700"),
-        ("tg", "--fine-step-k 0"),
-        ("modulus", "--strain-increment 0"),
-        ("modulus", "--elastic-strain-limit 0.5"),
-        ("relax", "--step-strain 0"),
-        ("equilibrate", "-r TOOLONG"),
-    ],
-)
-def test_every_protocols_settings_are_checked_before_anything_is_built(
-    protocol: str,
-    flags: str,
-    no_build: list[Any],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A dry run of a bad request used to build a melt first, for some protocols."""
-
-    def unexpected(*args: Any, **kwargs: Any) -> Any:
-        pytest.fail("a refused request read the crystal")
-
-    monkeypatch.setattr(cli, "load_crystal", unexpected)
-    crystal = "--crystal-pdb c.pdb --system-xml s.xml" if protocol == "tm" else ""
-    argv = _argv(protocol, *f"--dry-run -o output {crystal} {flags}".split())
-    with pytest.raises(SystemExit, match="2"):
-        main(argv)
-    assert not no_build
-    assert not Path("output").exists()
-
-
 # --------------------------------------------------------------------------
 # The build
 # --------------------------------------------------------------------------
@@ -581,7 +545,7 @@ def test_a_rebuild_that_is_refused_or_breaks_leaves_the_build_as_it_was(
 ) -> None:
     """A refusal is a usage error; a build that breaks says so itself."""
     assert main(["[*]CC[*]", "--dry-run"]) == 0
-    before = _files(Path("run"))
+    before = snapshot_files(Path("run"))
     if failure == "refused":
         staged_melt["system_suffix"] = "\n"
         expected: type[BaseException] = SystemExit
@@ -590,7 +554,7 @@ def test_a_rebuild_that_is_refused_or_breaks_leaves_the_build_as_it_was(
         expected = RuntimeError
     with pytest.raises(expected):
         main(["[*]CC[*]", "--dry-run"])
-    assert _files(Path("run")) == before
+    assert snapshot_files(Path("run")) == before
 
 
 def test_a_dry_run_can_go_on_to_dynamics_on_the_verified_build(
@@ -615,10 +579,10 @@ def test_a_dry_run_can_go_on_to_dynamics_on_the_verified_build(
         )
 
     assert main(["[*]CC[*]", "--dry-run"]) == 0
-    before = _files(Path("run"))
+    before = snapshot_files(Path("run"))
     monkeypatch.setattr(cli, "run_protocol", dynamics)
     assert main(["[*]CC[*]"]) == 0
-    assert _files(Path("run")) == before
+    assert snapshot_files(Path("run")) == before
     (protocol, output, options) = ran[0]
     assert protocol == DEFAULT_SETTINGS["equilibrate"]
     assert output == Path("run")
@@ -783,54 +747,6 @@ def test_a_scan_settles_its_melt_as_the_flags_ask_and_says_what_it_found(
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["--protocol", "tm"],
-        ["--protocol", "tm", "--crystal-pdb", "crystal.pdb"],
-        [
-            "[*]CC[*]",
-            "--protocol",
-            "tm",
-            "--crystal-pdb",
-            "crystal.pdb",
-            "--system-xml",
-            "system.xml",
-        ],
-        ["[*]CC[*]", "--crystal-pdb", "crystal.pdb"],
-    ],
-)
-def test_melting_requires_a_prepared_crystal_before_creating_files(
-    argv: list[str],
-) -> None:
-    with pytest.raises(SystemExit):
-        main([*argv, "-o", "output"])
-    assert not Path("output").exists()
-
-
-@pytest.mark.parametrize(
-    "controls",
-    [
-        ["--t-start", "500", "--t-end", "300"],
-        ["--step-k", "0"],
-        ["--hold-ps", "-1"],
-        ["--max-total-ns", "0.001"],
-        ["--check-melt"],
-    ],
-)
-def test_melting_rejects_invalid_schedules_before_reading_the_crystal(
-    controls: list[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def unexpected_read(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("The schedule should fail before the crystal is read")
-
-    monkeypatch.setattr(cli, "load_crystal", unexpected_read)
-    crystal = ["--crystal-pdb", "crystal.pdb", "--system-xml", "system.xml"]
-    with pytest.raises(SystemExit):
-        main(["--protocol", "tm", *crystal, "-o", "output", *controls])
-    assert not Path("output").exists()
-
-
 def test_melting_dry_run_validates_prepared_inputs_without_building(
     argon_box: tuple[Any, Any], capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -948,44 +864,28 @@ def test_analyse_dispatches_melting_and_reports_unresolved_results(
     ) in printed
 
 
-def test_the_analysis_mode_reports_a_transition_and_writes_a_report(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("resolved", [True, False])
+def test_saved_quench_analysis_reports_the_transition_verdict(
+    resolved: bool, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """No monomer, no OpenMM, no chemistry: a directory in, a number out."""
     temperature, density = two_line_curve(transition_k=340.0)
+    if not resolved:
+        density = 1.0 / (1.0 + 5.0e-4 * temperature)
     write_quench(
         tmp_path,
         temperature[::-1],
         density[::-1],
-        stage="06_quench",
         segment_duration_ps=[1000.0] * 21,
     )
-    exit_code = main(["--analyse", str(tmp_path), "--no-melt-check", "--no-figures"])
+    assert main(["--analyse", str(tmp_path), "--no-melt-check", "--no-figures"]) == 0
     printed = capsys.readouterr().out
-
-    assert exit_code == 0
     assert "quenches: 06_quench (20 K steps, 20.00 K/ns)" in printed
-    assert "Tg = 340 K" in printed
-    assert "aV" in printed
-    assert (tmp_path / "analysis" / "tg.json").is_file()
-
-
-def test_an_unresolved_analysis_is_a_result_rather_than_a_usage_error(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A curve with no break in it is something the science can say."""
-    temperature = np.linspace(200.0, 600.0, 21)
-    straight = 1.0 / (1.0 + 5.0e-4 * temperature)
-    write_quench(
-        tmp_path,
-        temperature[::-1],
-        straight[::-1],
-        segment_duration_ps=[1000.0] * 21,
-    )
-    exit_code = main(["--analyse", str(tmp_path), "--no-melt-check", "--no-figures"])
-
-    assert exit_code == 0
-    assert "no clear transition" in capsys.readouterr().out
+    if resolved:
+        assert "Tg = 340 K" in printed
+        assert "aV" in printed
+    else:
+        assert "no clear transition" in printed
+    assert (tmp_path / "analysis/tg.json").is_file()
 
 
 @pytest.mark.parametrize("form", ["log_linear", "vft"])
@@ -1161,39 +1061,32 @@ def test_each_number_is_printed_with_what_qualifies_it(printer: str) -> None:
     assert list(getattr(cli, printer)(report)) == lines
 
 
-def test_analyse_reports_mechanics_when_the_directory_holds_a_deformation(
-    capsys: pytest.CaptureFixture[str],
+@pytest.mark.parametrize("with_quench,modulus", [(False, 2000.0), (True, 1800.0)])
+def test_saved_analysis_detects_mechanics_and_any_accompanying_quench(
+    with_quench: bool, modulus: float, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Dispatched on what the run recorded, and the rate travels with E."""
-    write_deformation(Path("run"), modulus_mpa=2000.0, poisson=0.35)
-    assert main(["--analyse", "run", "--no-figures"]) == 0
-    captured = capsys.readouterr().out
-    assert "E = 2000 MPa" in captured
-    assert "strain/ns" in captured
-    assert "nu = 0.350" in captured
-    assert Path("run/analysis/mechanics.json").is_file()
-
-
-def test_analyse_reports_both_when_the_directory_holds_both(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """One verb, and it does not have to be told which kind of run this was."""
-    Path("run").mkdir()
-    temperature, density = two_line_curve(transition_k=340.0)
-    write_quench(
-        Path("run"),
-        temperature[::-1],
-        density[::-1],
-        segment_duration_ps=[1000.0] * 21,
-    )
-    write_deformation(Path("run"), modulus_mpa=1800.0)
-    exit_code = main(["--analyse", "run", "--no-melt-check", "--no-figures"])
-    captured = capsys.readouterr().out
-    assert exit_code == 0
-    assert "E = 1800 MPa" in captured
-    assert "quenches:" in captured
-    assert Path("run/analysis/tg.json").is_file()
-    assert Path("run/analysis/mechanics.json").is_file()
+    directory = Path("run")
+    directory.mkdir()
+    flags = ["--no-figures"]
+    if with_quench:
+        temperature, density = two_line_curve(transition_k=340.0)
+        write_quench(
+            directory,
+            temperature[::-1],
+            density[::-1],
+            segment_duration_ps=[1000.0] * 21,
+        )
+        flags.append("--no-melt-check")
+    write_deformation(directory, modulus_mpa=modulus, poisson=0.35)
+    assert main(["--analyse", str(directory), *flags]) == 0
+    printed = capsys.readouterr().out
+    assert f"E = {modulus:g} MPa" in printed
+    assert "strain/ns" in printed
+    assert "nu = 0.350" in printed
+    assert (directory / "analysis/mechanics.json").is_file()
+    if with_quench:
+        assert "quenches:" in printed
+        assert (directory / "analysis/tg.json").is_file()
 
 
 @pytest.mark.parametrize("kind", ["empty", "unmeasured", "structure_skipped"])

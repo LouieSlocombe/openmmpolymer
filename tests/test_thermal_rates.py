@@ -22,7 +22,7 @@ from openmmpolymer.thermal_rates import (
     run_thermal_rate_scan,
     validate_thermal_rate_scan,
 )
-from openmmpolymer.tm import TmSpec
+from openmmpolymer.tm import HeatingCurve, TmSpec
 from openmmpolymer.trajectory import AnalysisError
 
 from .helpers import planted_curve, write_heating, write_quench
@@ -55,6 +55,15 @@ def _tg_series(root: Path, replicas: int = 1) -> list[Path]:
         )
         for rate, hold in enumerate(HOLDS)
         for replica in range(replicas)
+    ]
+
+
+def _tm_series(root: Path, curves: list[HeatingCurve]) -> list[Path]:
+    return [
+        write_heating(
+            root / str(index), replace(curve, hold_ps=(hold,) * curve.n_points)
+        )
+        for index, (hold, curve) in enumerate(zip(HOLDS, curves, strict=True))
     ]
 
 
@@ -94,14 +103,10 @@ def test_replicate_thermal_temperatures_propagate_rate_uncertainty(
 def test_saved_melting_brackets_are_preserved_but_not_standard_errors(
     tmp_path: Path,
 ) -> None:
-    directories = []
-    for index, hold in enumerate(HOLDS):
-        curve = planted_curve(volume_split=12 - index, enthalpy_split=12 - index)
-        directories.append(
-            write_heating(
-                tmp_path / str(index), replace(curve, hold_ps=(hold,) * curve.n_points)
-            )
-        )
+    directories = _tm_series(
+        tmp_path,
+        [planted_curve(volume_split=12 - i, enthalpy_split=12 - i) for i in range(3)],
+    )
     report = analyse_thermal_rates(
         directories, property_name="melting_temperature", target_rate=0.1
     )
@@ -117,14 +122,9 @@ def test_saved_melting_brackets_are_preserved_but_not_standard_errors(
 def test_missing_melting_event_blocks_models_without_dropping_history(
     tmp_path: Path,
 ) -> None:
-    directories = []
-    for index, hold in enumerate(HOLDS):
-        curve = planted_curve(volume_jump=0 if index == 1 else 0.1)
-        directories.append(
-            write_heating(
-                tmp_path / str(index), replace(curve, hold_ps=(hold,) * curve.n_points)
-            )
-        )
+    directories = _tm_series(
+        tmp_path, [planted_curve(volume_jump=0 if i == 1 else 0.1) for i in range(3)]
+    )
     report = analyse_thermal_rates(
         directories, property_name="melting_temperature", target_rate=0.1
     )
@@ -161,24 +161,20 @@ def test_too_short_cooling_histories_remain_unresolved_observations(
 def test_different_saved_thermal_conditions_are_refused(
     tmp_path: Path, change: str
 ) -> None:
-    directories = []
-    for index, hold in enumerate(HOLDS):
-        curve = planted_curve()
-        if index == 1 and change == "ladder":
-            curve = replace(
-                curve, temperature_k=tuple(t + 5 for t in curve.temperature_k)
-            )
-        if index == 1 and change == "pressure":
-            curve = replace(curve, pressure_bar=(2.0,) * curve.n_points)
-        directory = write_heating(
-            tmp_path / str(index), replace(curve, hold_ps=(hold,) * curve.n_points)
+    curve = planted_curve()
+    changed = curve
+    if change == "ladder":
+        changed = replace(
+            curve, temperature_k=tuple(t + 5 for t in curve.temperature_k)
         )
-        if index == 1 and change == "system":
-            manifest = RunManifest.load(directory)
-            assert manifest is not None
-            manifest.system = {"hydrogen_mass_amu": 3}
-            manifest.save(directory)
-        directories.append(directory)
+    elif change == "pressure":
+        changed = replace(curve, pressure_bar=(2.0,) * curve.n_points)
+    directories = _tm_series(tmp_path, [curve, changed, curve])
+    if change == "system":
+        manifest = RunManifest.load(directories[1])
+        assert manifest is not None
+        manifest.system = {"hydrogen_mass_amu": 3}
+        manifest.save(directories[1])
     with pytest.raises(AnalysisError, match="different"):
         analyse_thermal_rates(
             directories, property_name="melting_temperature", target_rate=0.1
