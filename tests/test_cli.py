@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 from dataclasses import replace
@@ -22,15 +23,121 @@ from openmmpolymer.__main__ import (
     build_parser,
     main,
 )
-from openmmpolymer.protocols import melt_quench
+from openmmpolymer.protocols import _canonical, melt_quench
 
 from .helpers import (
+    BuildReached,
     transition_at,
     two_line_curve,
     write_deformation,
     write_polymer_snapshot,
     write_quench,
 )
+
+#: SHA-256 of what every command-line run's ``build_request.json`` is made
+#: of: each destination with its flags, default and const, and the namespace
+#: each protocol's shortest command line parses to once that protocol's own
+#: defaults are filled in. The request is ``vars(arguments)``, compared whole
+#: when a run resumes, so renaming, removing or re-defaulting a flag - or
+#: changing what a protocol fills in - makes every run already on disk refuse
+#: to resume. Change one of these only knowing that.
+RECORDED_REQUEST_SHA256 = {
+    "defaults": "7dee2dafb06a7a3f98caac0787aae9d6fc956ab72f71c646bf11eab9405cdce2",
+    "analyse": "de0816302b550e30bbd6bab0569f077527562e7294cbecfac7bfb72a469930e9",
+    "breaking": "1c0733748e93a35670c4f69ff0579045da4a0f640cb4386adfdf9bb4826d1a6f",
+    "elongation": "2be7461048f580a378bef14b4a703814d77baa0768e0ff8b425f4aa1ca8a86de",
+    "equilibrate": "9498f1b1fe4db82ed20c7d380737e222dee09e51c41843c27116360e444a5b29",
+    "melt-quench": "f9b959049e64e256f001fd6a20d47a7e0ff4db0e85de330b327c035c9a115397",
+    "modulus": "0088a39eb842c91b36d816105068d7e3cdbb0e8f1b442b79d1123710400d4fda",
+    "relax": "3cb7cf85ba7c1d63a0b1d1d8984aa6270d43cc507ea47e8f3d29fe115ef1d80b",
+    "tg": "5935f5f501003989b6265f9e06eed094a93e41a14d1a46b4db3a8827d06251f3",
+    "tm": "f66ed12a1460e2f2e5546b1bdf5075004755b20b86baa02b9cdc3b29910fc23e",
+    "yield": "012ff7978ea93edc33b04a21caffd630ca654b2d45a5786e0e9ad0a6e071f44a",
+}
+
+#: What the build request leaves out: where things go, which device runs
+#: them, how much is said, and whether - or under what budget - dynamics
+#: start. None of them changes the physical system.
+UNRECORDED = {
+    "output_dir",
+    "platform",
+    "dry_run",
+    "verbose",
+    "no_figures",
+    "figure_format",
+    "max_total_ns",
+}
+
+
+def _sha256(value: Any) -> str:
+    text = json.dumps(_canonical(value), sort_keys=True, allow_nan=False)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def test_every_setting_a_build_request_records_is_pinned() -> None:
+    """Changing one refuses the resume of every command-line run on disk."""
+    parser = build_parser()
+    recorded = {
+        "defaults": _sha256(
+            {
+                action.dest: [action.option_strings, action.default, action.const]
+                for action in parser._actions
+            }
+        ),
+        "analyse": _sha256(vars(parser.parse_args(["--analyse", "run"]))),
+    }
+    for protocol in (
+        "breaking",
+        "elongation",
+        "equilibrate",
+        "melt-quench",
+        "modulus",
+        "relax",
+        "tg",
+        "tm",
+        "yield",
+    ):
+        monomer = [] if protocol == "tm" else ["[*]CC[*]"]
+        arguments = parser.parse_args([*monomer, "--protocol", protocol])
+        recorded[protocol] = _sha256(vars(arguments))
+    assert recorded == RECORDED_REQUEST_SHA256
+
+
+def test_the_build_request_is_every_setting_but_where_and_how_it_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openmmpolymer import __main__ as cli
+
+    recorded: dict[str, Any] = {}
+
+    def record(output: Path, request: dict[str, Any]) -> None:
+        recorded.update(request)
+        raise BuildReached
+
+    monkeypatch.setattr(cli, "record_build_request", record)
+    argv = [
+        "[*]CC[*]",
+        "--conformers",
+        "50",
+        "--platform",
+        "CPU",
+        "--max-total-ns",
+        "1e6",
+        "--no-figures",
+        "-o",
+        "elsewhere",
+        "-v",
+    ]
+    with pytest.raises(BuildReached):
+        main(argv)
+    versions = recorded.pop("runtime_versions")
+    assert set(versions) == {"openmm", "rdkit", "forcefill", "openff-toolkit", "numpy"}
+    namespace = vars(build_parser().parse_args(argv))
+    assert recorded == {
+        **{key: value for key, value in namespace.items() if key not in UNRECORDED},
+        "conformers": 30,
+        "characteristic_ratio": 7.0,
+    }
 
 
 def test_the_parser_says_what_the_command_does() -> None:

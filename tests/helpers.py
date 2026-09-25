@@ -1453,3 +1453,7 @@ def fake_scan_dynamics(
     monkeypatch.setattr(_workflow, "run_protocol", runner)
     monkeypatch.setattr(module, "run_protocol", runner)
     monkeypatch.setattr(_workflow, "equilibrated_box_nm", lambda state: list(box_nm))
+
+
+class BuildReached(Exception):
+    """Where a stand-in for the melt build stops a command-line run."""
