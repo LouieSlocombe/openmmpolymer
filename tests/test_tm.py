@@ -394,6 +394,15 @@ def _ensemble_controls(control: str) -> list[Any]:
         "thermostat": [mm.AndersenThermostat(100.0, 100.0)],
         "barostat": [mm.MonteCarloBarostat(1.0, 100.0)],
         "anisotropic": [mm.MonteCarloAnisotropicBarostat(mm.Vec3(1, 1, 1), 100.0)],
+        "membrane": [
+            mm.MonteCarloMembraneBarostat(
+                1.0,
+                0.0,
+                100.0,
+                mm.MonteCarloMembraneBarostat.XYIsotropic,
+                mm.MonteCarloMembraneBarostat.ZFree,
+            )
+        ],
         "two_barostats": [
             mm.MonteCarloBarostat(1.0, 100.0),
             mm.MonteCarloFlexibleBarostat(1.0, 100.0),
@@ -446,6 +455,7 @@ def test_a_matching_starting_state_is_accepted(
         ("thermostat", "no barostat or Andersen thermostat"),
         ("barostat", "no barostat or Andersen thermostat"),
         ("anisotropic", "no barostat or Andersen thermostat"),
+        ("membrane", "no barostat or Andersen thermostat"),
         ("two_barostats", "no barostat or Andersen thermostat"),
         ("periodicity", "periodic boundary conditions"),
         ("box", "CRYST1"),
@@ -464,7 +474,13 @@ def test_a_crystal_the_scan_could_not_heat_is_refused_as_it_loads(
     atoms = list(box.topology.atoms())
     if invalid == "atom_count":
         system.addParticle(1.0)
-    elif invalid in ("thermostat", "barostat", "anisotropic", "two_barostats"):
+    elif invalid in (
+        "thermostat",
+        "barostat",
+        "anisotropic",
+        "membrane",
+        "two_barostats",
+    ):
         for force in _ensemble_controls(invalid):
             system.addForce(force)
     elif invalid == "periodicity":

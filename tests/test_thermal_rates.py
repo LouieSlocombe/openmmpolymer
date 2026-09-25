@@ -352,6 +352,13 @@ def test_a_system_that_controls_its_own_state_is_refused_before_writing(
             mm.Vec3(1.0, 1.0, 1.0), 300.0
         ),
         "flexible": lambda: mm.MonteCarloFlexibleBarostat(1.0, 300.0),
+        "membrane": lambda: mm.MonteCarloMembraneBarostat(
+            1.0,
+            0.0,
+            300.0,
+            mm.MonteCarloMembraneBarostat.XYIsotropic,
+            mm.MonteCarloMembraneBarostat.ZFree,
+        ),
         "andersen": lambda: mm.AndersenThermostat(300.0, 1.0),
     }
     system = mm.XmlSerializer.deserialize(argon_run.system_xml)

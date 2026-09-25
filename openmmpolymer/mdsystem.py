@@ -654,6 +654,21 @@ def find_barostat(system: Any) -> tuple[str, Any] | None:
     return found[0] if found else None
 
 
+def ensemble_controls(system: Any) -> list[str]:
+    """Name every barostat and Andersen thermostat *system* already carries.
+
+    Every barostat counts, the membrane barostat that no stage here attaches
+    among them: OpenMM applies each one a System carries, so a stage adding
+    its own would run under both.
+    """
+    return [
+        type(force).__name__
+        for force in system.getForces()
+        if type(force).__name__.endswith("Barostat")
+        or isinstance(force, mm.AndersenThermostat)
+    ]
+
+
 def barostat_kind(system: Any) -> str | None:
     """Return the kind of barostat in *system*, or None if it has none.
 

@@ -34,7 +34,7 @@ from ._workflow import (
     spec_request,
 )
 from .forcefield import PolymerForceField
-from .mdsystem import PackedBox, SystemAssemblyError, SystemSpec, find_barostat
+from .mdsystem import PackedBox, SystemSpec, ensemble_controls
 from .protocols import (
     Protocol,
     RunManifest,
@@ -657,16 +657,12 @@ def _refuse_ensemble_controls(system: Any, error: type[Exception]) -> None:
     The heating stages control temperature and pressure themselves, and
     OpenMM applies every barostat a System carries, a second one included.
     """
-    try:
-        barostat = find_barostat(system) is not None
-    except SystemAssemblyError:  # More than one.
-        barostat = True
-    if barostat or any(
-        isinstance(force, mm.AndersenThermostat) for force in system.getForces()
-    ):
+    controls = ensemble_controls(system)
+    if controls:
         raise error(
             "The supplied System must contain no barostat or Andersen thermostat; "
-            "the heating stages provide their own temperature and pressure control."
+            "the heating stages provide their own temperature and pressure "
+            f"control. It carries {', '.join(controls)}."
         )
 
 

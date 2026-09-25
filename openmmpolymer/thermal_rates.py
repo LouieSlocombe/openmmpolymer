@@ -28,7 +28,7 @@ from ._workflow import (
     start_fingerprint,
     validate_hold_times,
 )
-from .mdsystem import SystemAssemblyError, find_barostat
+from .mdsystem import ensemble_controls
 from .protocols import Protocol, RunManifest, Stage, run_protocol
 from .rate_dependence import (
     RateObservation,
@@ -200,18 +200,12 @@ def _check_system(run: RunContext) -> None:
     """Refuse a System that would fight the stages' own thermostat and barostat."""
     import openmm as mm
 
-    system = mm.XmlSerializer.deserialize(run.system_xml)
-    try:
-        barostat = find_barostat(system) is not None
-    except SystemAssemblyError:
-        # More than one: refused all the same, and for the same reason.
-        barostat = True
-    if barostat or any(
-        isinstance(force, mm.AndersenThermostat) for force in system.getForces()
-    ):
+    controls = ensemble_controls(mm.XmlSerializer.deserialize(run.system_xml))
+    if controls:
         raise ThermalRateError(
             "The supplied System must contain no barostat or Andersen thermostat; "
-            "the thermal stages provide their own temperature and pressure control."
+            "the thermal stages provide their own temperature and pressure "
+            f"control. It carries {', '.join(controls)}."
         )
 
 
