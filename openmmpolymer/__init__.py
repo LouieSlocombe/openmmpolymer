@@ -1,42 +1,26 @@
 """All-atom polymer melts with OpenMM, packmol and forcefill.
 
-The package takes a monomer SMILES to an equilibrated melt in four steps, each
-of which is usable on its own::
+A monomer SMILES becomes an equilibrated, measured melt::
 
-    from openmmpolymer import (
-        ChainSpec, build_chain, assign_charges, build_polymer_forcefield,
-        PackedComponent, box_edge_nm, pack_box, assemble_box, prepare_box,
-        prepare_run, standard_melt_equilibration, run_protocol,
-    )
+    from openmmpolymer import ChainSpec, build_melt, run_protocol, standard_melt_equilibration
 
-    chain = build_chain(
+    chain, run = build_melt(
         ChainSpec(monomer_smiles="[*]CC[*]", degree_of_polymerization=20,
                   residue_name="PE"),
-        n_conformers=50,
+        n_chains=50,
+        directory="run",
+        target_density_g_cm3=0.85,
     )
-    assign_charges(chain.sdf_paths[0], "nagl")
-    forcefield = build_polymer_forcefield(chain.sdf_paths[0], residue_name="PE")
+    run_protocol(standard_melt_equilibration(), run, "run",
+                 chain_backbone=chain.backbone, atoms_per_chain=chain.n_atoms)
 
-    components = [PackedComponent(path, 1) for path in chain.pdb_paths]
-    edge = box_edge_nm([50], [chain.molar_mass_g_mol], 0.3)
-    packed = pack_box(components, edge)
-
-    box = prepare_box(assemble_box(components, packed.packed_pdb, packed.box_nm),
-                      forcefield)
-    run = prepare_run(box, forcefield)
-    run_protocol(standard_melt_equilibration(), run, "run")
-
-The shape of all this follows from one constraint. forcefill will not
-parameterise a residue bonded to its neighbours, and it is right not to: a
-stand-alone GAFF treatment of a chain-linked residue is not valid. So a chain
-is built as a single molecule and a single residue, charged here rather than by
-the backend - a graph neural network scales where AM1-BCC's semi-empirical QM
-does not - and packed by conformer so that the cell holds fifty different
-conformations rather than fifty copies of one.
-
-It sits next to two of the same author's packages: ``forcefill`` does the
-parameterisation, and ``openmmnqe`` covers nuclear quantum effects for systems
-where they matter.
+:func:`build_melt` is the four layers in turn - :func:`build_chain`,
+:func:`assign_charges`, :func:`build_polymer_forcefield` and :func:`pack_box` -
+each usable on its own. Their shape follows from one constraint: forcefill will
+not parameterise a residue bonded to its neighbours, and it is right not to, so
+a chain is one molecule and one residue, charged here rather than by the
+backend and packed by conformer. The measurement workflows (``run_*_scan``,
+``analyse_*``, ``write_*_report``) take the run from there.
 """
 
 from importlib.metadata import PackageNotFoundError, version
