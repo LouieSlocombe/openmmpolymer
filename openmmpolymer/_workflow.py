@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import numpy.typing as npt
 
-from ._files import ReportFiles, file_sha256, write_json
+from ._files import ReportFiles, file_sha256, json_value, write_json
 from ._validation import require_positive
 from .protocols import (
     MANIFEST_NAME,
@@ -349,9 +349,9 @@ def write_report_files(
     the run, so a surprising number can be placed. Its *fields* are spelled
     out by each workflow rather than taken from ``asdict``, which drops
     properties, renders arrays as strings and would tie what is on disk to how
-    the dataclasses happen to be laid out; and it is lenient JSON, in which an
-    undefined diagnostic is NaN and says so. Each ``(stem, figure)`` pair is
-    saved as ``<stem>.<figure_format>``, in the order *figures* yields them.
+    the dataclasses happen to be laid out. An undefined diagnostic is written
+    as null, as every report writes it. Each ``(stem, figure)`` pair is saved
+    as ``<stem>.<figure_format>``, in the order *figures* yields them.
     """
     from . import __version__
 
@@ -364,7 +364,7 @@ def write_report_files(
         "versions": {} if manifest is None else manifest.versions,
         **fields,
     }
-    json_path = write_json(directory / name, record, strict=False)
+    json_path = write_json(directory / name, json_value(record))
     saved: list[str] = []
     for stem, figure in figures:
         path = directory / f"{stem}.{figure_format}"

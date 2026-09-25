@@ -38,9 +38,10 @@ def write_json(path: str | Path, record: Any, *, strict: bool = True) -> str:
     """Write *record* as indented JSON, atomically, and return the path.
 
     A strict record refuses NaN and infinity, so every number in it is one any
-    JSON reader accepts. A lenient one - a manifest, or a report that carries
-    an undefined diagnostic as NaN - writes them as JavaScript spells them and
-    falls back to ``str`` for anything else.
+    JSON reader accepts; pass it through :func:`json_value` first to turn an
+    undefined diagnostic into null. A lenient one - a manifest or a workflow
+    record - writes nonfinite numbers as JavaScript spells them and falls back
+    to ``str`` for anything else.
     """
     text = (
         json.dumps(record, indent=2, allow_nan=False)
@@ -52,8 +53,8 @@ def write_json(path: str | Path, record: Any, *, strict: bool = True) -> str:
 
 
 def json_value(value: Any) -> Any:
-    """Replace every nonfinite float with None, so a strict record can hold it."""
-    if isinstance(value, np.ndarray):
+    """Make *value* strict JSON: plain Python numbers, with None for nonfinite ones."""
+    if isinstance(value, (np.ndarray, np.generic)):
         return json_value(value.tolist())
     if isinstance(value, dict):
         return {key: json_value(item) for key, item in value.items()}

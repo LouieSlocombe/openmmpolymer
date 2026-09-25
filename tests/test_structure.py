@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import math
 import shutil
 from pathlib import Path
 from typing import Any
@@ -373,7 +372,8 @@ def test_the_report_writes_a_record_and_its_figures(tmp_path: Path) -> None:
     report = analyse_structure(tmp_path, backbone=(0, 1, 2, 3, 4))
     files = write_structure_report(report, tmp_path / "analysis")
 
-    record = json.loads(Path(files.json).read_text())
+    # Strict JSON: parse_constant refuses the NaN and Infinity tokens outright.
+    record = json.loads(Path(files.json).read_text(), parse_constant=_refuse)
     assert record["openmmpolymer"]
     assert record["stage"] == "05_npt"
     assert record["stage_source"] == "last_snapshot"
@@ -388,7 +388,8 @@ def test_the_report_writes_a_record_and_its_figures(tmp_path: Path) -> None:
     )
     assert record["conformation"]["settled"] is None
     assert record["persistence"]["decayed"] is False
-    assert math.isinf(record["persistence"]["persistence_length_nm"])
+    # An unbounded persistence length is undefined, which strict JSON spells null.
+    assert record["persistence"]["persistence_length_nm"] is None
     assert record["radial_distribution"]["n_frames"] == 1
     assert record["structure_factor"]["n_frames"] == 1
     assert record["displacement"] is None
@@ -434,3 +435,7 @@ def test_a_trajectory_report_draws_the_dynamics(dimer_run_directory: Path) -> No
     record = json.loads(Path(files.json).read_text())
     assert record["displacement"]["n_origins"] == 10
     assert record["relaxation"]["decorrelated"] in (True, False)
+
+
+def _refuse(token: str) -> None:
+    raise ValueError(f"{token} is not JSON")
