@@ -669,17 +669,6 @@ def ensemble_controls(system: Any) -> list[str]:
     ]
 
 
-def barostat_kind(system: Any) -> str | None:
-    """Return the kind of barostat in *system*, or None if it has none.
-
-    Raises:
-        SystemAssemblyError: The System carries more than one barostat. OpenMM accepts
-            that without complaint and then applies both.
-    """
-    found = find_barostat(system)
-    return found[0] if found is not None else None
-
-
 @functools.cache
 def platform_is_usable(name: str) -> bool:
     """Whether a Context can actually be built on the named platform.

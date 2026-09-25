@@ -20,7 +20,6 @@ from openmmpolymer.mdsystem import (
     SystemAssemblyError,
     SystemSpec,
     assemble_box,
-    barostat_kind,
     build_system,
     check_box,
     check_target_density,
@@ -544,7 +543,7 @@ def test_every_barostat_kind_is_found_and_named(argon_box: Any) -> None:
     System carrying two barostats could not see one of them.
     """
     _, system = argon_box
-    assert barostat_kind(system) is None
+    assert find_barostat(system) is None
     for kind, expected in (
         ("isotropic", mm.MonteCarloBarostat),
         ("anisotropic", mm.MonteCarloAnisotropicBarostat),
@@ -552,9 +551,9 @@ def test_every_barostat_kind_is_found_and_named(argon_box: Any) -> None:
     ):
         system = mm.System()
         system.addForce(make_barostat(kind, 300.0, 1.0, 25, 7))
-        assert barostat_kind(system) == kind
         found = find_barostat(system)
         assert found is not None
+        assert found[0] == kind
         assert isinstance(found[1], expected)
     assert not issubclass(mm.MonteCarloFlexibleBarostat, mm.MonteCarloBarostat)
 
@@ -568,7 +567,7 @@ def test_two_barostats_are_refused_even_when_one_is_flexible() -> None:
     system.addForce(make_barostat("anisotropic", 300.0, 1.0, 25, 7))
     system.addForce(make_barostat("flexible", 300.0, 1.0, 0, 9))
     with pytest.raises(SystemAssemblyError, match="2 barostats"):
-        barostat_kind(system)
+        find_barostat(system)
 
 
 def test_a_barostat_may_be_built_at_zero_frequency() -> None:
