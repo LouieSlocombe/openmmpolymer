@@ -413,6 +413,49 @@ class ChainDimensions:
     consistent: bool
 
 
+@dataclass
+class _ChainDimensionSums:
+    """Sufficient statistics to pool chains without retaining coordinates."""
+
+    n_chains: int = 0
+    sum_squared_end_to_end_nm2: float = 0.0
+    sum_radius_of_gyration_nm: float = 0.0
+    sum_squared_radius_of_gyration_nm2: float = 0.0
+    sum_bond_length_nm: float = 0.0
+
+    def add(self, other: _ChainDimensionSums) -> None:
+        """Include another cell or frame's chains in the pooled sums."""
+        self.n_chains += other.n_chains
+        self.sum_squared_end_to_end_nm2 += other.sum_squared_end_to_end_nm2
+        self.sum_radius_of_gyration_nm += other.sum_radius_of_gyration_nm
+        self.sum_squared_radius_of_gyration_nm2 += (
+            other.sum_squared_radius_of_gyration_nm2
+        )
+        self.sum_bond_length_nm += other.sum_bond_length_nm
+
+    def dimensions(
+        self, n_bonds: int, *, expected_characteristic_ratio: float
+    ) -> ChainDimensions:
+        """Form ratios from pooled means, including the square of mean bond length."""
+        mean_square = self.sum_squared_end_to_end_nm2 / self.n_chains
+        mean_radius = self.sum_radius_of_gyration_nm / self.n_chains
+        mean_squared_radius = self.sum_squared_radius_of_gyration_nm2 / self.n_chains
+        bond_length = self.sum_bond_length_nm / self.n_chains
+        measured = mean_square / (n_bonds * bond_length**2)
+        drift = (
+            abs(measured - expected_characteristic_ratio)
+            / expected_characteristic_ratio
+        )
+        return ChainDimensions(
+            mean_squared_end_to_end_nm2=mean_square,
+            mean_radius_of_gyration_nm=mean_radius,
+            ratio_of_squares=mean_square / mean_squared_radius,
+            characteristic_ratio=measured,
+            expected_characteristic_ratio=expected_characteristic_ratio,
+            consistent=drift <= CHAIN_DIMENSION_TOLERANCE,
+        )
+
+
 def chain_dimensions(
     positions_nm: npt.NDArray[np.float64],
     backbone: Sequence[int],
@@ -439,46 +482,45 @@ def chain_dimensions(
     Returns:
         The measurement.
     """
+    return _chain_dimension_sums(
+        positions_nm, backbone, atoms_per_chain, n_chains, masses=masses
+    ).dimensions(
+        len(backbone) - 1, expected_characteristic_ratio=expected_characteristic_ratio
+    )
+
+
+def _chain_dimension_sums(
+    positions_nm: npt.NDArray[np.float64],
+    backbone: Sequence[int],
+    atoms_per_chain: int,
+    n_chains: int,
+    *,
+    masses: npt.NDArray[np.float64] | None = None,
+) -> _ChainDimensionSums:
+    """Measure each chain once, keeping the sums needed by both dimension ratios."""
     path = np.asarray(backbone, dtype=int)
-    squares: list[float] = []
-    radii: list[float] = []
-    bonds: list[float] = []
+    sums = _ChainDimensionSums()
 
     for index in range(n_chains):
         offset = index * atoms_per_chain
         chain = positions_nm[offset : offset + atoms_per_chain]
         ends = chain[path[-1]] - chain[path[0]]
-        squares.append(float(ends @ ends))
+        sums.n_chains += 1
+        sums.sum_squared_end_to_end_nm2 += float(ends @ ends)
 
         weights = np.ones(len(chain)) if masses is None else masses
         centre = (weights[:, None] * chain).sum(axis=0) / weights.sum()
         offsets = chain - centre
-        radii.append(
-            float(
-                np.sqrt(
-                    (weights * (offsets * offsets).sum(axis=1)).sum() / weights.sum()
-                )
-            )
+        radius = float(
+            np.sqrt((weights * (offsets * offsets).sum(axis=1)).sum() / weights.sum())
         )
+        sums.sum_radius_of_gyration_nm += radius
+        sums.sum_squared_radius_of_gyration_nm2 += radius * radius
 
         steps = chain[path[1:]] - chain[path[:-1]]
-        bonds.append(float(np.sqrt((steps * steps).sum(axis=1)).mean()))
+        sums.sum_bond_length_nm += float(np.sqrt((steps * steps).sum(axis=1)).mean())
 
-    mean_square = float(np.mean(squares))
-    mean_radius = float(np.mean(radii))
-    bond_length = float(np.mean(bonds))
-    measured = mean_square / ((len(path) - 1) * bond_length**2)
-    drift = (
-        abs(measured - expected_characteristic_ratio) / expected_characteristic_ratio
-    )
-    return ChainDimensions(
-        mean_squared_end_to_end_nm2=mean_square,
-        mean_radius_of_gyration_nm=mean_radius,
-        ratio_of_squares=mean_square / float(np.mean(np.square(radii))),
-        characteristic_ratio=measured,
-        expected_characteristic_ratio=expected_characteristic_ratio,
-        consistent=drift <= CHAIN_DIMENSION_TOLERANCE,
-    )
+    return sums
 
 
 @dataclass

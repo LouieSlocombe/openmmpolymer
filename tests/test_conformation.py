@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import math
+import weakref
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 
+from openmmpolymer import conformation, protocols
 from openmmpolymer.conformation import (
     DIFFUSIVE_SLOPE_RANGE,
     NM2_PS_TO_CM2_S,
@@ -65,6 +68,140 @@ def test_a_single_frame_agrees_with_the_existing_snapshot_measurement() -> None:
         positions, list(range(21)), 21, 5, expected_characteristic_ratio=7.0
     )
     assert over_frames == directly
+
+
+def test_trajectory_ratios_use_pooled_means_even_when_one_frame_is_closed() -> None:
+    """A closed backbone still contributes its radius and bond lengths to
+    the pooled denominators, despite both of its own ratios being zero."""
+    frames = np.zeros((2, 3, 3), dtype=np.float64)
+    frames[0, :, 0] = (0.0, 1.0, 0.0)
+    frames[1, :, 0] = (0.0, 2.0, 4.0)
+    series = chain_conformation(
+        synthetic_ensemble(frames, n_chains=1),
+        (0, 1, 2),
+        expected_characteristic_ratio=16.0 / 9.0,
+    )
+
+    # R² is 0 and 16, Rg² is 2/9 and 8/3, and mean bond length is 1 and 2.
+    assert series.mean_squared_end_to_end_nm2 == pytest.approx([0.0, 16.0])
+    assert series.mean_radius_of_gyration_nm == pytest.approx(
+        [math.sqrt(2.0) / 3.0, math.sqrt(8.0 / 3.0)]
+    )
+    assert series.mean.mean_squared_end_to_end_nm2 == pytest.approx(8.0)
+    assert series.mean.mean_radius_of_gyration_nm == pytest.approx(
+        (math.sqrt(2.0) / 3.0 + math.sqrt(8.0 / 3.0)) / 2.0
+    )
+    assert series.mean.ratio_of_squares == pytest.approx(72.0 / 13.0)
+    assert series.mean.characteristic_ratio == pytest.approx(16.0 / 9.0)
+    assert series.mean.expected_characteristic_ratio == 16.0 / 9.0
+    assert series.mean.consistent
+
+
+@pytest.mark.parametrize(
+    ("n_frames", "n_chains", "stride"),
+    [(1, 3, 1), (2, 1, 1), (7, 3, 2), (5, 2, 8)],
+)
+def test_pooled_dimensions_match_selected_frames_with_masses_and_a_backbone_subset(
+    n_frames: int, n_chains: int, stride: int
+) -> None:
+    """Pooling must retain the weights of every chain and selected frame,
+    while using all atoms for Rg and only the backbone for bonds and R²."""
+    atoms_per_chain = 5
+    generator = np.random.default_rng(31)
+    positions = generator.normal(size=(n_frames, n_chains, atoms_per_chain, 3))
+    positions *= np.arange(1, n_frames + 1)[:, None, None, None]
+    positions *= np.arange(1, n_chains + 1)[None, :, None, None]
+    positions[0, :, 4, :] = positions[0, :, 0, :]
+    frames = positions.reshape(n_frames, n_chains * atoms_per_chain, 3)
+    masses = np.array([12.0, 1.0, 16.0, 2.0, 14.0])
+    backbone = (0, 2, 4)
+    expected_ratio = 1.75
+    interval = 2.5
+    ensemble = synthetic_ensemble(
+        frames,
+        n_chains=n_chains,
+        masses_amu=masses,
+        interval_ps=interval,
+        stage="weighted_chains",
+    )
+    selected = list(ensemble.frames(stride=stride))
+    snapshots = [
+        chain_dimensions(
+            frame.positions_nm,
+            backbone,
+            atoms_per_chain,
+            n_chains,
+            masses=masses,
+            expected_characteristic_ratio=expected_ratio,
+        )
+        for frame in selected
+    ]
+    pooled = chain_dimensions(
+        np.concatenate([frame.positions_nm for frame in selected]),
+        backbone,
+        atoms_per_chain,
+        n_chains * len(selected),
+        masses=masses,
+        expected_characteristic_ratio=expected_ratio,
+    )
+
+    series = chain_conformation(
+        ensemble,
+        backbone,
+        stride=stride,
+        expected_characteristic_ratio=expected_ratio,
+    )
+    assert series.stage == "weighted_chains"
+    assert series.n_frames == len(selected)
+    assert series.n_chains == n_chains
+    assert series.time_ps == pytest.approx([frame.time_ps for frame in selected])
+    assert series.mean_squared_end_to_end_nm2 == pytest.approx(
+        [frame.mean_squared_end_to_end_nm2 for frame in snapshots]
+    )
+    assert series.mean_radius_of_gyration_nm == pytest.approx(
+        [frame.mean_radius_of_gyration_nm for frame in snapshots]
+    )
+    assert series.mean.mean_squared_end_to_end_nm2 == pytest.approx(
+        pooled.mean_squared_end_to_end_nm2
+    )
+    assert series.mean.mean_radius_of_gyration_nm == pytest.approx(
+        pooled.mean_radius_of_gyration_nm
+    )
+    assert series.mean.ratio_of_squares == pytest.approx(pooled.ratio_of_squares)
+    assert series.mean.characteristic_ratio == pytest.approx(
+        pooled.characteristic_ratio
+    )
+    assert series.mean.expected_characteristic_ratio == expected_ratio
+    assert series.mean.consistent == pooled.consistent
+    assert (series.settled is None) == (len(selected) < 3)
+
+
+def test_each_selected_frame_is_measured_once_without_retaining_coordinates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The trajectory should only keep scalar statistics from prior frames,
+    and should not revisit their coordinates to compute the pooled mean."""
+    frames = np.repeat(dimer_cell(2)[None, :, :], 7, axis=0)
+    ensemble = synthetic_ensemble(frames, n_chains=2)
+    measure = protocols._chain_dimension_sums
+    measured_shapes: list[tuple[int, ...]] = []
+    coordinates: list[weakref.ReferenceType[npt.NDArray[np.float64]]] = []
+
+    def measure_once(
+        positions_nm: npt.NDArray[np.float64], *args: Any, **kwargs: Any
+    ) -> protocols._ChainDimensionSums:
+        assert all(reference() is None for reference in coordinates)
+        measured_shapes.append(positions_nm.shape)
+        coordinates.append(weakref.ref(positions_nm))
+        return measure(positions_nm, *args, **kwargs)
+
+    monkeypatch.setattr(protocols, "_chain_dimension_sums", measure_once)
+    monkeypatch.setattr(conformation, "_chain_dimension_sums", measure_once)
+    series = chain_conformation(ensemble, (0, 1), stride=3)
+
+    assert measured_shapes == [(4, 3)] * 3
+    assert series.n_frames == 3
+    assert all(reference() is None for reference in coordinates)
 
 
 def test_a_snapshot_has_no_settling_to_report() -> None:

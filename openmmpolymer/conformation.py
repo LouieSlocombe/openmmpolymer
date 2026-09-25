@@ -16,11 +16,10 @@ mean-squared displacement by six until its log-log slope says the chains are
 actually diffusing. A sub-linear slope is caged motion, and fitting a diffusion
 coefficient to it produces a number that looks like one and is not.
 
-None of this reimplements the per-frame arithmetic.
-:func:`~openmmpolymer.protocols.chain_dimensions` already measures a cell, and
-it is called frame by frame; the mean over a whole trajectory is taken by
-handing it every frame's chains at once, which works because a chain is a
-contiguous block of atoms and stacking frames just makes more blocks.
+The per-frame arithmetic is shared with
+:func:`~openmmpolymer.protocols.chain_dimensions`. Counts and sums accumulated
+while measuring each frame give the trajectory's pooled means and their ratios
+without retaining or measuring the coordinates again.
 """
 
 from __future__ import annotations
@@ -35,7 +34,7 @@ import numpy.typing as npt
 
 from ._fitting import TINY
 from ._validation import require_integer
-from .protocols import ChainDimensions, chain_dimensions
+from .protocols import ChainDimensions, _chain_dimension_sums, _ChainDimensionSums
 from .timeseries import Equilibration, equilibration
 from .trajectory import (
     AnalysisError,
@@ -216,39 +215,33 @@ def chain_conformation(
     """
     path = backbone_indices(backbone, ensemble.atoms_per_chain)
     require_integer(stride, name="stride")
-    # chain_dimensions takes a sequence, and is handed one rather than the
-    # array so that the existing signature does not have to widen.
     indices = [int(index) for index in path]
 
     squares: list[float] = []
     radii: list[float] = []
     times: list[float] = []
-    stacked: list[npt.NDArray[np.float64]] = []
+    pooled = _ChainDimensionSums()
     for frame in ensemble.frames(stride=stride):
-        measured = chain_dimensions(
+        sums = _chain_dimension_sums(
             frame.positions_nm,
             indices,
             ensemble.atoms_per_chain,
             ensemble.n_chains,
-            expected_characteristic_ratio=expected_characteristic_ratio,
             masses=ensemble.masses_amu,
+        )
+        measured = sums.dimensions(
+            len(indices) - 1,
+            expected_characteristic_ratio=expected_characteristic_ratio,
         )
         squares.append(measured.mean_squared_end_to_end_nm2)
         radii.append(measured.mean_radius_of_gyration_nm)
         times.append(frame.time_ps)
-        stacked.append(frame.positions_nm)
+        pooled.add(sums)
 
-    # Every frame's chains at once. A chain is a contiguous block, so stacking
-    # frames simply presents more blocks, and the averages come out over
-    # chains and frames together rather than as an average of averages - which
-    # would be wrong for the two ratios, both being ratios of means.
-    overall = chain_dimensions(
-        np.concatenate(stacked, axis=0),
-        indices,
-        ensemble.atoms_per_chain,
-        ensemble.n_chains * len(stacked),
+    # Both ratios use pooled means, not averages of each frame's ratios.
+    overall = pooled.dimensions(
+        len(indices) - 1,
         expected_characteristic_ratio=expected_characteristic_ratio,
-        masses=ensemble.masses_amu,
     )
     time_ps = np.asarray(times, dtype=np.float64)
     squared = np.asarray(squares, dtype=np.float64)
@@ -261,7 +254,7 @@ def chain_conformation(
         mean=overall,
         settled=settled,
         n_chains=ensemble.n_chains,
-        n_frames=len(stacked),
+        n_frames=len(times),
     )
 
 
