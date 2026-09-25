@@ -2,22 +2,31 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import replace
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import openmm as mm
 import pytest
 
+from openmmpolymer import protocols
+from openmmpolymer._files import file_sha256
+from openmmpolymer.mdsystem import SystemSpec
 from openmmpolymer.protocols import (
     MANIFEST_NAME,
     STAGE_RUNNERS,
     Protocol,
     ProtocolError,
     RunManifest,
+    RunSummary,
     Stage,
+    _canonical,
+    _stage_options,
     chain_dimensions,
     check_build_request,
     melt_quench,
@@ -32,6 +41,8 @@ from openmmpolymer.simulate import (
     quench_temperatures,
     run_heat,
 )
+
+from .helpers import argon_context
 
 #: A protocol short enough to run in a test but shaped like a real one.
 QUICK = Protocol(
@@ -58,6 +69,48 @@ QUICK = Protocol(
         ),
     ),
 )
+
+#: SHA-256 of each stage kind's default options, canonical and key-sorted, as
+#: a manifest records them. Every stage's request carries its runner's
+#: defaults - and, for a runner taking ``**kwargs``, those of ``run_segments``
+#: - into the provenance a resume is checked against, so renaming or
+#: re-defaulting any keyword makes every run already on disk refuse to resume.
+#: Change one of these only knowing that.
+RECORDED_DEFAULTS_SHA256 = {
+    "anneal": "2f5b428eabd6389c766c5785cc31e307139e980b14f3ff9bdcd96d9ade4b53a3",
+    "compress": "19e60ee4d5da965f44884d1d2d0bef087d5f1fc5fa10c73eb1a2cb78332bb923",
+    "deform": "1dcd8e2203fff90cc82b0b27446b4a3109a02d93db3fb8cb40e497a4d66103bf",
+    "heat": "4a10602459e5224074cff70d062b0852cfb689c39273f417bdd47ba52aba70b8",
+    "load": "502035a7efd1c39108ed009a6518606fedead4dfdb40b4d177608ced87cb4f55",
+    "minimise": "01264583f592f0a58d3307525cc8eebe5dfd47c425a2a421ad3f398f567ba27b",
+    "npt": "735f2f94e9a6176584cc86524292f5db7876aba5c284879e35f1cb497801ce72",
+    "nvt": "bed635ba5c28f35dae4b3ab668507ca3fe52ad643dc9baea76c2373c91c8cd00",
+    "production": "9b3061d4fa5e2e8788cf145a3e3ccafac24c9e1f809da2239d867f8e34f3cd41",
+    "pushoff": "914e78cc5b99af6fd335b17c41da3b6d615d012c791f65ae0b8f6d81a38d44d3",
+    "quench": "16189e0bee6346454029fe678ff407a692c5cf5f7b072542b3c3608b0b0f35c0",
+    "relax": "fbed5cc22943873546088616bb6ce8fa666c7fdd1aa83a636559beafc90e33ba",
+    "shear": "6b8e4e218eb7fbf3cd0e154218020056b4e9a3b05c0bc4d05eb6e684c874f981",
+}
+
+
+@pytest.fixture(scope="module")
+def quick_run(tmp_path_factory: pytest.TempPathFactory) -> RunSummary:
+    """:data:`QUICK`, run once for the tests that only read what it wrote."""
+    return run_protocol(
+        QUICK, argon_context(64, 2.4), tmp_path_factory.mktemp("quick") / "run"
+    )
+
+
+def test_the_defaults_every_manifest_records_are_pinned() -> None:
+    """Changing one refuses the resume of every run already on disk."""
+    recorded = {}
+    for kind in STAGE_RUNNERS:
+        options = _stage_options(Stage("x", kind, {}))
+        options.pop("state_in")
+        options.pop("output_prefix")
+        text = json.dumps(_canonical(options), sort_keys=True, allow_nan=False)
+        recorded[kind] = hashlib.sha256(text.encode()).hexdigest()
+    assert recorded == RECORDED_DEFAULTS_SHA256
 
 
 def test_a_stage_kind_must_be_one_that_can_run() -> None:
@@ -108,46 +161,49 @@ def test_melt_quench_is_the_standard_protocol_plus_a_quench() -> None:
     assert quenched.stages[-1].kind == "quench"
 
 
-def test_every_protocol_stage_names_a_runner_that_exists() -> None:
-    """The dispatch table and the protocols cannot drift apart."""
-    for protocol in (standard_melt_equilibration(), melt_quench()):
-        for stage in protocol.stages:
-            assert stage.kind in STAGE_RUNNERS
-
-
 def test_total_duration_adds_up_the_dynamics_asked_for() -> None:
     """Enough to tell nanoseconds from microseconds before starting."""
     assert standard_melt_equilibration(nvt_ps=100.0, npt_ps=200.0).total_duration_ps > 0
 
 
-def test_running_a_protocol_writes_a_manifest(argon_run: Any) -> None:
+def test_running_a_protocol_writes_a_manifest(quick_run: RunSummary) -> None:
     """The record of what happened, and the basis of picking it up again."""
-    summary = run_protocol(QUICK, argon_run, "run")
-    manifest = json.loads(Path(summary.manifest_path).read_text())
+    manifest = json.loads(Path(quick_run.manifest_path).read_text())
 
     assert manifest["protocol"] == "quick"
-    assert manifest["seed"] == argon_run.seed
+    assert manifest["seed"] == 11
     assert set(manifest["stages"]) == {"00_minimise", "01_nvt", "02_npt"}
     assert manifest["versions"]["openmm"]
-    assert (
-        manifest["system"]["nonbonded_cutoff_nm"] == argon_run.spec.nonbonded_cutoff_nm
-    )
+    assert manifest["system"]["nonbonded_cutoff_nm"] == SystemSpec().nonbonded_cutoff_nm
 
 
-def test_the_manifest_records_what_each_stage_actually_did(argon_run: Any) -> None:
+def test_the_manifest_records_what_each_stage_actually_did(
+    quick_run: RunSummary,
+) -> None:
     """The temperature asked for and the one reached are different numbers."""
-    summary = run_protocol(QUICK, argon_run, "run")
-    entry = json.loads(Path(summary.manifest_path).read_text())["stages"]["01_nvt"]
+    entry = json.loads(Path(quick_run.manifest_path).read_text())["stages"]["01_nvt"]
     assert entry["steps"] > 0
     assert entry["mean_temperature_k"] == pytest.approx(100.0, abs=40.0)
     assert Path(entry["final_state"]).is_file()
 
 
-def test_stages_write_into_the_run_directory(argon_run: Any) -> None:
+def test_stages_write_into_the_run_directory(quick_run: RunSummary) -> None:
     """One directory holds the whole run, in the order it ran."""
-    run_protocol(QUICK, argon_run, "run")
-    written = sorted(path.name for path in Path("run").glob("*.state.xml"))
+    written = sorted(path.name for path in Path(quick_run.run_dir).glob("*.state.xml"))
     assert written == ["00_minimise.state.xml", "01_nvt.state.xml", "02_npt.state.xml"]
+
+
+def test_the_manifest_records_what_was_in_the_cell(quick_run: RunSummary) -> None:
+    """SystemSpec records the settings a run was given but not the thing it was
+    given them for, so analysis of a finished run had to infer the block
+    structure every measurement indexes by."""
+    manifest = RunManifest.load(Path(quick_run.run_dir))
+    assert manifest is not None
+    assert manifest.box == {
+        "n_molecules": 64,
+        "atoms_per_chain": 1,
+        "box_nm": [2.4, 2.4, 2.4],
+    }
 
 
 def test_a_resumed_run_skips_what_is_already_done(argon_run: Any) -> None:
@@ -201,6 +257,30 @@ def test_a_stage_whose_state_has_gone_is_run_again(argon_run: Any) -> None:
     assert [result.name for result in resumed.results] == ["01_nvt", "02_npt"]
 
 
+def test_a_resumed_run_reads_each_state_once(
+    argon_run: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parent's final state is also its child's input, and each stage's output
+    the next one's; hashing each afresh for every role read it several times.
+    """
+    run_protocol(QUICK, argon_run, "run")
+    Path("run/02_npt.state.xml").unlink()
+    read: list[Path] = []
+
+    def counted(path: str | Path) -> str:
+        read.append(Path(path).resolve())
+        return file_sha256(path)
+
+    monkeypatch.setattr(protocols, "file_sha256", counted)
+    resumed = run_protocol(QUICK, argon_run, "run")
+    assert [result.name for result in resumed.results] == ["02_npt"]
+    assert sorted(path.name for path in read) == [
+        "00_minimise.state.xml",
+        "01_nvt.state.xml",
+        "02_npt.state.xml",
+    ]
+
+
 def _saved_artifacts(directory: Path) -> dict[str, bytes]:
     return {
         str(path): path.read_bytes() for path in directory.rglob("*") if path.is_file()
@@ -230,8 +310,6 @@ def test_changed_stage_settings_are_rejected_without_overwriting_artifacts(
 def test_changed_initial_inputs_are_rejected_without_overwriting_the_manifest(
     argon_run: Any, change: str
 ) -> None:
-    import openmm as mm
-
     protocol = Protocol("initial", (QUICK.stages[0],))
     run_protocol(protocol, argon_run, "run")
     before = _saved_artifacts(Path("run"))
@@ -343,8 +421,6 @@ def test_branch_only_resume_cannot_start_from_an_invalidated_parent(
 def test_invalidated_descendants_stay_invalid_when_upstream_rerun_fails(
     argon_run: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from functools import wraps
-
     run_protocol(QUICK, argon_run, "run")
     Path("run/01_nvt.state.xml").unlink()
 
@@ -412,20 +488,17 @@ def test_a_failing_stage_leaves_the_manifest_behind(argon_run: Any) -> None:
     assert "01_quench" not in manifest["stages"]
 
 
-def test_the_manifest_survives_a_write_that_never_finishes(tmp_path: Path) -> None:
-    """Written to a temporary file and moved into place, never in place."""
-    manifest = RunManifest(protocol="p", seed=1)
-    manifest.save(tmp_path)
-    assert (tmp_path / MANIFEST_NAME).is_file()
-    assert not list(tmp_path.glob("*.tmp"))
-
-
 def test_the_manifest_round_trips(tmp_path: Path) -> None:
-    """Loading gives back what was saved."""
+    """Loading gives back what was saved.
+
+    It is written to a temporary file and moved into place, never in place,
+    so a write that never finishes cannot leave half a manifest.
+    """
     original = RunManifest(
         protocol="p", seed=7, versions={"openmm": "8.6.1"}, stages={"00": {"steps": 5}}
     )
     original.save(tmp_path)
+    assert not list(tmp_path.glob("*.tmp"))
     loaded = RunManifest.load(tmp_path)
     assert loaded is not None
     assert loaded.seed == 7
@@ -490,20 +563,6 @@ def test_chain_dimensions_are_recorded_in_the_manifest(
     manifest = json.loads(Path(summary.manifest_path).read_text())
     assert manifest["chains"]["expected_characteristic_ratio"] == 7.0
     assert manifest["chains"]["backbone"] == [0, 1]
-
-
-def test_the_manifest_records_what_was_in_the_cell(argon_run: Any) -> None:
-    """SystemSpec records the settings a run was given but not the thing it was
-    given them for, so analysis of a finished run had to infer the block
-    structure every measurement indexes by."""
-    summary = run_protocol(QUICK, argon_run, "run")
-    manifest = RunManifest.load(Path(summary.run_dir))
-    assert manifest is not None
-    assert manifest.box == {
-        "n_molecules": 64,
-        "atoms_per_chain": 1,
-        "box_nm": [2.4, 2.4, 2.4],
-    }
 
 
 def test_a_manifest_written_before_the_cell_was_recorded_still_loads(
@@ -657,13 +716,6 @@ def test_a_quench_can_start_somewhere_other_than_the_melt_temperature() -> None:
 # --------------------------------------------------------------------------
 # The mechanical stage kinds
 # --------------------------------------------------------------------------
-
-
-def test_the_mechanical_stage_kinds_are_registered() -> None:
-    """A Stage validates its kind against this table, so absence is a refusal."""
-    for kind in ("deform", "load", "shear"):
-        assert kind in STAGE_RUNNERS
-        Stage(name=f"x_{kind}", kind=kind, options={})
 
 
 def test_every_mechanical_stage_prices_itself() -> None:

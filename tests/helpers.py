@@ -1075,3 +1075,35 @@ def write_two_molecule_sdf(path: Path) -> str:
         blocks.append(single.read_text())
     path.write_text("".join(blocks))
     return str(path)
+
+
+def bare_simulation(
+    system: Any,
+    topology: Any,
+    positions_nm: npt.ArrayLike,
+    *,
+    barostat: Any = None,
+    platform: str = "Reference",
+) -> Any:
+    """A Simulation of *system* with none of a stage's machinery around it.
+
+    For tests of what a stage calls rather than of a stage: a 1 fs Langevin
+    integrator at 300 K, *barostat* (a ``Force``) added when there is one, and
+    the positions set. Reference by default, because the stress tests compare
+    numbers to the last digit.
+    """
+    import openmm as mm
+    from openmm import app, unit
+
+    if barostat is not None:
+        system.addForce(barostat)
+    simulation = app.Simulation(
+        topology,
+        system,
+        mm.LangevinMiddleIntegrator(
+            300.0 * unit.kelvin, 1.0 / unit.picosecond, 1.0 * unit.femtoseconds
+        ),
+        mm.Platform.getPlatformByName(platform),
+    )
+    simulation.context.setPositions(np.asarray(positions_nm) * unit.nanometer)
+    return simulation

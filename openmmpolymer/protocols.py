@@ -17,6 +17,7 @@ interpretation is left to whoever reads it.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import inspect
 import json
@@ -24,11 +25,14 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
 import numpy.typing as npt
+import openmm as mm
+from openmm import unit
 
 from ._files import file_sha256, write_json
 from .reporters import TrajectoryOptions
@@ -515,9 +519,10 @@ class RunManifest:
 
 def _versions() -> dict[str, str]:
     """Record what produced a run, so a surprising result can be placed."""
-    from importlib.metadata import PackageNotFoundError, version
-
-    import openmm as mm
+    # Imported here rather than with the module: it brings the whole
+    # parameterisation stack with it, and only a run that writes a manifest
+    # needs its version.
+    import forcefill
 
     # Read from the installed metadata rather than the package namespace: this
     # module is imported while that namespace is still being built.
@@ -525,14 +530,11 @@ def _versions() -> dict[str, str]:
         own = version("openmmpolymer")
     except PackageNotFoundError:  # pragma: no cover - uninstalled checkout
         own = "0.0.0+unknown"
-    versions = {"openmmpolymer": own, "openmm": mm.version.version}
-    try:
-        import forcefill
-
-        versions["forcefill"] = getattr(forcefill, "__version__", "unknown")
-    except ImportError:  # pragma: no cover - forcefill is a hard dependency
-        pass
-    return versions
+    return {
+        "openmmpolymer": own,
+        "openmm": mm.version.version,
+        "forcefill": forcefill.__version__,
+    }
 
 
 def _canonical(value: Any) -> Any:
@@ -554,6 +556,7 @@ def _canonical(value: Any) -> Any:
 
 
 def _digest(value: bytes) -> str:
+    """The SHA-256 of *value*, in hex."""
     return hashlib.sha256(value).hexdigest()
 
 
@@ -601,6 +604,12 @@ def _run_identity(run: RunContext) -> dict[str, Any]:
 
 
 def _state_source(state: str | Path | None, manifest: RunManifest) -> dict[str, Any]:
+    """Say where a stage's starting state came from, as its request records it.
+
+    A state the manifest itself produced is named by the stage and the artifact
+    - its final state, or a waypoint by index - so that invalidating that stage
+    reaches the request too. Anything from outside is named by its content.
+    """
     if state is None:
         return {"packed": True}
     path = Path(state).resolve()
@@ -614,6 +623,7 @@ def _state_source(state: str | Path | None, manifest: RunManifest) -> dict[str, 
 
 
 def _source_path(source: dict[str, Any], manifest: RunManifest) -> str | None:
+    """The file a recorded stage source names, or None if it is not recorded."""
     parent = manifest.stages.get(source.get("stage", ""))
     if parent is None:
         return None
@@ -625,6 +635,11 @@ def _source_path(source: dict[str, Any], manifest: RunManifest) -> str | None:
 
 
 def _validate_identity(manifest: RunManifest, identity: dict[str, Any]) -> None:
+    """Refuse to resume a manifest written for other starting inputs, or none.
+
+    A legacy manifest, written before provenance was recorded, still loads for
+    analysis; it cannot be resumed, because nothing says what it started from.
+    """
     if manifest.provenance is None:
         raise ProtocolError(
             "Cannot safely resume a legacy manifest without input provenance. "
@@ -659,8 +674,11 @@ def _prepare_manifest(
 
     Stage dependencies support prefix extensions and independent branches in
     one manifest. Invalidating a parent also invalidates every descendant,
-    including branches absent from the current protocol invocation.
+    including branches absent from the current protocol invocation. Nothing is
+    written here, so each file's digest is taken once however many stages it
+    feeds.
     """
+    sha256 = functools.cache(file_sha256)
     identity = _run_identity(run)
     manifest = RunManifest.load(directory) if resume else None
     if manifest is not None:
@@ -709,11 +727,11 @@ def _prepare_manifest(
     invalid: set[str] = set()
     for name, recorded in manifest.stages.items():
         provenance = recorded_inputs.get(name)
-        final = Path(recorded.get("final_state", ""))
+        final = str(recorded.get("final_state", ""))
         if (
             provenance is None
-            or not final.is_file()
-            or provenance.get("output_sha256") != file_sha256(final)
+            or not Path(final).is_file()
+            or provenance.get("output_sha256") != sha256(final)
         ):
             invalid.add(name)
             continue
@@ -723,7 +741,7 @@ def _prepare_manifest(
             if (
                 path is None
                 or not Path(path).is_file()
-                or provenance.get("input_sha256") != file_sha256(path)
+                or provenance.get("input_sha256") != sha256(path)
             ):
                 invalid.add(name)
                 # A consumed waypoint is an upstream output too. Recreate
@@ -863,22 +881,29 @@ def run_protocol(
 
     results: list[StageResult] = []
     skipped: list[str] = []
+    # A state's digest travels with it, so none is read twice: a completed
+    # stage's was checked a moment ago, a new one's is taken as it is written,
+    # and only a state handed in from outside is read when a stage needs it.
     state: str | Path | None = state_in
+    digest: str | None = None
     started = time.monotonic()
 
     for stage in protocol.stages:
         recorded = manifest.stages.get(stage.name)
+        provenance = manifest.provenance["stages"][stage.name]
         if resume and recorded and Path(recorded.get("final_state", "")).is_file():
             log.info("Skipping %s: already complete.", stage.name)
             skipped.append(stage.name)
             state = recorded["final_state"]
+            digest = provenance["output_sha256"]
             continue
 
         log.info("Running %s (%s).", stage.name, stage.kind)
         manifest.chains = None
         runner = STAGE_RUNNERS[stage.kind]
-        provenance = manifest.provenance["stages"][stage.name]
-        provenance["input_sha256"] = None if state is None else file_sha256(state)
+        if state is not None and digest is None:
+            digest = file_sha256(state)
+        provenance["input_sha256"] = digest
         try:
             result = runner(
                 run,
@@ -896,8 +921,9 @@ def run_protocol(
 
         results.append(result)
         state = result.final_state
+        digest = file_sha256(state)
         manifest.stages[stage.name] = asdict(result)
-        provenance["output_sha256"] = file_sha256(result.final_state)
+        provenance["output_sha256"] = digest
         # Saved after every stage, not at the end: the point of the manifest is
         # to survive whatever stops the run.
         manifest.save(directory)
@@ -939,9 +965,6 @@ def _measure_chains(
     """Measure the final chain dimensions, when there is enough to do it with."""
     if backbone is None or atoms_per_chain is None or state_path is None:
         return None
-
-    import openmm as mm
-    from openmm import unit
 
     state = mm.XmlSerializer.deserialize(Path(state_path).read_text())
     positions = np.asarray(

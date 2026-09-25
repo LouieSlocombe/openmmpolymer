@@ -5,12 +5,8 @@ incompatible files. ``StateDataReporter`` renders progress as ``20.0%`` and a
 not-yet-known remaining time as ``--``, so a file carrying those columns is not
 a table of numbers however it is parsed - and it refuses to write progress at
 all without ``totalSteps``. The machine-readable CSV therefore carries only
-numeric columns, and the human log carries the rest.
-
-The checkpoint is written through :class:`AtomicStateReporter` rather than
-``CheckpointReporter``, which overwrites its target in place: a crash during
-the write leaves no usable checkpoint at all, which is a poor way to end a
-three-day run.
+numeric columns, and the human log carries the rest. Restart states are
+written through :class:`AtomicStateReporter`.
 """
 
 from __future__ import annotations
@@ -21,17 +17,18 @@ from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Self
+
+from ._validation import require_choice
 
 log = logging.getLogger(__name__)
 
 #: Trajectory formats. ``xtc`` is the default: it is compressed, and a melt run
-#: long enough to be interesting writes tens of gigabytes as DCD. ``pdb`` is
-#: written to ``<stem>_trajectory.pdb`` rather than ``<stem>.pdb``, which is
-#: the stage's closing structure - see :func:`_path_for`.
+#: long enough to be interesting writes tens of gigabytes as DCD.
 TRAJECTORY_FORMATS = ("xtc", "dcd", "pdb", "none")
 
-#: The numeric CSV's columns, in order. Every one is a number, so
+#: The numeric CSV's columns: the ``StateDataReporter`` flags that are switched
+#: on for it. Every one is a number, so
 #: ``numpy.genfromtxt(..., delimiter=",", names=True)`` reads the file.
 CSV_COLUMNS = (
     "step",
@@ -45,22 +42,44 @@ CSV_COLUMNS = (
 )
 
 
-class TrajectoryOptions(NamedTuple):
-    """How a stage writes its trajectory.
-
-    Args:
-        format: One of :data:`TRAJECTORY_FORMATS`.
-        interval_ps: Time between frames. None means ten times the state-data
-            interval, which is what a stage gets when it names a format as a
-            bare string rather than building one of these.
-        enforce_periodic_box: Whether to wrap molecules into the cell. Off by
-            default: wrapping splits a chain that straddles a face, and a split
-            chain has a meaningless radius of gyration.
-    """
+class _TrajectoryFields(NamedTuple):
+    """The fields of :class:`TrajectoryOptions`, which checks them."""
 
     format: str = "xtc"
     interval_ps: float | None = None
     enforce_periodic_box: bool = False
+
+
+class TrajectoryOptions(_TrajectoryFields):
+    """How a stage writes its trajectory.
+
+    A tuple and not a dataclass because a stage's options are fingerprinted
+    into its manifest, and a tuple is what every run already on disk recorded.
+
+    Args:
+        format: One of :data:`TRAJECTORY_FORMATS`.
+        interval_ps: Time between frames. None means ten times the state-data
+            interval, which is also what a stage naming a bare format string
+            gets.
+        enforce_periodic_box: Whether to wrap molecules into the cell. Off by
+            default: wrapping splits a chain that straddles a face, and a split
+            chain has a meaningless radius of gyration.
+
+    Raises:
+        ValueError: *format* is not one of :data:`TRAJECTORY_FORMATS`.
+    """
+
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        format: str = "xtc",
+        interval_ps: float | None = None,
+        enforce_periodic_box: bool = False,
+    ) -> Self:
+        """Refuse a format nothing writes, before a stage writes the wrong one."""
+        require_choice(format, TRAJECTORY_FORMATS, name="format")
+        return super().__new__(cls, format, interval_ps, enforce_periodic_box)
 
 
 @dataclass(frozen=True)
@@ -70,8 +89,7 @@ class ReporterPaths:
     Args:
         csv: The numeric state data.
         log: The human-readable progress log.
-        trajectory: The trajectory, if one was written. Never the same file as
-            the stage's closing structure, even in PDB format.
+        trajectory: The trajectory, if one was written.
         topology: The topology written beside a binary trajectory. None for a
             PDB trajectory, which carries its own.
         state: The portable restart state.
@@ -88,9 +106,9 @@ class AtomicStateReporter:
     """Writes a portable restart state, alternating between two files.
 
     ``CheckpointReporter`` overwrites in place, so a crash during a write
-    destroys the only checkpoint there was. Alternating between two files and
-    recording which is current only after the write completes means there is
-    always one good state on disk.
+    destroys the only checkpoint there was - a poor way to end a three-day
+    run. Alternating between two files and recording which is current only
+    after the write completes means there is always one good state on disk.
 
     Serialised state rather than a binary checkpoint because a checkpoint is
     tied to the platform that wrote it, and a run that has to move from a GPU
@@ -182,14 +200,11 @@ def rotate_existing(path: str | Path) -> str | None:
 def _path_for(output_prefix: str | Path, trajectory_format: str) -> Path:
     """Where a stage's trajectory goes, for *trajectory_format*.
 
-    Every format but one is ``<stem>.<format>``. A PDB trajectory is written to
-    ``<stem>_trajectory.pdb`` instead, because ``<stem>.pdb`` is already taken:
-    :func:`openmmpolymer.simulate.run_segments` writes the stage's closing
-    structure there at the end of every stage. Sharing the path meant two
-    writers holding one file open and the snapshot overwriting every frame, so
-    asking for ``pdb`` produced a file that was neither a trajectory nor
-    reliably a snapshot. The suffixed name follows ``<stem>_topology.pdb``,
-    which is already written beside a binary trajectory.
+    ``<stem>.<format>``, except that a PDB trajectory goes to
+    ``<stem>_trajectory.pdb``: ``<stem>.pdb`` is the stage's closing
+    structure, and two writers sharing it left a file that was neither a
+    trajectory nor reliably a snapshot. The suffix follows
+    ``<stem>_topology.pdb``, written beside a binary trajectory.
 
     Args:
         output_prefix: Stem for every file a stage writes.
@@ -204,23 +219,6 @@ def _path_for(output_prefix: str | Path, trajectory_format: str) -> Path:
     return prefix.with_suffix(f".{trajectory_format}")
 
 
-def _trajectory_reporter(path: Path, interval: int, options: TrajectoryOptions) -> Any:
-    """Build the trajectory reporter for *options*."""
-    from openmm import app
-
-    if options.format == "xtc":
-        return app.XTCReporter(
-            str(path), interval, enforcePeriodicBox=options.enforce_periodic_box
-        )
-    if options.format == "dcd":
-        return app.DCDReporter(
-            str(path), interval, enforcePeriodicBox=options.enforce_periodic_box
-        )
-    return app.PDBReporter(
-        str(path), interval, enforcePeriodicBox=options.enforce_periodic_box
-    )
-
-
 @contextmanager
 def reporting(
     simulation: Any,
@@ -230,7 +228,6 @@ def reporting(
     report_interval: int,
     trajectory: TrajectoryOptions | str = "xtc",
     trajectory_interval: int | None = None,
-    state_interval: int | None = None,
 ) -> Iterator[ReporterPaths]:
     """Attach a stage's reporters, and take them down again afterwards.
 
@@ -239,16 +236,19 @@ def reporting(
         output_prefix: Stem for every file this stage writes.
         total_steps: How many steps the stage will run. Required: without it
             ``StateDataReporter`` raises rather than omitting the progress
-            column.
+            column. A tenth of it is the interval between restart states, so a
+            stage always leaves several.
         report_interval: Steps between state-data rows.
         trajectory: Trajectory settings, or just a format name.
         trajectory_interval: Steps between frames. Defaults to ten times
             *report_interval*.
-        state_interval: Steps between restart states. Defaults to
-            *total_steps* divided by ten, so a stage always leaves several.
 
     Yields:
         Where everything was written.
+
+    Raises:
+        ValueError: The trajectory format is not one of
+            :data:`TRAJECTORY_FORMATS`.
     """
     from openmm import app
 
@@ -260,13 +260,12 @@ def reporting(
     prefix = Path(output_prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
     frames = trajectory_interval or report_interval * 10
-    states = state_interval or max(1, total_steps // 10)
 
     csv_path = prefix.with_suffix(".csv")
     log_path = prefix.with_suffix(".log")
     trajectory_path: Path | None = None
     topology_path: Path | None = None
-    state_reporter = AtomicStateReporter(prefix, states)
+    state_reporter = AtomicStateReporter(prefix, max(1, total_steps // 10))
 
     with ExitStack() as stack:
         # The file objects are opened here rather than inside the reporters so
@@ -277,16 +276,7 @@ def reporting(
 
         simulation.reporters.append(
             app.StateDataReporter(
-                csv_handle,
-                report_interval,
-                step=True,
-                time=True,
-                potentialEnergy=True,
-                kineticEnergy=True,
-                totalEnergy=True,
-                temperature=True,
-                volume=True,
-                density=True,
+                csv_handle, report_interval, **dict.fromkeys(CSV_COLUMNS, True)
             )
         )
         simulation.reporters.append(
@@ -318,8 +308,17 @@ def reporting(
                         simulation.context.getState(getPositions=True).getPositions(),
                         handle,
                     )
+            writer = {
+                "xtc": app.XTCReporter,
+                "dcd": app.DCDReporter,
+                "pdb": app.PDBReporter,
+            }[options.format]
             simulation.reporters.append(
-                _trajectory_reporter(trajectory_path, frames, options)
+                writer(
+                    str(trajectory_path),
+                    frames,
+                    enforcePeriodicBox=options.enforce_periodic_box,
+                )
             )
 
         simulation.reporters.append(state_reporter)

@@ -2,19 +2,36 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
+import openmm as mm
 import pytest
+from openmm.app.internal.xtc_utils import get_xtc_nframes
 
 from openmmpolymer.reporters import (
     CSV_COLUMNS,
     AtomicStateReporter,
     TrajectoryOptions,
+    _path_for,
     reporting,
     rotate_existing,
     steps_for,
 )
+from openmmpolymer.simulate import run_nvt
+
+from .helpers import bare_simulation
+
+
+def _simulation(run: Any) -> Any:
+    """A bare Simulation over a run context's cell, on the CPU."""
+    return bare_simulation(
+        mm.XmlSerializer.deserialize(run.system_xml),
+        run.box.topology,
+        run.box.positions_nm,
+        platform="CPU",
+    )
 
 
 @pytest.mark.parametrize(
@@ -64,25 +81,27 @@ def test_rotate_existing_ignores_an_empty_file(tmp_path: Path) -> None:
     assert rotate_existing(target) is None
 
 
-def test_the_state_reporter_alternates_between_two_files(tmp_path: Path) -> None:
-    """A crash during a write must not destroy the only checkpoint there was."""
-    reporter = AtomicStateReporter(tmp_path / "stage", 10)
-    assert reporter.state_path("a") != reporter.state_path("b")
+def test_the_state_reporter_alternates_and_points_at_the_last_complete_file(
+    argon_run: Any,
+) -> None:
+    """A crash during a write must not destroy the only checkpoint there was.
+
+    The pointer moves only once a file is complete, and a pointer to a file
+    that is not there reads as no state at all: half a restart is worse than
+    none.
+    """
+    reporter = AtomicStateReporter("stage", 10)
     assert reporter.current_state() is None
+    simulation = _simulation(argon_run)
 
-
-def test_the_state_pointer_names_the_file_that_was_written(tmp_path: Path) -> None:
-    """The pointer moves only once the file is complete."""
-    reporter = AtomicStateReporter(tmp_path / "stage", 10)
-    reporter.state_path("a").write_text("<State/>")
-    reporter.pointer_path.write_text("a")
+    reporter.report(simulation, None)
     assert reporter.current_state() == reporter.state_path("a")
+    reporter.report(simulation, None)
+    assert reporter.current_state() == reporter.state_path("b")
+    assert reporter.state_path("a").is_file()
+    mm.XmlSerializer.deserialize(reporter.state_path("b").read_text())
 
-
-def test_a_pointer_to_a_missing_file_reads_as_no_state(tmp_path: Path) -> None:
-    """Half a restart is worse than none."""
-    reporter = AtomicStateReporter(tmp_path / "stage", 10)
-    reporter.pointer_path.write_text("b")
+    reporter.state_path("b").unlink()
     assert reporter.current_state() is None
 
 
@@ -105,20 +124,26 @@ def test_trajectory_options_default_to_unwrapped_xtc() -> None:
     assert options.enforce_periodic_box is False
 
 
-def _simulation(run: Any) -> Any:
-    """Build a bare Simulation over a run context's cell."""
-    import openmm as mm
-    from openmm import app, unit
+def test_a_trajectory_format_nothing_writes_is_refused(argon_run: Any) -> None:
+    """``"xyz"`` used to write a PDB into ``<stem>.xyz`` without a word.
 
-    system = mm.XmlSerializer.deserialize(run.system_xml)
-    integrator = mm.LangevinMiddleIntegrator(
-        100.0 * unit.kelvin, 1.0 / unit.picosecond, 1.0 * unit.femtoseconds
-    )
-    simulation = app.Simulation(
-        run.box.topology, system, integrator, mm.Platform.getPlatformByName("CPU")
-    )
-    simulation.context.setPositions(run.box.positions)
-    return simulation
+    Refused when the options are built, and a bare format string is refused
+    before the stage writes anything.
+    """
+    with pytest.raises(ValueError, match="format='xyz'"):
+        TrajectoryOptions("xyz")
+    with (
+        pytest.raises(ValueError, match="format='xyz'"),
+        reporting(
+            _simulation(argon_run),
+            "stage",
+            total_steps=20,
+            report_interval=10,
+            trajectory="xyz",
+        ),
+    ):
+        pass
+    assert list(Path().iterdir()) == []
 
 
 @pytest.mark.parametrize("trajectory_format", ["xtc", "dcd"])
@@ -195,11 +220,6 @@ def test_a_requested_frame_interval_is_what_the_trajectory_gets(
     and was read nowhere: the stride came from the state-data interval instead,
     so a caller asking for a frame every picosecond got something unrelated.
     """
-    from openmm.app.internal.xtc_utils import get_xtc_nframes
-
-    from openmmpolymer.reporters import TrajectoryOptions
-    from openmmpolymer.simulate import run_nvt
-
     run_nvt(
         dimer_argon_run,
         "02_nvt",
@@ -217,10 +237,6 @@ def test_naming_a_format_as_a_string_keeps_the_interval_it_always_had(
 ) -> None:
     """Making interval_ps real should not quietly change what every existing
     stage writes, and a bare format string is what the stages pass."""
-    from openmm.app.internal.xtc_utils import get_xtc_nframes
-
-    from openmmpolymer.simulate import run_nvt
-
     run_nvt(
         dimer_argon_run,
         "02_nvt",
@@ -239,11 +255,6 @@ def test_a_stage_too_short_to_reach_a_frame_says_so(
 ) -> None:
     """It writes an unreadable empty trajectory, and the default interval of
     ten picoseconds does it to any stage shorter than that."""
-    import logging
-
-    from openmmpolymer.reporters import TrajectoryOptions
-    from openmmpolymer.simulate import run_nvt
-
     with caplog.at_level(logging.WARNING, logger="openmmpolymer.simulate"):
         run_nvt(
             dimer_argon_run,
@@ -256,17 +267,19 @@ def test_a_stage_too_short_to_reach_a_frame_says_so(
     assert "no frames in it" in caplog.text
 
 
-def test_a_pdb_trajectory_survives_the_stage_that_wrote_it(
+def test_a_pdb_trajectory_is_kept_apart_from_the_closing_structure(
     dimer_argon_run: Any,
 ) -> None:
     """It used to go to <stem>.pdb, which is also where the stage writes its
-    closing structure, so _save_final overwrote every frame on the way out and
-    a format listed in TRAJECTORY_FORMATS silently produced nothing usable.
-    """
-    from openmmpolymer.reporters import TrajectoryOptions
-    from openmmpolymer.simulate import run_nvt
+    closing structure, so the snapshot overwrote every frame on the way out.
 
-    run_nvt(
+    The snapshot is one frame and the trajectory is many, and every caller of
+    StageResult.final_pdb expects the former. A trajectory from an earlier
+    attempt is still evidence, and is moved aside from the trajectory's own
+    path rather than the snapshot's.
+    """
+    Path("02_nvt_trajectory.pdb").write_text("REMARK an earlier attempt\n")
+    result = run_nvt(
         dimer_argon_run,
         "02_nvt",
         temperature_k=120.0,
@@ -277,28 +290,11 @@ def test_a_pdb_trajectory_survives_the_stage_that_wrote_it(
     frames = Path("02_nvt_trajectory.pdb").read_text()
     assert frames.count("\nMODEL ") == 4
     assert frames.count("ENDMDL") == 4
-
-
-def test_a_pdb_trajectory_and_the_closing_structure_are_different_files(
-    dimer_argon_run: Any,
-) -> None:
-    """The snapshot is one frame and the trajectory is many, and every caller
-    of StageResult.final_pdb expects the former."""
-    from openmmpolymer.reporters import TrajectoryOptions
-    from openmmpolymer.simulate import run_nvt
-
-    result = run_nvt(
-        dimer_argon_run,
-        "02_nvt",
-        temperature_k=120.0,
-        duration_ps=2.0,
-        friction_ps=20.0,
-        trajectory=TrajectoryOptions("pdb", interval_ps=0.5),
-    )
     assert result.final_pdb == "02_nvt.pdb"
     snapshot = Path("02_nvt.pdb").read_text()
     assert "\nMODEL " not in snapshot
     assert snapshot.count("CRYST1") == 1
+    assert "earlier attempt" in Path("02_nvt_trajectory.attempt1.pdb").read_text()
 
 
 def test_the_reported_trajectory_path_is_the_trajectory(
@@ -306,8 +302,6 @@ def test_the_reported_trajectory_path_is_the_trajectory(
 ) -> None:
     """ReporterPaths.trajectory is what a caller opens, so it has to name the
     file with the frames in it rather than the snapshot beside it."""
-    from openmmpolymer.reporters import TrajectoryOptions, reporting
-
     simulation = _simulation(dimer_argon_run)
     with reporting(
         simulation,
@@ -334,28 +328,4 @@ def test_the_reported_trajectory_path_is_the_trajectory(
 def test_each_format_has_its_own_path(trajectory_format: str, expected: str) -> None:
     """Only pdb is special, and the binary formats must keep the names every
     run already on disk used."""
-    from openmmpolymer.reporters import _path_for
-
     assert _path_for("05_npt", trajectory_format).name == expected
-
-
-def test_a_pdb_trajectory_from_an_earlier_attempt_is_moved_aside(
-    dimer_argon_run: Any,
-) -> None:
-    """A partial trajectory from a crashed attempt is still evidence, and the
-    rotation has to follow the trajectory's path rather than the snapshot's."""
-    from openmmpolymer.reporters import TrajectoryOptions
-    from openmmpolymer.simulate import run_nvt
-
-    Path("02_nvt_trajectory.pdb").write_text("REMARK an earlier attempt\n")
-    run_nvt(
-        dimer_argon_run,
-        "02_nvt",
-        temperature_k=120.0,
-        duration_ps=2.0,
-        friction_ps=20.0,
-        trajectory=TrajectoryOptions("pdb", interval_ps=0.5),
-    )
-    assert Path("02_nvt_trajectory.attempt1.pdb").is_file()
-    assert "earlier attempt" in Path("02_nvt_trajectory.attempt1.pdb").read_text()
-    assert Path("02_nvt_trajectory.pdb").read_text().count("\nMODEL ") == 4

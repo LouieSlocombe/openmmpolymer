@@ -10,8 +10,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import openmm as mm
 import pytest
+from openmm import app, unit
 
+from openmmpolymer import mdsystem
 from openmmpolymer.mdsystem import (
     PackedBox,
     SystemAssemblyError,
@@ -26,6 +29,8 @@ from openmmpolymer.mdsystem import (
     make_barostat,
     max_timestep_fs,
     minimum_mass_g_mol,
+    platform_is_usable,
+    prepare_box,
     replicate_topology,
     select_platform,
 )
@@ -126,6 +131,8 @@ def test_minimum_mass_agrees_with_the_density_check() -> None:
     ("hydrogen_mass", "constraints", "expected"),
     [
         (None, "hbonds", 2.0),
+        # Repartitioning below 1.5 amu buys nothing.
+        (1.2, "hbonds", 2.0),
         (1.5, "hbonds", 3.0),
         (4.0, "hbonds", 4.0),
         (None, "none", 1.0),
@@ -178,8 +185,6 @@ def _packed_pdb(
     hand, because a PDB is fixed-width and getting it wrong by one column
     produces a file that looks fine and does not parse.
     """
-    from openmm import app, unit
-
     topology = app.Topology()
     chain = topology.addChain()
     positions = []
@@ -204,35 +209,34 @@ def _packed_pdb(
     return str(path)
 
 
+def _dimer_box(tmp_path: Path, n_molecules: int = 4, edge_nm: float = 4.0) -> PackedBox:
+    """A packed cell of dimers, assembled the way a real run assembles one."""
+    return assemble_box(
+        [PackedComponent(build_dimer_pdb(tmp_path / "dimer.pdb"), n_molecules)],
+        _packed_pdb(tmp_path / "packed.pdb", n_molecules),
+        (edge_nm, edge_nm, edge_nm),
+    )
+
+
 def test_assemble_box_takes_positions_from_packmol_and_bonds_from_the_chain(
     tmp_path: Path,
 ) -> None:
-    """The whole point of the module."""
-    source = build_dimer_pdb(tmp_path / "dimer.pdb")
-    packed = _packed_pdb(tmp_path / "packed.pdb", 3)
-    box = assemble_box([PackedComponent(source, 3)], packed, (3.0, 3.0, 3.0))
+    """The whole point of the module, periodic box vectors included."""
+    box = _dimer_box(tmp_path, 3, 3.5)
 
     assert box.n_molecules == 3
     assert box.topology.getNumAtoms() == 6
     assert sum(1 for _ in box.topology.bonds()) == 3
     assert box.positions_nm[2][0] == pytest.approx(1.0, abs=1e-3)
+    # Without them a System is not periodic, whatever the nonbonded method.
+    vectors = box.topology.getPeriodicBoxVectors()
+    assert vectors[0][0].value_in_unit(unit.nanometer) == pytest.approx(3.5)
 
 
-def test_assemble_box_refuses_a_packed_file_with_the_wrong_atom_count(
-    tmp_path: Path,
-) -> None:
-    """Silently mapping the wrong coordinates would not raise anywhere later."""
-    source = build_dimer_pdb(tmp_path / "dimer.pdb")
-    packed = _packed_pdb(tmp_path / "packed.pdb", 2)
-    with pytest.raises(SystemAssemblyError, match="not in the same order"):
-        assemble_box([PackedComponent(source, 3)], packed, (3.0, 3.0, 3.0))
+def test_a_packed_file_missing_atoms_is_refused_and_told_why(tmp_path: Path) -> None:
+    """Silently mapping the wrong coordinates would not raise anywhere later.
 
-
-def test_a_packed_file_missing_atoms_is_told_why_that_happens(
-    tmp_path: Path,
-) -> None:
-    """Atoms going missing has one cause in practice, and it is worth naming.
-
+    Atoms going missing has one cause in practice, and it is worth naming.
     Two molecules sharing a chain identifier and a residue number read as one
     residue described twice, and the PDB parser discards the second copy.
     Measured on a real 45-conformer pack without ``resnumbers 3``: 1406 atoms
@@ -240,8 +244,10 @@ def test_a_packed_file_missing_atoms_is_told_why_that_happens(
     """
     source = build_dimer_pdb(tmp_path / "dimer.pdb")
     packed = _packed_pdb(tmp_path / "packed.pdb", 2)
-    with pytest.raises(SystemAssemblyError, match="dropped the duplicates"):
+    with pytest.raises(SystemAssemblyError) as raised:
         assemble_box([PackedComponent(source, 3)], packed, (3.0, 3.0, 3.0))
+    assert "not in the same order" in str(raised.value)
+    assert "dropped the duplicates" in str(raised.value)
 
 
 def test_a_packed_file_with_extra_atoms_is_not_blamed_on_numbering(
@@ -265,126 +271,63 @@ def test_assemble_box_refuses_a_packed_file_with_the_elements_in_a_new_order(
         assemble_box([PackedComponent(source, 3)], packed, (3.0, 3.0, 3.0))
 
 
-def test_assemble_box_sets_the_periodic_box_vectors(tmp_path: Path) -> None:
-    """Without them a System is not periodic, whatever the nonbonded method."""
-    from openmm import unit
-
-    source = build_dimer_pdb(tmp_path / "dimer.pdb")
-    packed = _packed_pdb(tmp_path / "packed.pdb", 2)
-    box = assemble_box([PackedComponent(source, 2)], packed, (3.5, 3.5, 3.5))
-    vectors = box.topology.getPeriodicBoxVectors()
-    assert vectors[0][0].value_in_unit(unit.nanometer) == pytest.approx(3.5)
+def _nonbonded(system: Any) -> Any:
+    """The System's one NonbondedForce."""
+    return next(
+        force for force in system.getForces() if isinstance(force, mm.NonbondedForce)
+    )
 
 
 def test_build_system_uses_the_force_field_and_the_cell(
     tmp_path: Path, dimer_forcefield: Any
 ) -> None:
     """The real ForceField path, on a residue small enough to read."""
-    import openmm as mm
-
-    source = build_dimer_pdb(tmp_path / "dimer.pdb")
-    packed = _packed_pdb(tmp_path / "packed.pdb", 4)
-    box = assemble_box([PackedComponent(source, 4)], packed, (4.0, 4.0, 4.0))
-    system = build_system(box, dimer_forcefield, SystemSpec(constraints="none"))
+    system = build_system(
+        _dimer_box(tmp_path), dimer_forcefield, SystemSpec(constraints="none")
+    )
 
     assert system.getNumParticles() == 8
     assert system.usesPeriodicBoundaryConditions()
-    nonbonded = next(
-        force for force in system.getForces() if isinstance(force, mm.NonbondedForce)
-    )
-    assert nonbonded.getNonbondedMethod() == mm.NonbondedForce.PME
+    assert _nonbonded(system).getNonbondedMethod() == mm.NonbondedForce.PME
 
 
 def test_build_system_keeps_the_dispersion_correction_on(
     tmp_path: Path, dimer_forcefield: Any
 ) -> None:
     """Passing None instead would have turned it off, silently."""
-    import openmm as mm
-
-    source = build_dimer_pdb(tmp_path / "dimer.pdb")
-    packed = _packed_pdb(tmp_path / "packed.pdb", 4)
-    box = assemble_box([PackedComponent(source, 4)], packed, (4.0, 4.0, 4.0))
-
+    box = _dimer_box(tmp_path)
     for wanted in (True, False):
         system = build_system(
             box,
             dimer_forcefield,
             SystemSpec(constraints="none", use_dispersion_correction=wanted),
         )
-        nonbonded = next(
-            force
-            for force in system.getForces()
-            if isinstance(force, mm.NonbondedForce)
-        )
-        assert nonbonded.getUseDispersionCorrection() is wanted
+        assert _nonbonded(system).getUseDispersionCorrection() is wanted
 
 
 def test_build_system_refuses_a_cell_too_small_for_the_cutoff(
     tmp_path: Path, dimer_forcefield: Any
 ) -> None:
     """Checked before anything expensive happens."""
-    source = build_dimer_pdb(tmp_path / "dimer.pdb")
-    packed = _packed_pdb(tmp_path / "packed.pdb", 2)
-    box = assemble_box([PackedComponent(source, 2)], packed, (2.0, 2.0, 2.0))
+    box = _dimer_box(tmp_path, 2, 2.0)
     with pytest.raises(SystemAssemblyError, match="shortest edge"):
         build_system(box, dimer_forcefield, SystemSpec())
 
 
-def test_make_barostat_is_seeded_and_rigid_by_default() -> None:
+@pytest.mark.parametrize("kind", ["isotropic", "anisotropic", "flexible"])
+def test_make_barostat_is_seeded_and_rigid_unless_told_otherwise(kind: str) -> None:
     """A seed of zero would make OpenMM choose its own and lose the run."""
-    barostat = make_barostat("isotropic", 300.0, 1.0, 25, 4242)
+    barostat = make_barostat(kind, 300.0, 1.0, 25, 4242)
     assert barostat.getRandomNumberSeed() == 4242
-    # 8.3's isotropic barostat is always rigid, with no configurable switch.
-    assert getattr(barostat, "getScaleMoleculesAsRigid", lambda: True)() is True
-
-
-@pytest.mark.parametrize("kind", ["isotropic", "anisotropic"])
-def test_older_barostat_defaults_to_rigid_and_refuses_atomic_scaling(
-    monkeypatch: pytest.MonkeyPatch, kind: str
-) -> None:
-    """A missing optional API must neither break defaults nor silently change physics."""
-    import openmm as mm
-
-    cls = (
-        mm.MonteCarloBarostat
-        if kind == "isotropic"
-        else mm.MonteCarloAnisotropicBarostat
-    )
-    monkeypatch.delattr(cls, "setScaleMoleculesAsRigid", raising=False)
-    assert make_barostat(kind, 300.0, 1.0, 25, 4242).getRandomNumberSeed() == 4242
-    with pytest.raises(SystemAssemblyError, match="scale_molecules_as_rigid=False"):
-        make_barostat(kind, 300.0, 1.0, 25, 4242, scale_molecules_as_rigid=False)
+    assert barostat.getScaleMoleculesAsRigid() is True
+    atomic = make_barostat(kind, 300.0, 1.0, 25, 4242, scale_molecules_as_rigid=False)
+    assert atomic.getScaleMoleculesAsRigid() is False
 
 
 def test_make_barostat_refuses_a_zero_seed() -> None:
     """OpenMM reads zero as 'choose one', which is not reproducible."""
     with pytest.raises(ValueError, match="irreproducible"):
         make_barostat("isotropic", 300.0, 1.0, 25, 0)
-
-
-def test_make_barostat_builds_the_anisotropic_kind_too() -> None:
-    """A different Force class with different parameter names."""
-    import openmm as mm
-
-    barostat = make_barostat("anisotropic", 300.0, 1.0, 25, 7)
-    assert isinstance(barostat, mm.MonteCarloAnisotropicBarostat)
-
-
-def test_barostat_kind_reports_what_is_attached(argon_box: Any) -> None:
-    """None before one is added, and its kind after."""
-    _, system = argon_box
-    assert barostat_kind(system) is None
-    system.addForce(make_barostat("isotropic", 300.0, 1.0, 25, 3))
-    assert barostat_kind(system) == "isotropic"
-
-
-def test_two_barostats_are_refused(argon_box: Any) -> None:
-    """OpenMM applies both without complaining, which is not a pressure."""
-    _, system = argon_box
-    system.addForce(make_barostat("isotropic", 300.0, 1.0, 25, 3))
-    system.addForce(make_barostat("isotropic", 300.0, 1.0, 25, 4))
-    with pytest.raises(SystemAssemblyError, match="2 barostats"):
-        barostat_kind(system)
 
 
 def test_select_platform_falls_back_through_the_preference_order() -> None:
@@ -410,8 +353,6 @@ def test_select_platform_names_what_is_available_when_asked_for_nonsense() -> No
 
 def test_packed_box_positions_carry_units(argon_box: Any) -> None:
     """OpenMM calls want a Quantity; the rest of the package wants floats."""
-    from openmm import unit
-
     box, _ = argon_box
     assert box.positions.unit == unit.nanometer
     assert isinstance(box.positions_nm, np.ndarray)
@@ -421,41 +362,16 @@ def test_prepare_box_is_a_no_op_without_virtual_sites(
     argon_box: Any, dimer_forcefield: Any
 ) -> None:
     """Most force fields declare none, and then there is nothing to add."""
-    from openmmpolymer.mdsystem import prepare_box
-
     box, _ = argon_box
     assert prepare_box(box, dimer_forcefield) is box
-
-
-def test_packed_box_is_a_plain_dataclass() -> None:
-    """It travels into the manifest, so it has to stay simple."""
-    box = PackedBox(
-        topology=None,
-        positions_nm=np.zeros((1, 3)),
-        box_nm=(1.0, 1.0, 1.0),
-        n_molecules=1,
-    )
-    assert box.box_nm == (1.0, 1.0, 1.0)
-
-
-def test_a_small_hydrogen_mass_does_not_earn_a_longer_step() -> None:
-    """Repartitioning below 1.5 amu buys nothing, so the limit stays at 2 fs."""
-    spec = SystemSpec(hydrogen_mass_amu=1.2)
-    assert max_timestep_fs(300.0, spec) == pytest.approx(2.0)
 
 
 def test_hydrogen_mass_and_the_switch_reach_create_system(
     tmp_path: Path, dimer_forcefield: Any
 ) -> None:
     """Both are optional kwargs, and both have to actually arrive."""
-    import openmm as mm
-    from openmm import unit
-
-    source = build_dimer_pdb(tmp_path / "dimer.pdb")
-    packed = _packed_pdb(tmp_path / "packed.pdb", 4)
-    box = assemble_box([PackedComponent(source, 4)], packed, (4.0, 4.0, 4.0))
     system = build_system(
-        box,
+        _dimer_box(tmp_path),
         dimer_forcefield,
         SystemSpec(
             constraints="none",
@@ -463,9 +379,7 @@ def test_hydrogen_mass_and_the_switch_reach_create_system(
             hydrogen_mass_amu=1.5,
         ),
     )
-    nonbonded = next(
-        force for force in system.getForces() if isinstance(force, mm.NonbondedForce)
-    )
+    nonbonded = _nonbonded(system)
     assert nonbonded.getUseSwitchingFunction()
     assert nonbonded.getSwitchingDistance().value_in_unit(
         unit.nanometer
@@ -476,11 +390,8 @@ def test_naming_residue_templates_can_be_turned_off(
     tmp_path: Path, dimer_forcefield: Any
 ) -> None:
     """It is a shortcut past the graph search, not a requirement."""
-    source = build_dimer_pdb(tmp_path / "dimer.pdb")
-    packed = _packed_pdb(tmp_path / "packed.pdb", 4)
-    box = assemble_box([PackedComponent(source, 4)], packed, (4.0, 4.0, 4.0))
     system = build_system(
-        box,
+        _dimer_box(tmp_path),
         dimer_forcefield,
         SystemSpec(constraints="none"),
         use_residue_templates=False,
@@ -492,8 +403,6 @@ def test_a_residue_the_force_field_does_not_cover_is_reported(
     tmp_path: Path, dimer_forcefield: Any
 ) -> None:
     """The message names what failed rather than repeating OpenMM's internals."""
-    from openmm import app, unit
-
     topology = app.Topology()
     residue = topology.addResidue("NIT", topology.addChain())
     nitrogen = app.Element.getBySymbol("N")
@@ -522,8 +431,6 @@ def test_a_residue_the_force_field_does_not_cover_is_reported(
 
 def test_the_reference_platform_is_always_usable() -> None:
     """The floor of the preference order has to work, or nothing does."""
-    from openmmpolymer.mdsystem import platform_is_usable
-
     assert platform_is_usable("Reference")
 
 
@@ -536,8 +443,6 @@ def test_auto_selection_skips_a_platform_that_cannot_build_a_context(
     and then fails at the first Context. Without this the failure arrives at
     the start of the first stage instead of at platform selection.
     """
-    from openmmpolymer import mdsystem
-
     tried: list[str] = []
 
     def only_cpu_works(name: str) -> bool:
@@ -555,7 +460,6 @@ def test_a_named_platform_is_used_without_being_probed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Asked for one explicitly, the caller should see its real failure."""
-    from openmmpolymer import mdsystem
 
     def never_usable(name: str) -> bool:
         raise AssertionError("a named platform should not be probed")
@@ -565,6 +469,27 @@ def test_a_named_platform_is_used_without_being_probed(
     assert platform.getName() == "Reference"
 
 
+def test_an_automatic_choice_probes_each_platform_once_per_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every stage selects its platform, and a probe is a whole throwaway Context."""
+    probes: list[Any] = []
+    real = mm.Context
+
+    def counted(*args: Any) -> Any:
+        probes.append(args)
+        return real(*args)
+
+    platform_is_usable.cache_clear()
+    monkeypatch.setattr(mm, "Context", counted)
+    select_platform()
+    probed = len(probes)
+    select_platform()
+    select_platform()
+    assert probed >= 1
+    assert len(probes) == probed
+
+
 # --------------------------------------------------------------------------
 # Per-axis and flexible barostats
 # --------------------------------------------------------------------------
@@ -572,9 +497,6 @@ def test_a_named_platform_is_used_without_being_probed(
 
 def test_an_anisotropic_barostat_takes_a_pressure_per_axis() -> None:
     """Which is what makes a uniaxial load rather than a hydrostatic one."""
-    import openmm as mm
-    from openmm import unit
-
     barostat = make_barostat(
         "anisotropic", 300.0, 1.0, 25, 7, pressures_bar=(1.0, 1.0, -50.0)
     )
@@ -614,14 +536,15 @@ def test_per_axis_settings_are_refused_by_the_barostats_that_have_no_axes() -> N
             make_barostat(kind, 300.0, 1.0, 25, 7, scale_axes=(True, True, False))
 
 
-def test_a_flexible_barostat_is_found_rather_than_invisible() -> None:
-    """It is not a MonteCarloBarostat subclass, so an isinstance chain misses it.
+def test_every_barostat_kind_is_found_and_named(argon_box: Any) -> None:
+    """None before one is added, and each kind by its own class after.
 
-    Which would also mean the guard against a System carrying two barostats
-    could not see one of them.
+    The flexible barostat is not a MonteCarloBarostat subclass, so an
+    isinstance chain misses it - which would also mean the guard against a
+    System carrying two barostats could not see one of them.
     """
-    import openmm as mm
-
+    _, system = argon_box
+    assert barostat_kind(system) is None
     for kind, expected in (
         ("isotropic", mm.MonteCarloBarostat),
         ("anisotropic", mm.MonteCarloAnisotropicBarostat),
@@ -636,15 +559,16 @@ def test_a_flexible_barostat_is_found_rather_than_invisible() -> None:
     assert not issubclass(mm.MonteCarloFlexibleBarostat, mm.MonteCarloBarostat)
 
 
-def test_two_barostats_are_still_refused_when_one_is_flexible() -> None:
-    """The guard has to see every kind, or it only guards some of them."""
-    import openmm as mm
+def test_two_barostats_are_refused_even_when_one_is_flexible() -> None:
+    """OpenMM applies both without complaining, which is not a pressure.
 
+    The guard has to see every kind, or it only guards some of them.
+    """
     system = mm.System()
     system.addForce(make_barostat("anisotropic", 300.0, 1.0, 25, 7))
     system.addForce(make_barostat("flexible", 300.0, 1.0, 0, 9))
     with pytest.raises(SystemAssemblyError, match="2 barostats"):
-        find_barostat(system)
+        barostat_kind(system)
 
 
 def test_a_barostat_may_be_built_at_zero_frequency() -> None:
