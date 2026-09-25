@@ -22,7 +22,7 @@ import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass, field
-from functools import partial
+from functools import cached_property, partial
 from pathlib import Path
 from typing import Any
 
@@ -230,6 +230,11 @@ class _Live:
     started: float
     name: str
 
+    @cached_property
+    def degrees_of_freedom(self) -> int:
+        """Count once: the System's constraints and forces stay fixed per stage."""
+        return _degrees_of_freedom(self.simulation.system)
+
     def steps(self, duration_ps: float) -> int:
         """Return the steps covering *duration_ps* at this stage's timestep."""
         return steps_for(duration_ps, self.timestep_fs)
@@ -279,9 +284,9 @@ class _Live:
         A reading is taken every ``steps // readings`` steps and at the end of
         the window. At each, the energy is checked - *blew_up* says what a NaN
         means - *measure* reads the energy state, and the density and the
-        temperature are read, always in that order. Only the second half is
-        kept: the first is the cell still responding to whatever was just done
-        to it, and should not drag the window's average.
+        temperature are read from the same state, always in that order. Only
+        the second half is kept: the first is the cell still responding to
+        whatever was just done to it, and should not drag the window's average.
 
         What the window was asked for and what it ran at are appended to the
         four per-window lists *samples* already holds. The duration is recorded
@@ -309,8 +314,16 @@ class _Live:
                 raise SimulationError(blew_up)
             if measure is not None:
                 measured.append(measure(state))
-            densities.append(_density_g_cm3(self.simulation, self.run.total_mass_g_mol))
-            temperatures.append(temperature_k_of(self.simulation))
+            densities.append(
+                _density_g_cm3(self.simulation, self.run.total_mass_g_mol, state=state)
+            )
+            temperatures.append(
+                temperature_k_of(
+                    self.simulation,
+                    state=state,
+                    degrees_of_freedom=self.degrees_of_freedom,
+                )
+            )
 
         half = max(1, len(densities) // 2)
         density = float(np.mean(densities[-half:]))
@@ -552,30 +565,45 @@ def set_pressures(
         simulation.context.setParameter(name, value)
 
 
-def _density_g_cm3(simulation: Any, total_mass_g_mol: float) -> float:
-    """Return the cell's current density, in g/cm3."""
-    volume_nm3 = (
-        simulation.context.getState()
-        .getPeriodicBoxVolume()
-        .value_in_unit(unit.nanometer**3)
-    )
+def _density_g_cm3(
+    simulation: Any, total_mass_g_mol: float, *, state: Any | None = None
+) -> float:
+    """Return the cell's density in g/cm3, reusing *state* when supplied."""
+    if state is None:
+        state = simulation.context.getState()
+    volume_nm3 = state.getPeriodicBoxVolume().value_in_unit(unit.nanometer**3)
     return float(total_mass_g_mol * NM3_PER_CM3 / (AVOGADRO * volume_nm3))
 
 
-def temperature_k_of(simulation: Any) -> float:
-    """Return the cell's current instantaneous temperature, in kelvin."""
-    state = simulation.context.getState(getEnergy=True)
-    system = simulation.system
-    degrees = (
-        3 * system.getNumParticles()
-        - system.getNumConstraints()
-        - (3 if _has_cm_remover(system) else 0)
-    )
+def temperature_k_of(
+    simulation: Any,
+    *,
+    state: Any | None = None,
+    degrees_of_freedom: int | None = None,
+) -> float:
+    """Return the cell's instantaneous temperature, in kelvin.
+
+    Reuse *state* (fetched with ``getEnergy=True``) and a cached
+    *degrees_of_freedom* when supplied; otherwise read them from *simulation*.
+    """
+    if state is None:
+        state = simulation.context.getState(getEnergy=True)
+    if degrees_of_freedom is None:
+        degrees_of_freedom = _degrees_of_freedom(simulation.system)
     kinetic = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
     gas_constant = unit.MOLAR_GAS_CONSTANT_R.value_in_unit(
         unit.kilojoule_per_mole / unit.kelvin
     )
-    return float(2.0 * kinetic / (degrees * gas_constant))
+    return float(2.0 * kinetic / (degrees_of_freedom * gas_constant))
+
+
+def _degrees_of_freedom(system: Any) -> int:
+    """Count the degrees used to convert kinetic energy to temperature."""
+    return int(
+        3 * system.getNumParticles()
+        - system.getNumConstraints()
+        - (3 if _has_cm_remover(system) else 0)
+    )
 
 
 def _has_cm_remover(system: Any) -> bool:
@@ -2867,11 +2895,17 @@ def run_relax(
                     raw.flush()
             since_temperature += 1
             if since_temperature >= 50:
-                temperatures.append(temperature_k_of(simulation))
+                temperatures.append(
+                    temperature_k_of(
+                        simulation, degrees_of_freedom=live.degrees_of_freedom
+                    )
+                )
                 since_temperature = 0
 
         if not temperatures:
-            temperatures.append(temperature_k_of(simulation))
+            temperatures.append(
+                temperature_k_of(simulation, degrees_of_freedom=live.degrees_of_freedom)
+            )
         moved = _box_lengths_nm(simulation)
         if not np.allclose(moved, locked, rtol=0.0, atol=1.0e-9):
             raise SimulationError(

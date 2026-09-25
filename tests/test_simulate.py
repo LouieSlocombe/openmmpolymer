@@ -458,14 +458,28 @@ def test_a_run_is_reproducible_from_its_seed(argon_box: Any) -> None:
     assert temperatures(5) == temperatures(5)
 
 
-def test_density_and_temperature_helpers_agree_with_openmm(argon_run: Any) -> None:
+def test_density_and_temperature_helpers_agree_with_openmm(
+    argon_run: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Both are computed here rather than read off a reporter."""
     simulation = _probe(argon_run)
     expected = argon_run.total_mass_g_mol * NM3_PER_CM3 / (AVOGADRO * 2.4**3)
     assert _density_g_cm3(simulation, argon_run.total_mass_g_mol) == pytest.approx(
         expected
     )
-    assert temperature_k_of(simulation) == pytest.approx(120.0, rel=0.35)
+    temperature = temperature_k_of(simulation)
+    assert temperature == pytest.approx(120.0, rel=0.35)
+
+    state = simulation.context.getState(getEnergy=True)
+
+    def unexpected_fetch(**kwargs: Any) -> Any:
+        pytest.fail("An existing state must not trigger another state fetch.")
+
+    monkeypatch.setattr(simulation.context, "getState", unexpected_fetch)
+    assert _density_g_cm3(
+        simulation, argon_run.total_mass_g_mol, state=state
+    ) == pytest.approx(expected)
+    assert temperature_k_of(simulation, state=state) == pytest.approx(temperature)
 
 
 # --------------------------------------------------------------------------
@@ -644,22 +658,43 @@ def test_heat_records_density_enthalpy_and_anisotropic_pressure(
     assert len(resumed.samples["segment_enthalpy_kj_mol"]) == 1
 
 
+@pytest.mark.parametrize("remove_cm", [False, True])
+@pytest.mark.parametrize("measure_enthalpy", [False, True])
 def test_a_hold_keeps_every_observable_from_the_same_second_half(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, remove_cm: bool, measure_enthalpy: bool
 ) -> None:
     """The transient is discarded for every observable at the same times.
 
-    Enthalpy includes the kinetic energy and the pV work, and what the hold
-    was asked for is recorded beside what it ran at.
+    One state supplies each reading, and the degrees of freedom are counted
+    once across holds. Enthalpy includes the kinetic energy and the pV work.
     """
-    simulation = SimpleNamespace(index=-1)
+    system = mm.System()
+    system.addParticle(1.0)
+    system.addParticle(1.0)
+    system.addConstraint(0, 1, 0.1)
+    if remove_cm:
+        system.addForce(mm.CMMotionRemover())
+    simulation = SimpleNamespace(index=-1, system=system)
+    state_calls = 0
+    force_calls = 0
+    get_forces = system.getForces
+
+    def counted_forces() -> Any:
+        nonlocal force_calls
+        force_calls += 1
+        return get_forces()
+
+    monkeypatch.setattr(system, "getForces", counted_forces)
 
     def step(steps: int) -> None:
         assert steps == 1
         simulation.index += 1
 
     def state(**kwargs: Any) -> Any:
-        index = simulation.index
+        nonlocal state_calls
+        state_calls += 1
+        assert kwargs == {"getEnergy": True}
+        index = simulation.index % 4
         return SimpleNamespace(
             getPotentialEnergy=lambda: (
                 [1000, 500, 20, 40][index] * unit.kilojoule_per_mole
@@ -670,12 +705,6 @@ def test_a_hold_keeps_every_observable_from_the_same_second_half(
 
     simulation.step = step
     simulation.context = SimpleNamespace(getState=state)
-    monkeypatch.setattr(
-        simulate, "_density_g_cm3", lambda sim, mass: float(sim.index + 1)
-    )
-    monkeypatch.setattr(
-        simulate, "temperature_k_of", lambda sim: 100.0 * (sim.index + 1)
-    )
     run: Any = SimpleNamespace(total_mass_g_mol=1.0)
     live = _Live(run, Path("fake"), simulation, 1.0, 0.0, "fake")
     samples: dict[str, list[float]] = {
@@ -684,22 +713,35 @@ def test_a_hold_keeps_every_observable_from_the_same_second_half(
         "segment_density_g_cm3": [],
         "segment_duration_ps": [],
     }
-    enthalpies, density, temperature = live.hold(
-        samples,
-        300.0,
-        0.004,
-        4,
-        "blew up",
-        partial(_enthalpy_kj_mol, pressure_bar=2.0),
+    expected_density = NM3_PER_CM3 / AVOGADRO * (1 / 5 + 1 / 7) / 2
+    degrees = 2 if remove_cm else 5
+    gas_constant = unit.MOLAR_GAS_CONSTANT_R.value_in_unit(
+        unit.kilojoule_per_mole / unit.kelvin
     )
-    assert (density, temperature) == (3.5, 350.0)
-    assert np.mean(enthalpies) == pytest.approx(33.5 + 12.0 * 0.0602214076)
-    assert samples == {
-        "segment_temperature_k": [300.0],
-        "segment_mean_temperature_k": [350.0],
-        "segment_density_g_cm3": [3.5],
-        "segment_duration_ps": [0.004],
-    }
+    expected_temperature = 2 * 3.5 / (degrees * gas_constant)
+    for _ in range(2):
+        enthalpies, density, temperature = live.hold(
+            samples,
+            300.0,
+            0.004,
+            4,
+            "blew up",
+            partial(_enthalpy_kj_mol, pressure_bar=2.0) if measure_enthalpy else None,
+        )
+        assert density == pytest.approx(expected_density)
+        assert temperature == pytest.approx(expected_temperature)
+        if measure_enthalpy:
+            assert np.mean(enthalpies) == pytest.approx(33.5 + 12.0 * 0.0602214076)
+        else:
+            assert enthalpies == []
+    assert state_calls == 8
+    assert force_calls == 1
+    assert samples["segment_temperature_k"] == [300.0, 300.0]
+    assert samples["segment_duration_ps"] == [0.004, 0.004]
+    assert samples["segment_density_g_cm3"] == pytest.approx([expected_density] * 2)
+    assert samples["segment_mean_temperature_k"] == pytest.approx(
+        [expected_temperature] * 2
+    )
 
 
 def test_a_quench_can_be_given_its_temperatures_outright(
@@ -732,10 +774,12 @@ def test_the_readings_behind_a_segment_average_can_be_raised(
     calls = 0
     real = simulate._density_g_cm3
 
-    def counted(simulation: Any, total_mass_g_mol: float) -> float:
+    def counted(
+        simulation: Any, total_mass_g_mol: float, *, state: Any | None = None
+    ) -> float:
         nonlocal calls
         calls += 1
-        return real(simulation, total_mass_g_mol)
+        return real(simulation, total_mass_g_mol, state=state)
 
     monkeypatch.setattr(simulate, "_density_g_cm3", counted)
     run_nvt(
