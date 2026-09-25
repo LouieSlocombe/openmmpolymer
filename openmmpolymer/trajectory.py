@@ -689,16 +689,36 @@ def chain_positions(
         ``(n_frames, n_chains, atoms, 3)`` positions in nanometres, and the
         matching ``(n_frames,)`` times in picoseconds.
     """
+    positions, times, _ = _load_chain_frames(
+        ensemble, stride=stride, heavy_atoms_only=heavy_atoms_only
+    )
+    return positions, times
+
+
+def _load_chain_frames(
+    ensemble: Ensemble, *, stride: int = 1, heavy_atoms_only: bool = False
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Read chain positions, times and cell edges in one trajectory pass.
+
+    Returns:
+        ``(n_frames, n_chains, atoms, 3)`` positions in nanometres,
+        ``(n_frames,)`` times in picoseconds, and ``(n_frames, 3)`` cell edges
+        in nanometres, all sampled at the same stride. Only positions are
+        filtered by *heavy_atoms_only*.
+    """
     keep = ~ensemble.is_hydrogen if heavy_atoms_only else None
     positions: list[npt.NDArray[np.float64]] = []
     times: list[float] = []
+    boxes: list[npt.NDArray[np.float64]] = []
     for frame in ensemble.frames(stride=stride):
         chains = ensemble.per_chain(frame.positions_nm)
         positions.append(chains if keep is None else chains[:, keep])
         times.append(frame.time_ps)
+        boxes.append(frame.box_nm)
     return (
         np.asarray(positions, dtype=np.float64),
         np.asarray(times, dtype=np.float64),
+        np.asarray(boxes, dtype=np.float64),
     )
 
 

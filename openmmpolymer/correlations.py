@@ -39,7 +39,7 @@ import numpy.typing as npt
 
 from ._fitting import TINY
 from ._validation import require_integer, require_positive
-from .trajectory import AnalysisError, Ensemble, boxes_nm, chain_positions
+from .trajectory import AnalysisError, Ensemble, _load_chain_frames
 
 log = logging.getLogger(__name__)
 
@@ -167,7 +167,7 @@ def radial_distribution(
             "not of a melt, so it is not what this measures."
         )
 
-    positions, _ = chain_positions(
+    positions, _, boxes = _load_chain_frames(
         ensemble, stride=stride, heavy_atoms_only=heavy_atoms_only
     )
     per_chain = positions.shape[2]
@@ -175,7 +175,6 @@ def radial_distribution(
         raise AnalysisError(
             "Dropping hydrogens left no atoms. Pass heavy_atoms_only=False."
         )
-    boxes = boxes_nm(ensemble, stride=stride)
     limit = _pair_limit(boxes, r_max_nm)
 
     edges = np.linspace(0.0, limit, n_bins + 1)
@@ -256,7 +255,7 @@ def structure_factor(
     require_integer(n_bins, name="n_bins")
     require_integer(stride, name="stride")
 
-    positions, _ = chain_positions(
+    positions, _, boxes = _load_chain_frames(
         ensemble, stride=stride, heavy_atoms_only=heavy_atoms_only
     )
     per_chain = positions.shape[2]
@@ -264,7 +263,6 @@ def structure_factor(
         raise AnalysisError(
             "Dropping hydrogens left no atoms. Pass heavy_atoms_only=False."
         )
-    boxes = boxes_nm(ensemble, stride=stride)
     n_atoms = positions.shape[1] * per_chain
 
     edges = np.linspace(0.0, q_max_per_nm, n_bins + 1)

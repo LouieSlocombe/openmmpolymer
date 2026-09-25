@@ -39,8 +39,8 @@ from .timeseries import Equilibration, equilibration
 from .trajectory import (
     AnalysisError,
     Ensemble,
+    _load_chain_frames,
     backbone_indices,
-    boxes_nm,
     chain_positions,
     require_trajectory,
 )
@@ -408,14 +408,13 @@ def centre_of_mass_msd(
     require_trajectory(ensemble, "A mean-squared displacement")
     require_integer(stride, name="stride")
 
-    positions, _ = chain_positions(ensemble, stride=stride)
+    positions, _, boxes = _load_chain_frames(ensemble, stride=stride)
     weights = ensemble.masses_amu
     total = float(weights.sum())
     if total <= TINY:
         raise AnalysisError("The chains have no mass, so they have no centre of mass.")
     centres = np.einsum("a,fcad->fcd", weights, positions) / total
 
-    boxes = boxes_nm(ensemble, stride=stride)
     drift = _box_drift(boxes)
     if remove_box_scaling:
         volumes = boxes.prod(axis=1)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable, Iterator
+from dataclasses import fields
 from typing import Any
 
 import numpy as np
@@ -14,7 +16,7 @@ from openmmpolymer.correlations import (
     radial_distribution,
     structure_factor,
 )
-from openmmpolymer.trajectory import AnalysisError
+from openmmpolymer.trajectory import AnalysisError, Ensemble, Frame
 
 from .helpers import lattice, synthetic_ensemble
 
@@ -182,6 +184,66 @@ def test_the_frame_count_is_reported_alongside_the_answer() -> None:
         stride=2,
     )
     assert measured.n_frames == 3
+
+
+@pytest.mark.parametrize(
+    ("measure", "options"),
+    [(radial_distribution, {}), (structure_factor, {"q_max_per_nm": 12.0})],
+    ids=["radial_distribution", "structure_factor"],
+)
+@pytest.mark.parametrize("stride", [1, 2])
+@pytest.mark.parametrize("heavy_atoms_only", [False, True])
+def test_correlations_collect_coordinates_and_cells_in_one_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    measure: Callable[..., Any],
+    options: dict[str, float],
+    stride: int,
+    heavy_atoms_only: bool,
+) -> None:
+    """The chosen coordinates and changing cells must stay paired, without
+    decoding the trajectory again to recover its box dimensions."""
+    edges = np.linspace(2.8, 2.4, 6)
+    frames = np.asarray([lattice(64, edge) for edge in edges])
+    boxes = np.repeat(edges[:, None], 3, axis=1)
+    hydrogen = np.array([False, True])
+    ensemble = synthetic_ensemble(
+        frames, n_chains=32, box_nm=boxes, is_hydrogen=hydrogen
+    )
+    selected = synthetic_ensemble(
+        frames[::stride],
+        n_chains=32,
+        box_nm=boxes[::stride],
+        is_hydrogen=hydrogen,
+    )
+    expected = measure(
+        selected, stride=1, heavy_atoms_only=heavy_atoms_only, n_bins=24, **options
+    )
+    read_frames = Ensemble.frames
+    passes: list[int] = []
+    visited: list[int] = []
+
+    def frames_once(self: Ensemble, *, stride: int = 1) -> Iterator[Frame]:
+        passes.append(stride)
+        for frame in read_frames(self, stride=stride):
+            visited.append(frame.index)
+            yield frame
+
+    monkeypatch.setattr(Ensemble, "frames", frames_once)
+    measured = measure(
+        ensemble,
+        stride=stride,
+        heavy_atoms_only=heavy_atoms_only,
+        n_bins=24,
+        **options,
+    )
+
+    assert passes == [stride]
+    assert visited == list(range(0, len(frames), stride))
+    assert measured.n_frames == len(frames[::stride])
+    for field in fields(expected):
+        assert getattr(measured, field.name) == pytest.approx(
+            getattr(expected, field.name)
+        )
 
 
 def test_the_structure_factor_peaks_on_the_lattices_reciprocal_vector() -> None:

@@ -11,6 +11,7 @@ import pytest
 
 from openmmpolymer.trajectory import (
     AnalysisError,
+    _load_chain_frames,
     backbone_indices,
     boxes_nm,
     capped_stride,
@@ -278,6 +279,44 @@ def test_every_frame_reports_its_own_box(dimer_run_directory: Path) -> None:
     """Under a barostat the cell changes, and a density or a g(r) cut-off that
     used the first frame's box would drift out of date."""
     assert boxes_nm(open_run(dimer_run_directory, "02_nvt")).shape == (10, 3)
+
+
+@pytest.mark.parametrize("n_frames", [1, 5])
+@pytest.mark.parametrize("heavy_atoms_only", [False, True])
+def test_coordinates_times_and_boxes_follow_the_same_stride(
+    n_frames: int, heavy_atoms_only: bool
+) -> None:
+    """A changing cell must stay aligned with its coordinates after sampling
+    or dropping hydrogens, including a one-frame snapshot."""
+    coordinates = np.arange(n_frames * 6 * 3, dtype=np.float64).reshape(n_frames, 6, 3)
+    edges = np.arange(n_frames * 3, dtype=np.float64).reshape(n_frames, 3) + 10.0
+    ensemble = synthetic_ensemble(
+        coordinates,
+        n_chains=2,
+        box_nm=edges,
+        interval_ps=0.25,
+        is_hydrogen=np.array([False, True, False]),
+    )
+
+    positions, times, boxes = _load_chain_frames(
+        ensemble, stride=2, heavy_atoms_only=heavy_atoms_only
+    )
+
+    expected_positions = coordinates[::2].reshape(-1, 2, 3, 3)
+    if heavy_atoms_only:
+        expected_positions = expected_positions[:, :, [0, 2]]
+    np.testing.assert_array_equal(positions, expected_positions)
+    np.testing.assert_array_equal(boxes, edges[::2])
+    np.testing.assert_array_equal(times, [0.0] if n_frames == 1 else [0.25, 0.75, 1.25])
+    assert positions.dtype == times.dtype == boxes.dtype == np.float64
+
+    # The public helpers keep their existing return values and units.
+    public_positions, public_times = chain_positions(
+        ensemble, stride=2, heavy_atoms_only=heavy_atoms_only
+    )
+    np.testing.assert_array_equal(public_positions, positions)
+    np.testing.assert_array_equal(public_times, times)
+    np.testing.assert_array_equal(boxes_nm(ensemble, stride=2), boxes)
 
 
 def test_a_stage_with_no_trajectory_reads_back_as_a_single_snapshot(

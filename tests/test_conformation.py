@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import weakref
+from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
@@ -20,7 +21,7 @@ from openmmpolymer.conformation import (
     persistence_length,
 )
 from openmmpolymer.protocols import chain_dimensions
-from openmmpolymer.trajectory import AnalysisError
+from openmmpolymer.trajectory import AnalysisError, Ensemble, Frame
 
 from .helpers import (
     dimer_cell,
@@ -390,6 +391,39 @@ def test_removing_the_barostats_scaling_reports_how_much_it_removed() -> None:
     edges = np.linspace(4.0, 3.6, 40)
     measured = centre_of_mass_msd(shrinking_cell(), remove_box_scaling=True)
     assert measured.box_drift_fraction == pytest.approx(0.4 / edges.mean(), rel=1e-6)
+    assert float(measured.msd_nm2.max()) < 1e-18
+
+
+@pytest.mark.parametrize("stride", [1, 2])
+def test_displacement_collects_coordinates_and_cells_in_one_pass(
+    monkeypatch: pytest.MonkeyPatch, stride: int
+) -> None:
+    """Correcting affine motion needs the box from the same selected frame,
+    without loading the trajectory a second time."""
+    ensemble = shrinking_cell(n_frames=12, n_chains=8)
+    read_frames = Ensemble.frames
+    passes: list[int] = []
+    visited: list[int] = []
+
+    def frames_once(self: Ensemble, *, stride: int = 1) -> Iterator[Frame]:
+        passes.append(stride)
+        for frame in read_frames(self, stride=stride):
+            visited.append(frame.index)
+            yield frame
+
+    monkeypatch.setattr(Ensemble, "frames", frames_once)
+    measured = centre_of_mass_msd(ensemble, stride=stride)
+
+    selected_edges = np.linspace(4.0, 3.6, 12)[::stride]
+    assert passes == [stride]
+    assert visited == list(range(0, 12, stride))
+    assert measured.n_origins == selected_edges.size
+    assert measured.lag_ps == pytest.approx(
+        np.arange(selected_edges.size // 2) * stride * ensemble.interval_ps
+    )
+    assert measured.box_drift_fraction == pytest.approx(
+        np.ptp(selected_edges) / selected_edges.mean()
+    )
     assert float(measured.msd_nm2.max()) < 1e-18
 
 
