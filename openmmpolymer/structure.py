@@ -187,7 +187,7 @@ def structure_stages(run_dir: str | Path) -> tuple[str, ...]:
     return tuple(readable)
 
 
-def _select_stage(directory: Path, stage: str | None) -> tuple[StageFiles, str]:
+def select_stage(directory: Path, stage: str | None) -> tuple[StageFiles, str]:
     """Choose the stage to measure, and say how it was chosen.
 
     A trajectory beats a snapshot because it can answer the dynamic
@@ -307,7 +307,7 @@ def _is_index_list(value: object) -> bool:
     )
 
 
-def _resolve_backbone(
+def resolve_backbone(
     directory: Path,
     manifest: RunManifest | None,
     ensemble: Ensemble,
@@ -473,7 +473,7 @@ def analyse_structure(
     """
     require_integer(stride, name="stride")
     directory = Path(run_dir)
-    files, stage_source = _select_stage(directory, stage)
+    files, stage_source = select_stage(directory, stage)
     ensemble = open_run(directory, files.stage)
     manifest = RunManifest.load(directory)
     notes: list[str] = []
@@ -507,7 +507,7 @@ def analyse_structure(
                 "measured."
             )
 
-    path, backbone_source, backbone_file = _resolve_backbone(
+    path, backbone_source, backbone_file = resolve_backbone(
         directory, manifest, ensemble, backbone, infer_backbone, notes
     )
 

@@ -29,11 +29,6 @@ from openmmpolymer.convergence import (
     relaxation_window_convergence,
     time_window_convergence,
 )
-from openmmpolymer.convergence_report import (
-    plot_relaxation_convergence,
-    plot_structural_convergence,
-    plot_window_convergence,
-)
 from openmmpolymer.correlations import radial_distribution, structure_factor
 from openmmpolymer.elasticity import poisson_ratio, youngs_modulus
 from openmmpolymer.mechanical import analyse_mechanics
@@ -50,9 +45,12 @@ from openmmpolymer.plots import (
     plot_quench_curve,
     plot_rate_dependence,
     plot_relaxation,
+    plot_relaxation_convergence,
     plot_relaxation_spectrum,
     plot_state_data,
     plot_stress_strain,
+    plot_structural_convergence,
+    plot_window_convergence,
     plot_yield_strength,
 )
 from openmmpolymer.protocols import ChainDimensions
@@ -726,3 +724,51 @@ def test_a_nonfinite_target_keeps_its_rate_but_draws_no_value() -> None:
         "target estimate not finite" in label
         for label in axis.get_legend_handles_labels()[1]
     )
+
+
+def test_prefix_and_disjoint_block_figure_retains_errors_and_verdict() -> None:
+    data = stationary_trace()
+    result = time_window_convergence(
+        np.arange(data.size), data, property_name="density", value_unit="g/cm^3"
+    )
+    figure = plot_window_convergence(result)
+    prefix: Any = figure.axes[0]
+    blocks: Any = figure.axes[1]
+    np.testing.assert_allclose(
+        prefix.containers[0].lines[0].get_xdata(),
+        [item.duration_ps for item in result.windows],
+    )
+    np.testing.assert_allclose(
+        prefix.containers[0].lines[0].get_ydata(),
+        [item.mean for item in result.windows],
+    )
+    np.testing.assert_allclose(
+        blocks.containers[0].lines[0].get_ydata(), result.block_means
+    )
+    segments = prefix.containers[0].lines[2][0].get_segments()
+    for segment, window in zip(segments, result.windows, strict=True):
+        np.testing.assert_allclose(
+            segment[:, 1],
+            [window.mean - window.standard_error, window.mean + window.standard_error],
+        )
+    assert "overlapping" in prefix.get_title()
+    assert "disjoint" in blocks.get_title()
+
+
+def test_constant_snapshot_plot_labels_unknown_uncertainty() -> None:
+    result = time_window_convergence(
+        [0.0], [10.0], property_name="radius", value_unit="nm"
+    )
+    figure = plot_window_convergence(result)
+    assert "SE unavailable" in figure.axes[0].get_legend_handles_labels()[1]
+    assert any("not resolved" in item.get_text() for item in figure.texts)
+
+
+def test_relaxation_parameter_plot_keeps_unobserved_tails_unresolved() -> None:
+    times = np.geomspace(0.1, 10000.0, 140)
+    result = relaxation_window_convergence(
+        planted_relaxation(times, 1000.0 * np.exp(-times / 10000.0))
+    )
+    figure = plot_relaxation_convergence(result)
+    assert len(figure.axes) == 4
+    assert all("not resolved" in axis.get_title() for axis in figure.axes)

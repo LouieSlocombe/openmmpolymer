@@ -51,9 +51,6 @@ from .convergence import (
 from .convergence_report import (
     ConvergenceReport,
     analyse_convergence,
-    plot_relaxation_convergence,
-    plot_structural_convergence,
-    plot_window_convergence,
     write_convergence_report,
 )
 from .correlations import (
@@ -149,9 +146,12 @@ from .plots import (
     plot_quench_curve,
     plot_rate_dependence,
     plot_relaxation,
+    plot_relaxation_convergence,
     plot_relaxation_spectrum,
     plot_state_data,
     plot_stress_strain,
+    plot_structural_convergence,
+    plot_window_convergence,
     plot_yield_strength,
 )
 from .property_rates import (
