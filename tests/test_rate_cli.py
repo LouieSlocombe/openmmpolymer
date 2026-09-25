@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -41,26 +40,22 @@ def _modulus_runs(tmp_path: Path) -> list[str]:
     return [str(directory) for directory in directories]
 
 
-def _refused_before_building(
-    argv: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def unexpected(*args: Any, **kwargs: Any) -> Any:
-        pytest.fail("invalid rate controls reached the monomer build")
-
-    monkeypatch.setattr(cli, "build_chain", unexpected)
+def _refused_before_building(argv: list[str], no_build: list[Any]) -> None:
     with pytest.raises(SystemExit, match="2"):
         cli.main(argv)
-    assert not (tmp_path / "output").exists()
+    assert not no_build
+    assert not Path("output").exists()
 
 
 @pytest.mark.parametrize("property_name", list(RATE_PROPERTIES))
 def test_every_property_has_a_compatible_cli_spec_and_rate_units(
     property_name: str,
 ) -> None:
+    protocol = cli._rate_protocol(property_name)
     arguments = cli.build_parser().parse_args(
         [
             "--protocol",
-            cli._RATE_PROTOCOLS[property_name],
+            protocol,
             "--rate-property",
             property_name,
             "--rate-hold-times",
@@ -72,9 +67,10 @@ def test_every_property_has_a_compatible_cli_spec_and_rate_units(
     request = cli._property_rate_request(arguments)
     assert request.property_name == property_name
     assert request.hold_times_ps == (10.0, 20.0, 30.0)
-    assert type(request.spec) is type(default_rate_spec(property_name))
+    spec = cli.PROTOCOLS[protocol].settings(arguments)
+    assert type(spec) is type(default_rate_spec(property_name))
     plan = validate_property_rate_scan(
-        request.spec,
+        spec,
         request.hold_times_ps,
         property_name=property_name,
         target_rate=request.target_rate,
@@ -151,9 +147,7 @@ def test_analysis_does_not_apply_unrelated_cli_temperature_defaults(
         ]
     )
     request = cli._property_rate_request(arguments)
-    assert request.property_name == "melting_temperature"
-    assert request.target_rate == 0.001
-    assert type(request.spec) is type(default_rate_spec("melting_temperature"))
+    assert request == cli._RateRequest("melting_temperature", 0.001, ())
 
 
 @pytest.mark.parametrize(
@@ -243,12 +237,11 @@ def test_analysis_does_not_apply_unrelated_cli_temperature_defaults(
     ],
 )
 def test_invalid_rate_controls_stop_before_building(
-    controls: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    controls: list[str], no_build: list[Any]
 ) -> None:
     _refused_before_building(
         ["[*]CC[*]", "--protocol", "yield", "--dry-run", "-o", "output", *controls],
-        tmp_path,
-        monkeypatch,
+        no_build,
     )
 
 
@@ -275,23 +268,19 @@ def test_invalid_rate_controls_stop_before_building(
     ],
 )
 def test_invalid_youngs_rate_scan_is_rejected_before_building_or_writing(
-    controls: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    controls: list[str], no_build: list[Any]
 ) -> None:
     _refused_before_building(
-        ["[*]CC[*]", "--protocol", "modulus", "-o", "output", *controls],
-        tmp_path,
-        monkeypatch,
+        ["[*]CC[*]", "--protocol", "modulus", "-o", "output", *controls], no_build
     )
 
 
 def test_youngs_rate_flags_cannot_be_ignored_by_another_protocol_or_analysis(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, no_build: list[Any]
 ) -> None:
     rate = ["--modulus-relax-times", "10,50,100", "--target-strain-rate", "0.01"]
-    _refused_before_building(
-        ["[*]CC[*]", "--protocol", "yield", *rate], tmp_path, monkeypatch
-    )
-    _refused_before_building(["--analyse", str(tmp_path), *rate], tmp_path, monkeypatch)
+    _refused_before_building(["[*]CC[*]", "--protocol", "yield", *rate], no_build)
+    _refused_before_building(["--analyse", str(tmp_path), *rate], no_build)
 
 
 def test_saved_youngs_rates_report_through_the_common_writer(
@@ -401,31 +390,22 @@ def test_strain_rate_alias_selects_yield_instead_of_youngs(tmp_path: Path) -> No
     assert not (directories[0] / "analysis/youngs_modulus_rates.json").exists()
 
 
-def _fake_build(monkeypatch: pytest.MonkeyPatch) -> Any:
-    chain = SimpleNamespace(
-        n_atoms=4,
-        molar_mass_g_mol=50.0,
-        embedder="test",
-        sdf_paths=["chain.sdf"],
-        pdb_paths=["chain.pdb"],
-        backbone=(0, 1, 2),
-    )
-    prepared = object()
-    monkeypatch.setattr(cli, "_prepare_cli_melt", lambda *args: (chain, prepared))
-    return prepared
-
-
 @pytest.mark.parametrize(
     "property_name", ["bulk_modulus", "yield_strength", "glass_transition"]
 )
 def test_new_cli_scan_reaches_rate_workflow_with_chain_provenance(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, property_name: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    staged_melt: dict[str, Any],
+    property_name: str,
 ) -> None:
-    prepared = _fake_build(monkeypatch)
     received: dict[str, Any] = {}
 
     def scan(run: Any, output_dir: Path, **kwargs: Any) -> RateReport:
-        assert run is prepared
+        # The verified build, not the scratch rebuild it was checked against.
+        assert (
+            Path(run.forcefield.forcefield_xml) == output_dir / "build/polymer_ff.xml"
+        )
         assert output_dir == tmp_path / "output"
         received.update(kwargs)
         return RateReport(RATE_PROPERTIES[property_name], (), None, None, ())
@@ -438,7 +418,7 @@ def test_new_cli_scan_reaches_rate_workflow_with_chain_provenance(
         "--characteristic-ratio",
         "5.5",
         "--protocol",
-        cli._RATE_PROTOCOLS[property_name],
+        cli._rate_protocol(property_name),
         "--rate-property",
         property_name,
         "--rate-hold-times",
@@ -450,18 +430,22 @@ def test_new_cli_scan_reaches_rate_workflow_with_chain_provenance(
         str(tmp_path / "output"),
     ]
     assert cli.main(argv) == 0
-    assert received["chain_backbone"] == (0, 1, 2)
-    assert received["atoms_per_chain"] == 4
+    assert received["chain_backbone"] == ()
+    assert received["atoms_per_chain"] == 1
     assert received["expected_characteristic_ratio"] == 5.5
+    # A mechanical scan settles its melt as the flags ask; tg, from its spec.
+    assert ("melt_temperature_k" in received) == (property_name != "glass_transition")
     assert received["hold_times_ps"] == (50, 150, 500)
     assert received["target_rate"] == 0.1
     assert (tmp_path / "output/analysis" / f"{property_name}_rates.json").is_file()
 
 
 def test_a_youngs_scan_from_the_original_flags_runs_the_common_scan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    staged_melt: dict[str, Any],
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _fake_build(monkeypatch)
     received: dict[str, Any] = {}
 
     def scan(run: Any, output_dir: Path, **kwargs: Any) -> RateReport:
@@ -488,7 +472,7 @@ def test_a_youngs_scan_from_the_original_flags_runs_the_common_scan(
     assert received["hold_times_ps"] == (50.0, 500.0, 5000.0)
     assert received["target_rate"] == 0.0001
     assert received["spec"].elastic_strain_limit == 0.02
-    assert received["chain_backbone"] == (0, 1, 2)
+    assert received["chain_backbone"] == ()
     assert "youngs_modulus rate scan: " in capsys.readouterr().out
     assert (tmp_path / "output/analysis/youngs_modulus_rates.json").is_file()
     assert not (tmp_path / "output/analysis/modulus_rates.json").exists()
@@ -498,7 +482,7 @@ def test_new_tm_rate_scan_preserves_crystalline_input_and_writes_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     prepared = object()
-    monkeypatch.setattr(cli, "_prepared_crystal", lambda arguments: prepared)
+    monkeypatch.setattr(cli, "load_crystal", lambda *args, **kwargs: prepared)
 
     def scan(run: Any, output_dir: Path, **kwargs: Any) -> RateReport:
         assert run is prepared

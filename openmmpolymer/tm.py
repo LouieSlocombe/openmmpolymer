@@ -6,6 +6,10 @@ the same temperature interval here. A resolved result is still an apparent
 heating transition: superheating, finite size and crystal morphology can shift
 it away from equilibrium Tm. Confirm crystal loss in the saved structures or
 trajectories and repeat at longer holds before interpreting the number.
+
+The crystal is supplied rather than built: chains packed from a monomer make
+an amorphous melt, which has no melting point to find. :func:`load_crystal`
+reads a prepared cell with its System, and :func:`run_tm_scan` heats it.
 """
 
 from __future__ import annotations
@@ -14,9 +18,12 @@ import json
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+import openmm as mm
+from openmm import app, unit
 
 from ._files import ReportFiles, file_sha256, write_json
 from ._validation import require_integer
@@ -26,6 +33,8 @@ from ._workflow import (
     run_fingerprint,
     spec_request,
 )
+from .forcefield import PolymerForceField
+from .mdsystem import PackedBox, SystemAssemblyError, SystemSpec, find_barostat
 from .protocols import (
     Protocol,
     RunManifest,
@@ -35,7 +44,7 @@ from .protocols import (
     validate_run_inputs,
 )
 from .reporters import TrajectoryOptions
-from .simulate import RunContext, heating_temperatures, safe_timestep_fs
+from .simulate import RunContext, heating_temperatures, prepare_run, safe_timestep_fs
 from .trajectory import AnalysisError
 
 PROTOCOL_NAME = "tm_heating"
@@ -534,6 +543,174 @@ def analyse_melting(
     )
 
 
+def load_crystal(
+    crystal_pdb: str | Path,
+    system_xml: str | Path,
+    *,
+    state_in: str | Path | None = None,
+    platform: str | None = None,
+    seed: int = 0xF0,
+) -> RunContext:
+    """Read a prepared crystal and its System, ready for :func:`run_tm_scan`.
+
+    Nothing is repacked or reparameterised: the System keeps its own
+    parameters, masses and constraints, and the force field the run records is
+    provenance only. What is checked is everything a heating scan would
+    otherwise trip over later, before it writes a file: the PDB and the System
+    hold the same atoms, in a periodic cell of positive volume with finite
+    coordinates; the System brings no barostat or Andersen thermostat of its
+    own; and its bonded molecules are equal, contiguous blocks of atoms, which
+    is how the reports divide a cell into chains.
+
+    Args:
+        crystal_pdb: The crystalline or semicrystalline cell, with its box
+            vectors (CRYST1) and bonds, in the System's atom order.
+        system_xml: A serialized OpenMM System for exactly that cell.
+        state_in: A serialized State of the cell for the scan to start from,
+            checked here; the scan is handed it separately.
+        platform: OpenMM platform, or None for the fastest available.
+        seed: Master seed.
+
+    Returns:
+        The run context.
+
+    Raises:
+        ValueError: A file cannot be read, or does not describe such a cell.
+    """
+    try:
+        pdb = app.PDBFile(str(crystal_pdb))
+        system = mm.XmlSerializer.deserialize(Path(system_xml).read_text())
+    except Exception as error:
+        raise ValueError(
+            f"Could not read the prepared crystal and System: {error}"
+        ) from error
+    if not isinstance(system, mm.System):
+        raise ValueError("system_xml must contain a serialized OpenMM System")
+    if system.getNumParticles() != pdb.topology.getNumAtoms():
+        raise ValueError("Crystal PDB and System must contain the same number of atoms")
+    _refuse_ensemble_controls(system, ValueError)
+    if not system.usesPeriodicBoundaryConditions():
+        raise ValueError("The supplied System must use periodic boundary conditions")
+    vectors = pdb.topology.getPeriodicBoxVectors()
+    if vectors is None:
+        raise ValueError("Crystal PDB must contain periodic box vectors (CRYST1)")
+    matrix = np.asarray(vectors.value_in_unit(unit.nanometer), dtype=float)
+    if not np.all(np.isfinite(matrix)) or np.linalg.det(matrix) <= 0:
+        raise ValueError("Crystal PDB must have finite, positive-volume box vectors")
+    positions = np.asarray(pdb.positions.value_in_unit(unit.nanometer), dtype=float)
+    if not np.all(np.isfinite(positions)):
+        raise ValueError("Crystal PDB coordinates must be finite")
+    system.setDefaultPeriodicBoxVectors(*vectors)
+    if state_in is not None:
+        try:
+            state = mm.XmlSerializer.deserialize(Path(state_in).read_text())
+            if not isinstance(state, mm.State):
+                raise ValueError("state_in must contain a serialized OpenMM State")
+            saved_positions = np.asarray(
+                state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+                dtype=float,
+            )
+            saved_vectors = np.asarray(
+                state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer),
+                dtype=float,
+            )
+        except Exception as error:
+            raise ValueError(
+                f"Could not read the crystalline starting State: {error}"
+            ) from error
+        if saved_positions.shape != positions.shape or not np.all(
+            np.isfinite(saved_positions)
+        ):
+            raise ValueError(
+                "Starting State must have finite positions for every crystal atom"
+            )
+        if not np.all(np.isfinite(saved_vectors)) or np.linalg.det(saved_vectors) <= 0:
+            raise ValueError(
+                "Starting State must have finite, positive-volume box vectors"
+            )
+    a, b, c = np.linalg.norm(matrix, axis=1)
+    box = PackedBox(
+        topology=pdb.topology,
+        positions_nm=positions,
+        box_nm=(float(a), float(b), float(c)),
+        n_molecules=_molecule_count(pdb.topology),
+    )
+    forcefield = PolymerForceField(
+        forcefield_xml=str(Path(system_xml).resolve()),
+        base_forcefield=(),
+        residue_name="",
+        backend="prepared-system",
+    )
+    return prepare_run(
+        box,
+        forcefield,
+        SystemSpec(constraints="none", hydrogen_mass_amu=None),
+        platform=platform,
+        seed=seed,
+        system=system,
+    )
+
+
+def _refuse_ensemble_controls(system: Any, error: type[Exception]) -> None:
+    """Refuse a System that brings its own barostat or Andersen thermostat.
+
+    The heating stages control temperature and pressure themselves, and
+    OpenMM applies every barostat a System carries, a second one included.
+    """
+    try:
+        barostat = find_barostat(system) is not None
+    except SystemAssemblyError:  # More than one.
+        barostat = True
+    if barostat or any(
+        isinstance(force, mm.AndersenThermostat) for force in system.getForces()
+    ):
+        raise error(
+            "The supplied System must contain no barostat or Andersen thermostat; "
+            "the heating stages provide their own temperature and pressure control."
+        )
+
+
+def _molecule_count(topology: Any) -> int:
+    """Count the bonded molecules, which the reports take to be equal blocks."""
+    n_atoms = topology.getNumAtoms()
+    if n_atoms == 0:
+        raise ValueError("Crystal PDB must contain atoms")
+    neighbours: list[list[int]] = [[] for _ in range(n_atoms)]
+    for left, right in topology.bonds():
+        neighbours[left.index].append(right.index)
+        neighbours[right.index].append(left.index)
+    visited: set[int] = set()
+    components: list[list[int]] = []
+    for start in range(n_atoms):
+        if start in visited:
+            continue
+        visited.add(start)
+        pending = [start]
+        component = []
+        while pending:
+            atom = pending.pop()
+            component.append(atom)
+            for neighbour in neighbours[atom]:
+                if neighbour not in visited:
+                    visited.add(neighbour)
+                    pending.append(neighbour)
+        components.append(component)
+    if any(len(component) != len(components[0]) for component in components):
+        raise ValueError(
+            "Crystal PDB must contain molecules with equal atom counts; "
+            "check its bonds/CONECT records against the System"
+        )
+    if any(
+        max(component) - min(component) + 1 != len(component)
+        for component in components
+    ):
+        raise ValueError(
+            "Crystal PDB molecules must occupy contiguous atom blocks; "
+            "reorder both the PDB and System consistently"
+        )
+    return len(components)
+
+
 def run_tm_scan(
     run: RunContext,
     run_dir: str | Path = "run",
@@ -558,17 +735,7 @@ def run_tm_scan(
             "A melting scan requires a supplied crystalline or semicrystalline "
             "cell. Pass crystalline=True only after preparing that structure."
         )
-    import openmm as mm
-
-    system = mm.XmlSerializer.deserialize(run.system_xml)
-    if any(
-        "Barostat" in type(force).__name__ or isinstance(force, mm.AndersenThermostat)
-        for force in system.getForces()
-    ):
-        raise TmError(
-            "The supplied System must contain no barostat or Andersen thermostat; "
-            "the heating stages provide their own temperature and pressure control."
-        )
+    _refuse_ensemble_controls(mm.XmlSerializer.deserialize(run.system_xml), TmError)
     protocol = melting_scan(spec)
     total_ns = protocol.total_duration_ps / 1000.0
     timestep = safe_timestep_fs(spec.t_end_k, run.spec)

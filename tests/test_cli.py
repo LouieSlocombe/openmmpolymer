@@ -1,11 +1,16 @@
-"""Tests for the command-line driver."""
+"""Tests for the command-line driver.
+
+The build is stood in for twice over: ``no_build`` stops a run where the melt
+would start building, and ``staged_melt`` keeps the build's staging real but
+fakes its chemistry. The scans are stood in for by name, as the driver looks
+each one up when it runs it.
+"""
 
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
-from dataclasses import replace
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,25 +18,31 @@ from typing import Any
 import numpy as np
 import pytest
 
-from openmmpolymer.__main__ import (
-    _DESTS,
-    PROTOCOLS,
-    _modulus_spec,
-    _protocol_options,
-    _tg_spec,
-    _tm_spec,
-    build_parser,
-    main,
+from openmmpolymer import __main__ as cli
+from openmmpolymer.__main__ import PROTOCOLS, build_parser, main
+from openmmpolymer.mechanical import ModulusSpec, mechanical_scan
+from openmmpolymer.protocols import (
+    Protocol,
+    _canonical,
+    melt_quench,
+    standard_melt_equilibration,
 )
-from openmmpolymer.protocols import _canonical, melt_quench
+from openmmpolymer.reporters import TrajectoryOptions
+from openmmpolymer.tensile import BreakingSpec, ElongationSpec, YieldSpec, tensile_scan
+from openmmpolymer.tg import TgSpec, nominal_fine_schedule, tg_coarse_scan
+from openmmpolymer.tm import TmSpec, melting_scan
+from openmmpolymer.viscoelastic import RelaxationSpec, relaxation_scan
 
 from .helpers import (
     BuildReached,
     transition_at,
     two_line_curve,
+    write_crystal,
     write_deformation,
     write_polymer_snapshot,
     write_quench,
+    write_quenches,
+    write_relaxation,
 )
 
 #: SHA-256 of what every command-line run's ``build_request.json`` is made
@@ -68,10 +79,196 @@ UNRECORDED = {
     "max_total_ns",
 }
 
+#: What each protocol's shortest command line asks for. Seven of the command
+#: line's defaults differ from the library's, all on purpose.
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "equilibrate": standard_melt_equilibration(),
+    "melt-quench": melt_quench(),
+    "tg": TgSpec(
+        melt_temperature_k=600.0,
+        t_floor_k=200.0,
+        coarse_step_k=20.0,
+        coarse_hold_ps=200.0,
+    ),
+    "tm": TmSpec(min_points_per_branch=4),
+    "modulus": ModulusSpec(temperature_k=450.0),
+    "breaking": BreakingSpec(),
+    "elongation": ElongationSpec(),
+    "yield": YieldSpec(),
+    "relax": RelaxationSpec(temperature_k=450.0),
+}
+
+
+def _tensile_flags(name: str, criterion: str) -> str:
+    """Every flag of one tensile measurement: the shared ladder, its own name."""
+    return (
+        f"-t 310 --pressure 2 --deform-axis 0 --max-total-ns 900 "
+        f"--{name}-strain-increment 0.001 --{name}-max-strain 0.2 "
+        f"--{name}-relax-ps 20 --{name}-replicas 2 --{name}-samples-per-step 40 "
+        f"--{name}-stage-ps 200 --{name}-trajectory-ps 5 {criterion}"
+    )
+
+
+#: The ladder those flags set, in the spec's own terms.
+TENSILE_LADDER: dict[str, Any] = {
+    "temperature_k": 310.0,
+    "pressure_bar": 2.0,
+    "axis": 0,
+    "strain_increment": 0.001,
+    "max_strain": 0.2,
+    "relax_ps": 20.0,
+    "n_replicas": 2,
+    "samples_per_step": 40,
+    "stage_ps": 200.0,
+    "trajectory_ps": 5.0,
+    "max_total_ns": 900.0,
+}
+
+#: For each protocol, a command line setting every flag it takes, and the
+#: settings those have to make.
+EVERY_FLAG: dict[str, tuple[str, Any]] = {
+    "equilibrate": (
+        "-t 320 --melt-temperature 620 --pressure 2 --check-melt 5",
+        standard_melt_equilibration(
+            target_temperature_k=320.0,
+            melt_temperature_k=620.0,
+            pressure_bar=2.0,
+            npt_trajectory=TrajectoryOptions("xtc", interval_ps=5.0),
+        ),
+    ),
+    "melt-quench": (
+        "-t 320 --melt-temperature 620 --pressure 2 --check-melt "
+        "--t-start 640 --t-end 160 --step-k 25 --hold-ps 1000",
+        melt_quench(
+            target_temperature_k=320.0,
+            melt_temperature_k=620.0,
+            pressure_bar=2.0,
+            npt_trajectory=TrajectoryOptions("xtc", interval_ps=10.0),
+            t_start=640.0,
+            t_end=160.0,
+            step_k=25.0,
+            hold_ps=1000.0,
+        ),
+    ),
+    "tg": (
+        "--melt-temperature 610 --pressure 2 --t-end 180 --step-k 15 --hold-ps 300 "
+        "--fine-step-k 4 --fine-hold-ps 2500 --fine-window-k 50 --check-melt 4 "
+        "--min-points-per-branch 5 --max-total-ns 900",
+        TgSpec(
+            melt_temperature_k=610.0,
+            pressure_bar=2.0,
+            t_floor_k=180.0,
+            coarse_step_k=15.0,
+            coarse_hold_ps=300.0,
+            fine_step_k=4.0,
+            fine_hold_ps=2500.0,
+            window_k=50.0,
+            npt_trajectory_ps=4.0,
+            min_points_per_branch=5,
+            max_total_ns=900.0,
+        ),
+    ),
+    "tm": (
+        "--t-start 280 --t-end 500 --step-k 20 --hold-ps 50 --pressure 2 "
+        "--tm-equilibration-ps 10 --tm-stage-ps 100 --tm-trajectory-ps 5 "
+        "--tm-barostat isotropic --min-points-per-branch 5 --max-total-ns 900",
+        TmSpec(
+            t_start_k=280.0,
+            t_end_k=500.0,
+            step_k=20.0,
+            hold_ps=50.0,
+            pressure_bar=2.0,
+            equilibration_ps=10.0,
+            stage_ps=100.0,
+            trajectory_ps=5.0,
+            barostat="isotropic",
+            min_points_per_branch=5,
+            max_total_ns=900.0,
+        ),
+    ),
+    "modulus": (
+        "-t 310 --pressure 2 --deform-axis 0 --max-total-ns 900 "
+        "--strain-increment 0.001 --max-strain 0.03 --relax-ps 20 "
+        "--elastic-strain-limit 0.01 --replicas 2 --load-stresses 0,150,300 "
+        "--bulk-pressures 1,50,1 --shear-strains 0.01",
+        ModulusSpec(
+            temperature_k=310.0,
+            pressure_bar=2.0,
+            axis=0,
+            strain_increment=0.001,
+            max_strain=0.03,
+            relax_ps=20.0,
+            elastic_strain_limit=0.01,
+            n_replicas=2,
+            load_stresses_bar=(0.0, 150.0, 300.0),
+            bulk_pressures_bar=(1.0, 50.0, 1.0),
+            shear_strains=(0.01,),
+            max_total_ns=900.0,
+        ),
+    ),
+    "breaking": (
+        _tensile_flags("breaking", "--failure-fraction 0.4 --confirmation-steps 4"),
+        BreakingSpec(**TENSILE_LADDER, failure_fraction=0.4, confirmation_steps=4),
+    ),
+    "elongation": (
+        _tensile_flags("elongation", "--failure-fraction 0.4 --confirmation-steps 4"),
+        ElongationSpec(**TENSILE_LADDER, failure_fraction=0.4, confirmation_steps=4),
+    ),
+    "yield": (
+        _tensile_flags(
+            "yield",
+            "--yield-offset-strain 0.005 --yield-fit-min-strain 0.001 "
+            "--yield-fit-max-strain 0.015",
+        ),
+        YieldSpec(
+            **TENSILE_LADDER,
+            offset_strain=0.005,
+            fit_min_strain=0.001,
+            fit_max_strain=0.015,
+        ),
+    ),
+    "relax": (
+        "-t 310 --pressure 2 --deform-axis 0 --max-total-ns 900 --relax-mode shear "
+        "--step-strain 0.05 --baseline-ps 50 --relaxation-ps 500 --relax-replicas 2 "
+        "--sample-every-ps 0.1 --bins-per-decade 12 --relax-stage-ps 250 "
+        "--linearity-strains 0.01,0.09",
+        RelaxationSpec(
+            temperature_k=310.0,
+            pressure_bar=2.0,
+            axis=0,
+            mode="shear",
+            step_strain=0.05,
+            baseline_ps=50.0,
+            relax_ps=500.0,
+            n_replicas=2,
+            sample_every_ps=0.1,
+            bins_per_decade=12,
+            stage_ps=250.0,
+            linearity_strains=(0.01, 0.09),
+            max_total_ns=900.0,
+        ),
+    ),
+}
+
 
 def _sha256(value: Any) -> str:
     text = json.dumps(_canonical(value), sort_keys=True, allow_nan=False)
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _argv(protocol: str, *flags: str) -> list[str]:
+    """A command line for *protocol*: tm starts from a crystal, not a monomer."""
+    monomer = [] if protocol == "tm" else ["[*]CC[*]"]
+    return [*monomer, "--protocol", protocol, *flags]
+
+
+def _files(root: Path) -> dict[str, bytes]:
+    return {str(path): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+# --------------------------------------------------------------------------
+# What a rerun has to repeat
+# --------------------------------------------------------------------------
 
 
 def test_every_setting_a_build_request_records_is_pinned() -> None:
@@ -97,47 +294,56 @@ def test_every_setting_a_build_request_records_is_pinned() -> None:
         "tm",
         "yield",
     ):
-        monomer = [] if protocol == "tm" else ["[*]CC[*]"]
-        arguments = parser.parse_args([*monomer, "--protocol", protocol])
-        recorded[protocol] = _sha256(vars(arguments))
+        recorded[protocol] = _sha256(vars(parser.parse_args(_argv(protocol))))
     assert recorded == RECORDED_REQUEST_SHA256
 
 
 def test_the_build_request_is_every_setting_but_where_and_how_it_runs(
-    monkeypatch: pytest.MonkeyPatch,
+    no_build: list[Any],
 ) -> None:
-    from openmmpolymer import __main__ as cli
-
-    recorded: dict[str, Any] = {}
-
-    def record(output: Path, request: dict[str, Any]) -> None:
-        recorded.update(request)
-        raise BuildReached
-
-    monkeypatch.setattr(cli, "record_build_request", record)
-    argv = [
-        "[*]CC[*]",
-        "--conformers",
-        "50",
-        "--platform",
-        "CPU",
-        "--max-total-ns",
-        "1e6",
-        "--no-figures",
-        "-o",
-        "elsewhere",
-        "-v",
-    ]
+    argv = ["[*]CC[*]", "--conformers", "50", "--platform", "CPU", "--no-figures"]
+    argv += ["--max-total-ns", "1e6", "-o", "elsewhere", "-v"]
     with pytest.raises(BuildReached):
         main(argv)
+    recorded = json.loads(Path("elsewhere/build_request.json").read_text())
     versions = recorded.pop("runtime_versions")
     assert set(versions) == {"openmm", "rdkit", "forcefill", "openff-toolkit", "numpy"}
     namespace = vars(build_parser().parse_args(argv))
-    assert recorded == {
-        **{key: value for key, value in namespace.items() if key not in UNRECORDED},
-        "conformers": 30,
-        "characteristic_ratio": 7.0,
-    }
+    assert recorded == _canonical(
+        {
+            **{key: value for key, value in namespace.items() if key not in UNRECORDED},
+            "conformers": 30,
+            "characteristic_ratio": 7.0,
+        }
+    )
+    assert no_build[0].characteristic_ratio == 7.0
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [["--seed", "7"], ["--temperature", "500"], ["--tail-cap", "[*]O"]],
+)
+def test_a_changed_request_is_refused_before_it_can_overwrite_the_build(
+    changed: list[str], no_build: list[Any]
+) -> None:
+    arguments = ["[*]CC[*]", "-o", "run"]
+    with pytest.raises(BuildReached):
+        main(arguments)
+    artifact = Path("run/build/polymer_ff.xml")
+    artifact.parent.mkdir()
+    artifact.write_text("existing parameters")
+    with pytest.raises(SystemExit, match="2"):
+        main([*arguments, *changed])
+    assert artifact.read_text() == "existing parameters"
+    # Presentation, device selection and switching from build-only to dynamics
+    # do not change the prepared physical system.
+    with pytest.raises(BuildReached):
+        main([*arguments, "--platform", "CPU", "--dry-run", "-v"])
+
+
+# --------------------------------------------------------------------------
+# The parser
+# --------------------------------------------------------------------------
 
 
 def test_the_parser_says_what_the_command_does() -> None:
@@ -155,24 +361,192 @@ def test_the_monomer_is_the_one_required_argument() -> None:
     assert arguments.chains == 30
 
 
-def test_cli_passes_polyester_caps_and_polymer_dimensions_to_the_builder(
+@pytest.mark.parametrize(
+    "flags",
+    [
+        *(
+            ["--characteristic-ratio", value]
+            for value in ("0", "-1", "nan", "inf", "bad")
+        ),
+        ["--protocol", "anneal-forever"],
+        ["--charge-method", "am1bbc"],
+        *(["--cooling-rates", rates] for rates in ("10,fast,2", "10", "10,10", "0,10")),
+        ["--load-stresses", "not,numbers"],
+        ["--check-melt", "0"],
+        ["--backbone", "0,x"],
+        ["--backbone", "3"],
+        ["--stride", "0"],
+        ["--stride", "two"],
+    ],
+)
+def test_a_malformed_flag_is_refused_at_the_front_door(flags: list[str]) -> None:
+    """With a message about the flag, before any chemistry starts."""
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["[*]CC[*]", *flags])
+
+
+def test_list_flags_parse_in_the_order_they_were_written() -> None:
+    arguments = build_parser().parse_args(
+        [
+            "--analyse",
+            "run",
+            "other",
+            "--cooling-rates",
+            "10,5,2",
+            "--backbone",
+            "0,1,4",
+            "--stride",
+            "4",
+            "--structure-stage",
+            "03_npt",
+            "--no-structure",
+        ]
+    )
+    assert arguments.monomer is None
+    assert arguments.analyse == ["run", "other"]
+    assert arguments.cooling_rates == (10.0, 5.0, 2.0)
+    assert arguments.backbone == (0, 1, 4)
+    assert arguments.stride == 4
+    assert arguments.structure_stage == "03_npt"
+    assert arguments.no_structure
+
+
+def test_building_a_melt_still_needs_a_monomer() -> None:
+    """The one required argument, unless the other mode was asked for."""
+    with pytest.raises(SystemExit):
+        main([])
+
+
+# --------------------------------------------------------------------------
+# The protocol table
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("protocol", sorted(EVERY_FLAG))
+def test_every_flag_a_protocol_takes_reaches_its_settings(protocol: str) -> None:
+    """A flag the table sends nowhere is parsed, ignored and never arrives.
+
+    That is how t_end, step_k and hold_ps were once unreachable while looking
+    perfectly present in --help, and how --min-points-per-branch never reached
+    a tg scan.
+    """
+    flags, expected = EVERY_FLAG[protocol]
+    arguments = build_parser().parse_args(_argv(protocol, *flags.split()))
+    assert PROTOCOLS[protocol].settings(arguments) == expected
+
+
+@pytest.mark.parametrize("protocol", sorted(DEFAULT_SETTINGS))
+def test_the_command_lines_own_defaults_are_the_ones_it_means(protocol: str) -> None:
+    """Including the seven that differ from the library's."""
+    arguments = build_parser().parse_args(_argv(protocol))
+    assert PROTOCOLS[protocol].settings(arguments) == DEFAULT_SETTINGS[protocol]
+
+
+def test_a_pass_named_in_skip_is_dropped() -> None:
+    """Clearer than passing an empty list to the flag that configures it."""
+    arguments = build_parser().parse_args(_argv("modulus", "--skip", "bulk", "shear"))
+    spec = PROTOCOLS["modulus"].settings(arguments)
+    assert spec.bulk_pressures_bar is None
+    assert spec.shear_strains is None
+    assert spec.load_stresses_bar == ModulusSpec().load_stresses_bar
+
+
+# --------------------------------------------------------------------------
+# Checked and priced before anything is built
+# --------------------------------------------------------------------------
+
+
+def _listed_ps(protocol: str, rates: tuple[float, ...] = ()) -> float:
+    """Every stage of *protocol*'s default run, as the library lists it."""
+    settings = DEFAULT_SETTINGS[protocol]
+    if protocol in ("equilibrate", "melt-quench"):
+        return float(settings.total_duration_ps)
+    if protocol == "tg":
+        holds = [settings.fine_step_k / rate * 1000.0 for rate in rates]
+        fine = sum(
+            nominal_fine_schedule(settings, hold_ps=hold).total_ps
+            for hold in holds or [None]
+        )
+        return float(tg_coarse_scan(settings).total_duration_ps + fine)
+    listings: dict[str, Callable[[Any], Protocol]] = {
+        "tm": melting_scan,
+        "modulus": mechanical_scan,
+        "relax": relaxation_scan,
+        **dict.fromkeys(("breaking", "elongation", "yield"), tensile_scan),
+    }
+    return listings[protocol](settings).total_duration_ps
+
+
+@pytest.mark.parametrize(
+    ("protocol", "rates"),
+    [(protocol, ()) for protocol in sorted(DEFAULT_SETTINGS)] + [("tg", (10.0, 5.0))],
+)
+def test_every_run_is_priced_in_full_before_anything_is_built(
+    protocol: str,
+    rates: tuple[float, ...],
+    no_build: list[Any],
+    argon_box: tuple[Any, Any],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every replica, pass and fine window, as a dry run reports it."""
+    flags = ["--dry-run"]
+    if rates:
+        flags += ["--cooling-rates", ",".join(f"{rate:g}" for rate in rates)]
+    if protocol == "tm":
+        pdb, xml = write_crystal(*argon_box, Path("."))
+        flags += ["--crystal-pdb", str(pdb), "--system-xml", str(xml)]
+        assert main(_argv("tm", *flags)) == 0
+    else:
+        with pytest.raises(BuildReached):
+            main(_argv(protocol, *flags))
+    total_ns = _listed_ps(protocol, rates) / 1000.0
+    assert f"{protocol} run: {total_ns:.3g} ns of dynamics in total" in (
+        capsys.readouterr().out
+    )
+
+
+@pytest.mark.parametrize(
+    ("protocol", "flags"),
+    [
+        *((protocol, "--max-total-ns 0.001") for protocol in sorted(DEFAULT_SETTINGS)),
+        ("melt-quench", "--step-k 0"),
+        ("melt-quench", "--t-end 700"),
+        ("tg", "--fine-step-k 0"),
+        ("modulus", "--strain-increment 0"),
+        ("modulus", "--elastic-strain-limit 0.5"),
+        ("relax", "--step-strain 0"),
+        ("equilibrate", "-r TOOLONG"),
+    ],
+)
+def test_every_protocols_settings_are_checked_before_anything_is_built(
+    protocol: str,
+    flags: str,
+    no_build: list[Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A supported polyester must be constructible through the CLI as well."""
-    from openmmpolymer import __main__ as cli
-    from openmmpolymer.chain import ChainSpec, assemble_chain
+    """A dry run of a bad request used to build a melt first, for some protocols."""
 
-    class BuildReached(Exception):
-        pass
+    def unexpected(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("a refused request read the crystal")
 
-    def build(spec: ChainSpec, *args: Any, **kwargs: Any) -> Any:
-        assert spec.head_cap == "[*][H]"
-        assert spec.tail_cap == "[*]O"
-        assert spec.characteristic_ratio == 5.5
-        assert assemble_chain(spec).GetNumAtoms() > 0
-        raise BuildReached
+    monkeypatch.setattr(cli, "load_crystal", unexpected)
+    crystal = "--crystal-pdb c.pdb --system-xml s.xml" if protocol == "tm" else ""
+    argv = _argv(protocol, *f"--dry-run -o output {crystal} {flags}".split())
+    with pytest.raises(SystemExit, match="2"):
+        main(argv)
+    assert not no_build
+    assert not Path("output").exists()
 
-    monkeypatch.setattr(cli, "build_chain", build)
+
+# --------------------------------------------------------------------------
+# The build
+# --------------------------------------------------------------------------
+
+
+def test_the_chain_flags_reach_the_builder(no_build: list[Any]) -> None:
+    """A capped polyester is built as asked, with its own C-infinity."""
+    from openmmpolymer.chain import assemble_chain
+
     with pytest.raises(BuildReached):
         main(
             [
@@ -185,211 +559,77 @@ def test_cli_passes_polyester_caps_and_polymer_dimensions_to_the_builder(
                 "[*]O",
                 "--characteristic-ratio",
                 "5.5",
+                "--tacticity",
+                "isotactic",
+                "-r",
+                "PLA",
+                "--seed",
+                "7",
                 "--dry-run",
             ]
         )
+    (spec,) = no_build
+    assert (spec.head_cap, spec.tail_cap) == ("[*][H]", "[*]O")
+    assert (spec.degree_of_polymerization, spec.characteristic_ratio) == (3, 5.5)
+    assert (spec.tacticity, spec.residue_name, spec.seed) == ("isotactic", "PLA", 7)
+    assert assemble_chain(spec).GetNumAtoms() > 0
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "bad"])
-def test_invalid_characteristic_ratio_is_rejected_by_the_parser(value: str) -> None:
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(["[*]CC[*]", "--characteristic-ratio", value])
-
-
-def test_default_build_ratio_and_request_identity_remain_seven(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("failure", ["refused", "broken"])
+def test_a_rebuild_that_is_refused_or_breaks_leaves_the_build_as_it_was(
+    staged_melt: dict[str, Any], failure: str
 ) -> None:
-    from openmmpolymer import __main__ as cli
-    from openmmpolymer.chain import ChainSpec
-
-    class BuildReached(Exception):
-        pass
-
-    def build(spec: ChainSpec, *args: Any, **kwargs: Any) -> Any:
-        assert spec.characteristic_ratio == 7.0
-        raise BuildReached
-
-    def request(output: Path, options: dict[str, Any]) -> None:
-        assert options["characteristic_ratio"] == 7.0
-
-    monkeypatch.setattr(cli, "build_chain", build)
-    monkeypatch.setattr(cli, "record_build_request", request)
-    with pytest.raises(BuildReached):
-        main(["[*]CC[*]", "--dry-run"])
-
-
-@pytest.mark.parametrize(
-    "changed",
-    [["--seed", "7"], ["--temperature", "500"], ["--tail-cap", "[*]O"]],
-)
-def test_changed_cli_request_is_refused_before_overwriting_build_assets(
-    changed: list[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    from openmmpolymer import __main__ as cli
-
-    class BuildReached(Exception):
-        pass
-
-    def build(*args: Any, **kwargs: Any) -> Any:
-        raise BuildReached
-
-    monkeypatch.setattr(cli, "build_chain", build)
-    arguments = ["[*]CC[*]", "-o", str(tmp_path / "run")]
-    with pytest.raises(BuildReached):
-        main(arguments)
-    artifact = tmp_path / "run" / "build" / "polymer_ff.xml"
-    artifact.parent.mkdir()
-    artifact.write_text("existing parameters")
-    with pytest.raises(SystemExit, match="2"):
-        main([*arguments, *changed])
-    assert artifact.read_text() == "existing parameters"
-    # Presentation, device selection and switching from build-only to dynamics
-    # do not change the prepared physical system.
-    with pytest.raises(BuildReached):
-        main([*arguments, "--platform", "CPU", "--dry-run", "-v"])
-
-
-@pytest.fixture
-def staged_cli_build(monkeypatch: pytest.MonkeyPatch, argon_run: Any) -> dict[str, Any]:
-    """Real input fingerprints with inexpensive stand-ins for chemistry tools."""
-    from openmmpolymer import __main__ as cli
-    from openmmpolymer.chain import ChainResult
-
-    control: dict[str, Any] = {"system_suffix": "", "fail": False, "paths": []}
-
-    def build(arguments: Any, build_dir: Path, cache_dir: Path) -> Any:
-        del arguments, cache_dir
-        control["paths"].append(build_dir)
-        build_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("chain_0.sdf", "chain_0.pdb", "polymer_ff.xml", "packed.pdb"):
-            (build_dir / name).write_text(f"prepared artifact {len(control['paths'])}")
-        if control["fail"]:
-            raise RuntimeError("preparation failed")
-        chain = ChainResult(
-            sdf_paths=(str(build_dir / "chain_0.sdf"),),
-            pdb_paths=(str(build_dir / "chain_0.pdb"),),
-            smiles="[Ar]",
-            n_atoms=1,
-            molar_mass_g_mol=39.948,
-        )
-        run = replace(
-            argon_run,
-            system_xml=argon_run.system_xml + control["system_suffix"],
-            forcefield=replace(
-                argon_run.forcefield, forcefield_xml=str(build_dir / "polymer_ff.xml")
-            ),
-        )
-        return chain, run
-
-    monkeypatch.setattr(cli, "_build_cli_melt", build)
-    return control
-
-
-def _cli_artifacts() -> dict[str, bytes]:
-    return {
-        str(path): path.read_bytes()
-        for path in Path("run").rglob("*")
-        if path.is_file()
-    }
-
-
-def test_repeated_cli_preparation_preserves_original_build_files(
-    staged_cli_build: dict[str, Any],
-) -> None:
+    """A refusal is a usage error; a build that breaks says so itself."""
     assert main(["[*]CC[*]", "--dry-run"]) == 0
-    before = _cli_artifacts()
-    assert main(["[*]CC[*]", "--dry-run", "--platform", "CPU"]) == 0
-    assert _cli_artifacts() == before
-    assert staged_cli_build["paths"][0] == Path("run/build")
-    assert staged_cli_build["paths"][1] != Path("run/build")
-    assert not staged_cli_build["paths"][1].exists()
-
-
-@pytest.mark.parametrize("failure", ["different_system", "build_error"])
-def test_failed_cli_repreparation_cannot_overwrite_existing_assets(
-    staged_cli_build: dict[str, Any], failure: str
-) -> None:
-    assert main(["[*]CC[*]", "--dry-run"]) == 0
-    before = _cli_artifacts()
-    if failure == "different_system":
-        staged_cli_build["system_suffix"] = "\n"
+    before = _files(Path("run"))
+    if failure == "refused":
+        staged_melt["system_suffix"] = "\n"
         expected: type[BaseException] = SystemExit
     else:
-        staged_cli_build["fail"] = True
+        staged_melt["fail"] = True
         expected = RuntimeError
     with pytest.raises(expected):
         main(["[*]CC[*]", "--dry-run"])
-    assert _cli_artifacts() == before
-    assert not list(Path("run").glob(".build-check-*"))
+    assert _files(Path("run")) == before
 
 
-def test_cli_dry_run_can_continue_to_dynamics_using_verified_build_files(
-    staged_cli_build: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+def test_a_dry_run_can_go_on_to_dynamics_on_the_verified_build(
+    staged_melt: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from openmmpolymer import __main__ as cli
+    ran: list[Any] = []
 
-    class DynamicsReached(Exception):
-        pass
-
-    def dynamics(protocol: Any, run: Any, *args: Any, **kwargs: Any) -> Any:
+    def dynamics(protocol: Any, run: Any, output: Path, **options: Any) -> Any:
+        ran.append((protocol, output, options))
         assert Path(run.forcefield.forcefield_xml) == Path("run/build/polymer_ff.xml")
-        assert Path(run.forcefield.forcefield_xml).is_file()
-        raise DynamicsReached
+        chains = SimpleNamespace(
+            mean_radius_of_gyration_nm=1.25, characteristic_ratio=6.5, consistent=True
+        )
+        return SimpleNamespace(
+            protocol=protocol.name,
+            results=(1, 2),
+            wall_seconds=90.0,
+            manifest_path="run/manifest.json",
+            chains=chains,
+        )
 
     assert main(["[*]CC[*]", "--dry-run"]) == 0
-    before = _cli_artifacts()
+    before = _files(Path("run"))
     monkeypatch.setattr(cli, "run_protocol", dynamics)
-    with pytest.raises(DynamicsReached):
-        main(["[*]CC[*]"])
-    assert _cli_artifacts() == before
-
-
-@pytest.mark.parametrize("manifest_dir", ["run", "run/equilibration"])
-def test_cli_checks_actual_inputs_against_existing_workflow_manifests(
-    staged_cli_build: dict[str, Any], argon_run: Any, manifest_dir: str
-) -> None:
-    from openmmpolymer.protocols import Protocol, Stage, run_protocol
-
-    assert main(["[*]CC[*]", "--dry-run"]) == 0
-    run_protocol(
-        Protocol("other", (Stage("00_minimise", "minimise"),)),
-        replace(argon_run, seed=99),
-        manifest_dir,
-    )
-    before = _cli_artifacts()
-    with pytest.raises(SystemExit):
-        main(["[*]CC[*]", "--dry-run"])
-    assert _cli_artifacts() == before
-
-
-def test_cli_refuses_a_modified_original_forcefield_before_rebuilding(
-    staged_cli_build: dict[str, Any],
-) -> None:
-    assert main(["[*]CC[*]", "--dry-run"]) == 0
-    Path("run/build/polymer_ff.xml").write_text("modified original")
-    before = _cli_artifacts()
-    with pytest.raises(SystemExit):
-        main(["[*]CC[*]", "--dry-run"])
-    assert len(staged_cli_build["paths"]) == 1
-    assert _cli_artifacts() == before
-
-
-def test_the_parser_rejects_a_protocol_it_cannot_run() -> None:
-    """argparse catches it before any chemistry starts."""
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(["[*]CC[*]", "--protocol", "anneal-forever"])
-
-
-def test_every_offered_protocol_is_buildable() -> None:
-    """The choices and the factories cannot drift apart."""
-    for entry in PROTOCOLS.values():
-        assert entry.factory().stages
-
-
-def test_the_parser_rejects_an_unknown_charge_method() -> None:
-    """Same reason: fail at the front door."""
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(["[*]CC[*]", "--charge-method", "am1bbc"])
+    assert main(["[*]CC[*]"]) == 0
+    assert _files(Path("run")) == before
+    (protocol, output, options) = ran[0]
+    assert protocol == DEFAULT_SETTINGS["equilibrate"]
+    assert output == Path("run")
+    assert options == {
+        "chain_backbone": (),
+        "atoms_per_chain": 1,
+        "expected_characteristic_ratio": 7.0,
+    }
+    printed = capsys.readouterr().out
+    assert "standard_melt_equilibration: 2 stages in 1.5 min" in printed
+    assert "chains: Rg 1.250 nm, C 6.50 (consistent)" in printed
 
 
 def test_the_cell_size_guard_reaches_the_command_line() -> None:
@@ -432,140 +672,115 @@ def test_a_dry_run_builds_packs_and_stops(
     )
     captured = capsys.readouterr().out
     assert exit_code == 0
+    assert "chain: " in captured and "packed: 40 chains" in captured
     assert "dry run" in captured
     assert Path("out/build/packed.pdb").is_file()
     assert Path("out/build/polymer_ff.xml").is_file()
 
 
-def test_every_protocol_option_is_a_real_parameter_of_its_factory() -> None:
-    """The table and the factories cannot drift apart without a failure here.
+# --------------------------------------------------------------------------
+# The runs
+# --------------------------------------------------------------------------
 
-    A flag that reaches no factory is parsed, ignored, and never arrives -
-    which is exactly how t_end, step_k and hold_ps came to be unreachable
-    from the command line while looking perfectly present in --help.
-    """
-    for name, entry in PROTOCOLS.items():
-        parameters = inspect.signature(entry.factory).parameters
-        takes_anything = any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters.values()
+
+def test_a_tg_run_hands_the_flat_flags_to_the_scan_as_a_spec(
+    staged_melt: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The translation from seventeen flags to one spec, checked end to end."""
+    seen: dict[str, Any] = {}
+
+    def scan(run: Any, run_dir: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return SimpleNamespace(
+            temperature_k=418.0,
+            resolved=True,
+            restart="waypoint",
+            approximate=SimpleNamespace(temperature_k=425.0),
+            fine_schedule=SimpleNamespace(cooling_rate_k_per_ns=1.67),
+            fine_summary=SimpleNamespace(chains=None),
         )
-        for option in entry.options:
-            assert takes_anything or option in parameters, (name, option)
+
+    monkeypatch.setattr(cli, "run_tg_scan", scan)
+    flags = ["--t-end", "180", "--fine-window-k", "50", "--check-melt", "4"]
+    flags += ["--characteristic-ratio", "5.5", "--tg-approx", "420"]
+    assert main(_argv("tg", *flags)) == 0
+
+    spec = seen["spec"]
+    assert (spec.t_floor_k, spec.window_k, spec.npt_trajectory_ps) == (180, 50, 4)
+    assert seen["tg_approx_k"] == 420.0
+    assert seen["expected_characteristic_ratio"] == 5.5
+    # A tg scan settles its melt from its spec, not from separate keywords.
+    assert "melt_temperature_k" not in seen
+    assert "tg: Tg = 418 K at 1.67 K/ns (coarse said 425 K)" in capsys.readouterr().out
 
 
-def test_the_flat_cooling_flags_reach_the_spec_a_scan_takes() -> None:
-    """The tg factory takes **kwargs, so the check above cannot see it."""
-    parameters = inspect.signature(_tg_spec).parameters
-    for option in PROTOCOLS["tg"].options:
-        assert option in parameters, option
+def test_a_tg_run_at_several_rates_reports_each_and_then_the_fit(
+    staged_melt: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every measurement, then the extrapolation with its span attached."""
+
+    def series(run: Any, run_dir: Any, **kwargs: Any) -> Any:
+        return tuple(
+            transition_at(rate, 340.0 + 20.0 * np.log10(rate))
+            for rate in kwargs["rates_k_per_ns"]
+        )
+
+    monkeypatch.setattr(cli, "cooling_rate_series", series)
+    assert main(_argv("tg", "--cooling-rates", "100,10,1", "--rate-form", "vft")) == 0
+    printed = capsys.readouterr().out
+    assert printed.count("tg: ") == 3
+    assert "vft: " in printed
+    assert "not resolved" in printed
+    assert "per decade" in printed
 
 
-def test_the_quench_controls_reach_the_protocol(tmp_path: Path) -> None:
-    """They were unreachable: main passed three keywords and no more."""
-    arguments = build_parser().parse_args(
-        [
-            "[*]CC[*]",
-            "--protocol",
-            "melt-quench",
-            "--t-start",
-            "640",
-            "--t-end",
-            "160",
-            "--step-k",
-            "25",
-            "--hold-ps",
-            "1000",
-        ]
-    )
-    entry = PROTOCOLS["melt-quench"]
-    options = {
-        name: getattr(arguments, _DESTS.get(name, name)) for name in entry.options
-    }
-    quench = entry.factory(**options).stages[-1].options
+@pytest.mark.parametrize(
+    ("protocol", "scan", "report", "line"),
+    [
+        (
+            "modulus",
+            "run_modulus_scan",
+            {"youngs": None, "poisson": None, "bulk": None, "shear": None}
+            | {"load_modulus": None, "consistency": None},
+            "modulus: nothing was deformed",
+        ),
+        ("relax", "run_relaxation_scan", {"mean": None}, "relax: nothing was strained"),
+    ],
+)
+def test_a_scan_settles_its_melt_as_the_flags_ask_and_says_what_it_found(
+    protocol: str,
+    scan: str,
+    report: dict[str, Any],
+    line: str,
+    staged_melt: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--melt-temperature and --check-melt reach every melt a scan settles."""
+    seen: dict[str, Any] = {}
 
-    assert quench["t_start"] == pytest.approx(640.0)
-    assert quench["t_end"] == pytest.approx(160.0)
-    assert quench["step_k"] == pytest.approx(25.0)
-    assert quench["hold_ps"] == pytest.approx(1000.0)
+    def run_scan(run: Any, output: Path, **kwargs: Any) -> Any:
+        seen.update(kwargs, output=output)
+        return SimpleNamespace(**report)
 
-
-def test_a_start_temperature_defaults_to_the_melt_temperature() -> None:
-    """What every existing invocation has always got."""
-    arguments = build_parser().parse_args(["[*]CC[*]"])
-    assert arguments.t_start is None
-    assert melt_quench(t_start=None).stages[-1].options["t_start"] == pytest.approx(
-        600.0
-    )
-
-
-def test_a_malformed_cooling_rate_list_is_refused_at_the_front_door() -> None:
-    """argparse catches it before any chemistry starts."""
-    for bad in ("10,fast,2", "10", "10,10", "0,10"):
-        with pytest.raises(SystemExit):
-            build_parser().parse_args(["[*]CC[*]", "--cooling-rates", bad])
+    monkeypatch.setattr(cli, scan, run_scan)
+    flags = ["--melt-temperature", "620", "--check-melt", "5", "-o", "measured"]
+    assert main(_argv(protocol, *flags)) == 0
+    assert seen["output"] == Path("measured")
+    assert seen["spec"] == DEFAULT_SETTINGS[protocol]
+    assert seen["melt_temperature_k"] == 620.0
+    assert seen["npt_trajectory"] == TrajectoryOptions("xtc", interval_ps=5.0)
+    assert seen["expected_characteristic_ratio"] == 7.0
+    assert line in capsys.readouterr().out
 
 
-def test_a_well_formed_cooling_rate_list_is_accepted() -> None:
-    """Three rates, in the order they were written."""
-    arguments = build_parser().parse_args(["[*]CC[*]", "--cooling-rates", "10,5,2"])
-    assert arguments.cooling_rates == (10.0, 5.0, 2.0)
-
-
-def test_the_monomer_is_not_needed_to_read_a_finished_directory() -> None:
-    """Reading a run back is a different verb over a different input."""
-    arguments = build_parser().parse_args(["--analyse", "run", "other"])
-
-    assert arguments.monomer is None
-    assert arguments.analyse == ["run", "other"]
-
-
-def test_building_a_melt_still_needs_a_monomer() -> None:
-    """The one required argument, unless the other mode was asked for."""
-    with pytest.raises(SystemExit):
-        main([])
-
-
-def test_melting_and_cooling_keep_their_own_defaults() -> None:
-    """Adding heating must not reverse any existing cooling command."""
-    parser = build_parser()
-    cooling = parser.parse_args(["[*]CC[*]", "--protocol", "melt-quench"])
-    heating = parser.parse_args(["--protocol", "tm"])
-    assert (cooling.t_start, cooling.t_end, cooling.step_k, cooling.hold_ps) == (
-        None,
-        200.0,
-        20.0,
-        200.0,
-    )
-    assert (heating.t_start, heating.t_end, heating.step_k, heating.hold_ps) == (
-        250.0,
-        650.0,
-        10.0,
-        1000.0,
-    )
-    for option in PROTOCOLS["tm"].options:
-        assert option in inspect.signature(_tm_spec).parameters
-    explicit = parser.parse_args(
-        [
-            "--t-start",
-            "100",
-            "--t-end",
-            "200",
-            "--step-k",
-            "5",
-            "--hold-ps",
-            "10",
-            "--protocol",
-            "tm",
-        ]
-    )
-    spec = _tm_spec(**_protocol_options(explicit, PROTOCOLS["tm"]))
-    assert (spec.t_start_k, spec.t_end_k, spec.step_k, spec.hold_ps) == (
-        100,
-        200,
-        5,
-        10,
-    )
+# --------------------------------------------------------------------------
+# Melting a supplied crystal
+# --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -586,11 +801,11 @@ def test_melting_and_cooling_keep_their_own_defaults() -> None:
     ],
 )
 def test_melting_requires_a_prepared_crystal_before_creating_files(
-    argv: list[str], tmp_path: Path
+    argv: list[str],
 ) -> None:
     with pytest.raises(SystemExit):
-        main([*argv, "-o", str(tmp_path / "output")])
-    assert not (tmp_path / "output").exists()
+        main([*argv, "-o", "output"])
+    assert not Path("output").exists()
 
 
 @pytest.mark.parametrize(
@@ -600,198 +815,99 @@ def test_melting_requires_a_prepared_crystal_before_creating_files(
         ["--step-k", "0"],
         ["--hold-ps", "-1"],
         ["--max-total-ns", "0.001"],
+        ["--check-melt"],
     ],
 )
 def test_melting_rejects_invalid_schedules_before_reading_the_crystal(
-    controls: list[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    controls: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import openmmpolymer.__main__ as cli
-
-    def unexpected_read(arguments: Any) -> Any:
+    def unexpected_read(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("The schedule should fail before the crystal is read")
 
-    monkeypatch.setattr(cli, "_prepared_crystal", unexpected_read)
+    monkeypatch.setattr(cli, "load_crystal", unexpected_read)
+    crystal = ["--crystal-pdb", "crystal.pdb", "--system-xml", "system.xml"]
     with pytest.raises(SystemExit):
-        main(
-            [
-                "--protocol",
-                "tm",
-                "--crystal-pdb",
-                "crystal.pdb",
-                "--system-xml",
-                "system.xml",
-                "-o",
-                str(tmp_path / "output"),
-                *controls,
-            ]
-        )
-    assert not (tmp_path / "output").exists()
-
-
-def _crystal_files(argon_box: tuple[Any, Any], directory: Path) -> list[str]:
-    """Write a prepared periodic cell and exactly its serialized System."""
-    import openmm as mm
-    from openmm import app
-
-    box, system = argon_box
-    pdb = directory / "crystal.pdb"
-    xml = directory / "system.xml"
-    with pdb.open("w") as stream:
-        app.PDBFile.writeFile(box.topology, box.positions, stream)
-    xml.write_text(mm.XmlSerializer.serialize(system))
-    return ["--crystal-pdb", str(pdb), "--system-xml", str(xml)]
+        main(["--protocol", "tm", *crystal, "-o", "output", *controls])
+    assert not Path("output").exists()
 
 
 def test_melting_dry_run_validates_prepared_inputs_without_building(
-    argon_box: tuple[Any, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    argon_box: tuple[Any, Any], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    args = _crystal_files(argon_box, tmp_path)
-    output = tmp_path / "output"
-    assert main(["--protocol", "tm", *args, "--dry-run", "-o", str(output)]) == 0
+    pdb, xml = write_crystal(*argon_box, Path("."))
+    crystal = ["--crystal-pdb", str(pdb), "--system-xml", str(xml)]
+    assert main(["--protocol", "tm", *crystal, "--dry-run", "-o", "output"]) == 0
     assert "crystal and heating schedule validated" in capsys.readouterr().out
-    assert not output.exists()
+    assert not Path("output").exists()
 
 
-def test_melting_dry_run_accepts_a_matching_crystalline_state(
-    argon_box: tuple[Any, Any], tmp_path: Path
+@pytest.mark.parametrize("invalid", ["barostat", "state"])
+def test_a_crystal_the_scan_could_not_heat_is_refused_before_any_file(
+    invalid: str, argon_box: tuple[Any, Any], capsys: pytest.CaptureFixture[str]
 ) -> None:
     import openmm as mm
 
     box, system = argon_box
-    args = _crystal_files(argon_box, tmp_path)
-    integrator = mm.VerletIntegrator(0.001)
-    context = mm.Context(system, integrator, mm.Platform.getPlatformByName("Reference"))
-    context.setPositions(box.positions)
-    context.setVelocitiesToTemperature(250.0, 1)
-    state = tmp_path / "crystal-state.xml"
-    state.write_text(
-        mm.XmlSerializer.serialize(
-            context.getState(getPositions=True, getVelocities=True)
-        )
-    )
-    assert main(["--protocol", "tm", *args, "--state-in", str(state), "--dry-run"]) == 0
-
-
-@pytest.mark.parametrize(
-    "invalid", ["atom_count", "barostat", "thermostat", "box", "periodicity", "state"]
-)
-def test_prepared_crystal_inputs_are_checked_before_the_scan(
-    invalid: str, argon_box: tuple[Any, Any], tmp_path: Path
-) -> None:
-    import openmm as mm
-
-    box, system = argon_box
-    if invalid == "atom_count":
-        system.addParticle(1.0)
-    elif invalid == "barostat":
+    if invalid == "barostat":
         system.addForce(mm.MonteCarloBarostat(1.0, 300.0))
-    elif invalid == "thermostat":
-        system.addForce(mm.AndersenThermostat(300.0, 1.0))
-    elif invalid == "periodicity":
-        system.getForce(0).setNonbondedMethod(mm.NonbondedForce.NoCutoff)
-    args = _crystal_files((box, system), tmp_path)
-    if invalid == "box":
-        pdb = tmp_path / "crystal.pdb"
-        pdb.write_text(
-            "\n".join(
-                line
-                for line in pdb.read_text().splitlines()
-                if not line.startswith("CRYST1")
-            )
-        )
-    elif invalid == "state":
-        args.extend(["--state-in", str(tmp_path / "missing-state.xml")])
-    with pytest.raises(SystemExit):
-        main(["--protocol", "tm", *args, "--dry-run", "-o", str(tmp_path / "output")])
-    assert not (tmp_path / "output").exists()
-
-
-@pytest.mark.parametrize("interleaved", [False, True])
-def test_crystal_molecule_layout_must_match_the_reporters_assumptions(
-    interleaved: bool,
-    argon_box: tuple[Any, Any],
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    box, _ = argon_box
-    atoms = list(box.topology.atoms())
-    if interleaved:
-        pairs = [
-            (0, 2),
-            (1, 3),
-            *[(index, index + 1) for index in range(4, len(atoms), 2)],
-        ]
-    else:
-        pairs = [(0, 1)]
-    for left, right in pairs:
-        box.topology.addBond(atoms[left], atoms[right])
-    args = _crystal_files(argon_box, tmp_path)
-    with pytest.raises(SystemExit):
-        main(["--protocol", "tm", *args, "--dry-run"])
-    message = "contiguous atom blocks" if interleaved else "equal atom counts"
+    pdb, xml = write_crystal(box, system, Path("."))
+    crystal = ["--crystal-pdb", str(pdb), "--system-xml", str(xml)]
+    if invalid == "state":
+        crystal += ["--state-in", "missing-state.xml"]
+    with pytest.raises(SystemExit, match="2"):
+        main(["--protocol", "tm", *crystal, "--dry-run", "-o", "output"])
+    message = "no barostat" if invalid == "barostat" else "starting State"
     assert message in capsys.readouterr().err
-    assert not (tmp_path / "run").exists()
+    assert not Path("output").exists()
 
 
 def test_melting_cli_dispatches_the_prepared_cell_and_explicit_schedule(
     argon_box: tuple[Any, Any],
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    import openmmpolymer.__main__ as cli
-
     seen: dict[str, Any] = {}
-    report = SimpleNamespace(notes=("Finite heating rate; inspect crystalline order.",))
+    transition = SimpleNamespace(
+        temperature_k=415.0, bracket_k=(410.0, 420.0), resolved=True
+    )
+    report = SimpleNamespace(
+        transition=transition,
+        notes=("Finite heating rate; inspect crystalline order.",),
+    )
 
     def scan(run: Any, output: Path, **kwargs: Any) -> Any:
         seen.update(kwargs, run=run, output=output)
-        return SimpleNamespace(
-            temperature_k=415.0, bracket_k=(410.0, 420.0), resolved=True, report=report
-        )
+        return SimpleNamespace(report=report)
 
-    def write(actual: Any, **kwargs: Any) -> Any:
+    def write(actual: Any, output_dir: Any, **kwargs: Any) -> Any:
         assert actual is report
+        assert output_dir is None
         assert kwargs["figures"] is False
-        return SimpleNamespace(json=tmp_path / "output/analysis/tm.json", figures=())
+        return SimpleNamespace(json="output/analysis/tm.json", figures=())
 
     monkeypatch.setattr(cli, "run_tm_scan", scan)
     monkeypatch.setattr(cli, "write_melting_report", write)
-    args = _crystal_files(argon_box, tmp_path)
-    assert (
-        main(
-            [
-                "--protocol",
-                "tm",
-                *args,
-                "--t-start",
-                "280",
-                "--t-end",
-                "500",
-                "--step-k",
-                "20",
-                "--hold-ps",
-                "50",
-                "--tm-equilibration-ps",
-                "10",
-                "--tm-stage-ps",
-                "100",
-                "--no-figures",
-                "-o",
-                str(tmp_path / "output"),
-            ]
-        )
-        == 0
-    )
+    pdb, xml = write_crystal(*argon_box, Path("."))
+    flags = ["--crystal-pdb", str(pdb), "--system-xml", str(xml), "--no-figures"]
+    flags += ["--t-start", "280", "--t-end", "500", "--step-k", "20", "--hold-ps"]
+    flags += ["50", "--tm-equilibration-ps", "10", "--tm-stage-ps", "100"]
+    assert main(_argv("tm", *flags, "-o", "output")) == 0
     assert seen["crystalline"] is True
     assert seen["state_in"] is None
-    assert seen["spec"].t_start_k == 280
-    assert seen["spec"].t_end_k == 500
+    assert seen["output"] == Path("output")
+    assert (seen["spec"].t_start_k, seen["spec"].t_end_k) == (280, 500)
     assert seen["spec"].hold_ps == 50
-    assert seen["run"].box.topology.getNumAtoms() == argon_box[0].topology.getNumAtoms()
     assert seen["run"].box.n_molecules == 64
     assert seen["run"].spec.constraints == "none"
-    assert "apparent Tm = 415 K (heating bracket 410-420 K)" in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert "apparent Tm = 415 K (heating bracket 410-420 K)" in printed
+    assert "note: Finite heating rate" in printed
+    assert "wrote output/analysis/tm.json and 0 figure(s)" in printed
+
+
+# --------------------------------------------------------------------------
+# What --analyse reports
+# --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("resolved", [True, False])
@@ -801,7 +917,6 @@ def test_analyse_dispatches_melting_and_reports_unresolved_results(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    import openmmpolymer.__main__ as cli
     from openmmpolymer.tm import heating_stages
 
     transition = SimpleNamespace(
@@ -814,7 +929,7 @@ def test_analyse_dispatches_melting_and_reports_unresolved_results(
 
     def analyse(run_dir: Path, **kwargs: Any) -> Any:
         assert run_dir == tmp_path
-        assert kwargs["min_points_per_branch"] == 4
+        assert kwargs["min_points_per_branch"] == 5
         return report
 
     def write(actual: Any, output: Any, **kwargs: Any) -> Any:
@@ -825,20 +940,8 @@ def test_analyse_dispatches_melting_and_reports_unresolved_results(
 
     monkeypatch.setattr(cli, "analyse_melting", analyse)
     monkeypatch.setattr(cli, "write_melting_report", write)
-    assert (
-        main(
-            [
-                "--analyse",
-                str(tmp_path),
-                "--no-figures",
-                "--min-points-per-branch",
-                "4",
-                "-o",
-                str(tmp_path / "reports"),
-            ]
-        )
-        == 0
-    )
+    argv = ["--analyse", str(tmp_path), "--no-figures", "--min-points-per-branch"]
+    assert main([*argv, "5", "-o", str(tmp_path / "reports")]) == 0
     printed = capsys.readouterr().out
     assert (
         "apparent Tm = 415 K" if resolved else "no clear melting transition"
@@ -861,7 +964,7 @@ def test_the_analysis_mode_reports_a_transition_and_writes_a_report(
     printed = capsys.readouterr().out
 
     assert exit_code == 0
-    assert "quenches: 06_quench" in printed
+    assert "quenches: 06_quench (20 K steps, 20.00 K/ns)" in printed
     assert "Tg = 340 K" in printed
     assert "aV" in printed
     assert (tmp_path / "analysis" / "tg.json").is_file()
@@ -885,165 +988,188 @@ def test_an_unresolved_analysis_is_a_result_rather_than_a_usage_error(
     assert "no clear transition" in capsys.readouterr().out
 
 
-class _FakeChain:
-    """Just the two fields the driver passes through to the run."""
-
-    backbone = (0, 1)
-    n_atoms = 2
-
-
-def test_a_tg_run_hands_the_flat_flags_to_the_scan_as_a_spec(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("form", ["log_linear", "vft"])
+def test_the_rate_form_leaves_every_extrapolation_in_an_analysis(
+    form: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The translation from seventeen flags to one spec, checked end to end."""
-    import openmmpolymer.__main__ as cli
-
-    seen: dict[str, Any] = {}
-
-    def fake_scan(run: Any, run_dir: Any, **kwargs: Any) -> Any:
-        seen.update(kwargs)
-        return SimpleNamespace(
-            temperature_k=418.0,
-            resolved=True,
-            restart="waypoint",
-            approximate=SimpleNamespace(temperature_k=425.0),
-            fine_schedule=SimpleNamespace(cooling_rate_k_per_ns=1.67),
-            fine_summary=SimpleNamespace(chains=None),
-        )
-
-    monkeypatch.setattr(cli, "run_tg_scan", fake_scan)
-    arguments = build_parser().parse_args(
-        [
-            "[*]CC[*]",
-            "--protocol",
-            "tg",
-            "--t-end",
-            "180",
-            "--step-k",
-            "20",
-            "--fine-window-k",
-            "50",
-            "--check-melt",
-            "4",
-            "--characteristic-ratio",
-            "5.5",
-        ]
-    )
-    entry = PROTOCOLS["tg"]
-    options = {
-        name: getattr(arguments, _DESTS.get(name, name)) for name in entry.options
+    """--rate-form picks the one a --cooling-rates run headlines, nothing more."""
+    coarse_t, coarse_d = two_line_curve(transition_k=340.0, n_points=11)
+    stages: dict[str, Any] = {
+        "06_coarse": {
+            "temperature_k": list(coarse_t[::-1]),
+            "density_g_cm3": list(coarse_d[::-1]),
+            "segment_duration_ps": [1000.0] * 11,
+        }
     }
-    exit_code = cli._run_tg_scan(arguments, None, Path("run"), _FakeChain(), options)
-
-    spec = seen["spec"]
-    assert exit_code == 0
-    assert spec.t_floor_k == pytest.approx(180.0)
-    assert spec.coarse_step_k == pytest.approx(20.0)
-    assert spec.window_k == pytest.approx(50.0)
-    assert spec.npt_trajectory_ps == pytest.approx(4.0)
-    assert seen["expected_characteristic_ratio"] == 5.5
-    assert "Tg = 418 K" in capsys.readouterr().out
-
-
-def test_a_tg_run_at_several_rates_reports_each_and_then_the_fit(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Every measurement, then the extrapolation with its span attached."""
-    import openmmpolymer.__main__ as cli
-
-    def fake_series(run: Any, run_dir: Any, **kwargs: Any) -> Any:
-        return tuple(
-            transition_at(rate, 340.0 + 20.0 * np.log10(rate))
-            for rate in kwargs["rates_k_per_ns"]
-        )
-
-    monkeypatch.setattr(cli, "cooling_rate_series", fake_series)
-    arguments = build_parser().parse_args(
-        ["[*]CC[*]", "--protocol", "tg", "--cooling-rates", "100,10,1"]
-    )
-    entry = PROTOCOLS["tg"]
-    options = {
-        name: getattr(arguments, _DESTS.get(name, name)) for name in entry.options
-    }
-    exit_code = cli._run_tg_scan(arguments, None, Path("run"), _FakeChain(), options)
+    for transition_k, hold_ps in ((360.0, 1000.0), (340.0, 4000.0), (320.0, 16000.0)):
+        temperature, density = two_line_curve(transition_k=transition_k)
+        stages[f"08_fine_{hold_ps:.0f}"] = {
+            "temperature_k": list(temperature[::-1]),
+            "density_g_cm3": list(density[::-1]),
+            "segment_duration_ps": [hold_ps] * 21,
+        }
+    write_quenches(tmp_path, stages)
+    argv = ["--analyse", str(tmp_path), "--no-melt-check", "--no-figures"]
+    assert main([*argv, "--rate-form", form]) == 0
     printed = capsys.readouterr().out
-
-    assert exit_code == 0
-    assert printed.count("tg: ") == 3
-    assert "log_linear" in printed
-    assert "not resolved" in printed
-    assert "per decade" in printed
+    assert "\nlog_linear: " in printed
+    assert "\nvft: " in printed
 
 
-# --------------------------------------------------------------------------
-# The modulus protocol, and what --analyse dispatches on
-# --------------------------------------------------------------------------
+def _fake(**fields: Any) -> Any:
+    return SimpleNamespace(**fields)
 
 
-def test_the_flat_mechanics_flags_reach_the_spec_a_scan_takes() -> None:
-    """The modulus factory takes **kwargs, so the general check cannot see it."""
-    parameters = inspect.signature(_modulus_spec).parameters
-    for option in PROTOCOLS["modulus"].options:
-        assert option in parameters, option
-
-
-def test_the_mechanics_flags_arrive_where_they_were_aimed() -> None:
-    """Parsed, mapped through the destination table, and into the spec."""
-    arguments = build_parser().parse_args(
+#: For each printer, a report with every caveat it can carry, and its lines.
+PRINTED: dict[str, tuple[Any, list[str]]] = {
+    "_modulus_lines": (
+        _fake(
+            youngs=_fake(
+                modulus_mpa=2012.4, strain_rate_per_ns=0.025, temperature_k=298.15
+            ),
+            replica_spread_mpa=41.6,
+            replicas=(1, 2, 3),
+            resolved=False,
+            poisson=_fake(ratio=0.3512, resolved=True),
+            bulk=_fake(modulus_mpa=3301.0, standard_error_mpa=120.0, resolved=True),
+            shear=_fake(modulus_mpa=741.0, standard_error_mpa=15.3, resolved=False),
+            load_modulus=_fake(modulus_mpa=1950.2),
+            consistency=_fake(
+                bulk_implied_mpa=2220.0,
+                shear_implied_mpa=744.8,
+                bulk_gap=0.33,
+                shear_gap=float("nan"),
+                consistent=False,
+            ),
+        ),
         [
-            "[*]CC[*]",
-            "--protocol",
-            "modulus",
-            "-t",
-            "310",
-            "--strain-increment",
-            "0.001",
-            "--max-strain",
-            "0.03",
-            "--replicas",
-            "2",
-            "--deform-axis",
-            "0",
-            "--load-stresses",
-            "0,150,300",
-        ]
-    )
-    spec = _modulus_spec(**_protocol_options(arguments, PROTOCOLS["modulus"]))
-    assert spec.temperature_k == pytest.approx(310.0)
-    assert spec.strain_increment == pytest.approx(0.001)
-    assert spec.max_strain == pytest.approx(0.03)
-    assert spec.n_replicas == 2
-    assert spec.axis == 0
-    assert spec.load_stresses_bar == (0.0, 150.0, 300.0)
+            "E = 2012 MPa +/- 42 over 3 replicas at 0.025 strain/ns, 298 K "
+            "(not resolved)",
+            "nu = 0.351",
+            "K = 3301 +/- 1.2e+02 MPa (fit SE)",
+            "G = 741 +/- 15 MPa (fit SE) (not resolved)",
+            "constant-stress cross-check: E = 1950 MPa",
+            "E and nu imply K = 2220, G = 745 MPa; measured differ by K 33% - not "
+            "consistent",
+        ],
+    ),
+    "_tg_lines": (
+        _fake(
+            curves=(
+                _fake(
+                    stage="06_quench",
+                    temperature_step_k=20.0,
+                    cooling_rate_k_per_ns=None,
+                ),
+            ),
+            melt=_fake(
+                stage="05_npt",
+                volume_settled=False,
+                chains_moved=True,
+                unchecked=("no trajectory to follow the chains",),
+            ),
+            coarse=None,
+            fine=_fake(cooling_rate_k_per_ns=5.0, resolved=False),
+            log_linear=None,
+            vft=None,
+        ),
+        [
+            "quenches: 06_quench (20 K steps, rate unknown)",
+            "melt 05_npt: volume still drifting; chains moved",
+            "  unchecked: no trajectory to follow the chains",
+            "fine: no clear transition at 5.00 K/ns",
+        ],
+    ),
+    "_relaxation_lines": (
+        _fake(
+            mean=_fake(
+                initial_modulus_mpa=912.3,
+                step_strain=0.03,
+                temperature_k=450.0,
+                decades=3.2,
+            ),
+            replica_spread_mpa=12.34,
+            curves=(1, 2, 3),
+            resolved=True,
+            kww=None,
+            prony=_fake(
+                equilibrium_mpa=1.234, n_active=3, n_terms=8, plateau_reached=False
+            ),
+            linearity=_fake(strains=(0.01, 0.03), gap=0.052, linear=True),
+        ),
+        [
+            "G(0) = 912.3 MPa +/- 12.3 over 3 replicas at +0.030 strain, 450 K, "
+            "over 3.2 decades",
+            "Prony: G_inf = 1.234 MPa over 3 of 8 terms - still decaying",
+            "linearity: strains [0.01, 0.03] differ by 5%",
+        ],
+    ),
+    "_structure_lines": (
+        _fake(
+            is_snapshot=False,
+            n_frames=10,
+            interval_ps=2.0,
+            stage="05_npt",
+            n_chains=32,
+            atoms_per_chain=2,
+            backbone=None,
+            distribution=None,
+            structure=_fake(first_peak_per_nm=0.0, q_min_per_nm=2.6),
+            conformation=_fake(
+                mean=_fake(
+                    mean_squared_end_to_end_nm2=1.5,
+                    mean_radius_of_gyration_nm=0.5,
+                    characteristic_ratio=6.1,
+                    expected_characteristic_ratio=7.0,
+                    consistent=True,
+                ),
+                settled=_fake(equilibrated=False),
+            ),
+            persistence=_fake(
+                persistence_length_nm=0.45,
+                n_bonds=20,
+                contour_length_nm=2.5,
+                decayed=False,
+            ),
+            displacement=_fake(log_slope=0.62, diffusion_coefficient_cm2_s=None),
+            relaxation=_fake(relaxation_time_ps=None, trajectory_ps=20.0),
+            recorded_chains=_fake(
+                mean_squared_end_to_end_nm2=1.4, mean_radius_of_gyration_nm=0.49
+            ),
+        ),
+        [
+            "structure: stage 05_npt (10 frames at 2 ps), 32 chains of 2 atoms",
+            "backbone: unknown, so no chain measurements",
+            "S(q): no resolvable peak above 2.6 /nm",
+            "chains: <R^2> = 1.500 nm2, Rg = 0.500 nm, C = 6.10 against an expected "
+            "7.00, <R^2> still moving",
+            "persistence length: 0.450 nm over 20 bonds (2.50 nm contour) - never "
+            "decayed to 1/e within the chain, so this is an extrapolation",
+            "MSD: slope 0.62, not diffusive, so no diffusion coefficient",
+            "end-to-end: not decorrelated in 20 ps; the relaxation time is longer "
+            "than the run",
+            "manifest recorded at the end of the run: <R^2> = 1.400 nm2, Rg = 0.490 nm",
+        ],
+    ),
+}
 
 
-def test_a_pass_named_in_skip_is_dropped() -> None:
-    """Clearer than passing an empty list to the flag that configures it."""
-    arguments = build_parser().parse_args(
-        ["[*]CC[*]", "--protocol", "modulus", "--skip", "bulk", "shear"]
-    )
-    spec = _modulus_spec(**_protocol_options(arguments, PROTOCOLS["modulus"]))
-    assert spec.bulk_pressures_bar is None
-    assert spec.shear_strains is None
-    assert spec.load_stresses_bar is not None
-
-
-def test_a_malformed_number_list_is_refused_at_the_front_door() -> None:
-    """With a message about the flag, not a traceback from inside a run."""
-    parser = build_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(["[*]CC[*]", "--load-stresses", "not,numbers"])
+@pytest.mark.parametrize("printer", sorted(PRINTED))
+def test_each_number_is_printed_with_what_qualifies_it(printer: str) -> None:
+    """A run and its --analyse print a report the same way, caveats and all."""
+    report, lines = PRINTED[printer]
+    assert list(getattr(cli, printer)(report)) == lines
 
 
 def test_analyse_reports_mechanics_when_the_directory_holds_a_deformation(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Dispatched on what the run recorded, not on a second flag."""
+    """Dispatched on what the run recorded, and the rate travels with E."""
     write_deformation(Path("run"), modulus_mpa=2000.0, poisson=0.35)
-    exit_code = main(["--analyse", "run", "--no-figures"])
+    assert main(["--analyse", "run", "--no-figures"]) == 0
     captured = capsys.readouterr().out
-    assert exit_code == 0
     assert "E = 2000 MPa" in captured
+    assert "strain/ns" in captured
     assert "nu = 0.350" in captured
     assert Path("run/analysis/mechanics.json").is_file()
 
@@ -1070,81 +1196,31 @@ def test_analyse_reports_both_when_the_directory_holds_both(
     assert Path("run/analysis/mechanics.json").is_file()
 
 
-def test_analyse_says_so_when_a_directory_holds_neither(
-    capsys: pytest.CaptureFixture[str],
+@pytest.mark.parametrize("kind", ["empty", "unmeasured", "structure_skipped"])
+def test_a_directory_with_nothing_to_report_says_so(
+    kind: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Rather than raising from inside a reader that was asked the wrong thing."""
-    Path("run").mkdir()
-    Path("run/manifest.json").write_text(
-        json.dumps(
-            {
-                "protocol": "t",
-                "seed": 1,
-                "versions": {},
-                "system": {},
-                "stages": {},
-                "chains": None,
-                "box": None,
-            }
+    """Rather than raising from inside a reader asked the wrong thing."""
+    flags: list[str] = []
+    if kind == "structure_skipped":
+        write_polymer_snapshot(Path("run"))
+        flags = ["--no-structure"]
+    else:
+        Path("run").mkdir()
+        stages: dict[str, Any] = {"05_npt": {"samples": {}}}
+        Path("run/manifest.json").write_text(
+            json.dumps(
+                {
+                    "protocol": "x",
+                    "seed": 1,
+                    "stages": {} if kind == "empty" else stages,
+                }
+            )
         )
-    )
-    exit_code = main(["--analyse", "run"])
-    assert exit_code == 1
-    assert "nothing to report" in capsys.readouterr().out
-
-
-def test_the_strain_rate_is_printed_with_the_modulus(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """The caveat travels with the number, on the command line too."""
-    write_deformation(Path("run"))
-    main(["--analyse", "run", "--no-figures"])
-    assert "strain/ns" in capsys.readouterr().out
-
-
-def test_the_flat_relaxation_flags_reach_the_spec_a_scan_takes() -> None:
-    """The relax factory takes **kwargs, so the check above cannot see it."""
-    from openmmpolymer.__main__ import _RELAXATION, _relaxation_spec
-
-    parameters = inspect.signature(_relaxation_spec).parameters
-    for option in _RELAXATION:
-        assert option in parameters, option
-
-
-def test_the_relaxation_controls_reach_the_protocol() -> None:
-    """A flag that is parsed, ignored and never arrives is the failure this
-    whole table exists to prevent."""
-    from openmmpolymer.__main__ import _protocol_options, _relaxation_spec
-
-    arguments = build_parser().parse_args(
-        [
-            "[*]CC[*]",
-            "--protocol",
-            "relax",
-            "--step-strain",
-            "0.05",
-            "--relaxation-ps",
-            "500",
-            "--baseline-ps",
-            "50",
-            "--relax-replicas",
-            "2",
-            "--relax-mode",
-            "shear",
-            "--bins-per-decade",
-            "12",
-            "--linearity-strains",
-            "0.01,0.09",
-        ]
-    )
-    spec = _relaxation_spec(**_protocol_options(arguments, PROTOCOLS["relax"]))
-    assert spec.step_strain == 0.05
-    assert spec.relax_ps == 500.0
-    assert spec.baseline_ps == 50.0
-    assert spec.n_replicas == 2
-    assert spec.mode == "shear"
-    assert spec.bins_per_decade == 12
-    assert spec.linearity_strains == (0.01, 0.09)
+    assert main(["--analyse", "run", *flags]) == 1
+    captured = capsys.readouterr().out
+    assert "quench, a heating scan, a deformation or a relaxation" in captured
+    assert "nothing to report" in captured
 
 
 def test_analysing_a_relaxation_directory_reports_and_writes_it(
@@ -1156,8 +1232,6 @@ def test_analysing_a_relaxation_directory_reports_and_writes_it(
     carries an overall verdict and a directory read back does not, and the
     shared printer has to cope with both rather than assuming the richer one.
     """
-    from .helpers import write_relaxation
-
     stages: dict[str, Any] | None = None
     for replica in range(3):
         write_relaxation(
@@ -1180,24 +1254,6 @@ def test_analysing_a_relaxation_directory_reports_and_writes_it(
     assert "tau = 150 ps" in captured
     assert (tmp_path / "analysis" / "relaxation.json").is_file()
     assert (tmp_path / "analysis" / "relaxation.png").is_file()
-
-
-def test_a_directory_that_is_none_of_the_reported_kinds_is_refused(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The refusal names all report kinds, including heating scans."""
-    (tmp_path / "manifest.json").write_text(
-        '{"protocol": "x", "seed": 1, "stages": {"05_npt": {"samples": {}}}}'
-    )
-    assert main(["--analyse", str(tmp_path)]) == 1
-    captured = capsys.readouterr().out
-    assert "quench, a heating scan, a deformation or a relaxation" in captured
-    assert "coordinates" in captured
-
-
-# --------------------------------------------------------------------------
-# The structure report, and what --analyse dispatches on
-# --------------------------------------------------------------------------
 
 
 def test_analyse_reports_structure_when_a_stage_left_coordinates(
@@ -1232,47 +1288,3 @@ def test_structure_analysis_preserves_saved_ratio_and_accepts_explicit_override(
     assert record["conformation"]["mean"]["expected_characteristic_ratio"] == (
         5.5 if override is None else float(override)
     )
-
-
-def test_the_structure_flags_are_parsed() -> None:
-    arguments = build_parser().parse_args(
-        [
-            "--analyse",
-            "run",
-            "--structure-stage",
-            "03_npt",
-            "--backbone",
-            "0,1,4",
-            "--stride",
-            "4",
-            "--no-structure",
-        ]
-    )
-    assert arguments.structure_stage == "03_npt"
-    assert arguments.backbone == (0, 1, 4)
-    assert arguments.stride == 4
-    assert arguments.no_structure
-
-
-@pytest.mark.parametrize(
-    "flags",
-    [
-        ["--backbone", "0,x"],
-        ["--backbone", "3"],
-        ["--stride", "0"],
-        ["--stride", "two"],
-    ],
-)
-def test_a_malformed_structure_flag_is_refused_at_the_front_door(
-    flags: list[str],
-) -> None:
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(["--analyse", "run", *flags])
-
-
-def test_no_structure_leaves_a_structure_only_directory_with_nothing_to_report(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    write_polymer_snapshot(Path("run"))
-    assert main(["--analyse", "run", "--no-structure"]) == 1
-    assert "nothing to report" in capsys.readouterr().out

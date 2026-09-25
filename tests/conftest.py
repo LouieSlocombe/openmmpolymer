@@ -223,3 +223,24 @@ def staged_melt(monkeypatch: pytest.MonkeyPatch, argon_run: Any) -> dict[str, An
 
     monkeypatch.setattr(melt, "_prepare", prepare)
     return control
+
+
+@pytest.fixture
+def no_build(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Stop any melt build where it would begin, with :class:`BuildReached`.
+
+    Returns the chain specs the build was asked for, so that a test can check
+    what reached it - or that nothing did.
+    """
+    from openmmpolymer import melt
+
+    from .helpers import BuildReached
+
+    asked: list[Any] = []
+
+    def build(spec: Any, *args: Any, **kwargs: Any) -> Any:
+        asked.append(spec)
+        raise BuildReached
+
+    monkeypatch.setattr(melt, "build_chain", build)
+    return asked

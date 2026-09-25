@@ -1457,3 +1457,16 @@ def fake_scan_dynamics(
 
 class BuildReached(Exception):
     """Where a stand-in for the melt build stops a command-line run."""
+
+
+def write_crystal(box: Any, system: Any, directory: Path) -> tuple[Path, Path]:
+    """Write a prepared periodic cell as a PDB, and exactly its System."""
+    import openmm as mm
+    from openmm import app
+
+    pdb = directory / "crystal.pdb"
+    xml = directory / "system.xml"
+    with pdb.open("w") as stream:
+        app.PDBFile.writeFile(box.topology, box.positions, stream)
+    xml.write_text(mm.XmlSerializer.serialize(system))
+    return pdb, xml
