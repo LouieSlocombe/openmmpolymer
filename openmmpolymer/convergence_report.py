@@ -10,14 +10,14 @@ JSON, with figures that retain every refusal and unknown error.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
 import numpy.typing as npt
 
-from ._files import ReportFiles, json_value, write_json
+from ._files import ReportFiles, write_report
 from ._validation import require_integer
 from .conformation import chain_conformation
 from .convergence import (
@@ -45,6 +45,9 @@ from .structure import resolve_backbone, select_stage
 from .timeseries import read_state_data
 from .trajectory import AnalysisError, load_manifest, open_run, stage_files
 from .viscoelastic import analyse_relaxation
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 
 @dataclass(frozen=True)
@@ -241,7 +244,6 @@ def write_convergence_report(
     directory = (
         Path(report.run_dir) / "analysis" if output_dir is None else Path(output_dir)
     )
-    directory.mkdir(parents=True, exist_ok=True)
     record = asdict(report)
     record["interpretation"] = (
         "Window stability is conditional on recorded observables and sampled times. "
@@ -250,24 +252,23 @@ def write_convergence_report(
         "Relaxation parameters require observed decay/plateau and resolved underlying "
         "models. This does not establish equilibrium or eliminate systematic bias."
     )
-    path = directory / "convergence.json"
-    write_json(path, json_value(record))
-    written: list[str] = []
-    if figures:
-        drawn: dict[str, Any] = {}
-        for name, result in report.results.items():
-            safe = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_")
-            drawn[f"convergence_{safe}"] = plot_window_convergence(result)
-        if report.relaxation is not None:
-            drawn["convergence_relaxation"] = plot_relaxation_convergence(
-                report.relaxation
-            )
-        if report.structural is not None:
-            drawn["convergence_structural"] = plot_structural_convergence(
-                report.structural
-            )
-        for stem, figure in drawn.items():
-            figure_path = directory / f"{stem}.{figure_format}"
-            figure.savefig(figure_path, bbox_inches="tight")
-            written.append(str(figure_path))
-    return ReportFiles(json=str(path), figures=tuple(written))
+    return write_report(
+        directory,
+        "convergence.json",
+        record,
+        _figures(report) if figures else (),
+        figure_format,
+    )
+
+
+def _figures(report: ConvergenceReport) -> Iterator[tuple[str, Figure]]:
+    """Figures for the available stationary, relaxation and structural diagnostics."""
+    drawn: dict[str, Figure] = {}
+    for name, result in report.results.items():
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_")
+        drawn[f"convergence_{safe}"] = plot_window_convergence(result)
+    if report.relaxation is not None:
+        drawn["convergence_relaxation"] = plot_relaxation_convergence(report.relaxation)
+    if report.structural is not None:
+        drawn["convergence_structural"] = plot_structural_convergence(report.structural)
+    yield from drawn.items()

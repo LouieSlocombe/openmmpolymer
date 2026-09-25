@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import numpy.typing as npt
 
-from ._files import ReportFiles, file_sha256, json_value, write_json
+from ._files import ReportFiles, file_sha256, write_report
 from ._validation import require_positive
 from .protocols import (
     MANIFEST_NAME,
@@ -356,7 +356,6 @@ def write_report_files(
     from . import __version__
 
     directory = Path(run_dir) / "analysis" if output_dir is None else Path(output_dir)
-    directory.mkdir(parents=True, exist_ok=True)
     manifest = RunManifest.load(run_dir)
     record = {
         "openmmpolymer": __version__,
@@ -364,13 +363,7 @@ def write_report_files(
         "versions": {} if manifest is None else manifest.versions,
         **fields,
     }
-    json_path = write_json(directory / name, json_value(record))
-    saved: list[str] = []
-    for stem, figure in figures:
-        path = directory / f"{stem}.{figure_format}"
-        figure.savefig(path, bbox_inches="tight")
-        saved.append(str(path))
-    return ReportFiles(json=json_path, figures=tuple(saved))
+    return write_report(directory, name, record, figures, figure_format)
 
 
 # --------------------------------------------------------------------------

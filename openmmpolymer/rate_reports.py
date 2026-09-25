@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from ._files import ReportFiles, json_value, write_json
+from ._files import ReportFiles, write_report
 from .plots import plot_rate_dependence
 from .rate_dependence import RateReport
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 
 def write_rate_report(
@@ -41,7 +46,6 @@ def write_rate_report(
     name = re.sub(r"[^A-Za-z0-9_-]+", "_", report.property.name).strip("_")
     if not name:
         raise ValueError("The property name must contain a filename-safe character.")
-    directory.mkdir(parents=True, exist_ok=True)
     record = asdict(report)
     record["model_difference"] = (
         abs(report.log_linear.value - report.power_law.value)
@@ -55,13 +59,17 @@ def write_rate_report(
         "without measurable replica spread yields null target uncertainty. "
         "Errors exclude model choice, correlated runs and systematic simulation errors."
     )
-    path = directory / f"{name}_rates.json"
-    write_json(path, json_value(record))
-    written: list[str] = []
-    if figures:
-        for fit in (report.log_linear, report.power_law):
-            if fit is not None:
-                figure_path = directory / f"{name}_rate_{fit.form}.{figure_format}"
-                plot_rate_dependence(fit).savefig(figure_path, bbox_inches="tight")
-                written.append(str(figure_path))
-    return ReportFiles(json=str(path), figures=tuple(written))
+    return write_report(
+        directory,
+        f"{name}_rates.json",
+        record,
+        _figures(report, name) if figures else (),
+        figure_format,
+    )
+
+
+def _figures(report: RateReport, name: str) -> Iterator[tuple[str, Figure]]:
+    """A figure for each available rate model."""
+    for fit in (report.log_linear, report.power_law):
+        if fit is not None:
+            yield f"{name}_rate_{fit.form}", plot_rate_dependence(fit)

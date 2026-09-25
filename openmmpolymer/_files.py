@@ -6,11 +6,15 @@ import hashlib
 import json
 import math
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 
 @dataclass(frozen=True)
@@ -24,6 +28,32 @@ class ReportFiles:
 
     json: str
     figures: tuple[str, ...]
+
+
+def write_report(
+    directory: str | Path,
+    name: str,
+    record: dict[str, Any],
+    figures: Iterable[tuple[str, Figure]],
+    figure_format: str,
+) -> ReportFiles:
+    """Write a prepared record and its figures, without adding report fields.
+
+    Create *directory*, convert undefined diagnostics to JSON null, and write
+    the strict JSON record atomically. Then save each ``(stem, figure)`` pair
+    as ``<stem>.<figure_format>`` in iteration order. The caller owns the
+    schema, filenames and figure selection; an iterable can defer plotting
+    until after the JSON has been written.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    json_path = write_json(directory / name, json_value(record))
+    saved: list[str] = []
+    for stem, figure in figures:
+        path = directory / f"{stem}.{figure_format}"
+        figure.savefig(path, bbox_inches="tight")
+        saved.append(str(path))
+    return ReportFiles(json=json_path, figures=tuple(saved))
 
 
 def write_atomically(path: str | Path, text: str) -> None:

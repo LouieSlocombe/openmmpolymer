@@ -28,6 +28,18 @@ def test_strict_json_preserves_measurements_model_difference_and_units(
     raw = Path(files.json).read_text()
     assert "NaN" not in raw and "Infinity" not in raw
     data = json.loads(raw)
+    assert set(data) == {
+        "property",
+        "observations",
+        "log_linear",
+        "power_law",
+        "notes",
+        "run_dirs",
+        "target_rate",
+        "max_extrapolation_decades",
+        "model_difference",
+        "uncertainty_description",
+    }
     assert data["property"]["value_unit"] == "MPa"
     assert data["property"]["rate_unit"] == "strain/ns"
     assert data["observations"][0]["source"] == "run-0"
@@ -62,6 +74,20 @@ def test_json_writes_unknown_and_nonfinite_errors_as_null(tmp_path: Path) -> Non
     assert (
         json.loads(Path(files.json).read_text())["log_linear"]["standard_error"] is None
     )
+
+
+def test_json_only_report_does_not_plot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected_plot(*args: object, **kwargs: object) -> None:
+        pytest.fail("A JSON-only report must not construct figures.")
+
+    monkeypatch.setattr(
+        "openmmpolymer.rate_reports.plot_rate_dependence", unexpected_plot
+    )
+    files = write_rate_report(planted_rate_report(), tmp_path, figures=False)
+    assert Path(files.json).is_file()
+    assert files.figures == ()
 
 
 def test_censored_report_has_no_fake_figures_or_prediction(tmp_path: Path) -> None:
@@ -103,14 +129,19 @@ def test_property_names_become_safe_file_names(tmp_path: Path) -> None:
         write_rate_report(nameless, tmp_path, figures=False)
 
 
+@pytest.mark.parametrize("figures", [True, False])
 def test_missing_output_directory_and_unsafe_format_fail_before_writing(
     tmp_path: Path,
+    figures: bool,
 ) -> None:
     with pytest.raises(ValueError, match="output_dir"):
-        write_rate_report(planted_rate_report())
+        write_rate_report(planted_rate_report(), figures=figures)
+    output = tmp_path / "report"
     with pytest.raises(ValueError, match="figure_format"):
-        write_rate_report(planted_rate_report(), tmp_path, figure_format="../png")
-    assert list(tmp_path.iterdir()) == []
+        write_rate_report(
+            planted_rate_report(), output, figures=figures, figure_format="../png"
+        )
+    assert not output.exists()
 
 
 def test_importing_the_writer_leaves_matplotlib_unloaded() -> None:

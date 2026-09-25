@@ -150,6 +150,15 @@ def test_strict_json_retains_unknown_error_and_qualifications(tmp_path: Path) ->
     raw = Path(files.json).read_text()
     assert "NaN" not in raw and "Infinity" not in raw
     data = json.loads(raw)
+    assert set(data) == {
+        "run_dir",
+        "stage",
+        "results",
+        "relaxation",
+        "notes",
+        "structural",
+        "interpretation",
+    }
     assert data["results"]["radius"]["windows"][-1]["standard_error"] is None
     assert not data["results"]["radius"]["resolved"]
     assert data["relaxation"] is None
@@ -182,10 +191,42 @@ def test_report_writes_stationary_and_relaxation_figures(tmp_path: Path) -> None
     )
 
 
-def test_unsafe_format_rejected_before_writing(tmp_path: Path) -> None:
+def test_json_only_report_does_not_plot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = time_window_convergence(
+        [0.0], [10.0], property_name="radius", value_unit="nm"
+    )
+    times = np.geomspace(0.1, 10000.0, 140)
+    relaxation = relaxation_window_convergence(
+        planted(times, 1000.0 * np.exp(-times / 50.0))
+    )
+    structural = structural_window_convergence(
+        frozen_rods(), range(5), **STRUCTURAL_OPTIONS
+    )
+    report = ConvergenceReport(
+        str(tmp_path), "hold", {"radius": result}, relaxation, (), structural
+    )
+
+    def unexpected_plot(*args: object, **kwargs: object) -> None:
+        pytest.fail("A JSON-only report must not construct figures.")
+
+    for name in (
+        "plot_window_convergence",
+        "plot_relaxation_convergence",
+        "plot_structural_convergence",
+    ):
+        monkeypatch.setattr(f"openmmpolymer.convergence_report.{name}", unexpected_plot)
+    files = write_convergence_report(report, figures=False)
+    assert Path(files.json).is_file()
+    assert files.figures == ()
+
+
+@pytest.mark.parametrize("figures", [True, False])
+def test_unsafe_format_rejected_before_writing(tmp_path: Path, figures: bool) -> None:
     report = ConvergenceReport(str(tmp_path), "hold", {}, None, ())
     with pytest.raises(ValueError, match="figure_format"):
-        write_convergence_report(report, figure_format="../svg")
+        write_convergence_report(report, figures=figures, figure_format="../svg")
     assert not (tmp_path / "analysis").exists()
 
 
