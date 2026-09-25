@@ -65,7 +65,8 @@ from .trajectory import (
     Ensemble,
     StageFiles,
     backbone_indices,
-    open_run,
+    load_manifest,
+    open_stage,
     stage_files,
 )
 
@@ -163,54 +164,61 @@ def structure_stages(run_dir: str | Path) -> tuple[str, ...]:
             them left anything to read.
     """
     directory = Path(run_dir)
-    manifest = RunManifest.load(directory)
-    names = list(manifest.stages) if manifest is not None else []
-    if not names:
-        # Refuses a directory with no manifest, or no stages, in its own words.
-        stage_files(directory)
+    return tuple(_structure_files(directory, load_manifest(directory)))
 
-    readable: list[str] = []
+
+def _structure_files(directory: Path, manifest: RunManifest) -> dict[str, StageFiles]:
+    """Resolve each readable stage once, preserving the manifest's order."""
+    names = list(manifest.stages)
+    if not names:
+        # Refuses a manifest with no stages in the usual words.
+        stage_files(directory, manifest=manifest)
+
+    readable: dict[str, StageFiles] = {}
     for name in names:
         try:
-            files = stage_files(directory, name)
+            files = stage_files(directory, name, manifest=manifest)
         except AnalysisError as error:
             log.info("%s: %s", name, error)
             continue
         if files.topology is not None:
-            readable.append(name)
+            readable[name] = files
     if not readable:
         raise AnalysisError(
             f"No stage in {directory} left coordinates to read. Every stage "
             f"writes <stem>.pdb at its end; the manifest records: "
             f"{', '.join(names)}."
         )
-    return tuple(readable)
+    return readable
 
 
-def select_stage(directory: Path, stage: str | None) -> tuple[StageFiles, str]:
+def select_stage(
+    directory: Path,
+    stage: str | None,
+    *,
+    manifest: RunManifest | None = None,
+) -> tuple[StageFiles, str]:
     """Choose the stage to measure, and say how it was chosen.
 
     A trajectory beats a snapshot because it can answer the dynamic
     questions; among trajectories the last one wins, because it is the most
     equilibrated cell in the directory.
     """
-    readable = structure_stages(directory)
+    if manifest is None:
+        manifest = load_manifest(directory)
+    readable = _structure_files(directory, manifest)
     if stage is not None:
         if stage not in readable:
             raise AnalysisError(
                 f"Stage {stage!r} left no coordinates to read. Stages that did: "
                 f"{', '.join(readable)}."
             )
-        return stage_files(directory, stage), "requested"
+        return readable[stage], "requested"
 
-    with_trajectory = [
-        files
-        for files in (stage_files(directory, name) for name in readable)
-        if files.trajectory is not None
-    ]
-    if with_trajectory:
-        return with_trajectory[-1], "last_trajectory"
-    return stage_files(directory, readable[-1]), "last_snapshot"
+    for files in reversed(readable.values()):
+        if files.trajectory is not None:
+            return files, "last_trajectory"
+    return next(reversed(readable.values())), "last_snapshot"
 
 
 # --------------------------------------------------------------------------
@@ -473,9 +481,9 @@ def analyse_structure(
     """
     require_integer(stride, name="stride")
     directory = Path(run_dir)
-    files, stage_source = select_stage(directory, stage)
-    ensemble = open_run(directory, files.stage)
-    manifest = RunManifest.load(directory)
+    manifest = load_manifest(directory)
+    files, stage_source = select_stage(directory, stage, manifest=manifest)
+    ensemble = open_stage(files)
     notes: list[str] = []
     if expected_characteristic_ratio is None:
         recorded = (

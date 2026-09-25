@@ -304,7 +304,12 @@ def stages_holding(
     return found
 
 
-def stage_files(run_dir: str | Path, stage: str | None = None) -> StageFiles:
+def stage_files(
+    run_dir: str | Path,
+    stage: str | None = None,
+    *,
+    manifest: RunManifest | None = None,
+) -> StageFiles:
     """Find what one stage of a run left on disk.
 
     Resolved through ``run/manifest.json`` rather than by appending suffixes to
@@ -314,6 +319,7 @@ def stage_files(run_dir: str | Path, stage: str | None = None) -> StageFiles:
         run_dir: A directory :func:`~openmmpolymer.protocols.run_protocol`
             wrote to.
         stage: Which stage, or None for the last one the manifest records.
+        manifest: An already loaded manifest to reuse, or None to read it.
 
     Returns:
         Where that stage's output went.
@@ -323,7 +329,8 @@ def stage_files(run_dir: str | Path, stage: str | None = None) -> StageFiles:
             not record the stage asked for.
     """
     directory = Path(run_dir)
-    manifest = load_manifest(directory)
+    if manifest is None:
+        manifest = load_manifest(directory)
     if not manifest.stages:
         raise AnalysisError(
             f"The manifest in {directory} records no completed stages, so the "
@@ -374,7 +381,11 @@ def open_run(
             divide into equal molecules, the trajectory is empty, it has been
             wrapped into the cell, or it is too large to load.
     """
-    files = stage_files(run_dir, stage)
+    return open_stage(stage_files(run_dir, stage), atoms_per_chain=atoms_per_chain)
+
+
+def open_stage(files: StageFiles, *, atoms_per_chain: int | None = None) -> Ensemble:
+    """Open already resolved stage files without reading the manifest again."""
     if files.topology is None:
         raise AnalysisError(
             f"Stage {files.stage!r} wrote no structure to read. Expected "
@@ -459,7 +470,7 @@ def _coordinate_paths(prefix: Path) -> tuple[str | None, str | None]:
 
 def _open_stage(files: StageFiles, *, atoms_per_chain: int | None = None) -> Ensemble:
     """Build an :class:`Ensemble` from resolved paths."""
-    assert files.topology is not None  # open_run checked this
+    assert files.topology is not None  # open_stage checked this
     structure = read_pdb(files.topology)
     topology = structure.topology
     declared = atoms_per_chain if atoms_per_chain is not None else files.atoms_per_chain
