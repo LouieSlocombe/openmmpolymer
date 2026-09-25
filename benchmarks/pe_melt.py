@@ -11,47 +11,43 @@ import argparse
 import hashlib
 import json
 import math
-from contextlib import nullcontext
 from dataclasses import asdict
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
 
 from openmmpolymer import (
     ChainSpec,
-    PackedComponent,
     Protocol,
     Stage,
-    SystemSpec,
     TrajectoryOptions,
-    assemble_box,
-    assign_charges,
-    box_edge_nm,
-    build_chain,
-    build_polymer_forcefield,
-    check_packing,
-    check_target_density,
+    build_melt,
     end_to_end_relaxation,
     equilibration,
     open_run,
-    pack_box,
-    prepare_box,
-    prepare_run,
     read_state_data,
     run_protocol,
     standard_melt_equilibration,
 )
 from openmmpolymer._files import json_value
-from openmmpolymer.protocols import (
-    RunManifest,
-    record_build_request,
-    validate_run_inputs,
-)
+from openmmpolymer.packing import PACKMOL_TIMEOUT_S
+from openmmpolymer.protocols import RunManifest, record_build_request
 
 REFERENCE_PATH = Path(__file__).with_name("polyethylene.json")
+
+#: A density above any the melt reaches at either reference temperature, for
+#: checking the compressed cell still fits the cutoff.
+_MAX_DENSITY_G_CM3 = 0.9
+
+
+def _specific_volumes(case: dict[str, Any]) -> dict[int, float]:
+    """The reference's specific volumes, in cm3/g, by temperature in kelvin."""
+    return {
+        int(kelvin): float(volume)
+        for kelvin, volume in case["reference"]["specific_volume_cm3_g"].items()
+    }
 
 
 def comparison(
@@ -102,6 +98,14 @@ def comparison(
             for row in measurements
         )
     )
+    if smoke:
+        status = "smoke_only"
+    elif not sampled:
+        status = "unresolved"
+    elif within_range and at_temperature:
+        status = "passed"
+    else:
+        status = "failed"
     return {
         "density_g_cm3": mean,
         "replica_standard_error_g_cm3": error,
@@ -114,15 +118,7 @@ def comparison(
         "all_replicas_within_range": within_range,
         "all_replicas_at_target_temperature": at_temperature,
         "sampling_sufficient": sampled,
-        "status": "smoke_only"
-        if smoke
-        else (
-            "passed"
-            if sampled and within_range and at_temperature
-            else "unresolved"
-            if not sampled
-            else "failed"
-        ),
+        "status": status,
     }
 
 
@@ -178,6 +174,13 @@ def _protocol(
     )
 
 
+def _version(package: str) -> str:
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        return "uninstalled checkout or unavailable metadata"
+
+
 def run_benchmark(
     output: Path,
     *,
@@ -191,9 +194,14 @@ def run_benchmark(
     packing_density = case[
         "smoke_packing_density_g_cm3" if smoke else "packing_density_g_cm3"
     ]
+    charge_method = "gasteiger" if smoke else case["charge_method"]
     seeds = tuple(case["seeds"]) if seeds is None else seeds
-    if str(temperature_k) not in case["reference"]["specific_volume_cm3_g"]:
-        raise ValueError("The reference contains only 350 K and 400 K.")
+    volumes = _specific_volumes(case)
+    if temperature_k not in volumes:
+        raise ValueError(
+            "The reference gives specific volumes only at "
+            f"{', '.join(f'{kelvin} K' for kelvin in sorted(volumes))}."
+        )
     if not seeds or len(set(seeds)) != len(seeds) or any(seed <= 0 for seed in seeds):
         raise ValueError("Use at least one positive seed, with no duplicates.")
     output = output.resolve()
@@ -213,69 +221,32 @@ def run_benchmark(
     observations = []
     for seed in seeds:
         directory = output / f"seed_{seed}"
-        # Rebuild an existing replica in scratch space: new dependency versions
-        # can change the Hamiltonian even when the saved request is unchanged.
-        # Validate that identity before touching the original replica artifacts.
-        workspace = (
-            TemporaryDirectory(prefix="openmmpolymer-pe-replay-")
-            if directory.exists()
-            else nullcontext(str(directory))
-        )
-        with workspace as workspace_path:
-            build_directory = Path(workspace_path)
-            chain = build_chain(
-                ChainSpec(
-                    monomer_smiles=case["monomer_smiles"],
-                    degree_of_polymerization=case["degree_of_polymerization"],
-                    residue_name="PE",
-                    seed=seed,
-                    characteristic_ratio=case["characteristic_ratio"],
-                ),
-                n_conformers=case["chains"],
-                output_dir=build_directory / "build",
-            )
-            assign_charges(
-                chain.sdf_paths[0], "gasteiger" if smoke else case["charge_method"]
-            )
-            forcefield = build_polymer_forcefield(
-                chain.sdf_paths[0],
-                build_directory / "build" / "polymer_ff.xml",
+        chain, run = build_melt(
+            ChainSpec(
+                monomer_smiles=case["monomer_smiles"],
+                degree_of_polymerization=case["degree_of_polymerization"],
                 residue_name="PE",
-                smirnoff_forcefield=case["smirnoff_forcefield"],
-                cache_dir=output / "cache",
-                workdir=build_directory / "forcefill",
-            )
-            spec = SystemSpec()
-            check_target_density([case["chains"]], [chain.molar_mass_g_mol], 0.9, spec)
-            components = [PackedComponent(path, 1) for path in chain.pdb_paths]
-            packed = pack_box(
-                components,
-                box_edge_nm(
-                    [case["chains"]], [chain.molar_mass_g_mol], packing_density
-                ),
-                build_directory / "build" / "packed.pdb",
                 seed=seed,
-                workdir=build_directory / "build",
-                timeout=120.0 if smoke else 3600.0,
-            )
-            box = assemble_box(components, packed.packed_pdb, packed.box_nm)
-            check_packing(box.topology, box.positions_nm)
-            run = prepare_run(
-                prepare_box(box, forcefield),
-                forcefield,
-                spec,
-                platform=platform,
-                seed=seed,
-            )
-            validate_run_inputs(run, directory)
-            run_protocol(
-                protocol,
-                run,
-                directory,
-                chain_backbone=chain.backbone,
-                atoms_per_chain=chain.n_atoms,
-                expected_characteristic_ratio=case["characteristic_ratio"],
-            )
+                characteristic_ratio=case["characteristic_ratio"],
+            ),
+            case["chains"],
+            directory,
+            target_density_g_cm3=_MAX_DENSITY_G_CM3,
+            charge_method=charge_method,
+            smirnoff_forcefield=case["smirnoff_forcefield"],
+            pack_density_g_cm3=packing_density,
+            packmol_timeout_s=120.0 if smoke else PACKMOL_TIMEOUT_S,
+            platform=platform,
+            cache_dir=output / "cache",
+        )
+        run_protocol(
+            protocol,
+            run,
+            directory,
+            chain_backbone=chain.backbone,
+            atoms_per_chain=chain.n_atoms,
+            expected_characteristic_ratio=case["characteristic_ratio"],
+        )
         manifest = RunManifest.load(directory)
         assert manifest is not None
         series = read_state_data(manifest.stages["06_measure"]["csv"])
@@ -288,8 +259,8 @@ def run_benchmark(
         observations.append(
             {
                 "seed": seed,
-                "n_atoms": box.topology.getNumAtoms(),
-                "n_chains": box.n_molecules,
+                "n_atoms": run.box.topology.getNumAtoms(),
+                "n_chains": run.box.n_molecules,
                 "frames": ensemble.n_frames,
                 "density_g_cm3": float(
                     density_check.window(series.density_g_cm3).mean()
@@ -307,23 +278,9 @@ def run_benchmark(
         )
     reference = {
         **case["reference"],
-        "density_g_cm3": 1.0
-        / case["reference"]["specific_volume_cm3_g"][str(temperature_k)],
+        "density_g_cm3": 1.0 / volumes[temperature_k],
         "temperature_k": temperature_k,
     }
-    versions = {}
-    for name in (
-        "openmmpolymer",
-        "openmm",
-        "forcefill",
-        "rdkit",
-        "numpy",
-        "openff-toolkit",
-    ):
-        try:
-            versions[name] = version(name)
-        except PackageNotFoundError:
-            versions[name] = "uninstalled checkout or unavailable metadata"
     report = {
         "case_id": case["id"],
         "smoke": smoke,
@@ -331,12 +288,22 @@ def run_benchmark(
         "temperature_k": temperature_k,
         "pressure_bar": case["pressure_bar"],
         "case_sha256": hashlib.sha256(REFERENCE_PATH.read_bytes()).hexdigest(),
-        "charge_method": "gasteiger" if smoke else case["charge_method"],
+        "charge_method": charge_method,
         "smirnoff_forcefield": case["smirnoff_forcefield"],
         "protocol": asdict(protocol),
-        "system": asdict(spec),
+        "system": asdict(run.spec),
         "requested_platform": run.platform_name,
-        "versions": versions,
+        "versions": {
+            package: _version(package)
+            for package in (
+                "openmmpolymer",
+                "openmm",
+                "forcefill",
+                "rdkit",
+                "numpy",
+                "openff-toolkit",
+            )
+        },
         "reference": reference,
         "replicas": observations,
         "comparison": comparison(observations, reference, smoke=smoke),
@@ -350,7 +317,12 @@ def run_benchmark(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--temperature", type=int, choices=(350, 400), default=400)
+    parser.add_argument(
+        "--temperature",
+        type=int,
+        choices=sorted(_specific_volumes(json.loads(REFERENCE_PATH.read_text()))),
+        default=400,
+    )
     parser.add_argument(
         "--smoke",
         action="store_true",

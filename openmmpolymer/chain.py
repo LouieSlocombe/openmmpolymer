@@ -11,11 +11,14 @@ the PSMILES convention - so ``[*]CC[*]`` is polyethylene and
 ``[*]CC([*])c1ccccc1`` is polystyrene. The first dummy in atom order is the
 head, the last is the tail, and units are joined head-to-tail.
 
-Two embedders live here because they fail in opposite directions. RDKit's
-ETKDG collapses a long chain into a globule; a hard-core self-avoiding walk
-swells it past the melt's unperturbed dimensions. :func:`build_chain`
-measures the characteristic ratio it actually produced and says so when it
-drifts, rather than trusting either.
+Two embedders live here, and they fail in opposite directions. RDKit's ETKDG
+collapses a long chain into a globule - a twenty-unit polyethylene comes out
+with a quarter of the dimensions it should have, and a cell packed from
+collapsed coils is a long way from a melt - so anything of four units or more
+is grown unit by unit instead. A hard-core self-avoiding walk like that errs
+the other way, swelling the chain past the melt's unperturbed dimensions.
+:func:`build_chain` therefore measures the characteristic ratio it produced,
+and says so when it drifts either way.
 """
 
 from __future__ import annotations
@@ -24,15 +27,19 @@ import logging
 import math
 import random
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+from rdkit import Chem
+from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
+from rdkit.Geometry import Point3D
 
 from ._seeds import derive_seed
 from ._validation import require_choice, require_integer, require_positive
+from .packing import ANGSTROM_PER_NM, CellList
 
 log = logging.getLogger(__name__)
 
@@ -45,12 +52,6 @@ TACTICITIES = ("atactic", "isotactic", "syndiotactic")
 #: The cap that means "just fill the valence with hydrogen".
 HYDROGEN_CAP = "[*][H]"
 
-#: Backbone torsion states the grown embedder draws from, in degrees: trans,
-#: gauche+, gauche-. These are absolute targets - each placement measures the
-#: dihedral it produced and rotates it onto one of these - so nothing depends
-#: on whatever conformation the relaxed template oligomer happened to settle in.
-_TORSION_TARGETS_DEG = (180.0, 60.0, -60.0)
-
 #: Ways to produce 3D coordinates. ``auto`` grows anything long enough to
 #: stamp a template down - four units - and falls back to ETKDG below that.
 EMBEDDERS = ("auto", "etkdg", "grown")
@@ -59,14 +60,37 @@ EMBEDDERS = ("auto", "etkdg", "grown")
 #: interior one and a last one to copy.
 _MIN_GROWN_UNITS = 4
 
+#: Backbone torsion states the grown embedder draws from, in degrees: trans,
+#: gauche+, gauche-. These are absolute targets - each placement measures the
+#: dihedral it produced and rotates it onto one of these - so nothing depends
+#: on whatever conformation the relaxed template oligomer happened to settle in.
+_TORSION_TARGETS_DEG = (180.0, 60.0, -60.0)
+
+#: The backbone bond angle the trans fraction is derived for, in degrees.
+_BOND_ANGLE_DEG = 112.0
+
 #: Closest approach allowed between heavy atoms of non-adjacent units during
 #: growth, in angstrom. Below a real van der Waals contact, because the geometry
 #: is relaxed afterwards and a stricter test rejects almost everything.
 _OVERLAP_ANGSTROM = 2.6
 
+#: Torsion draws per unit before growth backs up two units, and back-ups before
+#: it gives up.
+_MAX_TRIES = 40
+_MAX_RESTARTS = 200
+
+#: The reference direction used for the very first unit, which has no
+#: predecessor to take one from. Any fixed choice does, as long as the template
+#: and the chain make the same one.
+_SEED_REFERENCE = np.array([0.0, 1.0, 0.0])
+
 #: Fraction by which a measured characteristic ratio may differ from the
 #: expected one before :func:`build_chain` says so.
 _RATIO_TOLERANCE = 0.15
+
+#: Below this many backbone bonds a single chain's C is dominated by its own
+#: finite length and by sample-to-sample scatter, so there is nothing to judge.
+_RATIO_MIN_BONDS = 30
 
 
 class ChainError(RuntimeError):
@@ -130,13 +154,13 @@ class ChainResult:
             forcefill's smirnoff backend needs; a PDB records no bond orders.
         pdb_paths: One PDB per conformer, in the same atom order as the SDF.
             This is what packmol reads.
-        smiles: Canonical SMILES of the capped chain, used as the cache key for
-            parameterisation.
+        smiles: Canonical SMILES of the capped chain, hydrogens implicit.
         n_atoms: Atoms per chain, hydrogens included.
         molar_mass_g_mol: Chain molar mass.
-        radius_of_gyration_nm: Per-conformer radius of gyration.
-        max_extent_nm: Per-conformer largest interatomic distance. packmol
-            cannot place a conformer longer than the box.
+        radius_of_gyration_nm: Per-conformer mass-weighted radius of gyration.
+        max_extent_nm: Per-conformer upper bound on the largest interatomic
+            distance: twice the farthest atom's distance from the centroid.
+            packmol cannot place a conformer longer than the box.
         backbone: Backbone atom indices within one chain, head to tail. The
             run manifest measures chain dimensions with these, and nothing
             downstream can recover them: they come from the attachment points,
@@ -151,44 +175,39 @@ class ChainResult:
     smiles: str
     n_atoms: int
     molar_mass_g_mol: float
-    radius_of_gyration_nm: tuple[float, ...] = field(default_factory=tuple)
-    max_extent_nm: tuple[float, ...] = field(default_factory=tuple)
-    backbone: tuple[int, ...] = field(default_factory=tuple)
+    radius_of_gyration_nm: tuple[float, ...] = ()
+    max_extent_nm: tuple[float, ...] = ()
+    backbone: tuple[int, ...] = ()
     characteristic_ratio: float | None = None
     embedder: str = "etkdg"
 
 
-def _chem() -> tuple[Any, Any]:
-    """Return ``(rdkit.Chem, rdkit.Chem.AllChem)``."""
-    from rdkit import Chem
-    from rdkit.Chem import AllChem
-
-    return Chem, AllChem
+def _atoms(mol: Chem.Mol) -> list[Chem.Atom]:
+    """Return *mol*'s atoms in order: RDKit's stubs leave ``GetAtoms`` untyped."""
+    return list(mol.GetAtoms())  # type: ignore[no-untyped-call]
 
 
-def _parse_monomer(smiles: str) -> Any:
+def _dummies(mol: Chem.Mol) -> list[int]:
+    """Return the indices of *mol*'s ``[*]`` attachment points, in atom order."""
+    return [
+        atom.GetIdx()
+        for atom in _atoms(mol)
+        if atom.GetAtomicNum() == DUMMY_ATOMIC_NUMBER
+    ]
+
+
+def _parse_monomer(smiles: str) -> Chem.Mol:
     """Return the monomer molecule, checking it has exactly two dummies.
-
-    Args:
-        smiles: Monomer SMILES with two ``[*]`` attachment points.
-
-    Returns:
-        A sanitised RDKit molecule.
 
     Raises:
         ChainError: The SMILES does not parse, or does not carry exactly two
             attachment points each bonded to one real atom by a single bond.
     """
-    Chem, _ = _chem()
-    monomer = Chem.MolFromSmiles(smiles)
+    monomer: Chem.Mol | None = Chem.MolFromSmiles(smiles)
     if monomer is None:
         raise ChainError(f"monomer_smiles={smiles!r} is not valid SMILES.")
 
-    dummies = [
-        atom.GetIdx()
-        for atom in monomer.GetAtoms()
-        if atom.GetAtomicNum() == DUMMY_ATOMIC_NUMBER
-    ]
+    dummies = _dummies(monomer)
     if len(dummies) != 2:
         raise ChainError(
             f"monomer_smiles={smiles!r} has {len(dummies)} attachment points; "
@@ -197,8 +216,7 @@ def _parse_monomer(smiles: str) -> Any:
         )
 
     for idx in dummies:
-        atom = monomer.GetAtomWithIdx(idx)
-        bonds = atom.GetBonds()
+        bonds = monomer.GetAtomWithIdx(idx).GetBonds()
         if len(bonds) != 1:
             raise ChainError(
                 f"Attachment point {idx} of {smiles!r} has {len(bonds)} bonds; "
@@ -212,7 +230,7 @@ def _parse_monomer(smiles: str) -> Any:
             )
 
     if _attachment_neighbour(monomer, dummies[0]) == _attachment_neighbour(
-        monomer, dummies[-1]
+        monomer, dummies[1]
     ):
         raise ChainError(
             f"Both attachment points of {smiles!r} land on the same atom, so "
@@ -224,14 +242,14 @@ def _parse_monomer(smiles: str) -> Any:
     return monomer
 
 
-def _attachment_neighbour(mol: Any, dummy_idx: int) -> int:
+def _attachment_neighbour(mol: Chem.Mol, dummy_idx: int) -> int:
     """Return the real atom the dummy at *dummy_idx* is bonded to."""
     neighbours = mol.GetAtomWithIdx(dummy_idx).GetNeighbors()
     return int(neighbours[0].GetIdx())
 
 
-def _default_cap(mol: Any, dummy_idx: int, *, end: str) -> str:
-    """Choose a cap for the open valence at *dummy_idx*.
+def _default_cap(mol: Chem.Mol, end: str) -> str:
+    """Choose a cap for the open valence at the chain's *end*.
 
     Hydrogen is right almost everywhere and wrong in one place that matters: on
     a carbonyl carbon it makes an aldehyde, so an H-capped polyester ends in
@@ -239,9 +257,8 @@ def _default_cap(mol: Any, dummy_idx: int, *, end: str) -> str:
     terminal charges. Rather than guess a replacement, say what happened.
 
     Args:
-        mol: The molecule holding the attachment point.
-        dummy_idx: Index of the ``[*]`` atom.
-        end: ``"head"`` or ``"tail"``, for the error message.
+        mol: The chain, with its attachment point tagged *end*.
+        end: ``"head"`` or ``"tail"``.
 
     Returns:
         A cap SMILES.
@@ -250,7 +267,7 @@ def _default_cap(mol: Any, dummy_idx: int, *, end: str) -> str:
         ChainError: The attachment atom is a carbonyl carbon, where no default
             is safe.
     """
-    attachment = mol.GetAtomWithIdx(_attachment_neighbour(mol, dummy_idx))
+    attachment = mol.GetAtomWithIdx(_attachment_neighbour(mol, _find_role(mol, end)))
     if _is_carbonyl_carbon(attachment):
         raise ChainError(
             f"The {end} attachment point sits on a carbonyl carbon, where a "
@@ -261,9 +278,8 @@ def _default_cap(mol: Any, dummy_idx: int, *, end: str) -> str:
     return HYDROGEN_CAP
 
 
-def _is_carbonyl_carbon(atom: Any) -> bool:
+def _is_carbonyl_carbon(atom: Chem.Atom) -> bool:
     """Whether *atom* is a carbon double-bonded to an oxygen."""
-    Chem, _ = _chem()
     if atom.GetAtomicNum() != 6:
         return False
     return any(
@@ -273,61 +289,52 @@ def _is_carbonyl_carbon(atom: Any) -> bool:
     )
 
 
-def _tagged_unit(monomer: Any, unit: int) -> Any:
+def _tagged_unit(monomer: Chem.Mol, unit: int) -> Chem.RWMol:
     """Return a copy of *monomer* whose atoms carry their unit index and role."""
-    Chem, _ = _chem()
     copy = Chem.RWMol(monomer)
-    dummies = [
-        atom.GetIdx()
-        for atom in copy.GetAtoms()
-        if atom.GetAtomicNum() == DUMMY_ATOMIC_NUMBER
-    ]
-    for atom in copy.GetAtoms():
+    head, tail = _dummies(copy)
+    for atom in _atoms(copy):
         atom.SetIntProp("_omp_unit", unit)
-    copy.GetAtomWithIdx(dummies[0]).SetProp("_omp_role", "head")
-    copy.GetAtomWithIdx(dummies[-1]).SetProp("_omp_role", "tail")
+    copy.GetAtomWithIdx(head).SetProp("_omp_role", "head")
+    copy.GetAtomWithIdx(tail).SetProp("_omp_role", "tail")
     # The dummies are consumed by the joins, so the atoms they were bonded to
     # carry the memory of where the backbone runs. The grown embedder and the
     # characteristic-ratio measurement both need that path.
-    copy.GetAtomWithIdx(_attachment_neighbour(copy, dummies[0])).SetIntProp(
+    copy.GetAtomWithIdx(_attachment_neighbour(copy, head)).SetIntProp(
         "_omp_head_anchor", 1
     )
-    copy.GetAtomWithIdx(_attachment_neighbour(copy, dummies[-1])).SetIntProp(
+    copy.GetAtomWithIdx(_attachment_neighbour(copy, tail)).SetIntProp(
         "_omp_tail_anchor", 1
     )
     return copy
 
 
-def _find_role(mol: Any, role: str, *, start: int = 0, stop: int | None = None) -> int:
-    """Return the index of the single atom tagged *role* in ``[start, stop)``."""
-    stop = mol.GetNumAtoms() if stop is None else stop
-    for idx in range(start, stop):
-        atom = mol.GetAtomWithIdx(idx)
+def _find_role(mol: Chem.Mol, role: str) -> int:
+    """Return the index of the atom tagged *role*."""
+    for atom in _atoms(mol):
         if atom.HasProp("_omp_role") and atom.GetProp("_omp_role") == role:
-            return idx
-    raise ChainError(f"No atom tagged {role!r} between {start} and {stop}.")
+            return int(atom.GetIdx())
+    raise ChainError(f"No atom tagged {role!r}.")
 
 
-def _join(chain: Any, unit: Any) -> Any:
-    """Bond *unit*'s head onto *chain*'s open tail and drop both dummies."""
-    Chem, _ = _chem()
-    offset = chain.GetNumAtoms()
-    combined = Chem.RWMol(Chem.CombineMols(chain, unit))
-
-    tail_dummy = _find_role(combined, "tail", stop=offset)
-    head_dummy = _find_role(combined, "head", start=offset)
-    left = _attachment_neighbour(combined, tail_dummy)
-    right = _attachment_neighbour(combined, head_dummy)
-    combined.AddBond(left, right, Chem.BondType.SINGLE)
-
-    for idx in sorted((tail_dummy, head_dummy), reverse=True):
+def _splice(
+    left: Chem.Mol, left_dummy: int, right: Chem.Mol, right_dummy: int
+) -> Chem.RWMol:
+    """Bond *left* to *right* where their dummies were, and drop both dummies."""
+    combined = Chem.RWMol(Chem.CombineMols(left, right))
+    right_dummy += left.GetNumAtoms()
+    combined.AddBond(
+        _attachment_neighbour(combined, left_dummy),
+        _attachment_neighbour(combined, right_dummy),
+        Chem.BondType.SINGLE,
+    )
+    for idx in sorted((left_dummy, right_dummy), reverse=True):
         combined.RemoveAtom(idx)
     return combined
 
 
-def _attach_cap(chain: Any, role: str, cap_smiles: str) -> Any:
+def _attach_cap(chain: Chem.RWMol, role: str, cap_smiles: str) -> Chem.RWMol:
     """Close the open valence tagged *role* with *cap_smiles*."""
-    Chem, _ = _chem()
     dummy = _find_role(chain, role)
 
     if cap_smiles == HYDROGEN_CAP:
@@ -336,14 +343,10 @@ def _attach_cap(chain: Any, role: str, cap_smiles: str) -> Any:
         chain.RemoveAtom(dummy)
         return chain
 
-    cap = Chem.MolFromSmiles(cap_smiles)
-    if cap is None:
+    parsed: Chem.Mol | None = Chem.MolFromSmiles(cap_smiles)
+    if parsed is None:
         raise ChainError(f"cap {cap_smiles!r} is not valid SMILES.")
-    cap_dummies = [
-        atom.GetIdx()
-        for atom in cap.GetAtoms()
-        if atom.GetAtomicNum() == DUMMY_ATOMIC_NUMBER
-    ]
+    cap_dummies = _dummies(parsed)
     if len(cap_dummies) != 1:
         raise ChainError(
             f"cap {cap_smiles!r} has {len(cap_dummies)} attachment points; a "
@@ -351,22 +354,13 @@ def _attach_cap(chain: Any, role: str, cap_smiles: str) -> Any:
         )
 
     unit = chain.GetAtomWithIdx(dummy).GetIntProp("_omp_unit")
-    cap = Chem.RWMol(cap)
-    for atom in cap.GetAtoms():
+    cap = Chem.RWMol(parsed)
+    for atom in _atoms(cap):
         atom.SetIntProp("_omp_unit", unit)
-
-    offset = chain.GetNumAtoms()
-    combined = Chem.RWMol(Chem.CombineMols(chain, cap))
-    cap_dummy = offset + cap_dummies[0]
-    left = _attachment_neighbour(combined, dummy)
-    right = _attachment_neighbour(combined, cap_dummy)
-    combined.AddBond(left, right, Chem.BondType.SINGLE)
-    for idx in sorted((dummy, cap_dummy), reverse=True):
-        combined.RemoveAtom(idx)
-    return combined
+    return _splice(chain, dummy, cap, cap_dummies[0])
 
 
-def assemble_chain(spec: ChainSpec, n_units: int | None = None) -> Any:
+def assemble_chain(spec: ChainSpec, n_units: int | None = None) -> Chem.Mol:
     """Build the capped chain molecule, without coordinates.
 
     Args:
@@ -381,22 +375,17 @@ def assemble_chain(spec: ChainSpec, n_units: int | None = None) -> Any:
     Raises:
         ChainError: The monomer or a cap is malformed.
     """
-    Chem, _ = _chem()
     monomer = _parse_monomer(spec.monomer_smiles)
     units = spec.degree_of_polymerization if n_units is None else n_units
 
     chain = _tagged_unit(monomer, 0)
     for unit in range(1, units):
-        chain = _join(chain, _tagged_unit(monomer, unit))
-
-    head_cap = spec.head_cap or _default_cap(
-        chain, _find_role(chain, "head"), end="head"
-    )
-    chain = _attach_cap(chain, "head", head_cap)
-    tail_cap = spec.tail_cap or _default_cap(
-        chain, _find_role(chain, "tail"), end="tail"
-    )
-    chain = _attach_cap(chain, "tail", tail_cap)
+        next_unit = _tagged_unit(monomer, unit)
+        chain = _splice(
+            chain, _find_role(chain, "tail"), next_unit, _find_role(next_unit, "head")
+        )
+    for end, cap in (("head", spec.head_cap), ("tail", spec.tail_cap)):
+        chain = _attach_cap(chain, end, cap or _default_cap(chain, end))
 
     molecule = chain.GetMol()
     Chem.SanitizeMol(molecule)
@@ -404,18 +393,17 @@ def assemble_chain(spec: ChainSpec, n_units: int | None = None) -> Any:
     return molecule
 
 
-def _apply_tacticity(mol: Any, spec: ChainSpec, units: int) -> None:
+def _apply_tacticity(mol: Chem.Mol, spec: ChainSpec, units: int) -> None:
     """Set backbone chiral tags according to ``spec.tacticity``.
 
     A monomer with no backbone stereocentre - polyethylene, say - has nothing
     to set, and that is not an error.
     """
-    Chem, _ = _chem()
     Chem.AssignStereochemistry(
         mol, cleanIt=True, force=True, flagPossibleStereoCenters=True
     )
-    centres: dict[int, list[Any]] = {}
-    for atom in mol.GetAtoms():
+    centres: dict[int, list[Chem.Atom]] = {}
+    for atom in _atoms(mol):
         if atom.HasProp("_ChiralityPossible") and atom.HasProp("_omp_unit"):
             centres.setdefault(atom.GetIntProp("_omp_unit"), []).append(atom)
     if not centres:
@@ -438,7 +426,7 @@ def _apply_tacticity(mol: Any, spec: ChainSpec, units: int) -> None:
     Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
 
 
-def trans_fraction(characteristic_ratio: float, bond_angle_deg: float = 112.0) -> float:
+def _trans_fraction(characteristic_ratio: float) -> float:
     """Return the trans probability giving *characteristic_ratio*.
 
     Inverts the independent-rotation expression
@@ -447,50 +435,35 @@ def trans_fraction(characteristic_ratio: float, bond_angle_deg: float = 112.0) -
 
     for a symmetric three-state backbone, where ``<cos f> = 1.5 p - 0.5``. Two
     states at plus and minus 120 degrees contribute ``-0.5`` each, so the whole
-    dependence collapses onto the trans fraction.
-
-    Hard-coding a weight triplet instead is how a builder ends up producing
-    chains a quarter too compact while its own gate reports them fine: the
-    common ``(0.55, 0.225, 0.225)`` gives C = 4.3, not the 7.4 polyethylene has.
-
-    Args:
-        characteristic_ratio: The target C-infinity.
-        bond_angle_deg: Backbone bond angle.
+    dependence collapses onto the trans fraction. Hard-coding a weight triplet
+    instead is how chains come out a quarter too compact: the common
+    ``(0.55, 0.225, 0.225)`` gives C = 4.3, not the 7.4 polyethylene has.
 
     Returns:
         A trans probability, clamped to ``[0.05, 0.95]``.
     """
-    cos_theta = math.cos(math.radians(bond_angle_deg))
+    cos_theta = math.cos(math.radians(_BOND_ANGLE_DEG))
     angle_factor = (1.0 - cos_theta) / (1.0 + cos_theta)
     x = characteristic_ratio / angle_factor
     p = (3.0 * x - 1.0) / (3.0 * (1.0 + x))
     return min(0.95, max(0.05, p))
 
 
-def characteristic_ratio(
+def _characteristic_ratio(
     positions_nm: npt.NDArray[np.float64],
     backbone: Sequence[int],
     bond_length_nm: float,
 ) -> float:
-    """Return the measured C = <R^2> / (n l^2) for one conformer.
-
-    Args:
-        positions_nm: All atom positions.
-        backbone: Indices of the backbone atoms, in order along the chain.
-        bond_length_nm: Mean backbone bond length.
-
-    Returns:
-        The characteristic ratio.
-    """
+    """Return the measured C = <R^2> / (n l^2) for one conformer."""
     ends = positions_nm[backbone[-1]] - positions_nm[backbone[0]]
     n_bonds = len(backbone) - 1
     return float(ends @ ends) / (n_bonds * bond_length_nm**2)
 
 
-def _anchor(mol: Any, unit: int, which: str) -> int:
+def _anchor(mol: Chem.Mol, unit: int, which: str) -> int:
     """Return the index of unit *unit*'s head or tail backbone anchor atom."""
     prop = f"_omp_{which}_anchor"
-    for atom in mol.GetAtoms():
+    for atom in _atoms(mol):
         if (
             atom.HasProp(prop)
             and atom.HasProp("_omp_unit")
@@ -500,7 +473,7 @@ def _anchor(mol: Any, unit: int, which: str) -> int:
     raise ChainError(f"Unit {unit} has no {which} anchor.")
 
 
-def backbone_path(mol: Any, n_units: int) -> tuple[int, ...]:
+def backbone_path(mol: Chem.Mol, n_units: int) -> tuple[int, ...]:
     """Return the backbone atom indices, in order from head to tail.
 
     Args:
@@ -512,19 +485,15 @@ def backbone_path(mol: Any, n_units: int) -> tuple[int, ...]:
         anchor to the last unit's tail anchor, which for a linear chain is the
         backbone.
     """
-    Chem, _ = _chem()
     start = _anchor(mol, 0, "head")
     end = _anchor(mol, n_units - 1, "tail")
-    if start == end:
-        return (start,)
     return tuple(int(idx) for idx in Chem.GetShortestPath(mol, start, end))
 
 
-def _add_hydrogens(mol: Any) -> Any:
+def _add_hydrogens(mol: Chem.Mol) -> Chem.Mol:
     """Return *mol* with explicit hydrogens, each inheriting its parent's unit."""
-    Chem, _ = _chem()
     with_h = Chem.AddHs(mol)
-    for atom in with_h.GetAtoms():
+    for atom in _atoms(with_h):
         if atom.HasProp("_omp_unit"):
             continue
         parent = atom.GetNeighbors()[0]
@@ -532,7 +501,7 @@ def _add_hydrogens(mol: Any) -> Any:
     return with_h
 
 
-def _unit_atoms(mol: Any, n_units: int) -> list[list[int]]:
+def _unit_atoms(mol: Chem.Mol, n_units: int) -> list[list[int]]:
     """Return each unit's atom indices, ascending.
 
     Both the chain and the template oligomer are assembled by the same code, so
@@ -542,7 +511,7 @@ def _unit_atoms(mol: Any, n_units: int) -> list[list[int]]:
     copied onto a chain unit by position.
     """
     groups: list[list[int]] = [[] for _ in range(n_units)]
-    for atom in mol.GetAtoms():
+    for atom in _atoms(mol):
         groups[atom.GetIntProp("_omp_unit")].append(int(atom.GetIdx()))
     return groups
 
@@ -571,12 +540,6 @@ def _frame(
         norm = float(np.linalg.norm(ref))
     e2 = ref / norm
     return tail, np.column_stack((e1, e2, np.cross(e1, e2)))
-
-
-#: The reference direction used for the very first unit, which has no
-#: predecessor to take one from. Any fixed choice does, as long as the template
-#: and the chain make the same one.
-_SEED_REFERENCE = np.array([0.0, 1.0, 0.0])
 
 
 def _axis_rotation(
@@ -643,46 +606,38 @@ class _Template:
     last: npt.NDArray[np.float64]
 
 
-def _optimise(mol: Any, max_iters: int) -> None:
+def _optimise(mol: Chem.Mol, max_iters: int) -> None:
     """Relax *mol* in place with MMFF94, falling back to UFF."""
-    _, AllChem = _chem()
-    if AllChem.MMFFHasAllMoleculeParams(mol):
-        AllChem.MMFFOptimizeMolecule(mol, maxIters=max_iters)
+    if rdForceFieldHelpers.MMFFHasAllMoleculeParams(mol):
+        rdForceFieldHelpers.MMFFOptimizeMolecule(mol, maxIters=max_iters)
         return
-    AllChem.UFFOptimizeMolecule(mol, maxIters=max_iters)
+    rdForceFieldHelpers.UFFOptimizeMolecule(mol, maxIters=max_iters)
 
 
-def _embed_etkdg(mol: Any, seed: int, *, optimise_iters: int = 500) -> bool:
+def _embed_etkdg(mol: Chem.Mol, seed: int, *, optimise_iters: int = 500) -> bool:
     """Embed a single ETKDG conformer in place. Returns whether it worked."""
-    _, AllChem = _chem()
-    params = AllChem.ETKDGv3()
+    # Any, because the stubs give each of these attributes the parameters' type.
+    params: Any = rdDistGeom.ETKDGv3()
     params.randomSeed = seed
     params.useRandomCoords = True
     params.enforceChirality = True
-    if AllChem.EmbedMolecule(mol, params) != 0:
+    if rdDistGeom.EmbedMolecule(mol, params) != 0:
         return False
     _optimise(mol, optimise_iters)
     return True
 
 
-def _positions(mol: Any) -> npt.NDArray[np.float64]:
+def _positions(mol: Chem.Mol) -> npt.NDArray[np.float64]:
     """Return the conformer's positions in angstrom."""
     return np.asarray(mol.GetConformer().GetPositions(), dtype=np.float64)
 
 
-def build_template(spec: ChainSpec, seed: int) -> _Template:
+def _build_template(spec: ChainSpec, seed: int) -> _Template:
     """Relax a capped tetramer and reduce it to per-unit local geometry.
 
     Four units is the shortest oligomer that shows every junction the grown
     embedder has to make: first-to-second, interior-to-interior, and
     interior-to-last.
-
-    Args:
-        spec: The chain being built; only its monomer and caps matter here.
-        seed: Seed for the template's own embedding.
-
-    Returns:
-        The template.
 
     Raises:
         ChainError: Even a tetramer would not embed, which means the monomer
@@ -716,35 +671,15 @@ def build_template(spec: ChainSpec, seed: int) -> _Template:
     )
 
 
-class _Grid:
-    """A uniform grid over placed heavy atoms, for the overlap test."""
-
-    def __init__(self, spacing: float) -> None:
-        self._spacing = spacing
-        self._cells: dict[tuple[int, int, int], list[npt.NDArray[np.float64]]] = {}
-
-    def _cell(self, point: npt.NDArray[np.float64]) -> tuple[int, int, int]:
-        x, y, z = np.floor(point / self._spacing).astype(int)
-        return int(x), int(y), int(z)
-
-    def add(self, points: npt.NDArray[np.float64]) -> None:
-        """Record *points* as occupied."""
-        for point in points:
-            self._cells.setdefault(self._cell(point), []).append(point)
-
-    def clashes(self, points: npt.NDArray[np.float64], cutoff: float) -> bool:
-        """Whether any of *points* lies within *cutoff* of a recorded point."""
-        squared = cutoff * cutoff
-        for point in points:
-            cx, cy, cz = self._cell(point)
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    for dz in (-1, 0, 1):
-                        for other in self._cells.get((cx + dx, cy + dy, cz + dz), ()):
-                            delta = point - other
-                            if delta @ delta < squared:
-                                return True
-        return False
+def _clashes(grid: CellList, points: npt.NDArray[np.float64], cutoff: float) -> bool:
+    """Whether any of *points* lies within *cutoff* of a point in *grid*."""
+    squared = cutoff * cutoff
+    for point in points:
+        for index in grid.neighbours(point):
+            delta = point - grid.points[index]
+            if delta @ delta < squared:
+                return True
+    return False
 
 
 def _set_torsion(
@@ -777,14 +712,11 @@ def _set_torsion(
 
 
 def _grow_conformer(
-    mol: Any,
+    mol: Chem.Mol,
     spec: ChainSpec,
     template: _Template,
     n_units: int,
     seed: int,
-    *,
-    max_tries: int = 40,
-    max_restarts: int = 200,
 ) -> npt.NDArray[np.float64]:
     """Grow a self-avoiding conformer by stamping the template down the chain.
 
@@ -798,11 +730,9 @@ def _grow_conformer(
     Args:
         mol: The chain, with explicit hydrogens.
         spec: The chain spec, for the torsion statistics.
-        template: Per-unit geometry from :func:`build_template`.
+        template: Per-unit geometry from :func:`_build_template`.
         n_units: Degree of polymerization.
         seed: Seed for the torsion draws.
-        max_tries: Torsion draws per unit before backing up.
-        max_restarts: Total back-ups before giving up.
 
     Returns:
         Positions in angstrom.
@@ -811,12 +741,6 @@ def _grow_conformer(
         ChainError: Growth could not find a self-avoiding path.
     """
     groups = _unit_atoms(mol, n_units)
-    heavy_global = [
-        np.array(
-            [i for i in group if mol.GetAtomWithIdx(i).GetAtomicNum() > 1], dtype=int
-        )
-        for group in groups
-    ]
     heavy_local = [
         np.array(
             [
@@ -827,6 +751,10 @@ def _grow_conformer(
             dtype=int,
         )
         for group in groups
+    ]
+    heavy_global = [
+        np.asarray(group)[local]
+        for group, local in zip(groups, heavy_local, strict=True)
     ]
     heads = [_anchor(mol, i, "head") for i in range(n_units)]
     tails = [_anchor(mol, i, "tail") for i in range(n_units)]
@@ -840,13 +768,13 @@ def _grow_conformer(
             )
 
     rng = random.Random(seed)
-    p_trans = trans_fraction(spec.characteristic_ratio)
+    p_trans = _trans_fraction(spec.characteristic_ratio)
     weights = (p_trans, (1.0 - p_trans) / 2.0, (1.0 - p_trans) / 2.0)
 
     coords = np.zeros((mol.GetNumAtoms(), 3), dtype=np.float64)
     coords[groups[0]] = template.first
 
-    grid = _Grid(_OVERLAP_ANGSTROM)
+    grid = CellList(_OVERLAP_ANGSTROM)
     grid_upto = -1
     unit = 1
     restarts = 0
@@ -856,7 +784,7 @@ def _grow_conformer(
         # bonded to this one and is meant to be in contact.
         target = unit - 2
         if grid_upto > target:
-            grid = _Grid(_OVERLAP_ANGSTROM)
+            grid = CellList(_OVERLAP_ANGSTROM)
             grid_upto = -1
         while grid_upto < target:
             grid_upto += 1
@@ -877,7 +805,7 @@ def _grow_conformer(
         head_in_block = groups[unit].index(heads[unit])
         tail_in_block = groups[unit].index(tails[unit])
 
-        for _ in range(max_tries):
+        for _ in range(_MAX_TRIES):
             trial = _to_world(frame, block)
             # Two backbone bonds are opened by adding a unit: the previous
             # unit's own head-to-tail bond, and the junction bond joining the
@@ -912,18 +840,18 @@ def _grow_conformer(
                 ),
                 target=rng.choices(_TORSION_TARGETS_DEG, weights=weights)[0],
             )
-            if target < 0 or not grid.clashes(
-                trial[heavy_local[unit]], _OVERLAP_ANGSTROM
+            if target < 0 or not _clashes(
+                grid, trial[heavy_local[unit]], _OVERLAP_ANGSTROM
             ):
                 coords[groups[unit]] = trial
                 break
         else:
             restarts += 1
-            if restarts > max_restarts:
+            if restarts > _MAX_RESTARTS:
                 raise ChainError(
                     f"Could not grow a self-avoiding conformer of "
                     f"{spec.residue_name} past unit {unit} of {n_units} after "
-                    f"{max_restarts} back-ups. Try a different seed, or a "
+                    f"{_MAX_RESTARTS} back-ups. Try a different seed, or a "
                     "shorter chain."
                 )
             unit = max(1, unit - 2)
@@ -933,11 +861,8 @@ def _grow_conformer(
     return coords
 
 
-def _set_conformer(mol: Any, coords: npt.NDArray[np.float64]) -> None:
+def _set_conformer(mol: Chem.Mol, coords: npt.NDArray[np.float64]) -> None:
     """Replace *mol*'s conformers with one holding *coords* (angstrom)."""
-    Chem, _ = _chem()
-    from rdkit.Geometry import Point3D
-
     mol.RemoveAllConformers()
     conformer = Chem.Conformer(mol.GetNumAtoms())
     for index, (x, y, z) in enumerate(coords):
@@ -945,40 +870,22 @@ def _set_conformer(mol: Any, coords: npt.NDArray[np.float64]) -> None:
     mol.AddConformer(conformer, assignId=True)
 
 
-_BASE36 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-
-def _base36(value: int) -> str:
-    """Render *value* in base 36, so four PDB columns hold more atoms."""
-    digits = ""
-    while value:
-        value, remainder = divmod(value, 36)
-        digits = _BASE36[remainder] + digits
-    return digits or "0"
-
-
-def atom_names(mol: Any) -> list[str]:
+def _atom_names(mol: Chem.Mol) -> list[str]:
     """Return unique PDB atom names, at most four characters each.
 
     PDB atom names are four columns wide and ``PDBFile.writeModel`` truncates
     to four without complaint, so a naive ``C1000`` scheme silently produces
     duplicates. Counting per element in base 36 fits 46656 carbons.
 
-    Args:
-        mol: The molecule to name.
-
-    Returns:
-        One name per atom, in atom order.
-
     Raises:
         ChainError: An element has more atoms than four columns can name.
     """
     counts: dict[str, int] = {}
     names: list[str] = []
-    for atom in mol.GetAtoms():
+    for atom in _atoms(mol):
         symbol = atom.GetSymbol().upper()
         counts[symbol] = counts.get(symbol, 0) + 1
-        name = f"{symbol}{_base36(counts[symbol])}"
+        name = f"{symbol}{np.base_repr(counts[symbol], 36)}"
         if len(name) > 4:
             raise ChainError(
                 f"{counts[symbol]} {symbol} atoms cannot be given unique "
@@ -988,10 +895,9 @@ def atom_names(mol: Any) -> list[str]:
     return names
 
 
-def _label_atoms(mol: Any, residue_name: str) -> None:
+def _label_atoms(mol: Chem.Mol, residue_name: str) -> None:
     """Attach PDB residue information, so the whole chain is one residue."""
-    Chem, _ = _chem()
-    for atom, name in zip(mol.GetAtoms(), atom_names(mol), strict=True):
+    for atom, name in zip(_atoms(mol), _atom_names(mol), strict=True):
         info = Chem.AtomPDBResidueInfo()
         info.SetName(name.ljust(4))
         info.SetResidueName(residue_name.ljust(3))
@@ -1003,41 +909,24 @@ def _label_atoms(mol: Any, residue_name: str) -> None:
         atom.SetMonomerInfo(info)
 
 
-def molar_mass_g_mol(mol: Any) -> float:
-    """Return a molecule's molar mass, summed over its atoms.
-
-    Summed here rather than taken from ``rdkit.Chem.Descriptors`` so that the
-    hydrogens this package always makes explicit are counted once, and only
-    once.
-
-    Args:
-        mol: The molecule, with explicit hydrogens.
-
-    Returns:
-        The molar mass in g/mol.
-    """
-    return float(sum(atom.GetMass() for atom in mol.GetAtoms()))
-
-
-def _radius_of_gyration_nm(mol: Any, coords: npt.NDArray[np.float64]) -> float:
+def _radius_of_gyration_nm(mol: Chem.Mol, coords: npt.NDArray[np.float64]) -> float:
     """Return the mass-weighted radius of gyration, in nanometres."""
-    masses = np.array([atom.GetMass() for atom in mol.GetAtoms()], dtype=np.float64)
+    masses = np.array([atom.GetMass() for atom in _atoms(mol)], dtype=np.float64)
     centre = (masses[:, None] * coords).sum(axis=0) / masses.sum()
     offsets = coords - centre
     squared = float((masses * (offsets * offsets).sum(axis=1)).sum() / masses.sum())
-    return math.sqrt(squared) / 10.0
+    return math.sqrt(squared) / ANGSTROM_PER_NM
 
 
 def _extent_bound_nm(coords: npt.NDArray[np.float64]) -> float:
-    """Return a conservative bound on the conformer's diameter, in nanometres.
+    """Return twice the largest distance from the centroid, in nanometres.
 
-    Twice the largest distance from the centroid. It never understates the
-    extent, which is what the "does this fit in the packing cell" check needs,
-    and it costs one pass rather than the N-squared of every pair.
+    A bound that never understates the conformer's largest interatomic
+    distance, at the cost of one pass rather than the N-squared of every pair.
     """
     centre = coords.mean(axis=0)
     offsets = coords - centre
-    return 2.0 * float(np.sqrt((offsets * offsets).sum(axis=1)).max()) / 10.0
+    return 2.0 * float(np.sqrt((offsets * offsets).sum(axis=1)).max()) / ANGSTROM_PER_NM
 
 
 def _mean_bond_length_nm(
@@ -1046,7 +935,7 @@ def _mean_bond_length_nm(
     """Return the mean backbone bond length, in nanometres."""
     points = coords[list(backbone)]
     steps = points[1:] - points[:-1]
-    return float(np.sqrt((steps * steps).sum(axis=1)).mean()) / 10.0
+    return float(np.sqrt((steps * steps).sum(axis=1)).mean()) / ANGSTROM_PER_NM
 
 
 def build_chain(
@@ -1073,10 +962,8 @@ def build_chain(
         output_dir: Directory the files are written into. Defaults to the
             working directory, which is where the rest of the package writes.
         embedder: One of :data:`EMBEDDERS`. ``auto`` grows any chain of four
-            units or more. ETKDG is not the default for those because it
-            collapses a chain into a globule - a twenty-unit polyethylene comes
-            out with a quarter of the dimensions it should have - and a cell
-            packed from collapsed coils is a long way from a melt.
+            units or more rather than let ETKDG collapse it; see the module
+            docstring.
 
     Returns:
         What was built, including the paths to feed packing and
@@ -1085,8 +972,6 @@ def build_chain(
     Raises:
         ChainError: The monomer, a cap or the embedding failed.
     """
-    Chem, _ = _chem()
-
     require_integer(n_conformers, name="n_conformers")
     require_choice(embedder, EMBEDDERS, name="embedder")
     directory = Path(output_dir) if output_dir is not None else Path()
@@ -1105,7 +990,7 @@ def build_chain(
         )
     grown = embedder == "grown" or (embedder == "auto" and units >= _MIN_GROWN_UNITS)
     template = (
-        build_template(spec, derive_seed(spec.seed, "template")) if grown else None
+        _build_template(spec, derive_seed(spec.seed, "template")) if grown else None
     )
     log.info(
         "Building %d conformer(s) of %s: %d units, %d atoms, %s embedder.",
@@ -1152,8 +1037,10 @@ def build_chain(
         extents.append(_extent_bound_nm(coords))
         if len(backbone) > 2:
             ratios.append(
-                characteristic_ratio(
-                    coords / 10.0, backbone, _mean_bond_length_nm(coords, backbone)
+                _characteristic_ratio(
+                    coords / ANGSTROM_PER_NM,
+                    backbone,
+                    _mean_bond_length_nm(coords, backbone),
                 )
             )
 
@@ -1165,7 +1052,7 @@ def build_chain(
         pdb_paths=tuple(pdb_paths),
         smiles=Chem.MolToSmiles(Chem.RemoveHs(molecule)),
         n_atoms=n_atoms,
-        molar_mass_g_mol=molar_mass_g_mol(molecule),
+        molar_mass_g_mol=float(sum(atom.GetMass() for atom in _atoms(molecule))),
         radius_of_gyration_nm=tuple(radii),
         max_extent_nm=tuple(extents),
         backbone=backbone,
@@ -1174,20 +1061,12 @@ def build_chain(
     )
 
 
-#: Below this many backbone bonds a single chain's C is dominated by its own
-#: finite length and by sample-to-sample scatter, so there is nothing to judge.
-_RATIO_MIN_BONDS = 30
-
-
 def _report_ratio(
     measured: float | None, spec: ChainSpec, n_bonds: int, n_conformers: int
 ) -> None:
     """Say so when the built conformers are not the dimensions asked for.
 
-    The two embedders err in opposite directions - ETKDG collapses a long chain
-    into a globule, a hard-core self-avoiding walk swells it past the melt's
-    unperturbed dimensions - so this checks both signs rather than only the one
-    the embedder in use is prone to.
+    Both signs are checked, since the two embedders err in opposite directions.
     """
     if measured is None:
         return

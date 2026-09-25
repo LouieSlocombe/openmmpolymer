@@ -166,3 +166,60 @@ def fake_packmol(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
     monkeypatch.setenv("PATH", f"{directory}{':'}{Path('/usr/bin')}")
     monkeypatch.delenv("PACKMOL", raising=False)
     yield script
+
+
+@pytest.fixture
+def staged_melt(monkeypatch: pytest.MonkeyPatch, argon_run: Any) -> dict[str, Any]:
+    """Stand in for the chemistry behind ``build_melt``, keeping its staging real.
+
+    Each preparation writes the four kinds of asset ``build_melt`` records,
+    adds an entry to the force-field cache it was handed, and returns the argon
+    run with its force-field reference in the build directory. Set
+    ``system_suffix`` to change the next preparation's Hamiltonian or ``fail``
+    to make it raise; ``builds`` lists every build directory used and
+    ``options`` the settings the last preparation was given.
+    """
+    from dataclasses import replace
+
+    from openmmpolymer import melt
+    from openmmpolymer.chain import ChainResult
+
+    control: dict[str, Any] = {
+        "system_suffix": "",
+        "fail": False,
+        "builds": [],
+        "options": {},
+    }
+
+    def prepare(
+        spec: Any, n_chains: int, build_dir: Path, cache_dir: Path, **options: Any
+    ) -> Any:
+        control["builds"].append(build_dir)
+        control["options"] = options
+        number = len(control["builds"])
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / f"entry_{number}.xml").write_text("parameters")
+        build_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("chain_0.sdf", "chain_0.pdb", "polymer_ff.xml", "packed.pdb"):
+            (build_dir / name).write_text(f"prepared artifact {number}")
+        if control["fail"]:
+            raise RuntimeError("preparation failed")
+        chain = ChainResult(
+            sdf_paths=(str(build_dir / "chain_0.sdf"),),
+            pdb_paths=(str(build_dir / "chain_0.pdb"),),
+            smiles="[Ar]",
+            n_atoms=1,
+            molar_mass_g_mol=39.948,
+        )
+        run = replace(
+            argon_run,
+            system_xml=argon_run.system_xml + control["system_suffix"],
+            forcefield=replace(
+                argon_run.forcefield,
+                forcefield_xml=str(build_dir / "polymer_ff.xml"),
+            ),
+        )
+        return chain, run
+
+    monkeypatch.setattr(melt, "_prepare", prepare)
+    return control

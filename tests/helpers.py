@@ -1056,3 +1056,22 @@ def write_tensile_scan(run_dir: Path, spec: TensileSpec) -> Path:
     path = run_dir / f"{name}_workflow.json"
     path.write_text(json.dumps(record))
     return path
+
+
+def write_two_molecule_sdf(path: Path) -> str:
+    """Write methanol and ethane, with conformers, into one SDF.
+
+    What a chain SDF must never be: the chain readers refuse it rather than
+    quietly taking the first molecule.
+    """
+    from openff.toolkit import Molecule
+
+    blocks = []
+    for index, smiles in enumerate(("CO", "CC")):
+        molecule = Molecule.from_smiles(smiles)
+        molecule.generate_conformers(n_conformers=1)
+        single = path.with_name(f"{path.stem}_{index}.sdf")
+        molecule.to_file(str(single), file_format="SDF")
+        blocks.append(single.read_text())
+    path.write_text("".join(blocks))
+    return str(path)

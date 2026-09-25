@@ -42,24 +42,8 @@ where they matter.
 from importlib.metadata import PackageNotFoundError, version
 
 from ._files import ReportFiles
-from .chain import (
-    ChainError,
-    ChainResult,
-    ChainSpec,
-    assemble_chain,
-    atom_names,
-    backbone_path,
-    build_chain,
-    characteristic_ratio,
-    trans_fraction,
-)
-from .charges import (
-    CHARGE_METHODS,
-    ChargeError,
-    ChargeResult,
-    assign_charges,
-    default_nagl_model,
-)
+from .chain import ChainError, ChainResult, ChainSpec, build_chain
+from .charges import CHARGE_METHODS, ChargeError, ChargeResult, assign_charges
 from .conformation import (
     ConformationSeries,
     EndToEndRelaxation,
@@ -125,7 +109,6 @@ from .forcefield import (
     ForceFieldError,
     PolymerForceField,
     build_polymer_forcefield,
-    check_forcefield,
 )
 from .mdsystem import (
     PackedBox,
@@ -157,6 +140,7 @@ from .mechanical import (
     run_modulus_scan,
     write_mechanical_report,
 )
+from .melt import build_melt
 from .modulus_rate_report import write_modulus_rate_report
 from .modulus_rates import (
     ModulusRatePlan,
@@ -167,22 +151,15 @@ from .modulus_rates import (
 )
 from .packing import (
     DEFAULT_PACKING_DENSITY,
-    DEFAULT_TOLERANCE_NM,
     PackedComponent,
     PackmolError,
     PackResult,
     box_edge_nm,
     check_packing,
-    density_g_cm3,
     distribute_conformers,
-    find_packmol,
-    find_rings,
-    load_positions_nm,
     pack_box,
-    packmol_version,
     read_packed_pdb,
     read_pdb,
-    render_packmol_input,
 )
 from .plots import (
     plot_breaking_strength,
@@ -419,7 +396,6 @@ __all__ = [
     "CHARGE_METHODS",
     "DEFAULT_BASE_FORCEFIELD",
     "DEFAULT_PACKING_DENSITY",
-    "DEFAULT_TOLERANCE_NM",
     "DEFAULT_WINDOW_FRACTIONS",
     "DSC_COOLING_RATE_K_PER_NS",
     "ELASTIC_RATE_PROPERTIES",
@@ -553,33 +529,27 @@ __all__ = [
     "analyse_thermal_rates",
     "analyse_yield",
     "assemble_box",
-    "assemble_chain",
     "assign_charges",
-    "atom_names",
-    "backbone_path",
     "barostat_kind",
     "box_edge_nm",
     "breaking_stages",
     "breaking_strength",
     "build_chain",
+    "build_melt",
     "build_polymer_forcefield",
     "build_system",
     "bulk_modulus",
     "centre_of_mass_msd",
     "chain_conformation",
     "chain_dimensions",
-    "characteristic_ratio",
     "check_box",
-    "check_forcefield",
     "check_packing",
     "check_target_density",
     "check_timestep",
     "cooling_rate_extrapolation",
     "cooling_rate_series",
-    "default_nagl_model",
     "default_rate_spec",
     "deform_stages",
-    "density_g_cm3",
     "deviatoric_strain",
     "distribute_conformers",
     "elastic_consistency",
@@ -588,8 +558,6 @@ __all__ = [
     "end_to_end_relaxation",
     "equilibration",
     "find_barostat",
-    "find_packmol",
-    "find_rings",
     "fit_kww",
     "fit_prony",
     "glass_transition",
@@ -598,7 +566,6 @@ __all__ = [
     "heating_temperatures",
     "infer_backbone",
     "load_curve",
-    "load_positions_nm",
     "load_stages",
     "make_barostat",
     "max_timestep_fs",
@@ -612,7 +579,6 @@ __all__ = [
     "nnls",
     "open_run",
     "pack_box",
-    "packmol_version",
     "persistence_length",
     "platform_is_usable",
     "plot_breaking_strength",
@@ -655,7 +621,6 @@ __all__ = [
     "relaxation_curve",
     "relaxation_scan",
     "relaxation_window_convergence",
-    "render_packmol_input",
     "replicate_topology",
     "run_anneal",
     "run_breaking_scan",
@@ -704,7 +669,6 @@ __all__ = [
     "tg_coarse_scan",
     "tg_fine_scan",
     "time_window_convergence",
-    "trans_fraction",
     "validate_elastic_rate_scan",
     "validate_modulus_rate_scan",
     "validate_property_rate_scan",

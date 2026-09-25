@@ -3,40 +3,30 @@
 from __future__ import annotations
 
 import math
-import shutil
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 
+from openmmpolymer.mdsystem import assemble_box
 from openmmpolymer.packing import (
-    AVOGADRO,
     PackedComponent,
     PackmolError,
+    _render_packmol_input,
     box_edge_nm,
     check_packing,
-    density_g_cm3,
-    find_packmol,
-    find_rings,
-    load_positions_nm,
+    distribute_conformers,
     pack_box,
-    packmol_version,
-    render_packmol_input,
+    read_packed_pdb,
 )
 
 from .helpers import build_dimer_pdb
 
 
-def test_box_edge_matches_the_density_it_was_asked_for() -> None:
-    """The cell holds exactly the material it was sized for."""
-    edge = box_edge_nm([30], [563.1], 0.3)
-    assert density_g_cm3([30], [563.1], edge**3) == pytest.approx(0.3)
-
-
 def test_box_edge_against_a_hand_computed_volume() -> None:
-    """The conversion between g/mol, g/cm3 and nm3 is the documented one."""
-    expected = (100 * 18.0 * 1.0e21 / (1.0 * AVOGADRO)) ** (1 / 3)
-    assert box_edge_nm([100], [18.0], 1.0) == pytest.approx(expected)
+    """A hundred waters at 1 g/cm3 fill 2.989 nm3, a cube 1.4405 nm on edge."""
+    assert box_edge_nm([100], [18.0], 1.0) == pytest.approx(1.44048, abs=1e-5)
 
 
 def test_box_edge_scales_as_the_cube_root_of_the_count() -> None:
@@ -46,179 +36,155 @@ def test_box_edge_scales_as_the_cube_root_of_the_count() -> None:
     )
 
 
-def test_box_edge_refuses_an_empty_cell() -> None:
-    """Nothing to pack is an error, not a zero-sized box."""
-    with pytest.raises(ValueError, match="Nothing to pack"):
-        box_edge_nm([0], [500.0], 0.5)
+@pytest.mark.parametrize(
+    ("count", "density", "message"),
+    [(0, 0.5, "Nothing to pack"), (10, 0.0, "density_g_cm3")],
+)
+def test_box_edge_refuses_a_cell_it_cannot_size(
+    count: int, density: float, message: str
+) -> None:
+    """Nothing to pack is an error, and so is a density that asks for infinity."""
+    with pytest.raises(ValueError, match=message):
+        box_edge_nm([count], [500.0], density)
 
 
-def test_box_edge_refuses_a_non_positive_density() -> None:
-    """A density of zero would ask for an infinite cell."""
-    with pytest.raises(ValueError, match="density_g_cm3"):
-        box_edge_nm([10], [500.0], 0.0)
+@pytest.mark.parametrize(
+    ("components", "fragments", "absent"),
+    [
+        (
+            [PackedComponent("a.pdb", 3)],
+            [
+                "tolerance 2.0000",
+                "filetype pdb",
+                "output packed.pdb",
+                "seed 7",
+                "structure a.pdb",
+                "  number 3",
+            ],
+            [],
+        ),
+        # A zero count writes no block rather than an empty one.
+        (
+            [PackedComponent("a.pdb", 0), PackedComponent("b.pdb", 2)],
+            ["structure b.pdb", "  number 2"],
+            ["a.pdb"],
+        ),
+        (
+            [PackedComponent(f"c{index}.pdb", 1) for index in range(3)],
+            ["structure c0.pdb", "structure c2.pdb"],
+            [],
+        ),
+    ],
+)
+def test_the_packmol_input_has_one_block_per_placed_structure(
+    components: list[PackedComponent], fragments: list[str], absent: list[str]
+) -> None:
+    """And numbers residues across the whole output in every block.
 
-
-def test_packmol_input_converts_nanometres_to_angstrom_once() -> None:
-    """The rendered input is in angstrom, which is what packmol reads."""
-    text = render_packmol_input(
-        [PackedComponent("a.pdb", 3)],
+    packmol restarts residue numbering in each block by default, and past the
+    twenty-sixth the chain identifiers run out as well, so molecules start
+    sharing a chain and residue number and OpenMM merges them - measured at 40
+    conformers, 37 residues came back instead of 40.
+    """
+    text = _render_packmol_input(
+        components,
         (24.0, 24.0, 24.0),
         "packed.pdb",
         tolerance_angstrom=2.0,
         inset_angstrom=1.0,
         seed=7,
     )
-    assert "tolerance 2.0000" in text
-    assert "seed 7" in text
-    assert "filetype pdb" in text
-    assert "output packed.pdb" in text
-    assert "structure a.pdb" in text
-    assert "  number 3" in text
-    assert "  resnumbers 3" in text
+    assert all(fragment in text for fragment in fragments)
+    assert not any(name in text for name in absent)
+    placed = sum(1 for component in components if component.count)
+    assert text.count("  resnumbers 3") == text.count("end structure") == placed
 
 
-def test_packmol_region_is_inset_from_every_face() -> None:
-    """Molecules stay a full tolerance apart across the periodic boundary.
-
-    An atom at the inset and one at the far face are two insets apart across
-    the boundary, so the inset has to be at least half the tolerance.
-    """
-    text = render_packmol_input(
-        [PackedComponent("a.pdb", 1)],
-        (24.0, 24.0, 24.0),
-        "packed.pdb",
-        tolerance_angstrom=2.0,
-        inset_angstrom=1.0,
-        seed=1,
-    )
-    assert "inside box 1.0000 1.0000 1.0000 23.0000 23.0000 23.0000" in text
-
-
-def test_every_structure_block_numbers_its_residues_across_the_output() -> None:
-    """One block per conformer, and packmol restarts numbering in each.
-
-    Past the twenty-sixth block the chain identifiers run out as well, so
-    molecules start sharing a chain and residue number and OpenMM merges
-    them - measured at 40 conformers, 37 residues came back instead of 40.
-    """
-    text = render_packmol_input(
-        [PackedComponent(f"c{index}.pdb", 1) for index in range(3)],
-        (40.0, 40.0, 40.0),
-        "packed.pdb",
-        tolerance_angstrom=2.0,
-        inset_angstrom=1.0,
-        seed=1,
-    )
-    assert text.count("resnumbers 3") == 3
-
-
-def test_packmol_input_skips_a_component_with_no_copies() -> None:
-    """A zero count writes no block rather than an empty one."""
-    text = render_packmol_input(
-        [PackedComponent("a.pdb", 0), PackedComponent("b.pdb", 2)],
-        (24.0, 24.0, 24.0),
-        "packed.pdb",
-        tolerance_angstrom=2.0,
-        inset_angstrom=1.0,
-        seed=1,
-    )
-    assert "a.pdb" not in text
-    assert "b.pdb" in text
-
-
-def test_packmol_input_includes_nloop_only_when_asked() -> None:
-    """Left out, packmol uses its own default rather than ours."""
-    common = {
-        "box_angstrom": (24.0, 24.0, 24.0),
-        "output_pdb": "packed.pdb",
-        "tolerance_angstrom": 2.0,
-        "inset_angstrom": 1.0,
-        "seed": 1,
-    }
-    components = [PackedComponent("a.pdb", 1)]
-    assert "nloop" not in render_packmol_input(components, **common)  # type: ignore[arg-type]
-    assert "nloop 50" in render_packmol_input(components, nloop=50, **common)  # type: ignore[arg-type]
-
-
-def test_find_packmol_reports_how_to_get_it(
+@pytest.mark.parametrize("named_by_environment", [False, True])
+def test_pack_box_converts_to_angstrom_and_insets_the_region(
+    fake_packmol: Path,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    named_by_environment: bool,
 ) -> None:
-    """A missing binary says where to get one rather than failing obscurely."""
-    monkeypatch.setenv("PATH", "")
-    monkeypatch.delenv("PACKMOL", raising=False)
-    with pytest.raises(PackmolError, match="conda install"):
-        find_packmol()
+    """The region is held back from each face by half the tolerance.
 
-
-def test_find_packmol_rejects_a_path_that_is_not_a_file(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """An explicit path that does not exist fails at once, by name."""
-    monkeypatch.delenv("PACKMOL", raising=False)
-    with pytest.raises(PackmolError, match="not an executable file"):
-        find_packmol(tmp_path / "nowhere")
-
-
-def test_find_packmol_honours_the_environment_override(fake_packmol: Path) -> None:
-    """The stub on PATH is what gets found."""
-    assert Path(find_packmol()).name == "packmol"
-
-
-def test_pack_box_raises_when_packmol_does_not_report_success(
-    fake_packmol: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """packmol can exit zero without converging, so the output is read."""
-    fake_packmol.write_text("#!/bin/sh\ncat > /dev/null\necho 'not converged'\n")
-    fake_packmol.chmod(0o755)
-    build_dimer_pdb(tmp_path / "dimer.pdb")
-    with pytest.raises(PackmolError, match="did not report success"):
-        pack_box([PackedComponent(str(tmp_path / "dimer.pdb"), 2)], 3.0)
-
-
-def test_pack_box_reports_the_exit_code_and_what_it_means(
-    fake_packmol: Path, tmp_path: Path
-) -> None:
-    """packmol's own failure codes start at 170 and are worth naming."""
-    fake_packmol.write_text("#!/bin/sh\ncat > /dev/null\necho boom\nexit 171\n")
-    fake_packmol.chmod(0o755)
-    build_dimer_pdb(tmp_path / "dimer.pdb")
-    with pytest.raises(PackmolError, match=r"171.*could not satisfy"):
-        pack_box([PackedComponent(str(tmp_path / "dimer.pdb"), 2)], 3.0)
-
-
-def test_pack_box_writes_the_input_it_used(
-    fake_packmol: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The generated input stays on disk, because it is the thing to inspect."""
+    An atom at the inset and one at the far face are then a full tolerance
+    apart across the periodic boundary. The input stays on disk, because it is
+    the thing to inspect.
+    """
+    if named_by_environment:
+        monkeypatch.setenv("PACKMOL", str(fake_packmol))
     source = build_dimer_pdb(tmp_path / "dimer.pdb")
     monkeypatch.setenv("PACKMOL_FAKE_OUTPUT", source)
     result = pack_box([PackedComponent(source, 1)], 3.0, "packed.pdb")
     text = Path(result.input_path).read_text()
     assert "tolerance 2.0000" in text
+    assert "inside box 1.0000 1.0000 1.0000 29.0000 29.0000 29.0000" in text
     assert result.box_nm == (3.0, 3.0, 3.0)
     assert result.n_molecules == 1
 
 
-def test_load_positions_reads_through_the_pdb_parser(tmp_path: Path) -> None:
-    """Coordinates come back in nanometres, in file order."""
-    path = Path(build_dimer_pdb(tmp_path / "dimer.pdb"))
-    positions = load_positions_nm(path)
+def test_a_missing_packmol_says_how_to_get_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rather than failing obscurely."""
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.delenv("PACKMOL", raising=False)
+    with pytest.raises(PackmolError, match="conda install"):
+        pack_box([PackedComponent("dimer.pdb", 1)], 3.0)
+
+
+def test_a_packmol_named_by_the_environment_has_to_exist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """It fails at once, by name, rather than falling back to PATH."""
+    monkeypatch.setenv("PACKMOL", str(tmp_path / "nowhere"))
+    with pytest.raises(PackmolError, match="not an executable file"):
+        pack_box([PackedComponent("dimer.pdb", 1)], 3.0)
+
+
+@pytest.mark.parametrize(
+    ("script", "timeout_s", "message"),
+    [
+        # packmol can exit zero without converging, so the output is read.
+        ("cat > /dev/null\necho 'not converged'", None, "did not report success"),
+        # Its own failure codes start at 170 and are worth naming.
+        ("cat > /dev/null\necho boom\nexit 171", None, r"171.*could not satisfy"),
+        ("sleep 5", 0.1, "did not finish within 0.1 s"),
+    ],
+)
+def test_a_packmol_failure_is_reported_for_what_it_is(
+    fake_packmol: Path,
+    tmp_path: Path,
+    script: str,
+    timeout_s: float | None,
+    message: str,
+) -> None:
+    fake_packmol.write_text(f"#!/bin/sh\n{script}\n")
+    source = build_dimer_pdb(tmp_path / "dimer.pdb")
+    with pytest.raises(PackmolError, match=message):
+        pack_box([PackedComponent(source, 2)], 3.0, timeout_s=timeout_s)
+
+
+def test_packed_coordinates_are_read_in_nanometres(tmp_path: Path) -> None:
+    """Through the PDB parser, in file order."""
+    topology, positions = read_packed_pdb(build_dimer_pdb(tmp_path / "dimer.pdb"))
+    assert topology.getNumAtoms() == 2
     assert positions.shape == (2, 3)
     assert positions[1][0] == pytest.approx(0.153, abs=1e-3)
 
 
-def _two_molecule_topology(separation_nm: float) -> tuple[object, np.ndarray]:
-    """Two dimers, *separation_nm* apart, with their bonds recorded."""
+def _two_dimers(separation_nm: float, symbol: str = "C") -> tuple[Any, np.ndarray]:
+    """Two bonded pairs of *symbol* atoms, the second *separation_nm* along x."""
     from openmm import app
 
     topology = app.Topology()
     chain = topology.addChain()
-    carbon = app.Element.getBySymbol("C")
+    element = app.Element.getBySymbol(symbol)
     positions = []
     for index in range(2):
         residue = topology.addResidue("DIM", chain)
-        first = topology.addAtom("C1", carbon, residue)
-        second = topology.addAtom("C2", carbon, residue)
+        first = topology.addAtom("A1", element, residue)
+        second = topology.addAtom("A2", element, residue)
         topology.addBond(first, second)
         offset = index * separation_nm
         positions.extend([[offset, 0.0, 0.0], [offset + 0.153, 0.0, 0.0]])
@@ -226,114 +192,123 @@ def _two_molecule_topology(separation_nm: float) -> tuple[object, np.ndarray]:
 
 
 def test_check_packing_passes_a_well_separated_cell() -> None:
-    """Two dimers a nanometre apart are fine."""
-    topology, positions = _two_molecule_topology(1.0)
-    check_packing(topology, positions, check_rings=False)
+    """Including the bonds, which are shorter than the intermolecular limit.
+
+    packmol's tolerance is intermolecular, so bonded neighbours must not trip
+    it: a C-C bond is 0.153 nm against a 0.20 nm limit.
+    """
+    check_packing(*_two_dimers(1.0))
 
 
 def test_check_packing_catches_a_molecule_split_across_the_boundary() -> None:
     """A bond the width of the cell is the signature, and it is fatal."""
-    topology, positions = _two_molecule_topology(1.0)
+    topology, positions = _two_dimers(1.0)
     positions[1] = [5.0, 0.0, 0.0]
     with pytest.raises(PackmolError, match="bonded but"):
-        check_packing(topology, positions, check_rings=False)
+        check_packing(topology, positions)
 
 
-def test_check_packing_catches_two_molecules_on_top_of_each_other() -> None:
-    """Overlap between molecules is fatal; the C-H distance inside one is not."""
-    topology, positions = _two_molecule_topology(0.05)
+def test_check_packing_catches_molecules_on_top_of_each_other() -> None:
+    """Heavy atoms of different molecules 0.18 nm apart are too close."""
     with pytest.raises(PackmolError, match="different molecules"):
-        check_packing(topology, positions, check_rings=False)
+        check_packing(*_two_dimers(0.33))
 
 
-def test_check_packing_ignores_bonded_neighbours() -> None:
-    """packmol's tolerance is intermolecular; a 0.153 nm bond must not trip it."""
-    topology, positions = _two_molecule_topology(2.0)
-    check_packing(topology, positions, min_heavy_nm=0.30, check_rings=False)
+def test_check_packing_lets_hydrogens_come_closer() -> None:
+    """Where either atom is a hydrogen the limit is 0.15 nm, not 0.20."""
+    check_packing(*_two_dimers(0.33, "H"))
 
 
-def _benzene_topology() -> tuple[object, np.ndarray]:
-    """A flat six-ring in the xy plane, plus a separate two-atom rod."""
+def _ring_and_rod(
+    *, rod_x_nm: float, rod_in_own_residue: bool
+) -> tuple[Any, np.ndarray]:
+    """A flat six-ring of radius 0.2 nm at the origin, and a rod along z.
+
+    The ring is wide enough, and the 0.24 nm rod long enough, that a rod
+    through the centre clears every contact and bond limit, so threading is the
+    only fault. On its own the rod is a molecule of a different size from the
+    ring's. Otherwise there are two identical molecules, each a ring and a rod,
+    the second's rod through the first's ring: then the rings are found once
+    and shifted onto the copy.
+    """
     from openmm import app
 
     topology = app.Topology()
     chain = topology.addChain()
     carbon = app.Element.getBySymbol("C")
-    ring_residue = topology.addResidue("BEN", chain)
-    atoms = [topology.addAtom(f"C{i}", carbon, ring_residue) for i in range(6)]
-    for index in range(6):
-        topology.addBond(atoms[index], atoms[(index + 1) % 6])
-
-    radius = 0.14
-    positions = [
-        [radius * math.cos(i * math.pi / 3), radius * math.sin(i * math.pi / 3), 0.0]
+    hexagon = [
+        [0.2 * math.cos(i * math.pi / 3), 0.2 * math.sin(i * math.pi / 3), 0.0]
         for i in range(6)
     ]
-    rod_residue = topology.addResidue("ROD", chain)
-    first = topology.addAtom("C1", carbon, rod_residue)
-    second = topology.addAtom("C2", carbon, rod_residue)
-    topology.addBond(first, second)
+    rod = [[rod_x_nm, 0.0, -0.12], [rod_x_nm, 0.0, 0.12]]
+    if rod_in_own_residue:
+        molecules = [(hexagon, []), ([], rod)]
+    else:
+        far_ring = [[x + 10.0, y, z] for x, y, z in hexagon]
+        far_rod = [[x + 5.0, y, z] for x, y, z in rod]
+        molecules = [(hexagon, far_rod), (far_ring, rod)]
+
+    positions: list[list[float]] = []
+    for ring, pair in molecules:
+        residue = topology.addResidue("MOL", chain)
+        atoms = [topology.addAtom(f"C{i}", carbon, residue) for i in range(len(ring))]
+        for index, atom in enumerate(atoms):
+            topology.addBond(atom, atoms[(index + 1) % len(atoms)])
+        if pair:
+            ends = [topology.addAtom(f"R{i}", carbon, residue) for i in range(2)]
+            topology.addBond(*ends)
+        positions.extend([*ring, *pair])
     return topology, np.asarray(positions, dtype=np.float64)
 
 
-def test_find_rings_finds_the_six_ring() -> None:
-    """The ring finder sees a benzene-shaped cycle."""
-    topology, _ = _benzene_topology()
-    rings = find_rings(topology)
-    assert [len(ring) for ring in rings] == [6]
-
-
-def test_check_packing_catches_a_bond_threaded_through_a_ring() -> None:
+@pytest.mark.parametrize("rod_in_own_residue", [True, False])
+def test_check_packing_catches_a_bond_threaded_through_a_ring(
+    rod_in_own_residue: bool,
+) -> None:
     """The classic packmol failure for anything with a ring in it."""
-    topology, ring = _benzene_topology()
-    speared = np.vstack([ring, [[0.0, 0.0, -0.1], [0.0, 0.0, 0.1]]])
+    topology, positions = _ring_and_rod(
+        rod_x_nm=0.0, rod_in_own_residue=rod_in_own_residue
+    )
     with pytest.raises(PackmolError, match="passes through the ring"):
-        check_packing(topology, speared, min_heavy_nm=0.05)
+        check_packing(topology, positions)
 
 
 def test_check_packing_allows_a_bond_that_misses_the_ring() -> None:
     """A segment crossing the ring's plane outside it is not threaded."""
-    topology, ring = _benzene_topology()
-    clear = np.vstack([ring, [[1.0, 0.0, -0.1], [1.0, 0.0, 0.1]]])
-    check_packing(topology, clear, min_heavy_nm=0.05)
+    check_packing(*_ring_and_rod(rod_x_nm=1.0, rod_in_own_residue=False))
 
 
-@pytest.mark.packmol
-def test_real_packmol_reports_a_version() -> None:
-    """The version probe works against the real binary."""
-    if shutil.which("packmol") is None:
-        pytest.skip("packmol is not on PATH")
-    assert packmol_version()[0] >= 20
-
-
-def test_conformers_are_spread_evenly_over_the_molecules() -> None:
-    """Fewer conformers than molecules still beats one conformation repeated."""
-    from openmmpolymer.packing import distribute_conformers
-
-    components = distribute_conformers(["a.pdb", "b.pdb", "c.pdb"], 10)
-    assert [component.count for component in components] == [4, 3, 3]
-    assert sum(component.count for component in components) == 10
-
-
-def test_one_conformer_per_molecule_is_one_block_each() -> None:
-    """The default, and what build_chain is set up for."""
-    from openmmpolymer.packing import distribute_conformers
-
-    components = distribute_conformers([f"{i}.pdb" for i in range(4)], 4)
-    assert all(component.count == 1 for component in components)
-
-
-def test_conformers_with_nothing_to_place_are_dropped() -> None:
-    """A zero-count block is not something packmol should be given."""
-    from openmmpolymer.packing import distribute_conformers
-
-    components = distribute_conformers(["a.pdb", "b.pdb", "c.pdb"], 2)
-    assert [component.count for component in components] == [1, 1]
+@pytest.mark.parametrize(
+    ("n_conformers", "n_molecules", "counts"),
+    [
+        # Fewer conformers than molecules still beats one conformation repeated.
+        (3, 10, [4, 3, 3]),
+        # The default, and what build_chain is set up for.
+        (4, 4, [1, 1, 1, 1]),
+        # A conformer with nothing to place is not given to packmol at all.
+        (3, 2, [1, 1]),
+    ],
+)
+def test_conformers_are_spread_evenly_over_the_molecules(
+    n_conformers: int, n_molecules: int, counts: list[int]
+) -> None:
+    paths = [f"{index}.pdb" for index in range(n_conformers)]
+    components = distribute_conformers(paths, n_molecules)
+    assert [component.count for component in components] == counts
+    assert [component.pdb_path for component in components] == paths[: len(counts)]
 
 
 def test_distributing_over_no_conformers_is_refused() -> None:
     """A clearer failure than dividing by zero."""
-    from openmmpolymer.packing import distribute_conformers
-
     with pytest.raises(ValueError, match="No conformers"):
         distribute_conformers([], 5)
+
+
+@pytest.mark.packmol
+def test_real_packmol_packs_a_cell_that_passes_the_checks(tmp_path: Path) -> None:
+    """Every molecule whole, none overlapping, and in the order they were given."""
+    components = [PackedComponent(build_dimer_pdb(tmp_path / "dimer.pdb"), 40)]
+    packed = pack_box(components, 3.0, tmp_path / "packed.pdb", seed=3)
+    box = assemble_box(components, packed.packed_pdb, packed.box_nm)
+    check_packing(box.topology, box.positions_nm)
+    assert box.n_molecules == 40
