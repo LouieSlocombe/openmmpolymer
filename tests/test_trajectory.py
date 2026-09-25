@@ -13,10 +13,13 @@ from openmmpolymer.trajectory import (
     AnalysisError,
     backbone_indices,
     boxes_nm,
+    capped_stride,
     chain_positions,
     open_run,
     require_trajectory,
     stage_files,
+    stage_names,
+    stages_holding,
 )
 
 from .helpers import synthetic_ensemble
@@ -57,6 +60,44 @@ def test_asking_for_a_stage_that_is_not_there_lists_the_ones_that_are(
     write_manifest(tmp_path, {"02_nvt": {"final_pdb": str(tmp_path / "02_nvt.pdb")}})
     with pytest.raises(AnalysisError, match="It records: 02_nvt"):
         stage_files(tmp_path, "04_npt")
+
+
+def test_stages_are_found_by_what_they_recorded(tmp_path: Path) -> None:
+    """Not by their names, and the refusal names what was there instead."""
+    write_manifest(
+        tmp_path,
+        {
+            "02_nvt": {"samples": {"segment_strain": []}},
+            "anything": {"samples": {"segment_strain": [0.01]}},
+            "05_npt": {},
+        },
+    )
+
+    def holds_strain(samples: dict[str, Any]) -> bool:
+        return bool(samples.get("segment_strain"))
+
+    assert stages_holding(tmp_path, holds_strain, "strains") == ("anything",)
+    with pytest.raises(AnalysisError, match=r"recorded pressures\. It records: 02_nvt"):
+        stages_holding(tmp_path, lambda samples: False, "pressures")
+
+
+def test_a_stage_argument_is_one_name_or_several() -> None:
+    """Several chunks of one pass are named together, and naming none is a
+    mistake rather than a request for nothing."""
+    assert stage_names("06_quench") == ("06_quench",)
+    assert stage_names(["a", "b"]) == ("a", "b")
+    with pytest.raises(AnalysisError, match="No stage was named"):
+        stage_names(())
+
+
+def test_a_frame_cap_only_ever_coarsens_the_stride() -> None:
+    """At most *cap* frames, never finer than asked, and no cap is no cap."""
+    assert capped_stride(144, 1, 12) == 12
+    assert capped_stride(145, 1, 12) == 13
+    assert capped_stride(10, 3, 50) == 3
+    assert capped_stride(10, 3, None) == 3
+    with pytest.raises(ValueError, match="frame cap"):
+        capped_stride(10, 1, 0)
 
 
 def test_the_default_stage_is_the_last_one_the_manifest_recorded(
@@ -233,14 +274,6 @@ def test_a_stride_skips_frames_and_keeps_their_times(
     assert times == pytest.approx([0.2, 0.6, 1.0, 1.4, 1.8], abs=1e-5)
 
 
-def test_the_last_frame_is_the_one_the_stage_ended_on(
-    dimer_run_directory: Path,
-) -> None:
-    """It is the frame a final measurement should be taken from."""
-    ensemble = open_run(dimer_run_directory, "02_nvt")
-    assert ensemble.last_frame().time_ps == pytest.approx(2.0, abs=1e-5)
-
-
 def test_every_frame_reports_its_own_box(dimer_run_directory: Path) -> None:
     """Under a barostat the cell changes, and a density or a g(r) cut-off that
     used the first frame's box would drift out of date."""
@@ -355,18 +388,7 @@ def test_an_empty_trajectory_says_why_it_is_empty(
         open_run(tmp_path, "09_empty")
 
 
-def test_a_trajectory_the_universe_cannot_match_to_its_topology_is_refused(
-    dimer_run_directory: Path,
-) -> None:
-    """A topology from a different system would put every atom's coordinates on
-    the wrong atom, which is not something to discover from the answers."""
-    from openmmpolymer.trajectory import AnalysisError as Error
-
-    with pytest.raises(Error, match="does not divide"):
-        open_run(dimer_run_directory, "02_nvt", atoms_per_chain=5)
-
-
-def test_a_topology_with_uneven_residues_is_refused(tmp_path: Path) -> None:
+def test_a_topology_with_uneven_residues_is_refused() -> None:
     """Every molecule should be a copy of the same chain, and an uneven cell
     would make every per-chain average silently wrong."""
     from openmm import app, unit

@@ -33,8 +33,8 @@ from typing import Any, cast
 from ._files import ReportFiles, file_sha256, write_json
 from .chain import ChainResult, ChainSpec, build_chain
 from .charges import CHARGE_METHODS, assign_charges
-from .convergence import DEFAULT_WINDOW_FRACTIONS, analyse_convergence
-from .convergence_report import write_convergence_report
+from .convergence import DEFAULT_WINDOW_FRACTIONS
+from .convergence_report import analyse_convergence, write_convergence_report
 from .elasticity import deform_stages, load_stages, shear_stages
 from .forcefield import BACKENDS, PolymerForceField, build_polymer_forcefield
 from .mdsystem import (

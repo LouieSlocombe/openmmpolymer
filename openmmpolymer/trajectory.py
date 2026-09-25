@@ -1,6 +1,6 @@
 """The one place a finished run becomes something measurable.
 
-Four facts about what this package writes shape everything here.
+Five facts about what this package writes shape everything here.
 
 A stage's file stem is not its name. :func:`~openmmpolymer.simulate.run_pushoff`
 runs three sub-stages into ``01_pushoff_0..2`` and reports them as one
@@ -47,15 +47,18 @@ the stage start, not the run start.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator, Sequence
+import warnings
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+from openmm import unit
 
 from ._validation import require_integer
+from .packing import read_pdb
 from .protocols import RunManifest
 
 log = logging.getLogger(__name__)
@@ -195,10 +198,6 @@ class Ensemble:
                 / _ANGSTROM_PER_NM,
             )
 
-    def last_frame(self) -> Frame:
-        """Return the final frame, which is the one a stage ended on."""
-        return next(self.frames(start=self.n_frames - 1))
-
     def per_chain(
         self, positions_nm: npt.NDArray[np.float64]
     ) -> npt.NDArray[np.float64]:
@@ -231,6 +230,80 @@ class Ensemble:
         return (index + 1) * self.interval_ps
 
 
+def load_manifest(run_dir: str | Path) -> RunManifest:
+    """Read the manifest that makes a directory a run directory.
+
+    Raises:
+        AnalysisError: There is none.
+    """
+    directory = Path(run_dir)
+    manifest = RunManifest.load(directory)
+    if manifest is None:
+        raise AnalysisError(
+            f"No manifest in {directory}, so there is nothing to say what the "
+            "run wrote. A run directory is one that holds manifest.json."
+        )
+    return manifest
+
+
+def stage_record(manifest: RunManifest, name: str, directory: Path) -> dict[str, Any]:
+    """What the manifest in *directory* recorded for one stage.
+
+    Raises:
+        AnalysisError: It recorded no stage of that name.
+    """
+    recorded = manifest.stages.get(name)
+    if recorded is None:
+        raise AnalysisError(
+            f"The manifest in {directory} has no stage {name!r}. It records: "
+            f"{', '.join(manifest.stages) or 'nothing'}."
+        )
+    return recorded
+
+
+def stage_names(stage: str | Sequence[str]) -> tuple[str, ...]:
+    """One stage name, or several read as one pass, as a tuple.
+
+    Raises:
+        AnalysisError: *stage* names nothing.
+    """
+    names = (stage,) if isinstance(stage, str) else tuple(stage)
+    if not names:
+        raise AnalysisError("No stage was named, so there is nothing to read.")
+    return names
+
+
+def stages_holding(
+    run_dir: str | Path, holds: Callable[[dict[str, Any]], bool], what: str
+) -> tuple[str, ...]:
+    """Name every stage whose recorded samples *holds* accepts, in manifest order.
+
+    Stages are found by what they recorded rather than by what they were
+    called, so a ladder split into chunks for resume - or repeated as several
+    replicas - is read without anything having to agree on names in advance.
+
+    Args:
+        run_dir: A directory a run wrote to.
+        holds: Whether one stage's samples are the kind being looked for.
+        what: What that kind is, for the refusal.
+
+    Raises:
+        AnalysisError: There is no manifest, or no stage in it qualifies.
+    """
+    stages = load_manifest(run_dir).stages
+    found = tuple(
+        name
+        for name, recorded in stages.items()
+        if holds(recorded.get("samples") or {})
+    )
+    if not found:
+        raise AnalysisError(
+            f"No stage in {Path(run_dir)} recorded {what}. It records: "
+            f"{', '.join(stages) or 'nothing'}."
+        )
+    return found
+
+
 def stage_files(run_dir: str | Path, stage: str | None = None) -> StageFiles:
     """Find what one stage of a run left on disk.
 
@@ -250,24 +323,14 @@ def stage_files(run_dir: str | Path, stage: str | None = None) -> StageFiles:
             not record the stage asked for.
     """
     directory = Path(run_dir)
-    manifest = RunManifest.load(directory)
-    if manifest is None:
-        raise AnalysisError(
-            f"No manifest in {directory}, so there is nothing to say what the "
-            "run wrote. A run directory is one that holds manifest.json."
-        )
+    manifest = load_manifest(directory)
     if not manifest.stages:
         raise AnalysisError(
             f"The manifest in {directory} records no completed stages, so the "
             "run did not get far enough to leave anything to measure."
         )
     name = stage if stage is not None else list(manifest.stages)[-1]
-    recorded = manifest.stages.get(name)
-    if recorded is None:
-        raise AnalysisError(
-            f"The manifest in {directory} has no stage {name!r}. It records: "
-            f"{', '.join(manifest.stages)}."
-        )
+    recorded = stage_record(manifest, name, directory)
 
     final_pdb = recorded.get("final_pdb")
     csv = recorded.get("csv")
@@ -396,8 +459,6 @@ def _coordinate_paths(prefix: Path) -> tuple[str | None, str | None]:
 
 def _open_stage(files: StageFiles, *, atoms_per_chain: int | None = None) -> Ensemble:
     """Build an :class:`Ensemble` from resolved paths."""
-    from .packing import read_pdb
-
     assert files.topology is not None  # open_run checked this
     structure = read_pdb(files.topology)
     topology = structure.topology
@@ -413,12 +474,6 @@ def _open_stage(files: StageFiles, *, atoms_per_chain: int | None = None) -> Ens
 
     universe = _universe(files.topology, files.trajectory)
     n_frames = len(universe.trajectory)
-    if n_frames == 0:  # pragma: no cover - the readers raise first, see _universe
-        raise AnalysisError(
-            f"{files.trajectory} holds no frames. A stage shorter than its own "
-            "frame interval writes an empty trajectory; lower interval_ps on "
-            "its TrajectoryOptions."
-        )
     _check_size(universe.atoms.n_atoms, n_frames)
 
     masses, hydrogen = _chain_atoms(topology, block)
@@ -450,8 +505,6 @@ def _universe(topology_path: str, trajectory_path: str | None) -> Any:
     environment, so a library user under ``-W error`` is not tripped by a
     message about a file this package wrote and they never asked about.
     """
-    import warnings
-
     with warnings.catch_warnings():
         # Message-matched, never a blanket ignore: the diagnostics this module
         # relies on - an empty trajectory, a wrapped one - must still surface.
@@ -552,8 +605,6 @@ def _chain_atoms(
     topology: Any, atoms_per_chain: int
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.bool_]]:
     """One chain's masses and hydrogen mask, from the topology's elements."""
-    from openmm import unit
-
     masses: list[float] = []
     hydrogen: list[bool] = []
     for atom in list(topology.atoms())[:atoms_per_chain]:
@@ -664,6 +715,20 @@ def boxes_nm(ensemble: Ensemble, *, stride: int = 1) -> npt.NDArray[np.float64]:
     return np.asarray(
         [frame.box_nm for frame in ensemble.frames(stride=stride)], dtype=np.float64
     )
+
+
+def capped_stride(n_frames: int, stride: int, cap: int | None) -> int:
+    """The stride that keeps a measurement to at most *cap* of *n_frames*.
+
+    Never finer than *stride*, and *stride* itself when there is no cap.
+
+    Raises:
+        TypeError: *cap* is not an integer.
+        ValueError: *cap* is not positive.
+    """
+    if cap is None:
+        return stride
+    return max(stride, -(-n_frames // require_integer(cap, name="frame cap")))
 
 
 def require_trajectory(ensemble: Ensemble, what: str) -> None:

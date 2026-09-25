@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -21,30 +20,13 @@ from openmmpolymer.protocols import chain_dimensions
 from openmmpolymer.trajectory import AnalysisError
 
 from .helpers import (
+    dimer_cell,
     freely_rotating_chain,
     random_walk_frames,
     rod_positions,
+    rotating_dimer,
     synthetic_ensemble,
 )
-
-
-def dimer_cell(
-    n_chains: int = 32, separation_nm: float = 0.6, *, spacing_nm: float = 1.0
-) -> np.ndarray:
-    """One frame of *n_chains* two-atom molecules at a known separation.
-
-    The molecules sit on a lattice rather than on top of each other, so that
-    their centres of mass are distinct. Coincident chains make every
-    displacement identically zero, which passes a test without exercising it.
-    """
-    from .helpers import lattice
-
-    per_side = math.ceil(n_chains ** (1 / 3))
-    origins = lattice(n_chains, spacing_nm * per_side)
-    positions = np.zeros((n_chains * 2, 3), dtype=np.float64)
-    positions[0::2, :] = origins
-    positions[1::2, :] = origins + np.array([0.0, 0.0, separation_nm])
-    return positions
 
 
 def test_a_rigid_rod_gives_back_its_closed_form_radius_of_gyration() -> None:
@@ -174,12 +156,8 @@ def test_a_vector_rotating_at_a_known_rate_decorrelates_on_schedule() -> None:
     """``cos(theta) = 1/e`` at a known angle, so at a fixed rotation rate the
     relaxation time is a known number of picoseconds."""
     rate, interval = 0.02, 0.5
-    angles = np.arange(300, dtype=np.float64) * rate
-    frames = np.zeros((300, 2, 3), dtype=np.float64)
-    frames[:, 1, 0] = np.cos(angles) * 0.6
-    frames[:, 1, 1] = np.sin(angles) * 0.6
     measured = end_to_end_relaxation(
-        synthetic_ensemble(frames, n_chains=1, interval_ps=interval), (0, 1)
+        rotating_dimer(300, rate, interval_ps=interval), (0, 1)
     )
     assert measured.decorrelated
     assert measured.relaxation_time_ps == pytest.approx(
@@ -191,11 +169,7 @@ def test_a_vector_rotating_at_a_known_rate_decorrelates_on_schedule() -> None:
 def test_a_vector_that_never_turns_reports_no_relaxation_time() -> None:
     """The honest answer for a run shorter than the chains' own relaxation,
     which is every protocol this package ships."""
-    frames = np.zeros((50, 2, 3), dtype=np.float64)
-    frames[:, 1, 2] = 0.6
-    measured = end_to_end_relaxation(
-        synthetic_ensemble(frames, n_chains=1, interval_ps=1.0), (0, 1)
-    )
+    measured = end_to_end_relaxation(rotating_dimer(50, 0.0, interval_ps=1.0), (0, 1))
     assert not measured.decorrelated
     assert measured.relaxation_time_ps is None
     assert measured.trajectory_ps == pytest.approx(49.0)
@@ -317,12 +291,9 @@ def test_massless_chains_have_no_centre_of_mass() -> None:
         centre_of_mass_msd(ensemble)
 
 
-def test_the_measurements_that_need_a_trajectory_refuse_a_snapshot(
-    tmp_path: Path,
-) -> None:
+def test_the_measurements_that_need_a_trajectory_refuse_a_snapshot() -> None:
     """A displacement and a relaxation time are about change over time, and a
     number from one frame would be a fabrication."""
-    del tmp_path
     snapshot = synthetic_ensemble(dimer_cell(), n_chains=32)
     with pytest.raises(AnalysisError, match="needs a trajectory"):
         centre_of_mass_msd(snapshot)

@@ -56,17 +56,17 @@ from .conformation import (
 )
 from .convergence import (
     DEFAULT_WINDOW_FRACTIONS,
-    ConvergenceReport,
     ParameterConvergence,
     RelaxationWindowConvergence,
     RelaxationWindowEstimate,
     WindowConvergence,
     WindowEstimate,
-    analyse_convergence,
     relaxation_window_convergence,
     time_window_convergence,
 )
 from .convergence_report import (
+    ConvergenceReport,
+    analyse_convergence,
     plot_relaxation_convergence,
     plot_structural_convergence,
     plot_window_convergence,

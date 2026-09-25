@@ -37,6 +37,7 @@ from dataclasses import dataclass
 import numpy as np
 import numpy.typing as npt
 
+from ._fitting import TINY
 from ._validation import require_integer, require_positive
 from .trajectory import AnalysisError, Ensemble, boxes_nm, chain_positions
 
@@ -52,17 +53,17 @@ _Q_CHUNK = 4096
 #: to wait.
 MAX_WAVEVECTORS = 2_000_000
 
-#: Wavevectors a bin needs before its value may be called the peak. The
-#: longest waves a cell holds come in threes and sixes - there are only so many
-#: ways to make a short integer vector - and a sum over three of them follows
-#: the cell's own periodicity, not the structure inside it. On a real
-#: polyethylene melt those bins reach S(q) of twenty-six while the amorphous
-#: halo, averaged over a couple of hundred wavevectors, sits near three. A
-#: crystal is the exception, where a sharp Bragg peak genuinely has few
-#: wavevectors in it, so this is a parameter rather than a rule.
+#: Wavevectors a bin needs in each frame before its value may be called the
+#: peak. The longest waves a cell holds come in threes and sixes - there are
+#: only so many ways to make a short integer vector - and a sum over three of
+#: them follows the cell's own periodicity, not the structure inside it. On a
+#: real polyethylene melt those bins reach S(q) of twenty-six while the
+#: amorphous halo, averaged over a couple of hundred wavevectors, sits near
+#: three. Counted per frame, because averaging more frames of the same three
+#: wavevectors does not make them any more than three. A crystal is the
+#: exception, where a sharp Bragg peak genuinely has few wavevectors in it, so
+#: this is a parameter rather than a rule.
 MIN_WAVEVECTORS_PER_BIN = 20
-
-_TINY = 1.0e-30
 
 
 @dataclass(frozen=True)
@@ -107,13 +108,11 @@ class StructureFactor:
         q_per_nm: Bin centres, in inverse nanometres.
         s_q: The structure factor, spherically averaged over every wavevector
             of that magnitude the cell holds.
-        n_vectors: How many wavevectors fell in each bin. A bin fed by three
-            of them is not an average worth much.
+        n_vectors: How many wavevectors fell in each bin, over all the frames.
         first_peak_per_nm: Where it peaks - the amorphous halo. Searched only
-            over bins at or above :attr:`q_min_per_nm` that hold at least
-            ``min_vectors_per_bin`` wavevectors, because a peak the cell
-            cannot resolve is not a peak and a bin fed by three wavevectors is
-            not an average. Zero when no bin qualifies.
+            over the bins :func:`peak_bins` allows, which a peak the cell can
+            resolve and an average worth the name have to be in. Zero when no
+            bin qualifies.
         q_min_per_nm: ``2 pi / L`` for the largest cell edge. Nothing below
             this is measurable in a cell this size, whatever the curve does,
             because the cell cannot hold a longer wave.
@@ -201,18 +200,18 @@ def radial_distribution(
     other = n_atoms - per_chain
     ideal = 0.5 * n_atoms * other / float(np.mean([b.prod() for b in boxes])) * shells
     with np.errstate(divide="ignore", invalid="ignore"):
-        g_r = np.where(ideal > _TINY, counts / n_frames / np.maximum(ideal, _TINY), 0.0)
+        g_r = np.where(ideal > TINY, counts / n_frames / np.maximum(ideal, TINY), 0.0)
 
     # Read off the counts, not off g(r): the average number of other molecules'
     # atoms within a radius is a count, and needs no normalisation to be right.
     coordination = 2.0 * np.cumsum(counts) / n_frames / n_atoms
-    peak = int(np.argmax(g_r)) if g_r.size else 0
+    peak = int(np.argmax(g_r))
     return RadialDistribution(
         r_nm=centres,
         g_r=g_r,
         coordination_number=coordination,
-        first_peak_nm=float(centres[peak]) if g_r.size else 0.0,
-        first_peak_height=float(g_r[peak]) if g_r.size else 0.0,
+        first_peak_nm=float(centres[peak]),
+        first_peak_height=float(g_r[peak]),
         number_density_nm3=density,
         r_max_nm=limit,
         n_frames=int(n_frames),
@@ -240,9 +239,9 @@ def structure_factor(
         stride: Use every *stride*-th frame. Higher than elsewhere by
             default, because this is the expensive one and neighbouring frames
             carry almost the same structure.
-        min_vectors_per_bin: Wavevectors a bin needs before it may be called
-            the peak. Lower it to one for a crystal, whose Bragg peaks are
-            sharp and genuinely thinly populated; see
+        min_vectors_per_bin: Wavevectors a bin needs in each frame before it
+            may be called the peak. Lower it to one for a crystal, whose Bragg
+            peaks are sharp and genuinely thinly populated; see
             :data:`MIN_WAVEVECTORS_PER_BIN`.
 
     Returns:
@@ -285,38 +284,46 @@ def structure_factor(
     s_q[counted] = total[counted] / vectors[counted]
     centres = 0.5 * (edges[:-1] + edges[1:])
     floor = 2.0 * math.pi / float(boxes.max())
+    n_frames = int(positions.shape[0])
+    usable = peak_bins(centres, vectors, n_frames, floor, min_vectors_per_bin)
     return StructureFactor(
         q_per_nm=centres,
         s_q=s_q,
         n_vectors=vectors,
-        first_peak_per_nm=_peak_above(
-            centres, s_q, vectors, floor, min_vectors_per_bin
-        ),
+        first_peak_per_nm=_peak_above(centres, s_q, usable),
         q_min_per_nm=floor,
-        n_frames=int(positions.shape[0]),
+        n_frames=n_frames,
         heavy_atoms_only=heavy_atoms_only,
+    )
+
+
+def peak_bins(
+    q_per_nm: npt.NDArray[np.float64],
+    n_vectors: npt.NDArray[np.int64],
+    n_frames: int,
+    floor_per_nm: float,
+    min_vectors_per_bin: int,
+) -> npt.NDArray[np.bool_]:
+    """The bins of a structure factor that can carry its peak.
+
+    Two exclusions, and the second is the one that matters. Below
+    *floor_per_nm*, ``2 pi / L``, the cell cannot hold a wave at all, so a
+    peak there contradicts the floor reported beside it. And a bin fed by
+    fewer than *min_vectors_per_bin* wavevectors a frame is not an average;
+    :data:`MIN_WAVEVECTORS_PER_BIN` says why.
+    """
+    return np.asarray(
+        (n_vectors / n_frames >= min_vectors_per_bin) & (q_per_nm >= floor_per_nm),
+        dtype=np.bool_,
     )
 
 
 def _peak_above(
     q_per_nm: npt.NDArray[np.float64],
     s_q: npt.NDArray[np.float64],
-    n_vectors: npt.NDArray[np.int64],
-    floor_per_nm: float,
-    min_vectors: int,
+    usable: npt.NDArray[np.bool_],
 ) -> float:
-    """Where ``S(q)`` peaks, over the bins that can carry a peak.
-
-    Two exclusions, and the second is the one that matters. Below
-    ``2 pi / L`` the cell cannot hold a wave at all, so a peak there
-    contradicts the floor reported beside it. And a bin fed by a handful of
-    wavevectors is not an average: the longest waves a cell holds come in
-    threes and sixes, their sum follows the cell's periodicity rather than the
-    structure, and on a real melt they overtake the amorphous halo by an order
-    of magnitude. The halo is the answer wanted, and it is the bin with two
-    hundred wavevectors in it.
-    """
-    usable = (n_vectors >= min_vectors) & (q_per_nm >= floor_per_nm)
+    """Where ``S(q)`` peaks over the *usable* bins, or zero if there are none."""
     if not usable.any():
         return 0.0
     within = np.where(usable, s_q, -np.inf)

@@ -33,6 +33,7 @@ from dataclasses import dataclass
 import numpy as np
 import numpy.typing as npt
 
+from ._fitting import TINY
 from ._validation import require_integer
 from .protocols import ChainDimensions, chain_dimensions
 from .timeseries import Equilibration, equilibration
@@ -63,8 +64,6 @@ NM2_PS_TO_CM2_S = 1.0e-2
 #: Decades of lag time the diffusive slope is measured over, at the long-time
 #: end where the ballistic and caged regimes have been left behind.
 _SLOPE_DECADES = 1.0
-
-_TINY = 1.0e-30
 
 
 @dataclass(frozen=True)
@@ -296,7 +295,7 @@ def persistence_length(
     bonds = backbone_atoms[:, :, 1:, :] - backbone_atoms[:, :, :-1, :]
     lengths = np.linalg.norm(bonds, axis=-1)
     bond_length = float(lengths.mean())
-    units = bonds / np.clip(lengths, _TINY, None)[..., None]
+    units = bonds / np.clip(lengths, TINY, None)[..., None]
 
     n_bonds = units.shape[2]
     separations = np.arange(n_bonds, dtype=np.float64)
@@ -353,7 +352,7 @@ def end_to_end_relaxation(
     n_lags = _lag_count(vectors.shape[0], max_lag_fraction)
 
     reference = float((vectors * vectors).sum(-1).mean())
-    if reference <= _TINY:
+    if reference <= TINY:
         raise AnalysisError(
             "Every chain's end-to-end vector has zero length, so there is "
             "nothing to correlate. Is the backbone path right?"
@@ -419,7 +418,7 @@ def centre_of_mass_msd(
     positions, _ = chain_positions(ensemble, stride=stride)
     weights = ensemble.masses_amu
     total = float(weights.sum())
-    if total <= _TINY:
+    if total <= TINY:
         raise AnalysisError("The chains have no mass, so they have no centre of mass.")
     centres = np.einsum("a,fcad->fcd", weights, positions) / total
 
@@ -499,13 +498,9 @@ def _crossing(
     index = int(below[0])
     if index == 0:
         return float(x[0])
-    # Strictly positive by construction - the previous point is at or above
-    # the level and this one is below it - so the guard is against a denormal
-    # difference rather than a real tie.
-    span = y[index - 1] - y[index]
-    if abs(float(span)) < _TINY:  # pragma: no cover - needs denormal inputs
-        return float(x[index])
-    fraction = (y[index - 1] - level) / span
+    # The previous point is at or above the level and this one is below it,
+    # so the difference between them is positive and safe to divide by.
+    fraction = (y[index - 1] - level) / (y[index - 1] - y[index])
     return float(x[index - 1] + fraction * (x[index] - x[index - 1]))
 
 
@@ -533,10 +528,10 @@ def _decay_length(
     cut = max(2, min(cut, usable))
     x = distance[:cut]
     y = np.log(correlation[:cut])
-    if float(x[-1] - x[0]) < _TINY:
+    if float(x[-1] - x[0]) < TINY:
         return 0.0
     slope = float(np.polyfit(x, y, 1)[0])
-    if slope >= -_TINY:
+    if slope >= -TINY:
         return math.inf
     return -1.0 / slope
 
@@ -577,6 +572,6 @@ def _box_drift(boxes_nm_: npt.NDArray[np.float64]) -> float:
     """Spread of the cell edge over the frames used, over its mean."""
     edges = boxes_nm_.mean(axis=1)
     mean = float(edges.mean())
-    if mean <= _TINY:
+    if mean <= TINY:
         return 0.0
     return float(edges.max() - edges.min()) / mean

@@ -27,7 +27,6 @@ from openmmpolymer.elasticity import MPA_PER_BAR
 from openmmpolymer.relaxation import (
     KWW_BETA_BRACKET,
     MAX_EDGE_WEIGHT,
-    RelaxationCurve,
     _merge_bins,
     _prony_design,
     _signal_window,
@@ -43,35 +42,8 @@ from openmmpolymer.relaxation import (
 from openmmpolymer.stress import deviatoric_strain
 from openmmpolymer.trajectory import AnalysisError
 
+from .helpers import planted_relaxation as planted
 from .helpers import write_relaxation
-
-
-def planted(
-    time_ps: np.ndarray,
-    modulus_mpa: np.ndarray,
-    *,
-    error_mpa: np.ndarray | None = None,
-    floor: float = 0.0,
-    mode: str = "shear",
-    poisson: float = 0.5,
-) -> RelaxationCurve:
-    """A curve built straight from arrays, for testing a fit on its own."""
-    return RelaxationCurve(
-        stage="planted",
-        mode=mode,
-        bin_index=np.arange(time_ps.size),
-        time_ps=time_ps,
-        modulus_mpa=modulus_mpa,
-        standard_error_mpa=(np.zeros(time_ps.size) if error_mpa is None else error_mpa),
-        n_samples=np.full(time_ps.size, 100.0),
-        step_strain=0.03,
-        strain_measure=0.03,
-        temperature_k=298.15,
-        poisson=poisson,
-        baseline_mpa=0.0,
-        noise_floor_mpa=floor,
-    )
-
 
 # --------------------------------------------------------------------------
 # Reading a run directory

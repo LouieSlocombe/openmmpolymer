@@ -19,6 +19,8 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 
+from openmmpolymer.elasticity import ElasticModulus, StressStrain
+from openmmpolymer.relaxation import RelaxationCurve
 from openmmpolymer.tensile import BreakingSpec, ElongationSpec, TensileSpec, YieldSpec
 from openmmpolymer.timeseries import GlassTransition
 
@@ -1107,3 +1109,162 @@ def bare_simulation(
     )
     simulation.context.setPositions(np.asarray(positions_nm) * unit.nanometer)
     return simulation
+
+
+def nominal_curve(
+    strain: npt.ArrayLike,
+    nominal_stress_mpa: npt.ArrayLike,
+    *,
+    stage: str = "06_tensile_r0_00",
+    rate_per_ns: float | None = 0.2,
+    poisson: float = 0.2,
+    lateral_stress_mpa: float = 0.7,
+) -> StressStrain:
+    """A stress-strain curve whose nominal tensile stress is known exactly.
+
+    The lateral axes contract by *poisson* times the strain and carry a
+    constant *lateral_stress_mpa*, so the recorded stress is the nominal one
+    divided by the shrinking area plus that offset - which is what a strength
+    analysis has to undo, and what a figure of it should not show.
+    """
+    strains = np.asarray(strain, dtype=np.float64)
+    lateral = np.column_stack([-poisson * strains, -poisson * strains])
+    area_ratio = np.prod(1.0 + lateral, axis=1)
+    return StressStrain(
+        stage=stage,
+        axis=2,
+        strain=strains,
+        stress_mpa=np.asarray(nominal_stress_mpa, dtype=np.float64) / area_ratio
+        + lateral_stress_mpa,
+        lateral_strain=lateral,
+        lateral_stress_mpa=np.full((strains.size, 2), lateral_stress_mpa),
+        temperature_k=298.15,
+        strain_rate_per_ns=rate_per_ns,
+    )
+
+
+def rate_moduli(
+    moduli_mpa: Sequence[float], rates_per_ns: Sequence[float] = (0.01, 0.1, 1.0)
+) -> list[ElasticModulus]:
+    """Resolved Young's moduli, one per strain rate, each known to 10 MPa."""
+    return [
+        ElasticModulus(
+            modulus_mpa=value,
+            intercept_mpa=0.0,
+            strain_limit=0.015,
+            n_points=8,
+            residual_mpa=0.1,
+            standard_error_mpa=10.0,
+            half_disagreement=0.0,
+            temperature_k=298.15,
+            strain_rate_per_ns=rate,
+            resolved=True,
+        )
+        for rate, value in zip(rates_per_ns, moduli_mpa, strict=True)
+    ]
+
+
+def planted_relaxation(
+    time_ps: npt.NDArray[np.float64],
+    modulus_mpa: npt.NDArray[np.float64],
+    *,
+    error_mpa: npt.NDArray[np.float64] | None = None,
+    floor: float = 0.0,
+    mode: str = "shear",
+    poisson: float = 0.5,
+) -> RelaxationCurve:
+    """A relaxation curve built straight from arrays, for testing a fit alone."""
+    return RelaxationCurve(
+        stage="planted",
+        mode=mode,
+        bin_index=np.arange(time_ps.size),
+        time_ps=time_ps,
+        modulus_mpa=modulus_mpa,
+        standard_error_mpa=np.zeros(time_ps.size) if error_mpa is None else error_mpa,
+        n_samples=np.full(time_ps.size, 100.0),
+        step_strain=0.03,
+        strain_measure=0.03,
+        temperature_k=298.15,
+        poisson=poisson,
+        baseline_mpa=0.0,
+        noise_floor_mpa=floor,
+    )
+
+
+def stationary_trace(n_samples: int = 6000) -> npt.NDArray[np.float64]:
+    """Uncorrelated noise about ten, the trace every window test starts from."""
+    return 10.0 + np.random.default_rng(7).normal(0.0, 0.5, n_samples)
+
+
+#: Structural-window settings small enough for a test cell: coarse grids, no
+#: frame caps, and a wavevector floor a four-rod cell can meet.
+STRUCTURAL_OPTIONS: dict[str, Any] = {
+    "q_max_per_nm": 8,
+    "q_bins": 8,
+    "rdf_bins": 20,
+    "min_frames": 3,
+    "min_vectors_per_bin": 1,
+    "max_distribution_frames": None,
+    "max_structure_factor_frames": None,
+}
+
+
+def frozen_rods(n_frames: int = 72) -> Any:
+    """Four straight five-bead rods, repeated unchanged over *n_frames* frames."""
+    positions = np.concatenate(
+        [rod_positions(5, 0.15) + np.array([0, index * 0.8, 0]) for index in range(4)]
+    )
+    frames = np.repeat(positions[None, :, :], n_frames, axis=0)
+    return synthetic_ensemble(frames, n_chains=4, box_nm=4)
+
+
+def log_linear_transitions(
+    rates: Sequence[float] = (1.0, 10.0, 100.0), **options: Any
+) -> list[GlassTransition]:
+    """Transitions exactly on ``Tg = 340 + 20 log10(R)``, one per rate."""
+    return [
+        transition_at(rate, 340.0 + 20.0 * math.log10(rate), **options)
+        for rate in rates
+    ]
+
+
+#: The VFT melt the rate fits are checked against: T0, B and R0.
+VFT_PLANTED = (300.0, 400.0, 1.0e4)
+
+
+def vft_transitions(rates: Sequence[float] = (2.0, 5.0, 10.0)) -> list[GlassTransition]:
+    """Transitions exactly on the :data:`VFT_PLANTED` relation, one per rate."""
+    t0_k, b_k, r0 = VFT_PLANTED
+    return [transition_at(rate, t0_k + b_k / math.log(r0 / rate)) for rate in rates]
+
+
+def dimer_cell(
+    n_chains: int = 32, separation_nm: float = 0.6, *, spacing_nm: float = 1.0
+) -> np.ndarray:
+    """One frame of *n_chains* two-atom molecules at a known separation.
+
+    The molecules sit on a lattice rather than on top of each other, so that
+    their centres of mass are distinct. Coincident chains make every
+    displacement identically zero, which passes a test without exercising it.
+    """
+    per_side = math.ceil(n_chains ** (1 / 3))
+    origins = lattice(n_chains, spacing_nm * per_side)
+    positions = np.zeros((n_chains * 2, 3), dtype=np.float64)
+    positions[0::2, :] = origins
+    positions[1::2, :] = origins + np.array([0.0, 0.0, separation_nm])
+    return positions
+
+
+def rotating_dimer(
+    n_frames: int, radians_per_frame: float, *, interval_ps: float
+) -> Any:
+    """One 0.6 nm dimer turning at a constant rate in the xy plane.
+
+    Its end-to-end correlation is ``cos(rate * lag)`` exactly, so it crosses
+    1/e at a known lag; at a rate of zero it never decorrelates at all.
+    """
+    angles = np.arange(n_frames, dtype=np.float64) * radians_per_frame
+    frames = np.zeros((n_frames, 2, 3), dtype=np.float64)
+    frames[:, 1, 0] = np.cos(angles) * 0.6
+    frames[:, 1, 1] = np.sin(angles) * 0.6
+    return synthetic_ensemble(frames, n_chains=1, interval_ps=interval_ps)

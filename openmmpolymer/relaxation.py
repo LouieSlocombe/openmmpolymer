@@ -40,9 +40,10 @@ fitted to noise is an extremely convincing description of nothing.
 What makes the early part of the curve mean anything is replicas, not
 sampling. The first bins hold a reading or two, so a single run resolves the
 decade or so where the stress is largest and nothing else; several independent
-runs add bin for bin and push the usable window out at both ends. That is the
-reason the bin edges come from the settings rather than from the data - it is
-what makes chunk-merge and replica-merge the same addition.
+runs averaged bin for bin push the usable window out at both ends. That is the
+reason the bin edges come from the settings rather than from the data: it is
+what lets the chunks of one pass merge, and independent replicas line up, bin
+for bin.
 
 And there is no scipy here, which is a constraint rather than a preference -
 the package does not depend on it. Both fits are numpy. The KWW separates: for
@@ -66,13 +67,9 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 
-from .elasticity import (
-    MPA_PER_BAR,
-    _gather,
-    _require_stress_estimator,
-    _stages_holding,
-)
-from .trajectory import AnalysisError
+from ._fitting import NEGLIGIBLE, separable_fit
+from .elasticity import MPA_PER_BAR, _gather, _ladder, _require_stress_estimator
+from .trajectory import AnalysisError, stage_names, stages_holding
 
 log = logging.getLogger(__name__)
 
@@ -95,10 +92,10 @@ PRONY_PER_DECADE = 1
 
 #: The Prony grid stops at this fraction of the observed window. An
 #: exponential whose time constant is near the run length is barely
-#: distinguishable from a constant - measured, the cosine between that column
-#: and the column of ones is 0.99 - so the split between it and the
-#: equilibrium modulus becomes arbitrary. A third of the window keeps the
-#: slowest mode representable and still separable.
+#: distinguishable from a constant - the cosine between that column and the
+#: column of ones is 0.99 - so the split between it and the equilibrium
+#: modulus becomes arbitrary: against a planted value of 400, a grid reaching
+#: the whole window recovered 567 and one reaching a third of it 404.
 PRONY_SLOWEST_FRACTION = 1.0 / 3.0
 
 #: How many standard errors a point must stand above zero to be inside the
@@ -110,23 +107,16 @@ SIGNAL_TO_NOISE_FLOOR = 3.0
 #: How far the two halves of a fitted window may disagree about the
 #: stretching exponent before the fit has stopped describing the curve.
 #:
-#: Loose on purpose, and the measurement says why. On clean data it is a
-#: perfect discriminator: a genuine stretched exponential gives 0.00 and one
-#: with a five per cent plateau under it gives 0.26. But a genuine stretched
-#: exponential measured with five per cent noise also gives a median of 0.25,
-#: with draws running past 0.7 - so at any threshold tight enough to catch a
-#: small plateau, half of all honest noisy fits are thrown away too. The two
-#: cases are not separable this way, and pretending otherwise would just move
-#: the error somewhere less visible.
-#:
-#: So this is set where it only fires on gross misfit, which is a real thing
-#: to report even though it cannot say which of the two caused it. A plateau
-#: is caught properly elsewhere and by something that can actually tell:
-#: :func:`fit_prony` fits an equilibrium modulus explicitly, and a KWW - which
-#: decays to zero by construction - claiming to describe a curve that has one
-#: is a disagreement between two independent functional forms. That is the
-#: check with evidence behind it, and
-#: :func:`~openmmpolymer.viscoelastic.analyse_relaxation` makes it.
+#: Loose on purpose. On clean data the disagreement tells a genuine stretched
+#: exponential (0.00) from one with a five per cent plateau under it (0.26),
+#: but with five per cent noise a genuine one gives a median of 0.25 and draws
+#: past 0.7, so any threshold tight enough to catch a small plateau throws
+#: away half the honest fits too. It is set to fire on gross misfit only. A
+#: plateau is caught by something that can tell: :func:`fit_prony` fits an
+#: equilibrium modulus explicitly, and a KWW - which decays to zero by
+#: construction - claiming to describe a curve that has one is a disagreement
+#: between two independent functional forms, which
+#: :func:`~openmmpolymer.viscoelastic.analyse_relaxation` checks.
 MAX_KWW_HALF_DISAGREEMENT = 0.5
 
 #: Root-mean-square residual, in log modulus, a KWW may carry and still claim
@@ -145,13 +135,6 @@ MIN_FITTED_DECADES = 1.0
 #: How much of the relaxing weight may sit on the slowest time constant before
 #: the run is judged not to have seen the end of its own relaxation.
 MAX_EDGE_WEIGHT = 0.5
-
-#: Fraction of the fitted points that may lie inside the noise floor before a
-#: fit stops claiming to have described a decay.
-MAX_POINTS_IN_NOISE = 0.5
-
-#: Smallest denominator worth dividing by.
-_TINY = 1.0e-12
 
 
 # --------------------------------------------------------------------------
@@ -239,11 +222,6 @@ class RelaxationCurve:
         :attr:`instant_mpa` is the reading taken before any dynamics at all.
         """
         return float(self.modulus_mpa[0]) if self.n_points else math.nan
-
-    @property
-    def above_noise(self) -> npt.NDArray[np.bool_]:
-        """Which points stand above the floor the baseline scatter sets."""
-        return np.abs(self.modulus_mpa) > self.noise_floor_mpa
 
     def youngs_modulus_mpa(
         self, poisson: float | None = None
@@ -388,10 +366,8 @@ class PronyFit:
 def relax_stages(run_dir: str | Path) -> tuple[str, ...]:
     """Name every stage in a run that applied a step strain and held it.
 
-    Found by what a stage recorded rather than by what it was called, the same
-    way :func:`~openmmpolymer.elasticity.deform_stages` finds a deformation, so
-    a relaxation split into chunks for resume - or repeated as several
-    replicas - is read without anything having to agree on names in advance.
+    Found by what each stage recorded rather than by its name, as
+    :func:`~openmmpolymer.trajectory.stages_holding` explains.
 
     Args:
         run_dir: A directory a run wrote to.
@@ -402,22 +378,18 @@ def relax_stages(run_dir: str | Path) -> tuple[str, ...]:
     Raises:
         AnalysisError: There is no manifest, or nothing in it was a relaxation.
     """
-    return _stages_holding(run_dir, "segment_bin", "a binned stress relaxation")
+    return stages_holding(run_dir, _ladder("segment_bin"), "a binned stress relaxation")
 
 
 def _merge_bins(samples: dict[str, list[float]]) -> dict[str, npt.NDArray[np.float64]]:
     """Add several chunks' bins together, bin for bin.
 
     :func:`~openmmpolymer.elasticity._gather` concatenates, which is right for
-    a strain ladder and would be silently wrong here - two chunks of one
+    a strain ladder and would be silently wrong here: two chunks of one
     relaxation would give a curve with every shared bin in it twice, and
     nothing downstream would notice. Grouping the concatenation by bin index
     fixes that, and the count and the mean square recorded beside each mean
-    make it exact: the merged numbers are the ones one unbroken run would have
-    written, rather than an average of averages over unequal samples.
-
-    This is also what merges replicas, and the two being the same addition is
-    the point of deriving the bin edges from the settings.
+    make it exact rather than an average of averages over unequal samples.
     """
     index = np.asarray(samples["segment_bin"], dtype=np.int64)
     counts = np.asarray(samples["segment_samples"], dtype=np.float64)
@@ -445,9 +417,8 @@ def _standard_error(
 ) -> npt.NDArray[np.float64]:
     """The standard error of each bin's mean, or NaN for a bin of one.
 
-    Clamped at zero before the square root, the way
-    :func:`~openmmpolymer.elasticity` clamps a residual sum: the variance is a
-    difference of two large similar numbers and can come out a hair negative.
+    Clamped at zero before the square root: the variance is a difference of
+    two large similar numbers and can come out a hair negative.
 
     It is also an underestimate, and knowingly so. It assumes the readings in
     a bin are independent, and stress readings a tenth of a picosecond apart
@@ -477,11 +448,7 @@ def relaxation_curve(
         AnalysisError: There is nothing there to read, or what is there did
             not record a relaxation.
     """
-    names = (
-        relax_stages(run_dir)
-        if stage is None
-        else ((stage,) if isinstance(stage, str) else tuple(stage))
-    )
+    names = relax_stages(run_dir) if stage is None else stage_names(stage)
     samples, temperature = _gather(run_dir, names)
     if "relax_plane" in samples:
         _require_stress_estimator(samples, names)
@@ -492,14 +459,14 @@ def relaxation_curve(
         )
 
     measures = samples.get("relax_strain_measure") or []
-    if not measures or abs(measures[0]) < _TINY:
+    if not measures or abs(measures[0]) < NEGLIGIBLE:
         raise AnalysisError(
             f"{', '.join(names)} recorded no strain to divide by, so its "
             "stress cannot be turned into a modulus."
         )
     # Chunks of one pass all record the same one; a caller who has grouped two
     # different passes together has asked for a curve that does not exist.
-    if max(measures) - min(measures) > _TINY:
+    if max(measures) - min(measures) > NEGLIGIBLE:
         raise AnalysisError(
             f"{', '.join(names)} were strained by different amounts "
             f"({sorted(set(measures))}), so they are not chunks of one "
@@ -510,14 +477,12 @@ def relaxation_curve(
     merged = _merge_bins(samples)
     order = np.argsort(merged["time_ps"])
     scale = MPA_PER_BAR / measure
-    baseline = float((samples.get("baseline_stress_bar") or [0.0])[0])
-
-    floor = math.nan
-    baseline_n = float((samples.get("baseline_samples") or [0.0])[0])
-    baseline_sq = float((samples.get("baseline_stress_sq_bar2") or [0.0])[0])
-    if baseline_n > 1.0:
-        spread = max(0.0, baseline_sq - baseline * baseline)
-        floor = math.sqrt(spread / baseline_n) * abs(scale)
+    baseline = _first(samples, "baseline_stress_bar", 0.0)
+    zero_level_error = _standard_error(
+        np.asarray([baseline]),
+        np.asarray([_first(samples, "baseline_stress_sq_bar2", 0.0)]),
+        np.asarray([_first(samples, "baseline_samples", 0.0)]),
+    )
 
     instant = samples.get("instant_stress_bar") or []
     mode = "shear" if "relax_plane" in samples else "tensile"
@@ -532,14 +497,19 @@ def relaxation_curve(
         )
         * abs(scale),
         n_samples=merged["n"][order],
-        step_strain=float((samples.get("step_strain") or [math.nan])[0]),
+        step_strain=_first(samples, "step_strain", math.nan),
         strain_measure=measure,
         temperature_k=temperature,
-        poisson=float((samples.get("relax_poisson") or [math.nan])[0]),
+        poisson=_first(samples, "relax_poisson", math.nan),
         baseline_mpa=baseline * scale,
-        noise_floor_mpa=floor,
+        noise_floor_mpa=float(zero_level_error[0]) * abs(scale),
         instant_mpa=(instant[0] - baseline) * scale if instant else math.nan,
     )
+
+
+def _first(samples: dict[str, list[float]], key: str, missing: float) -> float:
+    """The first value the stages recorded under *key*, or *missing*."""
+    return float((samples.get(key) or [missing])[0])
 
 
 def mean_curve(curves: Sequence[RelaxationCurve]) -> RelaxationCurve:
@@ -550,12 +520,6 @@ def mean_curve(curves: Sequence[RelaxationCurve]) -> RelaxationCurve:
     independent runs report how far they disagree with each other, which is
     the thing worth quoting - the same reason
     :data:`~openmmpolymer.mechanical.MAX_REPLICA_SPREAD` exists.
-
-    Averaging is what makes the early part of the curve mean anything at all.
-    The first bins hold one reading each, so a single run resolves about a
-    decade around the largest stress and nothing else; adding replicas is the
-    only way to push the usable window out at both ends, and it is exactly
-    why the bins were derived from the settings rather than from the data.
 
     Args:
         curves: The replicas, which must share a grid.
@@ -643,14 +607,10 @@ def _signal_window(
     stretching exponent down and the time constant out - the fit would be
     describing the asymmetry of the cut rather than the polymer.
 
-    The signal-to-noise floor is not fastidiousness either. A stretched
-    exponential is fitted through a logarithm, and ``ln(G + noise)`` sits
-    below ``ln G`` by about half the squared relative error: five per cent at
-    a signal-to-noise of three, thirteen at two.
-
     The test runs from the end because the earliest bins are noisy for the
     opposite reason - one reading each - and the usable stretch is in the
-    middle.
+    middle. How far above its error a bin must stand is
+    :data:`SIGNAL_TO_NOISE_FLOOR`, and why.
     """
     scale = np.where(np.isfinite(error_mpa), error_mpa, 0.0)
     usable = modulus_mpa > floor * scale
@@ -662,18 +622,29 @@ def _signal_window(
     return window
 
 
+def _fitted(
+    curve: RelaxationCurve, signal_to_noise: float
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], tuple[float, float]]:
+    """The times and moduli a fit rests on, and the first and last time."""
+    window = _signal_window(
+        curve.modulus_mpa, curve.standard_error_mpa, signal_to_noise
+    )
+    time_ps = curve.time_ps[window]
+    span = (
+        (float(time_ps[0]), float(time_ps[-1]))
+        if time_ps.size
+        else (math.nan, math.nan)
+    )
+    return time_ps, curve.modulus_mpa[window], span
+
+
 def _kww_search(
     time_ps: npt.NDArray[np.float64], modulus_mpa: npt.NDArray[np.float64]
 ) -> tuple[dict[str, float], float, str]:
-    """Fit ``G = G0 exp[-(t/tau)^beta]`` with numpy alone.
+    """Fit ``G = G0 exp[-(t/tau)^beta]``, which is linear in ``t^beta``.
 
-    Three parameters and no scipy, and the problem separates exactly the way
-    :func:`~openmmpolymer.timeseries._fit_vft` does: for any fixed ``beta``,
-    ``ln G = ln G0 - t^beta / tau^beta`` is *linear* in ``t^beta``, so the
-    nonlinear fit collapses to a one-dimensional search with an exact
-    least-squares solve inside it. A coarse sweep and four zoom rounds is a
-    few hundred solves of a two-by-two system: deterministic, derivative-free,
-    and with no way to fail to converge.
+    For any fixed ``beta``, ``ln G = ln G0 - t^beta / tau^beta``, so the fit
+    is a separable search over the exponent.
 
     Unweighted, and that is a choice rather than an omission. Bins equally
     spaced in log time already weight the fit equally per decade, which is the
@@ -685,43 +656,17 @@ def _kww_search(
     Returns the parameters, the sum of squared residuals in log modulus, and
     which end of the bracket - if either - the optimum ran to.
     """
-    y = np.log(modulus_mpa)
-
-    def solve(beta: float) -> tuple[float, float, float]:
-        design = np.vstack([time_ps**beta, np.ones_like(time_ps)]).T
-        solution, *_ = np.linalg.lstsq(design, y, rcond=None)
-        # Computed rather than taken from lstsq, which returns an empty
-        # residual array for an exactly-determined system.
-        residual = y - design @ solution
-        return float(solution[0]), float(solution[1]), float(residual @ residual)
-
-    lower, upper = KWW_BETA_BRACKET
-    grid = np.linspace(lower, upper, 181)
-    best_beta, best = lower, solve(lower)
-    for _ in range(4):
-        for candidate in grid:
-            trial = solve(float(candidate))
-            if trial[2] < best[2]:
-                best_beta, best = float(candidate), trial
-        span = float(grid[1] - grid[0])
-        grid = np.linspace(
-            max(lower, best_beta - span), min(upper, best_beta + span), 41
-        )
-
-    slope, intercept, total = best
-    edge = ""
-    if best_beta <= lower + 1.0e-9:
-        edge = "lower"
-    elif best_beta >= upper - 1.0e-9:
-        edge = "upper"
+    beta, slope, intercept, total, edge = separable_fit(
+        lambda beta: time_ps**beta, np.log(modulus_mpa), KWW_BETA_BRACKET
+    )
     if slope >= 0.0:
         # Not decaying, so there is no time constant to report.
-        return {"beta": best_beta}, total, edge
+        return {"beta": beta}, total, edge
     return (
         {
-            "beta": best_beta,
+            "beta": beta,
             "modulus_mpa": math.exp(intercept),
-            "tau_ps": (-1.0 / slope) ** (1.0 / best_beta),
+            "tau_ps": (-1.0 / slope) ** (1.0 / beta),
         },
         total,
         edge,
@@ -731,17 +676,12 @@ def _kww_search(
 def _mean_tau_ps(tau_ps: float, beta: float) -> float:
     """``(tau / beta) Gamma(1 / beta)``, the integral of the decay.
 
-    Guarded, because ``math.gamma`` raises ``OverflowError`` once ``1 / beta``
-    reaches about 172 and is already enormous well before that - it is 1.2e17
-    at ``beta = 0.05``. The bracket floor keeps this reachable in practice;
-    the guard is for the case where it does not.
+    ``math.gamma`` overflows once ``1 / beta`` reaches about 172, which the
+    floor of :data:`KWW_BETA_BRACKET` keeps well out of reach.
     """
-    if not (math.isfinite(tau_ps) and 0.0 < beta <= 1.0):
+    if not math.isfinite(tau_ps):
         return math.nan
-    try:
-        return float(tau_ps / beta * math.gamma(1.0 / beta))
-    except (OverflowError, ValueError):  # pragma: no cover - beta below 0.006
-        return math.inf
+    return float(tau_ps / beta * math.gamma(1.0 / beta))
 
 
 def fit_kww(
@@ -761,17 +701,7 @@ def fit_kww(
     Returns:
         The fit, whose ``resolved`` says whether to believe it.
     """
-    window = _signal_window(
-        curve.modulus_mpa, curve.standard_error_mpa, signal_to_noise
-    )
-    time_ps = curve.time_ps[window]
-    modulus = curve.modulus_mpa[window]
-    span = (
-        (float(time_ps[0]), float(time_ps[-1]))
-        if time_ps.size
-        else (math.nan, math.nan)
-    )
-
+    time_ps, modulus, span = _fitted(curve, signal_to_noise)
     if time_ps.size < max(2, min_points):
         return KWWFit(
             modulus_mpa=math.nan,
@@ -790,24 +720,21 @@ def fit_kww(
         )
 
     parameters, total, edge = _kww_search(time_ps, modulus)
-    beta = parameters.get("beta", math.nan)
+    beta = parameters["beta"]
     tau = parameters.get("tau_ps", math.nan)
     modulus_0 = parameters.get("modulus_mpa", math.nan)
     mean_tau = _mean_tau_ps(tau, beta)
     residual = math.sqrt(total / time_ps.size)
 
-    # The check that catches the real mistake, and the same one
-    # `elasticity.ElasticModulus` makes about a slope. A melt has a rubbery
-    # plateau; a stretched exponential decays to zero; fitting the one to the
-    # other succeeds and returns an entirely plausible number. The two halves
-    # of the window then want different exponents, and a genuine KWW's do not.
+    # The check elasticity.ElasticModulus makes of a slope: the two halves of a
+    # genuine KWW want one exponent, and a curve with something else in it -
+    # most often a plateau - wants two.
     half = time_ps.size // 2
     disagreement = math.nan
-    if half >= 2 and math.isfinite(beta) and beta > 0.0:
+    if half >= 2:
         early, _, _ = _kww_search(time_ps[:half], modulus[:half])
         late, _, _ = _kww_search(time_ps[half:], modulus[half:])
-        if "beta" in early and "beta" in late:
-            disagreement = abs(early["beta"] - late["beta"]) / beta
+        disagreement = abs(early["beta"] - late["beta"]) / beta
 
     decades = (
         max(0.0, math.log10(mean_tau / span[1]))
@@ -907,7 +834,7 @@ def nnls(
             step = float(
                 np.min(
                     solution[blocking]
-                    / np.maximum(solution[blocking] - trial[blocking], _TINY)
+                    / np.maximum(solution[blocking] - trial[blocking], NEGLIGIBLE)
                 )
             )
             solution = solution + step * (trial - solution)
@@ -940,12 +867,9 @@ def prony_times_ps(
     """The relaxation times a Prony fit uses, fixed rather than fitted.
 
     Fixing them is what makes the weights linear and so exactly solvable. The
-    top of the grid is the choice that matters: an exponential whose time
-    constant is near the length of the run is almost indistinguishable from a
-    constant - the two columns are 0.99 collinear - so the split between it
-    and the equilibrium modulus becomes arbitrary and ``G_inf`` comes out
-    wrong. Measured against a planted value of 400, a grid reaching the whole
-    window recovered 567 and one reaching a third of it recovered 404.
+    top of the grid is the choice that matters, and it stops at
+    :data:`PRONY_SLOWEST_FRACTION` of the window so that ``G_inf`` stays
+    separable from the slowest mode.
 
     Args:
         first_ps: The earliest time fitted.
@@ -981,17 +905,7 @@ def fit_prony(
     Returns:
         The spectrum, whose ``resolved`` says whether to believe it.
     """
-    window = _signal_window(
-        curve.modulus_mpa, curve.standard_error_mpa, signal_to_noise
-    )
-    time_ps = curve.time_ps[window]
-    modulus = curve.modulus_mpa[window]
-    span = (
-        (float(time_ps[0]), float(time_ps[-1]))
-        if time_ps.size
-        else (math.nan, math.nan)
-    )
-
+    time_ps, modulus, span = _fitted(curve, signal_to_noise)
     if time_ps.size < max(2, min_points):
         return PronyFit(
             tau_ps=np.zeros(0, dtype=np.float64),
@@ -1017,12 +931,12 @@ def fit_prony(
     residual = modulus - design @ coefficients
 
     relaxing = float(weights.sum())
-    edge = float(weights[-1] / relaxing) if relaxing > _TINY else math.nan
+    edge = float(weights[-1] / relaxing) if relaxing > NEGLIGIBLE else math.nan
     # A spectrum whose slowest term carries the weight is saying the decay was
     # still going when the data stopped, so whatever G_inf came out is a
     # plateau nobody watched the curve reach.
     plateau = bool(math.isfinite(edge) and edge <= MAX_EDGE_WEIGHT)
-    active = int(np.count_nonzero(weights > _TINY))
+    active = int(np.count_nonzero(weights > NEGLIGIBLE))
 
     resolved = bool(
         time_ps.size >= min_points

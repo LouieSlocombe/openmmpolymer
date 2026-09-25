@@ -25,9 +25,12 @@ from openmmpolymer.timeseries import (
 from openmmpolymer.trajectory import AnalysisError
 
 from .helpers import (
+    VFT_PLANTED,
+    log_linear_transitions,
     state_data_csv,
     transition_at,
     two_line_curve,
+    vft_transitions,
     write_quench,
     write_quenches,
 )
@@ -136,16 +139,50 @@ def test_a_series_that_never_moves_is_handled_rather_than_dividing_by_zero() -> 
     assert settled.relative_drift == pytest.approx(0.0, abs=1.0e-9)
 
 
-def test_a_correlated_series_is_worth_fewer_samples_than_it_has_rows() -> None:
-    """Reporting often does not buy independent evidence, and quoting a
-    standard error over the row count would understate it."""
+def correlated_series() -> np.ndarray:
+    """Two thousand rows of a series that remembers 95 per cent of its last."""
     rng = np.random.default_rng(5)
     values = np.zeros(2000)
     for index in range(1, values.size):
         values[index] = 0.95 * values[index - 1] + rng.normal(0.0, 0.1)
-    settled = equilibration(np.arange(values.size, dtype=np.float64), values + 10.0)
+    return values + 10.0
+
+
+def test_a_correlated_series_is_worth_fewer_samples_than_it_has_rows() -> None:
+    """Reporting often does not buy independent evidence, and quoting a
+    standard error over the row count would understate it."""
+    values = correlated_series()
+    settled = equilibration(np.arange(values.size, dtype=np.float64), values)
     assert settled.n_independent_samples < settled.n_samples / 5
     assert settled.correlation_time_ps > 1.0
+
+
+def test_a_series_in_tiny_units_is_worth_the_samples_it_is_worth_in_any_other() -> None:
+    """A variance floor read a series in small enough units as constant, so
+    every row counted as independent and the standard error collapsed."""
+    values = correlated_series()
+    times = np.arange(values.size, dtype=np.float64)
+    ordinary = equilibration(times, values)
+    tiny = equilibration(times, values * 1.0e-20)
+    assert tiny.start_index == ordinary.start_index
+    assert tiny.n_independent_samples == pytest.approx(
+        ordinary.n_independent_samples, rel=1e-9
+    )
+    assert tiny.n_independent_samples < tiny.n_samples / 5
+    assert tiny.relative_standard_error == pytest.approx(
+        ordinary.relative_standard_error, rel=1e-9
+    )
+
+
+def test_the_standard_error_is_the_sample_deviation_over_independent_samples() -> None:
+    """Bessel-corrected, the same estimator the window analysis uses."""
+    values = np.random.default_rng(3).normal(0.85, 0.01, 400)
+    settled = equilibration(np.arange(400.0), values)
+    window = settled.window(values)
+    expected = float(np.std(window, ddof=1)) / math.sqrt(settled.n_independent_samples)
+    assert settled.relative_standard_error == pytest.approx(
+        expected / float(window.mean()), rel=1e-12
+    )
 
 
 def test_two_series_of_different_lengths_are_refused() -> None:
@@ -307,10 +344,9 @@ def test_a_curve_whose_branches_are_the_wrong_way_round_is_not_resolved(
     assert not glass_transition(quench_curve(tmp_path)).resolved
 
 
-def test_the_correlation_time_is_reported_in_picoseconds(tmp_path: Path) -> None:
+def test_the_correlation_time_is_reported_in_picoseconds() -> None:
     """Every other time in this package is, and a correlation time in rows
     would be a number that changed when the reporting interval did."""
-    del tmp_path
     rng = np.random.default_rng(9)
     values = np.zeros(4000)
     for index in range(1, values.size):
@@ -327,9 +363,10 @@ def test_the_correlation_time_is_reported_in_picoseconds(tmp_path: Path) -> None
 
 def test_a_series_whose_candidate_windows_run_out_still_settles() -> None:
     """The coarse grid of candidate starts can propose a window with too few
-    rows left in it, which is skipped rather than fitted."""
-    times = np.arange(6.0)
-    settled = equilibration(times, np.array([5.0, 1.0, 1.0, 1.0, 1.0, 1.0]))
+    rows left in it - four rows start as late as the third - which is skipped
+    rather than fitted."""
+    settled = equilibration(np.arange(4.0), np.array([5.0, 1.0, 1.0, 1.0]))
+    assert settled.start_index < 2
     assert settled.n_samples >= 3
 
 
@@ -342,10 +379,9 @@ def test_two_identical_branches_are_not_a_transition(tmp_path: Path) -> None:
     assert not fitted.resolved
 
 
-def test_a_series_that_straddles_zero_is_scaled_by_its_spread(tmp_path: Path) -> None:
+def test_a_series_that_straddles_zero_is_scaled_by_its_spread() -> None:
     """A total energy averaging zero has no meaningful relative drift against
     its mean, and dividing by it would give an enormous number or a NaN."""
-    del tmp_path
     from openmmpolymer.timeseries import _scale_of
 
     assert _scale_of(np.array([-1.0, 1.0, -1.0, 1.0])) == pytest.approx(1.0)
@@ -365,17 +401,6 @@ def test_a_window_spanning_no_time_has_no_drift() -> None:
     from openmmpolymer.timeseries import _relative_drift
 
     assert _relative_drift(np.zeros(4), np.array([1.0, 2.0, 3.0, 4.0]), 1.0) == 0.0
-
-
-def test_a_line_through_two_points_is_fitted_without_residuals() -> None:
-    """numpy.linalg.lstsq returns an empty residual array for an exactly
-    determined fit, so the sum has to be worked out rather than read off."""
-    from openmmpolymer.timeseries import _fit_line
-
-    (slope, intercept), total = _fit_line(np.array([0.0, 1.0]), np.array([1.0, 3.0]))
-    assert slope == pytest.approx(2.0)
-    assert intercept == pytest.approx(1.0)
-    assert total == pytest.approx(0.0, abs=1e-20)
 
 
 def test_a_cooling_rate_is_none_when_the_recorded_csv_has_gone(
@@ -675,11 +700,8 @@ def test_an_extrapolation_to_an_experimental_rate_is_never_resolved(
 
 def test_a_vft_fit_recovers_the_parameters_it_was_built_from() -> None:
     """Three rates exactly determine it, and the search has to find them."""
-    t0, b_k, r0 = 300.0, 400.0, 1.0e4
-    rates = (2.0, 5.0, 10.0)
-    fits = [transition_at(r, t0 + b_k / math.log(r0 / r)) for r in rates]
-
-    fit = cooling_rate_extrapolation(fits, form="vft")
+    t0, b_k, r0 = VFT_PLANTED
+    fit = cooling_rate_extrapolation(vft_transitions(), form="vft")
 
     assert fit.parameters["t0_k"] == pytest.approx(t0, rel=1.0e-4)
     assert fit.parameters["b_k"] == pytest.approx(b_k, rel=1.0e-4)
@@ -695,22 +717,33 @@ def test_the_two_forms_disagree_by_a_hundred_kelvin_over_ten_decades() -> None:
     this melt the honest answer is near 313 K. The straight line in log rate
     runs away to 190 K; VFT, which has a finite limit, does not.
     """
-    t0, b_k, r0 = 300.0, 400.0, 1.0e4
-    fits = [transition_at(r, t0 + b_k / math.log(r0 / r)) for r in (2.0, 5.0, 10.0)]
-
-    straight = cooling_rate_extrapolation(fits, form="log_linear")
-    curved = cooling_rate_extrapolation(fits, form="vft")
+    straight = cooling_rate_extrapolation(vft_transitions(), form="log_linear")
+    curved = cooling_rate_extrapolation(vft_transitions(), form="vft")
 
     assert straight.temperature_k == pytest.approx(190.0, abs=2.0)
     assert curved.temperature_k == pytest.approx(313.0, abs=2.0)
     assert curved.temperature_k - straight.temperature_k > 100.0
 
 
+@pytest.mark.parametrize("form", ["log_linear", "vft"])
+def test_the_fitted_relation_predicts_the_reported_transition(form: str) -> None:
+    """The number at the target is the curve a figure draws, evaluated there."""
+    fit = cooling_rate_extrapolation(vft_transitions(), form=form)
+    rates = np.geomspace(1.0e-3, 10.0, 7)
+
+    assert fit.predict(fit.target_rate_k_per_ns) == pytest.approx(fit.temperature_k)
+    assert fit.predict(rates) == pytest.approx(
+        [fit.predict(float(rate)) for rate in rates]
+    )
+    assert fit.predict(fit.cooling_rate_k_per_ns) == pytest.approx(
+        fit.transition_k, abs=2.0 if form == "log_linear" else 1.0e-3
+    )
+
+
 def test_the_wlf_constants_are_the_vft_ones_rewritten() -> None:
     """WLF and VFT are one relation, so one fit answers for both."""
-    t0, b_k, r0 = 300.0, 400.0, 1.0e4
-    fits = [transition_at(r, t0 + b_k / math.log(r0 / r)) for r in (2.0, 5.0, 10.0)]
-    fit = cooling_rate_extrapolation(fits, form="vft")
+    t0, b_k, _ = VFT_PLANTED
+    fit = cooling_rate_extrapolation(vft_transitions(), form="vft")
 
     reference = 350.0
     c1, c2 = fit.wlf_constants(reference)
@@ -721,9 +754,7 @@ def test_the_wlf_constants_are_the_vft_ones_rewritten() -> None:
 
 def test_wlf_constants_need_a_reference_above_the_fitted_floor() -> None:
     """Below T0 they diverge, and a divergent constant is not a constant."""
-    t0, b_k, r0 = 300.0, 400.0, 1.0e4
-    fits = [transition_at(r, t0 + b_k / math.log(r0 / r)) for r in (2.0, 5.0, 10.0)]
-    fit = cooling_rate_extrapolation(fits, form="vft")
+    fit = cooling_rate_extrapolation(vft_transitions(), form="vft")
 
     with pytest.raises(AnalysisError, match="diverge"):
         fit.wlf_constants(250.0)
@@ -731,8 +762,7 @@ def test_wlf_constants_need_a_reference_above_the_fitted_floor() -> None:
 
 def test_wlf_constants_come_only_from_a_vft_fit() -> None:
     """A straight line in log rate has no T0 to reference them to."""
-    fits = [transition_at(r, 340.0 + 20.0 * math.log10(r)) for r in (1.0, 10.0, 100.0)]
-    fit = cooling_rate_extrapolation(fits, form="log_linear")
+    fit = cooling_rate_extrapolation(log_linear_transitions(), form="log_linear")
 
     with pytest.raises(AnalysisError, match="VFT"):
         fit.wlf_constants(350.0)
@@ -740,9 +770,7 @@ def test_wlf_constants_come_only_from_a_vft_fit() -> None:
 
 def test_a_vft_search_that_degenerates_to_a_straight_line_says_so() -> None:
     """Exactly log-linear data sends R0 to infinity; that is not a fit."""
-    fits = [transition_at(r, 340.0 + 20.0 * math.log10(r)) for r in (1.0, 10.0, 100.0)]
-
-    assert not cooling_rate_extrapolation(fits, form="vft").resolved
+    assert not cooling_rate_extrapolation(log_linear_transitions(), form="vft").resolved
 
 
 def test_a_transition_that_rises_as_cooling_slows_is_not_resolved() -> None:
@@ -764,8 +792,9 @@ def test_a_fit_over_transitions_that_did_not_resolve_does_not_resolve() -> None:
 
 def test_exactly_as_many_rates_as_parameters_does_not_resolve() -> None:
     """The residual is then zero by construction and says nothing."""
-    fits = [transition_at(r, 340.0 + 20.0 * math.log10(r)) for r in (1.0, 100.0)]
-    fit = cooling_rate_extrapolation(fits, target_rate_k_per_ns=30.0)
+    fit = cooling_rate_extrapolation(
+        log_linear_transitions((1.0, 100.0)), target_rate_k_per_ns=30.0
+    )
 
     assert fit.n_rates == fit.n_parameters
     assert fit.residual_k == pytest.approx(0.0, abs=1.0e-9)
@@ -774,10 +803,8 @@ def test_exactly_as_many_rates_as_parameters_does_not_resolve() -> None:
 
 def test_vft_needs_more_rates_than_it_has_parameters() -> None:
     """Two points cannot determine three numbers, and it says which."""
-    fits = [transition_at(r, 340.0 + 20.0 * math.log10(r)) for r in (1.0, 100.0)]
-
     with pytest.raises(AnalysisError, match="3 parameters"):
-        cooling_rate_extrapolation(fits, form="vft")
+        cooling_rate_extrapolation(log_linear_transitions((1.0, 100.0)), form="vft")
 
 
 def test_one_rate_cannot_show_a_rate_dependence() -> None:
@@ -804,7 +831,7 @@ def test_a_transition_with_no_recorded_rate_is_refused() -> None:
 
 def test_an_unknown_extrapolation_form_is_refused_at_the_call_site() -> None:
     """An argument, so a ValueError, like every other choice in the package."""
-    fits = [transition_at(r, 340.0 + 20.0 * math.log10(r)) for r in (1.0, 10.0)]
-
     with pytest.raises(ValueError, match="form="):
-        cooling_rate_extrapolation(fits, form="arrhenius")
+        cooling_rate_extrapolation(
+            log_linear_transitions((1.0, 10.0)), form="arrhenius"
+        )
