@@ -9,14 +9,12 @@ from typing import Any
 import numpy as np
 import pytest
 
-from openmmpolymer.elasticity import ElasticModulus
 from openmmpolymer.rate_dependence import (
     RateObservation,
     RateProperty,
     analyse_rate_observations,
     rate_extrapolation,
 )
-from openmmpolymer.strain_rate import strain_rate_extrapolation
 from openmmpolymer.trajectory import AnalysisError
 
 PROPERTY = RateProperty(
@@ -31,45 +29,20 @@ def observations() -> list[RateObservation]:
     ]
 
 
+def measured(
+    pairs: list[tuple[float, float]], *, error: float = 10.0
+) -> list[RateObservation]:
+    return [RateObservation(rate, value, error, True) for rate, value in pairs]
+
+
 def _value(item: RateObservation) -> float:
     assert item.value is not None
     return item.value
 
 
-@pytest.mark.parametrize("form", ["log_linear", "power_law"])
-def test_matches_young_modulus_regression_and_guards(form: str) -> None:
-    source = observations()
-    young = [
-        ElasticModulus(
-            modulus_mpa=_value(item),
-            intercept_mpa=0.0,
-            strain_limit=0.015,
-            n_points=10,
-            residual_mpa=0.1,
-            standard_error_mpa=10.0,
-            half_disagreement=0.0,
-            temperature_k=298.15,
-            strain_rate_per_ns=item.rate,
-            resolved=True,
-        )
-        for item in source
-    ]
-    expected = strain_rate_extrapolation(young, target_rate_per_ns=0.01, form=form)
-    result = rate_extrapolation(source, property=PROPERTY, target_rate=0.01, form=form)
-    assert result.value == pytest.approx(expected.modulus_mpa)
-    assert result.standard_error == pytest.approx(expected.standard_error_mpa)
-    assert result.sensitivity_per_decade == pytest.approx(
-        expected.sensitivity_mpa_per_decade
-    )
-    assert result.residual == pytest.approx(expected.residual_mpa)
-    assert result.relative_residual == pytest.approx(expected.relative_residual)
-    assert result.resolved == expected.resolved
-    assert result.reference_rate == pytest.approx(expected.reference_rate_per_ns)
-    assert result.extrapolation_decades == expected.extrapolation_decades
-    assert result.predict(0.01) == pytest.approx(result.value)
-    np.testing.assert_allclose(
-        result.predict(result.rates), expected.predict(result.rates)
-    )
+#: Deviations of +20, -20, -20, +20 MPa about a line through (0.01 ... 10) /ns,
+#: orthogonal to it, so the fitted line is exact and the residual is 20 MPa.
+SCATTERED = [(0.01, 820.0), (0.1, 880.0), (1.0, 980.0), (10.0, 1120.0)]
 
 
 def test_logarithmic_exact_line_preserves_input_uncertainty_and_sorting() -> None:
@@ -79,10 +52,23 @@ def test_logarithmic_exact_line_preserves_input_uncertainty_and_sorting() -> Non
     assert result.value == pytest.approx(800.0)
     assert result.standard_error == pytest.approx(10.0 * math.sqrt(7 / 3))
     assert result.sensitivity_per_decade == pytest.approx(100.0)
+    assert result.parameters["reference_value"] == pytest.approx(1000.0)
+    assert result.reference_rate == pytest.approx(1.0)
+    assert result.residual == pytest.approx(0.0, abs=1e-10)
+    assert result.extrapolation_decades == pytest.approx(1.0)
     np.testing.assert_array_equal(result.rates, [0.1, 1.0, 10.0])
     assert result.resolved
     with pytest.raises(FrozenInstanceError):
         result.value = 123.0  # type: ignore[misc]
+
+
+def test_arrays_sort_values_and_uncertainties_together() -> None:
+    source = observations()
+    source[2] = replace(source[2], standard_error=30.0)
+    result = rate_extrapolation(source[::-1], property=PROPERTY, target_rate=1.0)
+    np.testing.assert_array_equal(result.values, [900.0, 1000.0, 1100.0])
+    np.testing.assert_array_equal(result.standard_errors, [10.0, 10.0, 30.0])
+    assert result.standard_error == pytest.approx(math.sqrt(1100.0) / 3)
 
 
 def test_power_law_recovers_exponent_with_relative_error_propagation() -> None:
@@ -96,8 +82,31 @@ def test_power_law_recovers_exponent_with_relative_error_propagation() -> None:
     expected = 1000.0 * 0.01**0.2
     assert result.value == pytest.approx(expected)
     assert result.parameters["exponent"] == pytest.approx(0.2)
+    assert result.parameters["reference_value"] == pytest.approx(1000.0)
     assert result.standard_error == pytest.approx(expected * 0.01 * math.sqrt(7 / 3))
     assert result.sensitivity_per_decade == pytest.approx(200.0 * math.log(10.0))
+    assert result.residual == pytest.approx(0.0, abs=1e-9)
+    assert result.resolved
+
+
+@pytest.mark.parametrize("form", ["log_linear", "power_law"])
+def test_predict_evaluates_scalar_and_array_consistently(form: str) -> None:
+    result = rate_extrapolation(
+        observations(), property=PROPERTY, target_rate=0.03, form=form
+    )
+    assert result.predict(0.03) == pytest.approx(result.value)
+    predictions = result.predict(np.asarray([0.03, 1.0]))
+    assert predictions[0] == pytest.approx(result.value)
+    assert predictions[1] == pytest.approx(result.parameters["reference_value"])
+
+
+@pytest.mark.parametrize("rate", [0.0, -1.0, math.nan, math.inf])
+def test_predict_rejects_invalid_rates(rate: float) -> None:
+    result = rate_extrapolation(observations(), property=PROPERTY, target_rate=1.0)
+    with pytest.raises(ValueError, match="finite positive"):
+        result.predict(rate)
+    with pytest.raises(ValueError, match="finite positive"):
+        result.predict(np.asarray([1.0, rate]))
 
 
 def test_unit_changes_transform_values_errors_and_slopes() -> None:
@@ -125,6 +134,15 @@ def test_unit_changes_transform_values_errors_and_slopes() -> None:
     assert converted.resolved
 
 
+def test_centring_handles_extreme_rate_units_without_overflowing_ratios() -> None:
+    source = measured([(1e-300, 900.0), (1e-200, 1000.0), (1e-100, 1100.0)])
+    result = rate_extrapolation(source, property=PROPERTY, target_rate=1e-250)
+    assert result.value == pytest.approx(950.0)
+    assert result.reference_rate == pytest.approx(1e-200)
+    assert result.predict(1e-250) == pytest.approx(950.0)
+    assert result.resolved
+
+
 @pytest.mark.parametrize(
     "trend, resolved", [("any", True), ("decreasing", True), ("increasing", False)]
 )
@@ -138,14 +156,32 @@ def test_trend_is_configurable_without_constraining_fit(
     assert result.value == pytest.approx(1200.0)
     assert result.sensitivity_per_decade == pytest.approx(-100.0)
     assert result.resolved is resolved
+    if not resolved:
+        assert any("contradicts" in note for note in result.notes)
 
 
 @pytest.mark.parametrize("trend", ["any", "increasing", "decreasing"])
-def test_constant_response_satisfies_every_trend(trend: str) -> None:
+@pytest.mark.parametrize("form", ["log_linear", "power_law"])
+def test_constant_response_satisfies_every_trend(trend: str, form: str) -> None:
     source = [replace(item, value=1000.0) for item in observations()]
     result = rate_extrapolation(
-        source, property=replace(PROPERTY, trend=trend), target_rate=0.01
+        source, property=replace(PROPERTY, trend=trend), target_rate=0.01, form=form
     )
+    assert result.value == pytest.approx(1000.0)
+    assert result.sensitivity_per_decade == 0.0
+    assert result.resolved
+
+
+@pytest.mark.parametrize("form", ["log_linear", "power_law"])
+@pytest.mark.parametrize("value", [0.15, 1.6322159939602894])
+def test_uneven_rates_do_not_give_a_flat_response_a_rounding_slope(
+    form: str, value: float
+) -> None:
+    rates = np.geomspace(0.1, 11.13, 10)
+    rates[1] *= 1.13
+    source = [RateObservation(float(rate), value, value * 0.01, True) for rate in rates]
+    result = rate_extrapolation(source, property=PROPERTY, target_rate=1.0, form=form)
+    assert result.value == pytest.approx(value)
     assert result.sensitivity_per_decade == 0.0
     assert result.resolved
 
@@ -189,6 +225,24 @@ def test_target_must_be_strictly_inside_physical_bounds(
     assert any("strict physical bounds" in note for note in result.notes)
 
 
+def test_overflowing_power_law_prediction_is_unresolved_without_runtime_warning() -> (
+    None
+):
+    source = measured([(0.1, 1.0), (1.0, 1000.0), (10.0, 1000000.0)], error=0.0)
+    result = rate_extrapolation(
+        source, property=PROPERTY, target_rate=1e300, form="power_law"
+    )
+    assert math.isinf(result.value)
+    assert not result.resolved
+    assert math.isinf(result.predict(1e300))
+
+
+@pytest.mark.parametrize("count", [0, 1, 2])
+def test_three_rates_are_required(count: int) -> None:
+    with pytest.raises(AnalysisError, match="three or more distinct"):
+        rate_extrapolation(observations()[:count], property=PROPERTY, target_rate=1.0)
+
+
 def test_distinct_rate_count_cannot_be_inflated_with_replicas() -> None:
     source = observations()[:2] * 10
     with pytest.raises(AnalysisError, match="three or more distinct"):
@@ -215,6 +269,7 @@ def test_pooling_preserves_replica_spread_without_counting_extra_rates() -> None
     np.testing.assert_allclose(result.standard_errors, [math.sqrt(200.0)] * 3)
     assert result.standard_error == pytest.approx(math.sqrt(200.0 * 7 / 3))
     assert result.resolved
+    assert any("Repeated rates were pooled" in note for note in result.notes)
 
 
 def test_pooling_unknown_within_replica_errors_can_use_nonzero_sample_spread() -> None:
@@ -267,13 +322,18 @@ def test_censored_value_is_retained_and_blocks_both_models() -> None:
     [
         ({"temperature_k": 299.151}, "within 1 K"),
         ({"temperature_k": -1.0}, "temperature"),
+        ({"temperature_k": math.nan}, "temperature"),
         ({"conditions": {"axis": "y"}}, "same measurement conditions"),
         ({"conditions": {}}, "same measurement conditions"),
         ({"rate": 0.0}, "positive rate"),
+        ({"rate": -1.0}, "positive rate"),
+        ({"rate": math.nan}, "positive rate"),
         ({"rate": math.inf}, "positive rate"),
         ({"value": math.nan}, "physical bounds"),
+        ({"value": math.inf}, "physical bounds"),
         ({"value": 0.0}, "physical bounds"),
         ({"standard_error": -1.0}, "standard error"),
+        ({"standard_error": math.nan}, "standard error"),
         ({"standard_error": math.inf}, "standard error"),
     ],
 )
@@ -307,6 +367,59 @@ def test_partially_missing_temperatures_are_unresolved() -> None:
     assert any("temperatures are unknown" in note for note in result.notes)
 
 
+def test_residual_scatter_contributes_even_when_input_errors_are_zero() -> None:
+    result = rate_extrapolation(
+        measured(SCATTERED, error=0.0), property=PROPERTY, target_rate=math.sqrt(0.1)
+    )
+    assert result.value == pytest.approx(950.0)
+    assert result.residual == pytest.approx(20.0)
+    assert result.standard_error == pytest.approx(math.sqrt(200.0))
+    assert result.residual_to_error_ratio is None
+    assert result.resolved
+
+
+def test_known_error_is_not_counted_again_as_residual_scatter() -> None:
+    result = rate_extrapolation(
+        measured(SCATTERED, error=100.0), property=PROPERTY, target_rate=math.sqrt(0.1)
+    )
+    assert result.standard_error == pytest.approx(50.0)
+
+
+def test_small_relative_residual_must_match_reported_precision() -> None:
+    result = rate_extrapolation(
+        measured(SCATTERED, error=1.0), property=PROPERTY, target_rate=0.1
+    )
+    assert result.relative_residual == pytest.approx(20 / 950)
+    assert result.residual_to_error_ratio == pytest.approx(20)
+    assert not result.resolved
+    assert any("3 times" in note for note in result.notes)
+
+
+def test_floating_point_residual_does_not_refuse_a_numerically_exact_relation() -> None:
+    source = [
+        RateObservation(float(rate), 1000.0 + 100.0 * math.log10(rate), 1e-30, True)
+        for rate in np.geomspace(0.1, 11.13, 13)
+    ]
+    result = rate_extrapolation(source, property=PROPERTY, target_rate=0.05)
+    assert result.relative_residual < 1e-14
+    assert result.resolved
+
+
+@pytest.mark.parametrize("form", ["log_linear", "power_law"])
+def test_more_rates_cannot_make_a_discontinuous_response_resolve(form: str) -> None:
+    source = [
+        RateObservation(float(rate), 1000.0 if rate < 1.0 else 2000.0, 10.0, True)
+        for rate in np.geomspace(0.01, 100.0, 21)
+    ]
+    result = rate_extrapolation(source, property=PROPERTY, target_rate=0.005, form=form)
+    # Mean uncertainty alone would accept this wrong functional form.
+    assert result.standard_error < 0.25 * result.value
+    assert result.residual_to_error_ratio is not None
+    assert result.residual_to_error_ratio > 20.0
+    assert not result.resolved
+    assert any("3 times" in note for note in result.notes)
+
+
 @pytest.mark.parametrize("form", ["log_linear", "power_law"])
 @pytest.mark.parametrize("error", [0.0, 1.0, 1000.0])
 def test_dense_discontinuous_response_is_unresolved_despite_small_mean_error(
@@ -318,27 +431,41 @@ def test_dense_discontinuous_response_is_unresolved_despite_small_mean_error(
     ]
     result = rate_extrapolation(source, property=PROPERTY, target_rate=1.0, form=form)
     assert result.standard_error < 0.25 * result.value
+    if error == 0.0:
+        assert result.residual_to_error_ratio is None
+    elif error == 1000.0:
+        assert result.residual_to_error_ratio is not None
+        assert result.residual_to_error_ratio < 3.0
     assert result.relative_residual > 0.1
     assert not result.resolved
     assert any("10%" in note for note in result.notes)
 
 
-def test_small_relative_residual_must_match_reported_precision() -> None:
-    source = [
-        RateObservation(rate, value, 1.0, True)
-        for rate, value in [(0.01, 820.0), (0.1, 880.0), (1.0, 980.0), (10.0, 1120.0)]
-    ]
-    result = rate_extrapolation(source, property=PROPERTY, target_rate=0.1)
-    assert result.relative_residual == pytest.approx(20 / 950)
-    assert result.residual_to_error_ratio == pytest.approx(20)
-    assert not result.resolved
-    assert any("3 times" in note for note in result.notes)
+def test_extrapolation_limit_is_measured_from_nearest_observed_rate() -> None:
+    def fit(target: float, maximum: float = 2.0) -> Any:
+        return rate_extrapolation(
+            observations(),
+            property=PROPERTY,
+            target_rate=target,
+            max_extrapolation_decades=maximum,
+        )
+
+    boundary, too_far = fit(0.001), fit(0.0001)
+    assert boundary.extrapolation_decades == pytest.approx(2.0)
+    assert boundary.resolved
+    assert too_far.extrapolation_decades == pytest.approx(3.0)
+    assert not too_far.resolved
+    assert any("2-decade limit" in note for note in too_far.notes)
+    assert fit(0.0001, 3.0).resolved
+    interpolated = fit(0.3, 0.0)
+    assert interpolated.extrapolation_decades == 0.0
+    assert interpolated.resolved
+    above = fit(10000.0)
+    assert above.extrapolation_decades == pytest.approx(3.0)
+    assert not above.resolved
 
 
-def test_extrapolation_distance_and_large_uncertainty_remain_unresolved() -> None:
-    distant = rate_extrapolation(observations(), property=PROPERTY, target_rate=1e-8)
-    assert distant.extrapolation_decades == 7.0
-    assert not distant.resolved
+def test_large_target_uncertainty_is_unresolved() -> None:
     broad = rate_extrapolation(
         [replace(item, standard_error=1000.0) for item in observations()],
         property=PROPERTY,
@@ -370,6 +497,8 @@ def test_bad_form_and_property_contracts_are_invalid_requests() -> None:
         rate_extrapolation(
             observations(), property=PROPERTY, target_rate=0.01, form="cubic"
         )
+    with pytest.raises(ValueError, match="nonempty"):
+        replace(PROPERTY, label=" ")
     with pytest.raises(ValueError, match="trend"):
         replace(PROPERTY, trend="positive")
     with pytest.raises(ValueError, match="bounds"):
@@ -385,3 +514,4 @@ def test_empty_report_keeps_request_and_unavailable_models() -> None:
     assert report.log_linear is None and report.power_law is None
     assert report.target_rate == 0.01
     assert report.run_dirs == ("run-a",)
+    assert any("three or more distinct" in note for note in report.notes)

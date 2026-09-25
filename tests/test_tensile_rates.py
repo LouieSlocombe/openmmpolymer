@@ -8,11 +8,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import numpy as np
 import pytest
 
 from openmmpolymer import tensile_rates
-from openmmpolymer.protocols import Protocol
+from openmmpolymer.protocols import Protocol, RunManifest
 from openmmpolymer.tensile import BreakingSpec, ElongationSpec, YieldSpec
 from openmmpolymer.tensile_rates import (
     WORKFLOW_NAME,
@@ -25,28 +24,12 @@ from openmmpolymer.trajectory import AnalysisError
 from .helpers import (
     PLANTED_TENSILE,
     QUICK_EQUILIBRATION,
+    fake_scan_dynamics,
     write_manifest,
-    write_tensile_scan,
+    write_tensile_rate_series,
 )
 
 BREAKING_SPEC = PLANTED_TENSILE["breaking"]
-
-
-def _series(root: Path, property_name: str) -> list[Path]:
-    spec = PLANTED_TENSILE[
-        {
-            "yield_strength": "yield",
-            "yield_strain": "yield",
-            "breaking_strength": "breaking",
-            "elongation_at_break": "elongation",
-        }[property_name]
-    ]
-    directories = []
-    for index, hold in enumerate((1.0, 10.0, 100.0)):
-        directory = root / f"rate_{index}"
-        write_tensile_scan(directory, replace(spec, relax_ps=hold, stage_ps=4 * hold))
-        directories.append(directory)
-    return directories
 
 
 @pytest.mark.parametrize(
@@ -56,7 +39,7 @@ def _series(root: Path, property_name: str) -> list[Path]:
 def test_each_event_has_correct_units_and_preserves_replicas(
     tmp_path: Path, property_name: str
 ) -> None:
-    directories = _series(tmp_path, property_name)
+    directories = write_tensile_rate_series(tmp_path, property_name)
     report = analyse_tensile_rates(
         directories, property_name=property_name, target_rate=0.1
     )
@@ -83,7 +66,7 @@ def test_each_event_has_correct_units_and_preserves_replicas(
 def test_missing_yield_replica_is_not_silently_dropped_from_rate_fit(
     tmp_path: Path,
 ) -> None:
-    directories = _series(tmp_path, "yield_strength")
+    directories = write_tensile_rate_series(tmp_path, "yield_strength")
     path = directories[1] / "manifest.json"
     record = json.loads(path.read_text())
     record["stages"] = {
@@ -99,7 +82,7 @@ def test_missing_yield_replica_is_not_silently_dropped_from_rate_fit(
 
 
 def test_surviving_yield_replica_retains_its_recorded_index(tmp_path: Path) -> None:
-    directories = _series(tmp_path, "yield_strength")
+    directories = write_tensile_rate_series(tmp_path, "yield_strength")
     path = directories[1] / "manifest.json"
     record = json.loads(path.read_text())
     record["stages"] = {
@@ -121,7 +104,7 @@ def test_surviving_yield_replica_retains_its_recorded_index(tmp_path: Path) -> N
 def test_different_yield_criteria_cannot_be_combined(
     tmp_path: Path, criterion: str
 ) -> None:
-    directories = _series(tmp_path, "yield_strength")
+    directories = write_tensile_rate_series(tmp_path, "yield_strength")
     path = directories[1] / "yield_workflow.json"
     record = json.loads(path.read_text())
     record["request"]["spec"][criterion] *= 0.9
@@ -134,24 +117,12 @@ def test_different_yield_criteria_cannot_be_combined(
 
 
 def test_duplicate_directories_are_not_independent_replicas(tmp_path: Path) -> None:
-    directories = _series(tmp_path, "yield_strength")
+    directories = write_tensile_rate_series(tmp_path, "yield_strength")
     with pytest.raises(AnalysisError, match="more than once"):
         analyse_tensile_rates(
             [*directories, directories[0]],
             property_name="yield_strength",
             target_rate=0.1,
-        )
-
-
-@pytest.mark.parametrize(
-    "holds", [(1, 2), (1, 1, 2), (1, 1 + 1e-9, 2), (1, 2, np.inf), (-1, 1, 2)]
-)
-def test_invalid_ladders_are_refused_before_any_output(
-    holds: tuple[float, ...],
-) -> None:
-    with pytest.raises(ValueError):
-        validate_tensile_rate_scan(
-            YieldSpec(), holds, property_name="yield_strength", target_rate=0.01
         )
 
 
@@ -190,8 +161,7 @@ def test_shared_start_independent_rate_seeds_and_resume_guard(
         state.write_text("test state")
         return SimpleNamespace(final_state=str(state))
 
-    monkeypatch.setattr(tensile_rates, "run_protocol", dynamics)
-    monkeypatch.setattr(tensile_rates, "equilibrated_box_nm", lambda _: [2.4] * 3)
+    fake_scan_dynamics(monkeypatch, tensile_rates, dynamics, box_nm=(2.4,) * 3)
     monkeypatch.setattr(
         tensile_rates, "analyse_tensile_rates", lambda *args, **kwargs: None
     )
@@ -221,7 +191,7 @@ def test_shared_start_independent_rate_seeds_and_resume_guard(
 
 
 def test_unconfirmed_terminal_event_is_preserved_as_missing(tmp_path: Path) -> None:
-    directories = _series(tmp_path, "breaking_strength")
+    directories = write_tensile_rate_series(tmp_path, "breaking_strength")
     for directory in directories:
         path = directory / "manifest.json"
         record = json.loads(path.read_text())
@@ -247,7 +217,7 @@ def test_unconfirmed_terminal_event_is_preserved_as_missing(tmp_path: Path) -> N
 def test_recorded_physics_must_match_saved_settings(
     tmp_path: Path, key: str, value: list[float]
 ) -> None:
-    directories = _series(tmp_path, "breaking_strength")
+    directories = write_tensile_rate_series(tmp_path, "breaking_strength")
     path = directories[0] / "manifest.json"
     record = json.loads(path.read_text())
     first = next(iter(record["stages"].values()))
@@ -314,7 +284,7 @@ def test_real_rate_workflow_round_trip_and_resume(
 def test_saved_tensile_physics_and_preparation_must_match(
     tmp_path: Path, metadata: str
 ) -> None:
-    directories = _series(tmp_path, "yield_strength")
+    directories = write_tensile_rate_series(tmp_path, "yield_strength")
     for index, directory in enumerate(directories):
         path = directory / "yield_workflow.json"
         record = json.loads(path.read_text())
@@ -347,7 +317,7 @@ def test_saved_tensile_physics_and_preparation_must_match(
 
 def test_legacy_tensile_preparation_absence_is_reported(tmp_path: Path) -> None:
     report = analyse_tensile_rates(
-        _series(tmp_path, "yield_strength"),
+        write_tensile_rate_series(tmp_path, "yield_strength"),
         property_name="yield_strength",
         target_rate=0.1,
     )
@@ -372,10 +342,10 @@ def test_tensile_shared_state_is_checked_before_any_resume_write(
         directory.mkdir(parents=True, exist_ok=True)
         final = directory / "state.xml"
         final.write_text("original common state")
+        RunManifest(protocol=protocol.name, seed=run.seed).save(directory)
         return SimpleNamespace(final_state=str(final))
 
-    monkeypatch.setattr(tensile_rates, "run_protocol", dynamics)
-    monkeypatch.setattr(tensile_rates, "equilibrated_box_nm", lambda _: [2.4] * 3)
+    fake_scan_dynamics(monkeypatch, tensile_rates, dynamics, box_nm=(2.4,) * 3)
     monkeypatch.setattr(
         tensile_rates, "analyse_tensile_rates", lambda *args, **kwargs: None
     )

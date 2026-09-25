@@ -53,7 +53,7 @@ from .timeseries import (
 )
 
 if TYPE_CHECKING:
-    from .strain_rate import StrainRateExtrapolation
+    from .rate_dependence import RateExtrapolation
     from .strength import BreakingStrength, ElongationAtBreak, YieldStrength
 
 #: Figure size in inches. Wide enough for a four-panel column to stay legible
@@ -654,98 +654,6 @@ def plot_moduli(report: Any) -> Any:
     return figure
 
 
-def plot_strain_rate(extrapolation: StrainRateExtrapolation) -> Any:
-    """Plot measured Young's moduli and a finite-rate empirical estimate.
-
-    Error bars show one standard error. The unsampled interval between the
-    measurements and target is shaded, including when the target lies above
-    the sampled rates. The title retains the temperature, elastic fit window
-    and resolution verdict so that a long extrapolation stays visible.
-
-    Args:
-        extrapolation: A fit from
-            :func:`~openmmpolymer.strain_rate.strain_rate_extrapolation`.
-
-    Returns:
-        A ``matplotlib.figure.Figure``.
-    """
-    figure, axis = _panel()
-    rates = extrapolation.strain_rate_per_ns
-    target = extrapolation.target_rate_per_ns
-    minimum = float(rates.min())
-    maximum = float(rates.max())
-    if target < minimum or target > maximum:
-        boundary = minimum if target < minimum else maximum
-        _span(
-            axis,
-            min(target, boundary),
-            max(target, boundary),
-            _GUIDE_COLOUR,
-            alpha=0.15,
-            label="extrapolated interval",
-        )
-    span = np.geomspace(min(target, minimum), max(target, maximum), 200)
-    predicted = extrapolation.predict(span)
-    _guide(
-        axis,
-        span,
-        np.where(np.isfinite(predicted), predicted, np.nan),
-        linewidth=0.9,
-        label=f"{extrapolation.form} fit",
-    )
-    axis.errorbar(
-        rates,
-        extrapolation.moduli_mpa,
-        yerr=extrapolation.standard_errors_mpa,
-        marker="o",
-        markersize=4.0,
-        linestyle="none",
-        elinewidth=0.9,
-        capsize=2,
-        color=_DATA_COLOUR,
-        label="measured (1 SE)",
-    )
-    if math.isfinite(extrapolation.modulus_mpa):
-        target_error = extrapolation.standard_error_mpa
-        has_error = math.isfinite(target_error)
-        error_label = "1 SE" if has_error else "SE unavailable"
-        axis.errorbar(
-            [target],
-            [extrapolation.modulus_mpa],
-            yerr=[target_error] if has_error else None,
-            marker="*",
-            markersize=9.0,
-            linestyle="none",
-            elinewidth=0.9,
-            capsize=2,
-            color=_GUIDE_COLOUR,
-            label=(
-                f"target = {extrapolation.modulus_mpa:.1f} MPa "
-                f"at {target:.3g} strain/ns ({error_label})"
-            ),
-        )
-    else:
-        axis.axvline(
-            target,
-            color=_GUIDE_COLOUR,
-            linewidth=0.9,
-            label=f"target estimate not finite at {target:.3g} strain/ns",
-        )
-    axis.set_xscale("log")
-    axis.set_xlabel("Strain rate (strain/ns)")
-    axis.set_ylabel("Young's modulus (MPa)")
-    verdict = "resolved" if extrapolation.resolved else "not resolved"
-    _title(
-        axis,
-        f"{extrapolation.temperature_k:.0f} K, "
-        f"elastic strain <= {extrapolation.strain_limit:g}\n"
-        f"{extrapolation.form}: {extrapolation.extrapolation_decades:.1f} "
-        f"decades extrapolated, {verdict}",
-    )
-    _legend(axis)
-    return figure
-
-
 def plot_breaking_strength(curve: StressStrain, result: BreakingStrength) -> Any:
     """Plot the nominal tensile response, its peak and a resolved stress drop.
 
@@ -1200,6 +1108,103 @@ def _relaxation_modulus_title(curve: RelaxationCurve) -> str:
 
 
 # --------------------------------------------------------------------------
+# Rate dependence
+# --------------------------------------------------------------------------
+
+
+def plot_rate_dependence(fit: RateExtrapolation) -> Any:
+    """Plot a property against the rate it was measured at, and the fit's target.
+
+    Each measured rate carries one standard error - the replicas' spread
+    retained as its floor where they were pooled - and so does the target, or
+    its label says none is known. The fit is drawn out to the target, and the
+    stretch between the target and the nearest measured rate is shaded on
+    whichever side it lies: the distance the number was carried is something
+    the eye can see, and the title says how far and whether it resolved.
+
+    Args:
+        fit: Either model of a
+            :func:`~openmmpolymer.rate_dependence.analyse_rate_observations`
+            report.
+
+    Returns:
+        A ``matplotlib.figure.Figure``.
+    """
+    figure, axis = _panel()
+    prop = fit.property
+    lowest, highest = float(fit.rates.min()), float(fit.rates.max())
+    target = fit.target_rate
+    if not lowest <= target <= highest:
+        boundary = lowest if target < lowest else highest
+        _span(
+            axis,
+            min(target, boundary),
+            max(target, boundary),
+            _GUIDE_COLOUR,
+            alpha=0.15,
+            label="extrapolated interval",
+        )
+    span = np.geomspace(min(target, lowest), max(target, highest), 200)
+    predicted = fit.predict(span)
+    _guide(
+        axis,
+        span,
+        np.where(np.isfinite(predicted), predicted, np.nan),
+        linewidth=0.9,
+        label=f"{fit.form} fit",
+    )
+    known = np.isfinite(fit.standard_errors)
+    for mask, errors, label in (
+        (known, fit.standard_errors[known], "measured (1 SE; replica spread retained)"),
+        (~known, None, "measured (SE unavailable)"),
+    ):
+        if np.any(mask):
+            _error_bars(
+                axis,
+                fit.rates[mask],
+                fit.values[mask],
+                errors,
+                marker="o",
+                markersize=4.0,
+                label=label,
+            )
+    if math.isfinite(fit.value):
+        has_error = math.isfinite(fit.standard_error)
+        _error_bars(
+            axis,
+            [target],
+            [fit.value],
+            [fit.standard_error] if has_error else None,
+            colour=_GUIDE_COLOUR,
+            marker="*",
+            markersize=9.0,
+            label=(
+                f"target = {fit.value:.4g} {prop.value_unit} at {target:.3g} "
+                f"{prop.rate_unit} ({'1 SE' if has_error else 'SE unavailable'})"
+            ),
+        )
+    else:
+        axis.axvline(
+            target,
+            color=_GUIDE_COLOUR,
+            linewidth=0.9,
+            label=f"target estimate not finite at {target:.3g} {prop.rate_unit}",
+        )
+    axis.set_xscale("log")
+    axis.set_xlabel(f"Rate ({prop.rate_unit})")
+    axis.set_ylabel(
+        f"{prop.label} ({prop.value_unit})" if prop.value_unit else prop.label
+    )
+    _title(
+        axis,
+        f"{prop.label}: {fit.form}\n{fit.extrapolation_decades:.1f} decades "
+        f"extrapolated, {'resolved' if fit.resolved else 'not resolved'}",
+    )
+    _legend(axis)
+    return figure
+
+
+# --------------------------------------------------------------------------
 # The scaffolding every figure is drawn with
 # --------------------------------------------------------------------------
 
@@ -1295,6 +1300,24 @@ def _point(
             "marker": marker,
             "markersize": markersize,
             "linestyle": "none",
+            "color": colour,
+            **style,
+        },
+    )
+
+
+def _error_bars(
+    axis: Any, x: Any, y: Any, errors: Any, *, colour: str = _DATA_COLOUR, **style: Any
+) -> None:
+    """Mark points with one standard error each, or none when *errors* is None."""
+    axis.errorbar(
+        x,
+        y,
+        yerr=errors,
+        **{
+            "linestyle": "none",
+            "elinewidth": 0.9,
+            "capsize": 2,
             "color": colour,
             **style,
         },

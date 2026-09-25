@@ -28,6 +28,11 @@ import numpy.typing as npt
 
 from ._fitting import ROUNDING, standard_error, statistical_inefficiency
 from ._validation import require_positive
+from .rate_dependence import (
+    MAX_RATE_RESIDUAL_TO_ERROR,
+    MAX_RELATIVE_RATE_RESIDUAL,
+    _rms,
+)
 from .relaxation import (
     SIGNAL_TO_NOISE_FLOOR,
     KWWFit,
@@ -37,7 +42,6 @@ from .relaxation import (
     fit_kww,
     fit_prony,
 )
-from .strain_rate import MAX_RATE_RESIDUAL_TO_ERROR, MAX_RELATIVE_RATE_RESIDUAL, _rms
 from .trajectory import AnalysisError
 
 #: Prefix lengths compared, as fractions of the observed time.

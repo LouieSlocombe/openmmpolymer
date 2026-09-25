@@ -27,16 +27,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import numpy.typing as npt
 
-from ._files import ReportFiles, write_json
+from ._files import ReportFiles, file_sha256, write_json
 from ._validation import require_positive
 from .protocols import (
+    MANIFEST_NAME,
     Protocol,
     RunManifest,
     RunSummary,
     Stage,
     run_protocol,
     standard_melt_equilibration,
+    validate_run_inputs,
 )
 from .trajectory import AnalysisError
 
@@ -138,12 +141,6 @@ def validate_hold_times(
     ):
         raise ValueError(f"{name} needs at least three distinct positive holds.")
     return holds
-
-
-def validate_extrapolation_limit(value: float) -> None:
-    """Reject an undefined or negative extrapolation allowance."""
-    if not math.isfinite(value) or value < 0:
-        raise ValueError("max_extrapolation_decades must be finite and nonnegative.")
 
 
 def require_positive_fields(
@@ -374,3 +371,129 @@ def write_report_files(
         figure.savefig(path, bbox_inches="tight")
         saved.append(str(path))
     return ReportFiles(json=json_path, figures=tuple(saved))
+
+
+# --------------------------------------------------------------------------
+# Rate scans: one equilibration, every rate and replica branched from it
+# --------------------------------------------------------------------------
+
+
+def chain_options(
+    chain_backbone: Sequence[int] | None,
+    atoms_per_chain: int | None,
+    expected_characteristic_ratio: float,
+) -> dict[str, Any]:
+    """The chain-measurement keywords a scan passes to every protocol it runs."""
+    return {
+        "chain_backbone": chain_backbone,
+        "atoms_per_chain": atoms_per_chain,
+        "expected_characteristic_ratio": expected_characteristic_ratio,
+    }
+
+
+def resumable_record(
+    run: RunContext,
+    workflow: Path,
+    request: dict[str, Any],
+    branches: Sequence[str],
+    *,
+    resume: bool,
+    error: type[Exception],
+    fingerprinted: bool = True,
+) -> dict[str, Any]:
+    """The saved record a branched scan goes on from, once it is safe to.
+
+    The manifests say what each run did, not that the runs belong together,
+    so this refuses before anything is written: a record of another request;
+    runs in the directory that no record accounts for; and, on a resume,
+    completed stages whose saved states are gone, *branches* whose common
+    starting state is missing, changed or was never fingerprinted, or a
+    *run* other than the one the equilibration recorded. Resuming any of them
+    would mix branches that did not all start from one verified cell.
+    *fingerprinted* False admits a record that predates the fingerprint: each
+    branch stage's own provenance still ties it to the state it started from.
+
+    Returns the record to extend: empty, unless resuming.
+    """
+    directory = workflow.parent
+    record = check_request(workflow, request, error=error)
+    if not record and directory.is_dir() and any(directory.rglob(MANIFEST_NAME)):
+        raise error(
+            f"{directory} already holds runs but no {workflow.name}, so their "
+            "settings cannot be verified. Use a fresh directory."
+        )
+    if not resume:
+        return {}
+    runs = [directory / "equilibration", *(directory / name for name in branches)]
+    for path in runs:
+        manifest = path / MANIFEST_NAME
+        if manifest.is_file() and any(
+            not Path(entry.get("final_state", "")).is_file()
+            for entry in json.loads(manifest.read_text()).get("stages", {}).values()
+        ):
+            raise error(
+                f"{path} has completed stages with missing states; restore them "
+                "or rerun with resume=False."
+            )
+    fingerprint = record.get("start_state_sha256")
+    if fingerprint is not None:
+        start = Path(record.get("start_state", ""))
+        if not start.is_file() or file_sha256(start) != fingerprint:
+            raise error(
+                "The common preparation state is missing or no longer matches its "
+                "recorded fingerprint; restore it or rerun with resume=False."
+            )
+    elif fingerprinted and any((path / MANIFEST_NAME).is_file() for path in runs[1:]):
+        raise error(
+            "Existing rate branches have no preparation-state fingerprint; rerun "
+            "with resume=False so every branch starts from one verified state."
+        )
+    validate_run_inputs(run, runs[0])
+    return record
+
+
+def start_fingerprint(
+    state: str, record: dict[str, Any], *, error: type[Exception]
+) -> str:
+    """The digest of the state every branch starts from, refusing a changed one.
+
+    An equilibration that had to run again on a resume would otherwise hand
+    the branches still to come a different cell from the ones measured.
+    """
+    digest = file_sha256(state)
+    if record.get("start_state_sha256", digest) != digest:
+        raise error(
+            "The common preparation state changed; restore it or rerun with "
+            "resume=False."
+        )
+    return digest
+
+
+def strain_ladder(
+    strain_start: float, strain_increment: float, n_steps: int
+) -> npt.NDArray[np.float64]:
+    """The strains a deformation stage records, compounding from *strain_start*.
+
+    Each increment scales a cell the one before it already scaled, so step
+    *i* of the stage ends at ``(1 + start) (1 + increment)**i - 1``.
+    """
+    steps = np.arange(1, n_steps + 1)
+    return np.asarray(
+        (1.0 + strain_start) * (1.0 + strain_increment) ** steps - 1.0,
+        dtype=np.float64,
+    )
+
+
+def require_distinct(directories: Sequence[Path], *, what: str) -> None:
+    """Refuse an empty series, or one that names a run directory twice.
+
+    Named twice - directly, or once directly and once through its scan's
+    record - a run's replicas would count twice, as if independent.
+    """
+    if not directories:
+        raise AnalysisError(f"Supply run directories containing {what}.")
+    seen: set[Path] = set()
+    for directory in directories:
+        if directory in seen:
+            raise AnalysisError(f"{directory} was supplied more than once.")
+        seen.add(directory)

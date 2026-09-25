@@ -8,20 +8,23 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from ._files import file_sha256, write_json
+from ._files import write_json
 from ._seeds import derive_seed
-from ._validation import require_positive
 from ._workflow import (
-    equilibrated_box_nm,
+    chain_options,
+    equilibrate,
+    require_distinct,
+    resumable_record,
     run_fingerprint,
-    validate_extrapolation_limit,
+    start_fingerprint,
+    strain_ladder,
     validate_hold_times,
 )
 from .protocols import (
@@ -29,23 +32,21 @@ from .protocols import (
     RunManifest,
     run_protocol,
     standard_melt_equilibration,
-    validate_run_inputs,
 )
 from .rate_dependence import (
     RateObservation,
     RateProperty,
     RateReport,
     analyse_rate_observations,
+    validate_rate_request,
 )
 from .simulate import RunContext, safe_timestep_fs
 from .tensile import (
     BREAKING,
     ELONGATION,
     YIELD,
-    BreakingSpec,
-    ElongationSpec,
+    TensileMeasurement,
     TensileSpec,
-    YieldSpec,
     analyse_breaking,
     analyse_elongation,
     analyse_yield,
@@ -74,27 +75,24 @@ TENSILE_RATE_PROPERTIES = {
     ),
 }
 
+#: For each property, the tensile measurement whose scans record it, how a
+#: finished run of that measurement is read, and which replica fit field
+#: holds the property.
+_EVENTS: dict[str, tuple[TensileMeasurement[Any], Callable[[Path], Any], str]] = {
+    "yield_strength": (YIELD, analyse_yield, "strength_mpa"),
+    "yield_strain": (YIELD, analyse_yield, "yield_strain"),
+    "breaking_strength": (BREAKING, analyse_breaking, "strength_mpa"),
+    "elongation_at_break": (ELONGATION, analyse_elongation, "elongation_percent"),
+}
 
-def _adapter(property_name: str) -> tuple[Any, type[Any], Any, Any, Any]:
-    if property_name in ("yield_strength", "yield_strain"):
-        return YIELD, YieldSpec, tensile_protocol, tensile_schedule, analyse_yield
-    if property_name == "breaking_strength":
-        return (
-            BREAKING,
-            BreakingSpec,
-            tensile_protocol,
-            tensile_schedule,
-            analyse_breaking,
-        )
-    if property_name == "elongation_at_break":
-        return (
-            ELONGATION,
-            ElongationSpec,
-            tensile_protocol,
-            tensile_schedule,
-            analyse_elongation,
-        )
-    raise ValueError(f"Unknown tensile rate property {property_name!r}.")
+
+def _event(
+    property_name: str,
+) -> tuple[TensileMeasurement[Any], Callable[[Path], Any], str]:
+    try:
+        return _EVENTS[property_name]
+    except KeyError:
+        raise ValueError(f"Unknown tensile rate property {property_name!r}.") from None
 
 
 @dataclass(frozen=True)
@@ -117,11 +115,10 @@ def validate_tensile_rate_scan(
     **equilibration: Any,
 ) -> TensileRatePlan:
     """Validate all holds and the total budget before writing or building MD."""
-    _, expected, _, schedule, _ = _adapter(property_name)
-    if type(spec) is not expected:
-        raise ValueError(f"{property_name} requires {expected.__name__}.")
-    require_positive(target_rate, None, name="target_rate")
-    validate_extrapolation_limit(max_extrapolation_decades)
+    measurement = _event(property_name)[0]
+    if type(spec) is not measurement.spec:
+        raise ValueError(f"{property_name} requires {measurement.spec.__name__}.")
+    validate_rate_request(target_rate, max_extrapolation_decades)
     holds = validate_hold_times(hold_times_ps)
     specs = tuple(
         replace(
@@ -136,24 +133,13 @@ def validate_tensile_rate_scan(
     )
     cost = (
         settle.total_duration_ps
-        + sum(item.n_replicas * schedule(item).total_ps for item in specs)
+        + sum(item.n_replicas * tensile_schedule(item).total_ps for item in specs)
     ) / 1000
     if spec.max_total_ns is not None and cost > spec.max_total_ns:
         raise ValueError(
             f"Tensile rate scan needs {cost:.3g} ns across all rates and replicas, above max_total_ns={spec.max_total_ns:g}."
         )
     return TensileRatePlan(property_name, settle, specs, cost)
-
-
-def _check_states(directory: Path) -> None:
-    manifest = RunManifest.load(directory)
-    if manifest is not None and any(
-        not Path(item.get("final_state", "")).is_file()
-        for item in manifest.stages.values()
-    ):
-        raise ValueError(
-            f"{directory} has completed stages with missing states; restore them or rerun with resume=False."
-        )
 
 
 def run_tensile_rate_scan(
@@ -176,10 +162,12 @@ def run_tensile_rate_scan(
     Every rate has an independently derived seed. Every replica starts from
     the same coordinates with fresh velocities. Unobserved yield or terminal
     stress loss remains censored; the scan never fabricates an event by
-    extrapolating its stress-strain curve. Engine failures propagate.
+    extrapolating its stress-strain curve. Engine failures propagate. A forced
+    rerun (``resume=False``) replaces the saved request instead of comparing
+    it.
     """
-    measurement, spec_type, protocol, schedule, _ = _adapter(property_name)
-    selected: TensileSpec = spec_type() if spec is None else spec
+    measurement = _event(property_name)[0]
+    selected: TensileSpec = measurement.spec() if spec is None else spec
     plan = validate_tensile_rate_scan(
         selected,
         hold_times_ps,
@@ -189,6 +177,7 @@ def run_tensile_rate_scan(
         **equilibration,
     )
     directory = Path(output_dir).resolve()
+    workflow = directory / WORKFLOW_NAME
     names = [f"rate_{index:02d}" for index in range(len(plan.specs))]
     request = json.loads(
         json.dumps(
@@ -202,74 +191,37 @@ def run_tensile_rate_scan(
             allow_nan=False,
         )
     )
-    workflow = directory / WORKFLOW_NAME
-    previous: dict[str, Any] = {}
-    if resume:
-        if workflow.is_file():
-            previous = json.loads(workflow.read_text())
-            if previous.get("request") != request:
-                raise ValueError(
-                    "Cannot resume tensile rates with different settings; use a fresh directory or resume=False."
-                )
-        elif any(directory.glob("**/manifest.json")):
-            raise ValueError(
-                "Cannot reuse recorded dynamics without a matching tensile rate workflow."
-            )
-        for name in ("equilibration", *names):
-            _check_states(directory / name)
-        if previous.get("start_state"):
-            start_path = Path(previous["start_state"])
-            if not start_path.is_file() or previous.get(
-                "start_state_sha256"
-            ) != file_sha256(start_path):
-                raise ValueError(
-                    "The common preparation state is missing, changed or lacks its fingerprint; "
-                    "restore the original state or rerun with resume=False."
-                )
-        elif any((directory / name / "manifest.json").is_file() for name in names):
-            raise ValueError(
-                "Recorded tensile branches lack the common preparation fingerprint; "
-                "rerun with resume=False."
-            )
-    if resume:
-        validate_run_inputs(run, directory / "equilibration")
+    record = (
+        resumable_record(run, workflow, request, names, resume=True, error=ValueError)
+        if resume
+        else {}
+    )
     directory.mkdir(parents=True, exist_ok=True)
-    root_record = {"request": request, "run_dirs": names}
-    root_record.update(
-        {
-            key: previous[key]
-            for key in ("start_state", "start_state_sha256", "reference_box_nm")
-            if key in previous
-        }
+    record.update(request=request, run_dirs=names)
+    write_json(workflow, record)
+    chains = chain_options(
+        chain_backbone, atoms_per_chain, expected_characteristic_ratio
     )
-    write_json(workflow, root_record)
-    chains: dict[str, Any] = {
-        "chain_backbone": chain_backbone,
-        "atoms_per_chain": atoms_per_chain,
-        "expected_characteristic_ratio": expected_characteristic_ratio,
-    }
-    settled = run_protocol(
-        plan.equilibration, run, directory / "equilibration", resume=resume, **chains
+    start, origin = equilibrate(
+        plan.equilibration,
+        run,
+        directory / "equilibration",
+        resume=resume,
+        error=ValueError,
+        verb="strain",
+        **chains,
     )
-    start = settled.final_state
-    if not start or not Path(start).is_file():
-        raise ValueError("Common equilibration did not leave a readable state.")
-    fingerprint = file_sha256(start)
-    if previous.get("start_state_sha256", fingerprint) != fingerprint:
-        raise ValueError(
-            "The common preparation changed on resume; rerun with resume=False."
-        )
-    origin = equilibrated_box_nm(start)
-    root_record.update(
+    fingerprint = start_fingerprint(start, record, error=ValueError)
+    record.update(
         start_state=start, start_state_sha256=fingerprint, reference_box_nm=origin
     )
-    write_json(workflow, root_record)
+    write_json(workflow, record)
     timestep = safe_timestep_fs(selected.temperature_k, run.spec)
     for index, (name, rate_spec) in enumerate(zip(names, plan.specs, strict=True)):
         rate_dir = directory / name
         rate_dir.mkdir(parents=True, exist_ok=True)
         ladders = tuple(
-            protocol(
+            tensile_protocol(
                 rate_spec,
                 timestep_fs=timestep,
                 replica=replica,
@@ -290,7 +242,7 @@ def run_tensile_rate_scan(
                 "replica_stages": [
                     [stage.name for stage in ladder.stages] for ladder in ladders
                 ],
-                "steps_per_replica": schedule(rate_spec).n_steps,
+                "steps_per_replica": tensile_schedule(rate_spec).n_steps,
                 "timestep_fs": timestep,
                 "start_state": start,
                 "reference_box_nm": origin,
@@ -315,52 +267,48 @@ def run_tensile_rate_scan(
 
 
 def _directories(
-    run_dirs: Sequence[str | Path], property_name: str
-) -> tuple[Path, ...]:
+    run_dirs: Sequence[str | Path],
+    property_name: str,
+    measurement: TensileMeasurement[Any],
+) -> list[Path]:
     result: list[Path] = []
     for raw in run_dirs:
         root = Path(raw).resolve()
         path = root / WORKFLOW_NAME
-        if path.is_file():
-            record = json.loads(path.read_text())
-            recorded_property = record.get("request", {}).get("property_name")
-            if recorded_property != property_name and {
-                recorded_property,
-                property_name,
-            } != {"yield_strength", "yield_strain"}:
+        if not path.is_file():
+            result.append(root)
+            continue
+        record = json.loads(path.read_text())
+        recorded_property = record.get("request", {}).get("property_name")
+        if recorded_property != property_name and {
+            recorded_property,
+            property_name,
+        } != {"yield_strength", "yield_strain"}:
+            raise AnalysisError(
+                f"{path} records {recorded_property}, not {property_name}."
+            )
+        names = record.get("run_dirs", [])
+        if not names:
+            raise AnalysisError(f"{path} records no rate directories.")
+        candidates = [root / name for name in names]
+        specs = record.get("request", {}).get("specs", [])
+        if len(specs) != len(candidates):
+            raise AnalysisError(f"{path} has inconsistent requested rate counts.")
+        for candidate, spec in zip(candidates, specs, strict=True):
+            child = candidate / measurement.workflow_name
+            if (
+                not child.is_file()
+                or json.loads(child.read_text()).get("request", {}).get("spec") != spec
+            ):
                 raise AnalysisError(
-                    f"{path} records {recorded_property}, not {property_name}."
+                    f"{candidate} has missing or different rate settings."
                 )
-            names = record.get("run_dirs", [])
-            if not names:
-                raise AnalysisError(f"{path} records no rate directories.")
-            candidates = [root / name for name in names]
-            specs = record.get("request", {}).get("specs", [])
-            if len(specs) != len(candidates):
-                raise AnalysisError(f"{path} has inconsistent requested rate counts.")
-            measurement = _adapter(property_name)[0]
-            for candidate, spec in zip(candidates, specs, strict=True):
-                child = candidate / measurement.workflow_name
-                if (
-                    not child.is_file()
-                    or json.loads(child.read_text()).get("request", {}).get("spec")
-                    != spec
-                ):
-                    raise AnalysisError(
-                        f"{candidate} has missing or different rate settings."
-                    )
-        else:
-            candidates = [root]
-        for candidate in candidates:
-            candidate = candidate.resolve()
-            if candidate in result:
-                raise AnalysisError(f"{candidate} was supplied more than once.")
-            if not (candidate / "manifest.json").is_file():
-                raise AnalysisError(f"Missing rate manifest in {candidate}.")
-            result.append(candidate)
-    if not result:
-        raise AnalysisError("Supply at least one tensile rate scan or finished run.")
-    return tuple(result)
+        result.extend(candidate.resolve() for candidate in candidates)
+    for candidate in result:
+        if not (candidate / "manifest.json").is_file():
+            raise AnalysisError(f"Missing rate manifest in {candidate}.")
+    require_distinct(result, what="tensile measurements")
+    return result
 
 
 def analyse_tensile_rates(
@@ -377,9 +325,10 @@ def analyse_tensile_rates(
     are never relabelled as standard errors. All censored replicas survive
     in the report and prevent a confidently extrapolated event.
     """
-    measurement, spec_type, protocol, _, analyse = _adapter(property_name)
+    measurement, analyse, field = _event(property_name)
+    validate_rate_request(target_rate, max_extrapolation_decades)
     observations: list[RateObservation] = []
-    directories = _directories(run_dirs, property_name)
+    directories = _directories(run_dirs, property_name, measurement)
     for directory in directories:
         report = analyse(directory)
         workflow = directory / measurement.workflow_name
@@ -390,8 +339,7 @@ def analyse_tensile_rates(
         )
         settings = request.get("spec", {})
         if settings:
-            recorded_spec = spec_type(**settings)
-            _validate_recorded_ladder(directory, recorded_spec, protocol)
+            _validate_recorded_ladder(directory, measurement.spec(**settings))
         conditions = {
             key: value
             for key, value in settings.items()
@@ -408,11 +356,8 @@ def analyse_tensile_rates(
         }
         if "system_sha256" in request:
             conditions["system_sha256"] = request["system_sha256"]
-        preparation = request.get("equilibration")
-        if isinstance(preparation, dict):
-            preparation = preparation.get("stages")
-        if preparation is not None:
-            conditions["preparation"] = preparation
+        if request.get("equilibration") is not None:
+            conditions["preparation"] = request["equilibration"]
         if request.get("preparation_state_sha256") is not None:
             conditions["preparation_state_sha256"] = request["preparation_state_sha256"]
         manifest = RunManifest.load(directory)
@@ -425,33 +370,15 @@ def analyse_tensile_rates(
                 for key in ("n_molecules", "atoms_per_chain")
                 if key in manifest.box
             }
-        if property_name in ("yield_strength", "yield_strain"):
-            conditions.update(
-                offset_strain=report.offset_strain,
-                fit_min_strain=report.fit_min_strain,
-                fit_max_strain=report.fit_max_strain,
-            )
-        else:
-            conditions.update(
-                failure_fraction=report.failure_fraction,
-                confirmation_steps=report.confirmation_steps,
-            )
-        indices = getattr(report, "replica_indices", tuple(range(len(report.curves))))
+        conditions.update({key: getattr(report, key) for key in measurement.criterion})
         for index, curve, fit in zip(
-            indices, report.curves, report.replicas, strict=True
+            report.replica_indices, report.curves, report.replicas, strict=True
         ):
             rate = curve.strain_rate_per_ns
             if rate is None or not math.isfinite(rate) or rate <= 0:
                 raise AnalysisError(
                     f"{directory} has a missing or invalid strain rate."
                 )
-            field = {
-                "yield_strength": "strength_mpa",
-                "yield_strain": "yield_strain",
-                "breaking_strength": "strength_mpa",
-                "elongation_at_break": "elongation_percent",
-            }[property_name]
-            value = getattr(fit, field)
             notes = list(fit.notes)
             notes.extend(report.notes)
             for key in ("preparation", "system_sha256", "composition"):
@@ -474,7 +401,7 @@ def analyse_tensile_rates(
             observations.append(
                 RateObservation(
                     rate=rate,
-                    value=value,
+                    value=getattr(fit, field),
                     standard_error=None,
                     resolved=bool(report.resolved and fit.resolved),
                     temperature_k=curve.temperature_k,
@@ -496,23 +423,21 @@ def analyse_tensile_rates(
     )
 
 
-def _validate_recorded_ladder(
-    directory: Path, spec: TensileSpec, protocol: Any
-) -> None:
+def _validate_recorded_ladder(directory: Path, spec: TensileSpec) -> None:
     """Check physical samples against the saved request, not just point counts."""
     manifest = RunManifest.load(directory)
     assert manifest is not None
     for replica in range(spec.n_replicas):
-        for stage in protocol(spec, replica=replica).stages:
+        for stage in tensile_protocol(spec, replica=replica).stages:
             if stage.name not in manifest.stages:
                 # The ordinary reader retains missing chunks as unresolved.
                 continue
             samples = manifest.stages[stage.name].get("samples", {})
             strains = np.asarray(samples.get("segment_strain", []), dtype=float)
             count = stage.options["n_steps"]
-            expected = (1 + stage.options["strain_start"]) * (
-                1 + spec.strain_increment
-            ) ** np.arange(1, count + 1) - 1
+            expected = strain_ladder(
+                stage.options["strain_start"], spec.strain_increment, count
+            )
             if (
                 strains.ndim != 1
                 or strains.size > count

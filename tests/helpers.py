@@ -10,19 +10,27 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from itertools import pairwise
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
 import numpy.typing as npt
 import pytest
 
-from openmmpolymer.elasticity import ElasticModulus, StressStrain
+from openmmpolymer.elasticity import StressStrain
+from openmmpolymer.rate_dependence import (
+    RateObservation,
+    RateProperty,
+    RateReport,
+    analyse_rate_observations,
+)
 from openmmpolymer.relaxation import RelaxationCurve
 from openmmpolymer.tensile import BreakingSpec, ElongationSpec, TensileSpec, YieldSpec
 from openmmpolymer.timeseries import GlassTransition
+from openmmpolymer.tm import HeatingCurve
 
 #: A force field for a two-atom "dimer" residue: enough to exercise the real
 #: ForceField path, small enough to read. The atoms are argon-like so nothing
@@ -1143,27 +1151,6 @@ def nominal_curve(
     )
 
 
-def rate_moduli(
-    moduli_mpa: Sequence[float], rates_per_ns: Sequence[float] = (0.01, 0.1, 1.0)
-) -> list[ElasticModulus]:
-    """Resolved Young's moduli, one per strain rate, each known to 10 MPa."""
-    return [
-        ElasticModulus(
-            modulus_mpa=value,
-            intercept_mpa=0.0,
-            strain_limit=0.015,
-            n_points=8,
-            residual_mpa=0.1,
-            standard_error_mpa=10.0,
-            half_disagreement=0.0,
-            temperature_k=298.15,
-            strain_rate_per_ns=rate,
-            resolved=True,
-        )
-        for rate, value in zip(rates_per_ns, moduli_mpa, strict=True)
-    ]
-
-
 def planted_relaxation(
     time_ps: npt.NDArray[np.float64],
     modulus_mpa: npt.NDArray[np.float64],
@@ -1268,3 +1255,201 @@ def rotating_dimer(
     frames[:, 1, 0] = np.cos(angles) * 0.6
     frames[:, 1, 1] = np.sin(angles) * 0.6
     return synthetic_ensemble(frames, n_chains=1, interval_ps=interval_ps)
+
+
+# --------------------------------------------------------------------------
+# Rate series
+# --------------------------------------------------------------------------
+
+
+def planted_rate_report(*, target: float = 0.01, unknown: bool = False) -> RateReport:
+    """A yield strength exactly logarithmic in rate, 100 MPa per decade from 0.1 /ns.
+
+    Each measurement is known to 10 MPa, or not at all with *unknown*.
+    """
+    property = RateProperty("yield_strength", "Yield strength", "MPa", "strain/ns")
+    source = [
+        RateObservation(
+            rate,
+            value,
+            None if unknown else 10.0,
+            True,
+            source=f"run-{index}",
+            notes=("Finite rate.",),
+        )
+        for index, (rate, value) in enumerate([(0.1, 900), (1.0, 1000), (10.0, 1100)])
+    ]
+    return analyse_rate_observations(source, property=property, target_rate=target)
+
+
+def deformation_rate_per_ns(
+    hold_ps: float, *, n_steps: int = 10, increment: float = 0.002
+) -> float:
+    """The nominal strain rate of :func:`write_deformation`'s compounding ladder."""
+    return ((1.0 + increment) ** n_steps - 1.0) / (n_steps * hold_ps) * 1000.0
+
+
+def planted_modulus_mpa(rate_per_ns: float) -> float:
+    """Young's modulus rising 300 MPa per decade of strain rate: 1700 at 0.001 /ns."""
+    return 2000.0 + 300.0 * math.log10(rate_per_ns / 0.01)
+
+
+def write_modulus_rate_series(
+    root: Path,
+    holds_ps: Sequence[float] = (50.0, 150.0, 500.0),
+    *,
+    modulus: Any = planted_modulus_mpa,
+) -> list[Path]:
+    """One extension run per hold, ``rate_00`` upwards, each on ``modulus(rate)``."""
+    directories = []
+    for index, hold in enumerate(holds_ps):
+        directory = root / f"rate_{index:02d}"
+        write_deformation(
+            directory,
+            modulus_mpa=modulus(deformation_rate_per_ns(hold)),
+            relax_ps=hold,
+        )
+        directories.append(directory)
+    return directories
+
+
+def planted_extension_runner(calls: list[dict[str, Any]]) -> Any:
+    """A ``run_protocol`` stand-in whose extensions record :func:`planted_modulus_mpa`.
+
+    Each call is appended to *calls*. An extension leaves a linear curve at the
+    rate its own ladder runs, stamped with the state it finished at, as a real
+    stage's manifest entry is; any other protocol leaves only a state.
+    """
+
+    def run(protocol: Any, run: Any, directory: Path, **options: Any) -> Any:
+        calls.append({"protocol": protocol, "directory": directory, **options})
+        directory.mkdir(parents=True, exist_ok=True)
+        final_state = directory / "state.xml"
+        final_state.write_text("state")
+        if protocol.stages[0].kind == "deform":
+            (stage,) = protocol.stages
+            settings = stage.options
+            rate = deformation_rate_per_ns(
+                settings["relax_ps"],
+                n_steps=settings["n_steps"],
+                increment=settings["strain_increment"],
+            )
+            manifest = write_deformation(
+                directory,
+                modulus_mpa=planted_modulus_mpa(rate),
+                n_steps=settings["n_steps"],
+                increment=settings["strain_increment"],
+                relax_ps=settings["relax_ps"],
+                stage=stage.name,
+            )
+            record = json.loads(manifest.read_text())
+            record["stages"][stage.name]["final_state"] = str(final_state)
+            manifest.write_text(json.dumps(record))
+        return SimpleNamespace(final_state=str(final_state))
+
+    return run
+
+
+def write_tensile_rate_series(root: Path, property_name: str) -> list[Path]:
+    """Planted tensile scans at holds of 1, 10 and 100 ps, measuring *property_name*.
+
+    Every hold carries the same planted curves, so no event depends on rate.
+    """
+    measurement = {
+        "yield_strength": "yield",
+        "yield_strain": "yield",
+        "breaking_strength": "breaking",
+        "elongation_at_break": "elongation",
+    }[property_name]
+    spec = PLANTED_TENSILE[measurement]
+    directories = []
+    for index, hold in enumerate((1.0, 10.0, 100.0)):
+        directory = root / f"rate_{index}"
+        write_tensile_scan(directory, replace(spec, relax_ps=hold, stage_ps=4 * hold))
+        directories.append(directory)
+    return directories
+
+
+def planted_curve(
+    *,
+    volume_jump: float = 0.1,
+    enthalpy_jump: float = 400.0,
+    volume_split: int = 10,
+    enthalpy_split: int = 10,
+    noise: float = 1.0,
+) -> HeatingCurve:
+    """Two expanding branches separated by a known first-order jump."""
+    temperatures = np.arange(300.0, 500.0, 10.0)
+    index = np.arange(len(temperatures))
+    # Noise is much smaller than a real jump, and differs between observables.
+    volume = (
+        1.0
+        + 0.0003 * (temperatures - 300.0)
+        + volume_jump * (index >= volume_split)
+        + noise * 0.0002 * np.sin(index * 2.1)
+    )
+    enthalpy = (
+        -4000.0
+        + 5.0 * (temperatures - 300.0)
+        + enthalpy_jump * (index >= enthalpy_split)
+        + noise * 0.7 * np.cos(index * 1.7)
+    )
+    return HeatingCurve(
+        temperature_k=tuple(float(t) for t in temperatures),
+        density_g_cm3=tuple(float(1.0 / v) for v in volume),
+        enthalpy_kj_mol=tuple(float(h) for h in enthalpy),
+        hold_ps=(1000.0,) * len(temperatures),
+        pressure_bar=(1.0,) * len(temperatures),
+        stages=("heating",),
+    )
+
+
+def write_heating(
+    directory: Path,
+    curve: HeatingCurve,
+    *,
+    chunks: tuple[int, ...] = (9, 10, 1),
+) -> Path:
+    """Store the public stage-result schema without running dynamics."""
+    from openmmpolymer.protocols import RunManifest
+
+    directory.mkdir(parents=True, exist_ok=True)
+    stages: dict[str, Any] = {}
+    start = 0
+    for number, length in enumerate(chunks):
+        stop = start + length
+        name = f"heat_{number:02d}"
+        stages[name] = {
+            "name": name,
+            "samples": {
+                "segment_temperature_k": list(curve.temperature_k[start:stop]),
+                "segment_density_g_cm3": list(curve.density_g_cm3[start:stop]),
+                "segment_enthalpy_kj_mol": list(curve.enthalpy_kj_mol[start:stop]),
+                "segment_duration_ps": list(curve.hold_ps[start:stop]),
+                "segment_pressure_bar": list(curve.pressure_bar[start:stop]),
+            },
+        }
+        start = stop
+    assert start == curve.n_points
+    RunManifest(protocol="tm_heating", seed=11, stages=stages).save(directory)
+    return directory
+
+
+def fake_scan_dynamics(
+    monkeypatch: pytest.MonkeyPatch,
+    module: Any,
+    runner: Any,
+    *,
+    box_nm: Sequence[float] = (5.0, 5.0, 5.0),
+) -> None:
+    """Route a rate scan's equilibration and branches through *runner*.
+
+    The shared workflow helpers run the equilibration and the scan's own
+    module its branches, so both are replaced; the equilibrated cell is
+    *box_nm* rather than whatever a state file holds.
+    """
+    from openmmpolymer import _workflow
+
+    monkeypatch.setattr(_workflow, "run_protocol", runner)
+    monkeypatch.setattr(module, "run_protocol", runner)
+    monkeypatch.setattr(_workflow, "equilibrated_box_nm", lambda state: list(box_nm))

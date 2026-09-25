@@ -1,15 +1,17 @@
 """Tests for the figures, asserting structure and data rather than pixels.
 
 The mechanical figures are in ``test_plots_mechanical.py``; this module has the
-thermal, structural and relaxation ones, and the one test that renders every
-figure the package draws.
+thermal, structural, relaxation and rate ones, and the one test that renders
+every figure the package draws.
 """
 
 from __future__ import annotations
 
 import io
+import math
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -46,16 +48,16 @@ from openmmpolymer.plots import (
     plot_moduli,
     plot_persistence,
     plot_quench_curve,
+    plot_rate_dependence,
     plot_relaxation,
     plot_relaxation_spectrum,
     plot_state_data,
-    plot_strain_rate,
     plot_stress_strain,
     plot_yield_strength,
 )
 from openmmpolymer.protocols import ChainDimensions
+from openmmpolymer.rate_dependence import RateExtrapolation
 from openmmpolymer.relaxation import RelaxationCurve, fit_kww, fit_prony
-from openmmpolymer.strain_rate import strain_rate_extrapolation
 from openmmpolymer.strength import (
     breaking_strength,
     elongation_at_break,
@@ -80,9 +82,9 @@ from .helpers import (
     lattice,
     log_linear_transitions,
     nominal_curve,
+    planted_rate_report,
     planted_relaxation,
     random_walk_frames,
-    rate_moduli,
     rod_positions,
     rotating_dimer,
     state_data_csv,
@@ -174,6 +176,16 @@ def _moduli_figure(directory: Path) -> Any:
     return plot_moduli(analyse_mechanics(directory, strain_limit=0.05))
 
 
+def _rate_fit(
+    form: str = "log_linear", *, target: float = 0.01, unknown: bool = False
+) -> RateExtrapolation:
+    fit: RateExtrapolation | None = getattr(
+        planted_rate_report(target=target, unknown=unknown), form
+    )
+    assert fit is not None
+    return fit
+
+
 FAILED = nominal_curve(
     np.arange(8) * 0.1, [0.0, 20.0, 60.0, 100.0, 70.0, 35.0, 30.0, 20.0]
 )
@@ -190,11 +202,7 @@ FIGURES: dict[str, Callable[[Path], Any]] = {
     "cooling_rate": lambda d: plot_cooling_rate(
         cooling_rate_extrapolation(log_linear_transitions(), form="vft")
     ),
-    "strain_rate": lambda d: plot_strain_rate(
-        strain_rate_extrapolation(
-            rate_moduli([800.0, 900.0, 1000.0]), target_rate_per_ns=1.0e-3
-        )
-    ),
+    "rate_dependence": lambda d: plot_rate_dependence(_rate_fit()),
     "conformation": lambda d: plot_conformation(
         chain_conformation(diffusing_dimers(), (0, 1))
     ),
@@ -635,3 +643,86 @@ def test_a_spectrum_figure_marks_what_lies_past_the_end_of_the_run() -> None:
         text.get_text() for text in figure.axes[0].get_legend().get_texts()
     )
     assert "past the end of the run" in labels
+
+
+# --------------------------------------------------------------------------
+# Rate dependence
+# --------------------------------------------------------------------------
+
+
+def _shaded(axis: Any) -> list[float]:
+    """The rates the extrapolated interval covers, in data coordinates."""
+    patch = next(
+        patch for patch in axis.patches if patch.get_label() == "extrapolated interval"
+    )
+    vertices = patch.get_path().transformed(patch.get_transform() - axis.transData)
+    return [vertices.vertices[:, 0].min(), vertices.vertices[:, 0].max()]
+
+
+@pytest.mark.parametrize("form", ["log_linear", "power_law"])
+def test_the_rate_figure_draws_the_data_the_fit_and_the_target(form: str) -> None:
+    """Every number on it is the analysis's own, errors included."""
+    fit = _rate_fit(form)
+    axis: Any = plot_rate_dependence(fit).axes[0]
+    line = next(line for line in axis.get_lines() if line.get_label() == f"{form} fit")
+    np.testing.assert_allclose(line.get_ydata(), fit.predict(line.get_xdata()))
+    assert line.get_xdata()[0] == pytest.approx(0.01)
+    assert line.get_xdata()[-1] == pytest.approx(10.0)
+    measured, target = axis.containers
+    np.testing.assert_allclose(measured.lines[0].get_xdata(), fit.rates)
+    np.testing.assert_allclose(measured.lines[0].get_ydata(), fit.values)
+    np.testing.assert_allclose(target.lines[0].get_xdata(orig=False), [0.01])
+    np.testing.assert_allclose(target.lines[0].get_ydata(orig=False), [fit.value])
+    for container, values, errors in (
+        (measured, fit.values, fit.standard_errors),
+        (target, [fit.value], [fit.standard_error]),
+    ):
+        segments = container.lines[2][0].get_segments()
+        for segment, value, error in zip(segments, values, errors, strict=True):
+            np.testing.assert_allclose(segment[:, 1], [value - error, value + error])
+    assert axis.get_xscale() == "log"
+    assert axis.get_xlabel() == "Rate (strain/ns)"
+    assert axis.get_ylabel() == "Yield strength (MPa)"
+    assert f"{form}\n1.0 decades extrapolated, " in axis.get_title()
+
+
+@pytest.mark.parametrize(
+    "target, expected", [(0.01, (0.01, 0.1)), (100.0, (10.0, 100.0))]
+)
+def test_the_rate_figure_shades_the_unmeasured_interval_on_either_side(
+    target: float, expected: tuple[float, float]
+) -> None:
+    axis: Any = plot_rate_dependence(_rate_fit(target=target)).axes[0]
+    assert _shaded(axis) == pytest.approx(expected)
+
+
+def test_an_interpolated_rate_has_no_extrapolated_interval() -> None:
+    axis: Any = plot_rate_dependence(_rate_fit(target=0.5)).axes[0]
+    assert not axis.patches
+    assert "0.0 decades extrapolated" in axis.get_title()
+
+
+def test_unknown_errors_and_a_distant_target_are_visibly_unresolved() -> None:
+    """A clean line cannot hide an unsupported distance or a missing error."""
+    axis: Any = plot_rate_dependence(_rate_fit(target=1e-8, unknown=True)).axes[0]
+    assert "7.0 decades extrapolated, not resolved" in axis.get_title()
+    labels = axis.get_legend_handles_labels()[1]
+    assert sum("SE unavailable" in label for label in labels) == 2
+    assert not any(container.has_yerr for container in axis.containers)
+
+
+def test_an_unknown_target_error_is_marked_unavailable() -> None:
+    fit = replace(_rate_fit(), standard_error=math.inf, resolved=False)
+    axis: Any = plot_rate_dependence(fit).axes[0]
+    assert "SE unavailable" in axis.containers[1].get_label()
+    assert not axis.containers[1].has_yerr
+
+
+def test_a_nonfinite_target_keeps_its_rate_but_draws_no_value() -> None:
+    fit = replace(_rate_fit(), value=math.inf, standard_error=math.inf, resolved=False)
+    axis: Any = plot_rate_dependence(fit).axes[0]
+    assert len(axis.containers) == 1
+    assert any(
+        "target estimate not finite" in label
+        for label in axis.get_legend_handles_labels()[1]
+    )

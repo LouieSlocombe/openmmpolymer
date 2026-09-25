@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, replace
 from importlib.metadata import version
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from ._files import ReportFiles, file_sha256, write_json
 from .chain import ChainResult, ChainSpec, build_chain
@@ -45,19 +45,11 @@ from .mdsystem import (
     prepare_box,
 )
 from .mechanical import (
-    MechanicalError,
     ModulusSpec,
     analyse_mechanics,
     mechanical_scan,
     run_modulus_scan,
     write_mechanical_report,
-)
-from .modulus_rate_report import write_modulus_rate_report
-from .modulus_rates import (
-    ModulusRateReport,
-    analyse_modulus_rates,
-    run_modulus_rate_scan,
-    validate_modulus_rate_scan,
 )
 from .packing import (
     DEFAULT_PACKING_DENSITY,
@@ -973,17 +965,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--modulus-relax-times",
         type=_floats,
         default=None,
-        help="comma-separated hold times in ps for a Young's modulus rate scan; "
-        "at least three distinct values, e.g. 50,150,500. Requires --protocol "
-        "modulus and --target-strain-rate; runs extension replicas at each rate",
+        help="the same as --rate-property youngs_modulus --rate-hold-times: "
+        "three or more distinct hold times in ps for a Young's modulus rate "
+        "scan, e.g. 50,150,500",
     )
     mechanics.add_argument(
         "--target-strain-rate",
         type=float,
         default=None,
-        help="positive target rate in strain/ns for modulus extrapolation "
-        "(multiply a rate in s^-1 by 1e-9); also enables rate analysis of "
-        "--analyse directories or a saved modulus rate scan",
+        help="the same as --target-property-rate, for a property measured in "
+        "strain/ns (multiply a rate in s^-1 by 1e-9); without --rate-property "
+        "or a measurement --protocol, the property is youngs_modulus",
     )
     mechanics.add_argument(
         "--elastic-strain-limit",
@@ -1421,47 +1413,77 @@ _PROTOCOL_RATE_DEFAULTS = {
 }
 
 
+class _RateRequest(NamedTuple):
+    """A rate scan or analysis, resolved from the command line.
+
+    An analysis runs no dynamics and has no hold times.
+    """
+
+    property_name: str
+    target_rate: float
+    hold_times_ps: tuple[float, ...]
+    spec: RateScanSpec
+
+
 def _property_rates_requested(arguments: argparse.Namespace) -> bool:
     return any(
-        (
-            arguments.rate_property is not None,
-            arguments.rate_hold_times is not None,
-            arguments.target_property_rate is not None,
-            arguments.target_strain_rate is not None
-            and arguments.protocol in ("yield", "breaking", "elongation"),
+        value is not None
+        for value in (
+            arguments.rate_property,
+            arguments.rate_hold_times,
+            arguments.modulus_relax_times,
+            arguments.target_property_rate,
+            arguments.target_strain_rate,
         )
     )
 
 
-def _property_rate_request(
-    arguments: argparse.Namespace,
-) -> tuple[str, float, RateScanSpec]:
-    """Resolve a physical rate unit before allowing any build or dynamics."""
-    property_name = arguments.rate_property or _PROTOCOL_RATE_DEFAULTS.get(
-        arguments.protocol
+def _either(new: Any, old: Any, flags: str) -> Any:
+    """A setting given by its flag or by the older one it replaced, never both ways."""
+    if new is not None and old is not None and new != old:
+        raise ValueError(f"{flags} give different values; pass one of them.")
+    return old if new is None else new
+
+
+def _property_rate_request(arguments: argparse.Namespace) -> _RateRequest:
+    """Resolve a physical rate unit before allowing any build or dynamics.
+
+    ``--modulus-relax-times`` and ``--target-strain-rate`` predate the other
+    properties. They stand for ``--rate-property youngs_modulus
+    --rate-hold-times`` and for ``--target-property-rate`` in strain/ns, and
+    the target alone still selects Young's modulus when neither a property
+    nor a measurement protocol does.
+    """
+    property_name = arguments.rate_property
+    if arguments.modulus_relax_times is not None:
+        if property_name not in (None, "youngs_modulus"):
+            raise ValueError(
+                "--modulus-relax-times sets Young's modulus holds; use "
+                f"--rate-hold-times for {property_name}."
+            )
+        property_name = "youngs_modulus"
+    property_name = (
+        property_name
+        or _PROTOCOL_RATE_DEFAULTS.get(arguments.protocol)
+        or ("youngs_modulus" if arguments.target_strain_rate is not None else None)
     )
     if property_name is None:
         raise ValueError(
             "Choose --rate-property for rate analysis, or a measurement --protocol for a scan."
         )
-    if arguments.modulus_relax_times is not None:
-        raise ValueError(
-            "Use --rate-hold-times with --rate-property; --modulus-relax-times belongs to the original Young's modulus interface."
-        )
-    if (
-        arguments.target_property_rate is not None
-        and arguments.target_strain_rate is not None
-    ):
-        raise ValueError(
-            "Specify one of --target-property-rate or --target-strain-rate."
-        )
-    target = arguments.target_property_rate
-    if target is None and arguments.target_strain_rate is not None:
-        if RATE_PROPERTIES[property_name].rate_unit != "strain/ns":
-            raise ValueError(
-                f"{property_name} uses {RATE_PROPERTIES[property_name].rate_unit}; use --target-property-rate."
-            )
-        target = arguments.target_strain_rate
+    unit = RATE_PROPERTIES[property_name].rate_unit
+    if arguments.target_strain_rate is not None and unit != "strain/ns":
+        raise ValueError(f"{property_name} uses {unit}; use --target-property-rate.")
+    target = _either(
+        arguments.target_property_rate,
+        arguments.target_strain_rate,
+        "--target-property-rate and --target-strain-rate",
+    )
+    holds = _either(
+        arguments.rate_hold_times,
+        arguments.modulus_relax_times,
+        "--rate-hold-times and --modulus-relax-times",
+    )
     if target is None or not math.isfinite(target) or target <= 0:
         raise ValueError("A finite positive --target-property-rate is required.")
     maximum = arguments.max_rate_extrapolation_decades
@@ -1471,12 +1493,15 @@ def _property_rate_request(
         )
     protocol_name = _RATE_PROTOCOLS[property_name]
     if arguments.analyse:
-        if arguments.rate_hold_times is not None:
+        if holds is not None:
             raise ValueError(
-                "--rate-hold-times starts new dynamics and cannot be used with --analyse."
+                "--rate-hold-times and --modulus-relax-times start new dynamics "
+                "and cannot be used with --analyse."
             )
-        return property_name, float(target), default_rate_spec(property_name)
-    elif arguments.protocol != protocol_name or arguments.rate_hold_times is None:
+        return _RateRequest(
+            property_name, float(target), (), default_rate_spec(property_name)
+        )
+    if arguments.protocol != protocol_name or holds is None:
         raise ValueError(
             f"{property_name} scans require --protocol {protocol_name} and --rate-hold-times."
         )
@@ -1491,7 +1516,7 @@ def _property_rate_request(
     spec = factories[protocol_name](
         **_protocol_options(arguments, PROTOCOLS[protocol_name])
     )
-    return property_name, float(target), spec
+    return _RateRequest(property_name, float(target), holds, spec)
 
 
 def _write_property_rate_result(
@@ -1756,74 +1781,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.convergence:
         if not arguments.analyse or len(arguments.analyse) != 1:
             parser.error("--convergence requires exactly one --analyse directory")
-        if (
-            _property_rates_requested(arguments)
-            or arguments.target_strain_rate is not None
-            or arguments.modulus_relax_times is not None
-        ):
+        if _property_rates_requested(arguments):
             parser.error("run --convergence separately from imposed-rate analysis")
         try:
             return _analyse_convergence(arguments)
         except (OSError, ValueError, AnalysisError) as error:
             parser.error(str(error))
 
-    property_request: tuple[str, float, RateScanSpec] | None = None
+    property_request: _RateRequest | None = None
     if _property_rates_requested(arguments):
         try:
             property_request = _property_rate_request(arguments)
-            property_name, target, rate_spec = property_request
             if arguments.analyse:
                 report = analyse_property_rates(
                     arguments.analyse,
-                    property_name=property_name,
-                    target_rate=target,
+                    property_name=property_request.property_name,
+                    target_rate=property_request.target_rate,
                     strain_limit=arguments.elastic_strain_limit,
                     max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
                 )
                 _write_property_rate_result(arguments, report)
                 return 0
             plan = validate_property_rate_scan(
-                rate_spec,
-                arguments.rate_hold_times,
-                property_name=property_name,
-                target_rate=target,
+                property_request.spec,
+                property_request.hold_times_ps,
+                property_name=property_request.property_name,
+                target_rate=property_request.target_rate,
                 n_replicas=arguments.thermal_rate_replicas,
                 max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
             )
             print(
-                f"{property_name} rate scan: {plan.total_ns:.3g} ns total including preparation and all replicas",
+                f"{property_request.property_name} rate scan: {plan.total_ns:.3g} ns total including preparation and all replicas",
                 flush=True,
             )
         except (OSError, ValueError, TypeError, RuntimeError) as error:
             parser.error(str(error))
 
-    if property_request is None and arguments.modulus_relax_times is not None:
-        if arguments.analyse or arguments.protocol != "modulus":
-            parser.error("--modulus-relax-times requires a new --protocol modulus scan")
-        if arguments.target_strain_rate is None:
-            parser.error("--modulus-relax-times requires --target-strain-rate")
-    if property_request is None and arguments.target_strain_rate is not None:
-        if (
-            not math.isfinite(arguments.target_strain_rate)
-            or arguments.target_strain_rate <= 0.0
-        ):
-            parser.error("--target-strain-rate must be finite and positive (strain/ns)")
-        if not arguments.analyse and arguments.modulus_relax_times is None:
-            parser.error(
-                "--target-strain-rate requires --modulus-relax-times or --analyse"
-            )
     if arguments.analyse:
-        if arguments.target_strain_rate is not None:
-            try:
-                modulus_report = analyse_modulus_rates(
-                    arguments.analyse,
-                    target_rate_per_ns=arguments.target_strain_rate,
-                    strain_limit=arguments.elastic_strain_limit,
-                )
-            except (OSError, ValueError, AnalysisError) as error:
-                parser.error(str(error))
-            _write_modulus_rate_result(arguments, modulus_report)
-            return 0
         if arguments.protocol == "modulus" and len(arguments.analyse) > 1:
             parser.error(
                 "analysing multiple modulus rates requires --target-strain-rate"
@@ -1849,14 +1843,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
         if property_request is not None:
-            property_name, target, rate_spec = property_request
             report = run_property_rate_scan(
                 crystal_run,
                 Path(arguments.output_dir or "run"),
-                property_name=property_name,
-                target_rate=target,
-                spec=rate_spec,
-                hold_times_ps=arguments.rate_hold_times,
+                property_name=property_request.property_name,
+                target_rate=property_request.target_rate,
+                spec=property_request.spec,
+                hold_times_ps=property_request.hold_times_ps,
                 n_replicas=arguments.thermal_rate_replicas,
                 max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
                 state_in=arguments.state_in,
@@ -1904,21 +1897,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             _yield_protocol(**_protocol_options(arguments, PROTOCOLS["yield"]))
         except (ValueError, YieldError) as error:
             parser.error(str(error))
-    if arguments.modulus_relax_times is not None:
-        try:
-            plan = validate_modulus_rate_scan(
-                _modulus_spec(**_protocol_options(arguments, PROTOCOLS["modulus"])),
-                arguments.modulus_relax_times,
-                target_rate_per_ns=arguments.target_strain_rate,
-            )
-        except (ValueError, MechanicalError) as error:
-            parser.error(str(error))
-        print(
-            f"modulus rate scan: {len(plan.schedules)} rates, "
-            f"{plan.n_replicas} replicas each, {plan.total_ns:.3g} ns total "
-            "including equilibration",
-            flush=True,
-        )
 
     output = Path(cast("str | None", arguments.output_dir) or "run")
     n_chains = int(arguments.chains)
@@ -1960,14 +1938,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if property_request is not None:
-        property_name, target, rate_spec = property_request
         report = run_property_rate_scan(
             run,
             output,
-            property_name=property_name,
-            target_rate=target,
-            spec=rate_spec,
-            hold_times_ps=arguments.rate_hold_times,
+            property_name=property_request.property_name,
+            target_rate=property_request.target_rate,
+            spec=property_request.spec,
+            hold_times_ps=property_request.hold_times_ps,
             n_replicas=arguments.thermal_rate_replicas,
             max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
             chain_backbone=chain.backbone,
@@ -2233,19 +2210,6 @@ def _run_modulus_scan(
     options: dict[str, Any],
 ) -> int:
     """Measure the elastic constants, and say what qualifies each one."""
-    if arguments.modulus_relax_times is not None:
-        report = run_modulus_rate_scan(
-            run,
-            output,
-            relax_ps=arguments.modulus_relax_times,
-            target_rate_per_ns=arguments.target_strain_rate,
-            spec=_modulus_spec(**options),
-            chain_backbone=chain.backbone,
-            atoms_per_chain=chain.n_atoms,
-            expected_characteristic_ratio=_build_characteristic_ratio(arguments),
-        )
-        _write_modulus_rate_result(arguments, report, output / "analysis")
-        return 0
     result = run_modulus_scan(
         run,
         output,
@@ -2258,44 +2222,6 @@ def _run_modulus_scan(
         print(line, flush=True)
     _print_chains(None)
     return 0
-
-
-def _write_modulus_rate_result(
-    arguments: argparse.Namespace,
-    report: ModulusRateReport,
-    output_dir: Path | None = None,
-) -> None:
-    """Keep each model's target, uncertainty and extrapolation distance visible."""
-    for fit in (report.log_linear, report.power_law):
-        print(
-            f"{fit.form}: E = {fit.modulus_mpa:.4g} +/- "
-            f"{fit.standard_error_mpa:.3g} MPa (fit SE) at "
-            f"{fit.target_rate_per_ns:.3g} strain/ns, {fit.temperature_k:.1f} K; "
-            f"{fit.sensitivity_mpa_per_decade:.3g} MPa per decade at "
-            f"{fit.reference_rate_per_ns:.3g} strain/ns; "
-            f"{fit.n_rates} measured rates, extrapolated "
-            f"{fit.extrapolation_decades:.2f} decades"
-            f"{'' if fit.resolved else ' (not resolved)'}",
-            flush=True,
-        )
-        for note in fit.notes:
-            print(f"note ({fit.form}): {note}", flush=True)
-    print(
-        "model difference at target: "
-        f"{abs(report.log_linear.modulus_mpa - report.power_law.modulus_mpa):.4g} MPa",
-        flush=True,
-    )
-    printed_notes = set(report.log_linear.notes) | set(report.power_law.notes)
-    for note in report.notes:
-        if note not in printed_notes:
-            print(f"note: {note}", flush=True)
-    files = write_modulus_rate_report(
-        report,
-        output_dir if output_dir is not None else arguments.output_dir,
-        figures=not arguments.no_figures,
-        figure_format=arguments.figure_format,
-    )
-    print(f"wrote {files.json} and {len(files.figures)} figure(s)", flush=True)
 
 
 def _modulus_lines(result: Any) -> list[str]:

@@ -25,8 +25,7 @@ from openmmpolymer.thermal_rates import (
 from openmmpolymer.tm import TmSpec
 from openmmpolymer.trajectory import AnalysisError
 
-from .helpers import write_quench
-from .test_tm import planted_curve, write_heating
+from .helpers import planted_curve, write_heating, write_quench
 
 HOLDS = (100.0, 1000.0, 10000.0)
 
@@ -186,16 +185,6 @@ def test_different_saved_thermal_conditions_are_refused(
         )
 
 
-@pytest.mark.parametrize("holds", [(1, 2), (1, 1, 2), (1, 2, math.inf), (0, 1, 2)])
-def test_invalid_thermal_rates_fail_before_work_starts(
-    holds: tuple[float, ...],
-) -> None:
-    with pytest.raises(ValueError):
-        validate_thermal_rate_scan(
-            TgSpec(), holds, property_name="glass_transition", target_rate=0.1
-        )
-
-
 @pytest.mark.parametrize(
     "spec,property_name",
     [(TgSpec(), "glass_transition"), (TmSpec(), "melting_temperature")],
@@ -347,15 +336,29 @@ def test_melting_needs_explicit_crystal_assertion_before_writing(
     assert not (tmp_path / "no").exists()
 
 
-def test_melting_rejects_system_with_existing_barostat(
-    tmp_path: Path, argon_run: Any
+@pytest.mark.parametrize(
+    "controls",
+    [("isotropic",), ("flexible",), ("isotropic", "anisotropic"), ("andersen",)],
+)
+def test_a_system_that_controls_its_own_state_is_refused_before_writing(
+    tmp_path: Path, argon_run: Any, controls: tuple[str, ...]
 ) -> None:
+    """The stages attach their own barostat; a second would act beside it."""
     import openmm as mm
 
+    forces = {
+        "isotropic": lambda: mm.MonteCarloBarostat(1.0, 300.0),
+        "anisotropic": lambda: mm.MonteCarloAnisotropicBarostat(
+            mm.Vec3(1.0, 1.0, 1.0), 300.0
+        ),
+        "flexible": lambda: mm.MonteCarloFlexibleBarostat(1.0, 300.0),
+        "andersen": lambda: mm.AndersenThermostat(300.0, 1.0),
+    }
     system = mm.XmlSerializer.deserialize(argon_run.system_xml)
-    system.addForce(mm.MonteCarloBarostat(1, 300))
+    for control in controls:
+        system.addForce(forces[control]())
     argon_run.system_xml = mm.XmlSerializer.serialize(system)
-    with pytest.raises(ThermalRateError, match="barostat"):
+    with pytest.raises(ThermalRateError, match="barostat or Andersen thermostat"):
         run_thermal_rate_scan(
             argon_run,
             tmp_path / "no",
@@ -393,7 +396,7 @@ def test_changed_thermal_inputs_are_refused_on_resume(
         options["hold_times_ps"] = (100, 500, 10000)
     else:
         options["npt_ps"] = 1234
-    with pytest.raises(ThermalRateError, match="changed"):
+    with pytest.raises(ThermalRateError, match="different settings"):
         run_thermal_rate_scan(argon_run, tmp_path / "scan", **options)
     assert len(fake_dynamics) == before
 
@@ -454,6 +457,7 @@ def test_workflow_is_saved_before_preparation_failure(
     assert saved["total_ns"] > 0
 
 
+@pytest.mark.slow
 def test_real_tiny_heating_series_records_three_rates_and_resumes(
     tmp_path: Path, argon_run: Any
 ) -> None:

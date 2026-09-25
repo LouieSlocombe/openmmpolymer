@@ -31,68 +31,7 @@ from openmmpolymer.tm import (
 )
 from openmmpolymer.trajectory import AnalysisError
 
-
-def planted_curve(
-    *,
-    volume_jump: float = 0.1,
-    enthalpy_jump: float = 400.0,
-    volume_split: int = 10,
-    enthalpy_split: int = 10,
-    noise: float = 1.0,
-) -> HeatingCurve:
-    """Two expanding branches separated by a known first-order jump."""
-    temperatures = np.arange(300.0, 500.0, 10.0)
-    index = np.arange(len(temperatures))
-    # Noise is much smaller than a real jump, and differs between observables.
-    volume = (
-        1.0
-        + 0.0003 * (temperatures - 300.0)
-        + volume_jump * (index >= volume_split)
-        + noise * 0.0002 * np.sin(index * 2.1)
-    )
-    enthalpy = (
-        -4000.0
-        + 5.0 * (temperatures - 300.0)
-        + enthalpy_jump * (index >= enthalpy_split)
-        + noise * 0.7 * np.cos(index * 1.7)
-    )
-    return HeatingCurve(
-        temperature_k=tuple(float(t) for t in temperatures),
-        density_g_cm3=tuple(float(1.0 / v) for v in volume),
-        enthalpy_kj_mol=tuple(float(h) for h in enthalpy),
-        hold_ps=(1000.0,) * len(temperatures),
-        pressure_bar=(1.0,) * len(temperatures),
-        stages=("heating",),
-    )
-
-
-def write_heating(
-    directory: Path,
-    curve: HeatingCurve,
-    *,
-    chunks: tuple[int, ...] = (9, 10, 1),
-) -> Path:
-    """Store the public stage-result schema without running dynamics."""
-    directory.mkdir(parents=True, exist_ok=True)
-    stages: dict[str, Any] = {}
-    start = 0
-    for number, length in enumerate(chunks):
-        stop = start + length
-        name = f"heat_{number:02d}"
-        stages[name] = {
-            "name": name,
-            "samples": {
-                "segment_temperature_k": list(curve.temperature_k[start:stop]),
-                "segment_density_g_cm3": list(curve.density_g_cm3[start:stop]),
-                "segment_enthalpy_kj_mol": list(curve.enthalpy_kj_mol[start:stop]),
-                "segment_duration_ps": list(curve.hold_ps[start:stop]),
-                "segment_pressure_bar": list(curve.pressure_bar[start:stop]),
-            },
-        }
-        start = stop
-    assert start == curve.n_points
-    RunManifest(protocol="tm_heating", seed=11, stages=stages).save(directory)
-    return directory
+from .helpers import planted_curve, write_heating
 
 
 def test_matching_enthalpy_and_volume_jumps_resolve_a_temperature_bracket() -> None:

@@ -125,14 +125,6 @@ from .mechanical import (
 )
 from .melt import build_melt
 from .melt_check import MeltEquilibration, melt_equilibration
-from .modulus_rate_report import write_modulus_rate_report
-from .modulus_rates import (
-    ModulusRatePlan,
-    ModulusRateReport,
-    analyse_modulus_rates,
-    run_modulus_rate_scan,
-    validate_modulus_rate_scan,
-)
 from .packing import (
     DEFAULT_PACKING_DENSITY,
     PackedComponent,
@@ -155,10 +147,10 @@ from .plots import (
     plot_moduli,
     plot_persistence,
     plot_quench_curve,
+    plot_rate_dependence,
     plot_relaxation,
     plot_relaxation_spectrum,
     plot_state_data,
-    plot_strain_rate,
     plot_stress_strain,
     plot_yield_strength,
 )
@@ -189,7 +181,7 @@ from .rate_dependence import (
     analyse_rate_observations,
     rate_extrapolation,
 )
-from .rate_reports import plot_rate_dependence, write_rate_report
+from .rate_reports import write_rate_report
 from .relaxation import (
     KWWFit,
     PronyFit,
@@ -229,7 +221,6 @@ from .simulate import (
     run_shear,
     safe_timestep_fs,
 )
-from .strain_rate import StrainRateExtrapolation, strain_rate_extrapolation
 from .strength import (
     BreakingStrength,
     ElongationAtBreak,
@@ -421,8 +412,6 @@ __all__ = [
     "MeltEquilibration",
     "MeltingReport",
     "MeltingTransition",
-    "ModulusRatePlan",
-    "ModulusRateReport",
     "ModulusReport",
     "ModulusSchedule",
     "ModulusSpec",
@@ -460,7 +449,6 @@ __all__ = [
     "StageFiles",
     "StageResult",
     "StateData",
-    "StrainRateExtrapolation",
     "StressError",
     "StressStrain",
     "StructuralParameterConvergence",
@@ -498,7 +486,6 @@ __all__ = [
     "analyse_elongation",
     "analyse_mechanics",
     "analyse_melting",
-    "analyse_modulus_rates",
     "analyse_property_rates",
     "analyse_rate_observations",
     "analyse_relaxation",
@@ -574,7 +561,6 @@ __all__ = [
     "plot_relaxation_convergence",
     "plot_relaxation_spectrum",
     "plot_state_data",
-    "plot_strain_rate",
     "plot_stress_strain",
     "plot_structural_convergence",
     "plot_window_convergence",
@@ -610,7 +596,6 @@ __all__ = [
     "run_heat",
     "run_load",
     "run_minimise",
-    "run_modulus_rate_scan",
     "run_modulus_scan",
     "run_npt",
     "run_nvt",
@@ -635,7 +620,6 @@ __all__ = [
     "stage_files",
     "standard_melt_equilibration",
     "steps_for",
-    "strain_rate_extrapolation",
     "stress_strain",
     "stress_tensor_bar",
     "structural_window_convergence",
@@ -649,7 +633,6 @@ __all__ = [
     "tg_fine_scan",
     "time_window_convergence",
     "validate_elastic_rate_scan",
-    "validate_modulus_rate_scan",
     "validate_property_rate_scan",
     "validate_tensile_rate_scan",
     "validate_thermal_rate_scan",
@@ -658,7 +641,6 @@ __all__ = [
     "write_elongation_report",
     "write_mechanical_report",
     "write_melting_report",
-    "write_modulus_rate_report",
     "write_rate_report",
     "write_relaxation_report",
     "write_structure_report",
