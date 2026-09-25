@@ -143,6 +143,8 @@ Every measurement follows the same pattern:
   with the same request and intact states; `resume=False` reruns everything.
   Long ladders are split into stages, so an interrupted scan resumes mid-way.
 - `max_total_ns` prices the whole scan and refuses before anything is written.
+  The command line prints that price first, and `--dry-run` stops once the
+  cell is built.
 - Every result carries `resolved` and `notes`. Unresolved means the data did
   not support a number - a fit that found a corner in noise, a curve that
   never failed, a replica that is missing - and the headline is then `None`.
@@ -201,9 +203,15 @@ below the expected melting range and heats it through a temperature ladder at
 fixed pressure.
 
 ```python
-from openmmpolymer import TmSpec, analyse_melting, run_tm_scan, write_melting_report
+from openmmpolymer import (
+    TmSpec,
+    analyse_melting,
+    load_crystal,
+    run_tm_scan,
+    write_melting_report,
+)
 
-# crystal_run is a prepared RunContext for your crystalline periodic cell.
+crystal_run = load_crystal("crystal.pdb", "system.xml")
 result = run_tm_scan(
     crystal_run,
     "melting",
@@ -223,9 +231,10 @@ cell size, morphology and the force field can all shift. Inspect the loss of
 order (`trajectory_ps` saves coordinates) and repeat with other starting
 configurations.
 
-The CLI takes the prepared PDB, with its periodic box and bonds, and an OpenMM
-`XmlSerializer` System in the same atom order with no thermostat or barostat.
-Molecules must have equal atom counts in contiguous blocks.
+`load_crystal` takes the prepared PDB, with its periodic box and bonds, and an
+OpenMM `XmlSerializer` System in the same atom order with no thermostat or
+barostat, and checks them before anything runs. Molecules must have equal
+atom counts in contiguous blocks. The command line takes the same two files:
 
 ```bash
 openmmpolymer --protocol tm --crystal-pdb crystal.pdb --system-xml system.xml \
