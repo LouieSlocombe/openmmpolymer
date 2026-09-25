@@ -301,6 +301,8 @@ def test_protocol_preserves_the_crystal_and_visits_every_heating_point_once() ->
     assert all(stage.kind == "heat" for stage in heating)
     ladder = [t for stage in heating for t in stage.options["temperatures_k"]]
     assert ladder == [300.0, 310.0, 320.0, 330.0, 340.0, 350.0, 355.0]
+    # Unlike a quench, a trailing one-temperature chunk is kept as it is.
+    assert [len(stage.options["temperatures_k"]) for stage in heating] == [2, 2, 2, 1]
     assert all(stage.options["barostat"] == "anisotropic" for stage in heating)
     assert protocol.total_duration_ps == pytest.approx(8000.0)
 

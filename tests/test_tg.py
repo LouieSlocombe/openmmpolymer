@@ -11,6 +11,8 @@ runs the whole thing in a couple of seconds.
 from __future__ import annotations
 
 import json
+import logging
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -22,20 +24,22 @@ from openmmpolymer.tg import (
     PRECOOL_STEM,
     TgError,
     TgSpec,
-    analyse_run,
+    analyse_tg,
     coarse_schedule,
     cooling_rate_series,
     fine_schedule,
     fine_window,
-    melt_equilibration,
     nominal_fine_schedule,
     pick_waypoint,
     run_tg_scan,
-    write_report,
+    tg_fine_scan,
+    write_tg_report,
 )
 from openmmpolymer.trajectory import AnalysisError
 
 from .helpers import (
+    QUICK_EQUILIBRATION,
+    argon_context,
     two_line_curve,
     write_quench,
     write_quenches,
@@ -56,19 +60,6 @@ QUICK = TgSpec(
     samples_per_segment=4,
     min_points_per_branch=2,
 )
-
-#: The equilibration, shortened to match. The compression ladder is gentle
-#: because a kilobar squeezes 216 argon atoms past twice the cutoff, and the
-#: anneal is brief for the same reason.
-QUICK_EQUILIBRATION: dict[str, Any] = {
-    "nvt_ps": 0.2,
-    "compress_ps_each": 0.2,
-    "npt_ps": 0.4,
-    "anneal_cycles": 1,
-    "anneal_window_ps": 0.1,
-    "anneal_hold_ps": 0.1,
-    "compress_pressures_bar": (1.0, 20.0, 1.0),
-}
 
 
 # --------------------------------------------------------------------------
@@ -146,7 +137,8 @@ def test_the_chunks_visit_every_temperature_once_and_in_order() -> None:
     """A split for resume is bookkeeping; the ladder has to survive it."""
     spec = TgSpec(stage_ps=3000.0)
     schedule = fine_schedule(480.0, 360.0, spec)
-    chunks = [stage.options["temperatures_k"] for stage in _fine_stages(schedule, spec)]
+    stages = tg_fine_scan(schedule, spec, timestep_fs=1.0).stages
+    chunks = [stage.options["temperatures_k"] for stage in stages]
     walked = [temperature for chunk in chunks for temperature in chunk]
 
     assert len(chunks) > 1
@@ -159,18 +151,9 @@ def test_no_chunk_is_left_holding_a_single_temperature() -> None:
     """A stage with no temperature step is one nothing can classify."""
     spec = TgSpec(stage_ps=2.0, fine_hold_ps=0.4)
     schedule = fine_schedule(140.0, 100.0, spec)
+    stages = tg_fine_scan(schedule, spec, timestep_fs=1.0).stages
 
-    sizes = [
-        len(stage.options["temperatures_k"]) for stage in _fine_stages(schedule, spec)
-    ]
-    assert min(sizes) > 1
-
-
-def _fine_stages(schedule: Any, spec: TgSpec) -> Any:
-    """The stages one fine ladder becomes."""
-    from openmmpolymer.tg import tg_fine_scan
-
-    return tg_fine_scan(schedule, spec, timestep_fs=1.0).stages
+    assert min(len(stage.options["temperatures_k"]) for stage in stages) > 1
 
 
 def test_a_fine_window_that_does_not_cool_is_refused() -> None:
@@ -180,27 +163,77 @@ def test_a_fine_window_that_does_not_cool_is_refused() -> None:
 
 
 # --------------------------------------------------------------------------
-# What the coarse pass is allowed to conclude
+# What a scan refuses, and when
 # --------------------------------------------------------------------------
 
 
-def test_an_unresolved_coarse_fit_refuses_rather_than_guessing(
+def test_an_unresolved_coarse_fit_refuses_and_names_the_ways_out(
     argon_scan_run: Any,
 ) -> None:
     """A fine pass is tens of nanoseconds.
 
     Spending them on a window derived from a fit that already reported it
     found a corner in noise produces a curve with nothing in it, and no way
-    to tell that apart from a polymer with no transition in range.
+    to tell that apart from a polymer with no transition in range. And a dead
+    end with no exits is worse than the run it prevented.
     """
-    with pytest.raises(TgError, match="did not resolve"):
+    with pytest.raises(TgError, match="did not resolve") as refusal:
         run_tg_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
+    assert "tg_approx_k" in str(refusal.value)
 
 
-def test_the_refusal_names_the_ways_out(argon_scan_run: Any) -> None:
-    """A dead end with no exits is worse than the run it prevented."""
-    with pytest.raises(TgError, match="tg_approx_k"):
-        run_tg_scan(argon_scan_run, "run", spec=QUICK, **QUICK_EQUILIBRATION)
+def test_a_scan_over_its_budget_stops_before_it_creates_anything(
+    argon_run: Any,
+) -> None:
+    """Decided before it starts, not discovered three days in."""
+    with pytest.raises(TgError, match="max_total_ns"):
+        run_tg_scan(
+            argon_run,
+            "run",
+            spec=replace(QUICK, max_total_ns=1.0e-6),
+            tg_approx_k=120.0,
+            **QUICK_EQUILIBRATION,
+        )
+    assert not Path("run").exists()
+
+
+@pytest.mark.parametrize("rate", [-5.0, 0.0])
+def test_every_cooling_rate_is_checked_before_any_dynamics(
+    argon_run: Any, rate: float
+) -> None:
+    """A bad last rate cannot wait until the passes before it have run."""
+    with pytest.raises(ValueError, match="rates_k_per_ns"):
+        cooling_rate_series(
+            argon_run,
+            "run",
+            rates_k_per_ns=(12500.0, rate),
+            spec=QUICK,
+            tg_approx_k=120.0,
+            **QUICK_EQUILIBRATION,
+        )
+    assert not Path("run").exists()
+
+
+def test_a_resume_that_names_another_window_is_refused_before_any_dynamics(
+    argon_run: Any,
+) -> None:
+    """The window is part of what was asked for, not only the spec."""
+    Path("run").mkdir()
+    Path("run/tg_workflow.json").write_text(
+        json.dumps({"request": {"spec": asdict(QUICK), "tg_approx_k": 100.0}})
+    )
+    with pytest.raises(TgError, match=r"\(tg_approx_k\)"):
+        run_tg_scan(
+            argon_run, "run", spec=QUICK, tg_approx_k=120.0, **QUICK_EQUILIBRATION
+        )
+    assert not Path("run/manifest.json").exists()
+
+
+def test_two_passes_at_the_same_rate_are_refused(argon_run: Any) -> None:
+    """They would be one measurement recorded under two names."""
+    with pytest.raises(TgError, match="not distinct"):
+        cooling_rate_series(argon_run, "run", rates_k_per_ns=(10.0, 10.0), spec=QUICK)
+    assert not Path("run").exists()
 
 
 # --------------------------------------------------------------------------
@@ -209,19 +242,29 @@ def test_the_refusal_names_the_ways_out(argon_scan_run: Any) -> None:
 
 
 @pytest.mark.parametrize("initial_resume", [True, False])
-def test_the_whole_scan_runs_and_then_resumes_without_repeating_itself(
+def test_the_whole_scan_runs_records_what_it_derived_and_resumes(
     argon_scan_run: Any,
     initial_resume: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The load-bearing one: both passes, the waypoint between them, resume."""
-    result = run_tg_scan(
-        argon_scan_run,
-        "run",
-        spec=QUICK,
-        tg_approx_k=120.0,
-        resume=initial_resume,
-        **QUICK_EQUILIBRATION,
-    )
+    """The load-bearing one: both passes, the waypoint between them, resume.
+
+    The cost goes to the log before anything runs, because in a queue the
+    outstanding cost is the only number anyone can act on. What the scan
+    derived goes beside the manifest rather than in it. And a resume that asks
+    for something else is refused: it would keep numbers measured under the
+    settings it replaced.
+    """
+    with caplog.at_level(logging.INFO, logger="openmmpolymer.tg"):
+        result = run_tg_scan(
+            argon_scan_run,
+            "run",
+            spec=QUICK,
+            tg_approx_k=120.0,
+            resume=initial_resume,
+            **QUICK_EQUILIBRATION,
+        )
+    assert "still to run" in caplog.text
 
     assert result.restart == "waypoint"
     assert "waypoint" in Path(result.start_state).name
@@ -234,41 +277,6 @@ def test_the_whole_scan_runs_and_then_resumes_without_repeating_itself(
     assert result.fine_curve is not None
     assert result.fine_curve.n_points == 9
 
-    again = run_tg_scan(
-        argon_scan_run,
-        "run",
-        spec=QUICK,
-        tg_approx_k=120.0,
-        **QUICK_EQUILIBRATION,
-    )
-    assert again.coarse_summary.results == ()
-    assert again.fine_summary.results == ()
-    assert again.fine_summary.skipped
-
-
-def test_the_scan_records_what_it_derived_and_says_what_it_will_cost(
-    argon_scan_run: Any, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The record goes beside the manifest, not in it.
-
-    The manifest is the resume ledger, read by every version of this package;
-    a derived, recomputable block in it would be stale after the next resume
-    and would break an older install's load. The cost goes to the log before
-    anything runs, because in a queue the outstanding cost is the only number
-    anyone can act on.
-    """
-    import logging
-
-    with caplog.at_level(logging.INFO, logger="openmmpolymer.tg"):
-        run_tg_scan(
-            argon_scan_run,
-            "run",
-            spec=QUICK,
-            tg_approx_k=120.0,
-            **QUICK_EQUILIBRATION,
-        )
-    assert "still to run" in caplog.text
-
     workflow = json.loads(Path("run/tg_workflow.json").read_text())
     assert workflow["tg_used_k"] == pytest.approx(120.0)
     assert workflow["window_top_k"] == pytest.approx(140.0)
@@ -277,25 +285,22 @@ def test_the_scan_records_what_it_derived_and_says_what_it_will_cost(
     assert workflow["request"]["spec"]["window_k"] == pytest.approx(20.0)
     assert workflow["coarse_stages"]
 
-    # And one timestep across every chunk: a measurement made three ways is a
-    # confound nobody would choose.
+    # One timestep across every fine chunk: a measurement integrated three
+    # ways is a confound nobody would choose.
     manifest = json.loads(Path("run/manifest.json").read_text())
-    assert len([n for n in manifest["stages"] if n.startswith(FINE_STEM)]) > 1
-    assert workflow["timestep_fs"] > 0.0
+    fine = [name for name in manifest["stages"] if name.startswith(FINE_STEM)]
+    assert len(fine) > 1
+    assert {
+        manifest["provenance"]["stages"][name]["request"]["options"]["timestep_fs"]
+        for name in fine
+    } == {workflow["timestep_fs"]}
 
-
-def test_a_scan_resumed_with_different_settings_is_refused(
-    argon_scan_run: Any,
-) -> None:
-    """Resuming would keep numbers measured under the settings it replaced.
-
-    Stage options are recorded nowhere, so without this the old result is
-    kept silently and belongs to a schedule nobody ran.
-    """
-    run_tg_scan(
+    again = run_tg_scan(
         argon_scan_run, "run", spec=QUICK, tg_approx_k=120.0, **QUICK_EQUILIBRATION
     )
-    from dataclasses import replace
+    assert again.coarse_summary.results == ()
+    assert again.fine_summary.results == ()
+    assert again.fine_summary.skipped
 
     with pytest.raises(TgError, match="fine_hold_ps"):
         run_tg_scan(
@@ -307,46 +312,10 @@ def test_a_scan_resumed_with_different_settings_is_refused(
         )
 
 
-def test_the_cost_of_both_passes_is_reported_before_anything_runs(
-    argon_scan_run: Any, caplog: pytest.LogCaptureFixture
-) -> None:
-    """In a queue the outstanding cost is the only number anyone can act on."""
-    import logging
-
-    with caplog.at_level(logging.INFO, logger="openmmpolymer.tg"):
-        run_tg_scan(
-            argon_scan_run,
-            "run",
-            spec=QUICK,
-            tg_approx_k=120.0,
-            **QUICK_EQUILIBRATION,
-        )
-    assert "still to run" in caplog.text
-
-
-def test_a_scan_over_its_budget_stops_before_it_writes_anything(
-    argon_scan_run: Any,
-) -> None:
-    """Decided before it starts, not discovered three days in."""
-    from dataclasses import replace
-
-    with pytest.raises(TgError, match="max_total_ns"):
-        run_tg_scan(
-            argon_scan_run,
-            "run",
-            spec=replace(QUICK, max_total_ns=1.0e-6),
-            tg_approx_k=120.0,
-            **QUICK_EQUILIBRATION,
-        )
-    assert not Path("run/manifest.json").exists()
-
-
 def test_a_deleted_waypoint_falls_back_to_a_pre_cool_from_the_melt(
     argon_scan_run: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A different thermal history, so it warns rather than doing it quietly."""
-    import logging
-
     run_tg_scan(
         argon_scan_run, "run", spec=QUICK, tg_approx_k=120.0, **QUICK_EQUILIBRATION
     )
@@ -368,119 +337,32 @@ def test_a_deleted_waypoint_falls_back_to_a_pre_cool_from_the_melt(
     assert PRECOOL_STEM in {result.name for result in again.fine_summary.results}
 
 
-def test_several_cooling_rates_start_from_one_configuration(
-    argon_scan_run: Any,
-) -> None:
+def test_several_cooling_rates_start_from_one_configuration() -> None:
     """Independent histories from a common melt, which is what makes them
-    comparable at all."""
+    comparable at all.
+
+    Run on dimers with a backbone, because every pass measures the chains at
+    its end: a fine pass that did not would clear the dimensions and the
+    backbone the coarse pass recorded, and the melt check and the structure
+    report both read them from the manifest.
+    """
     fits = cooling_rate_series(
-        argon_scan_run,
+        argon_context(216, 2.8, atoms_per_molecule=2),
         "run",
         rates_k_per_ns=(12500.0, 6250.0),
-        spec=TgSpec(**{**QUICK.__dict__, "stage_ps": 1.0e6}),
+        spec=replace(QUICK, stage_ps=1.0e6),
         tg_approx_k=120.0,
+        chain_backbone=(0, 1),
+        atoms_per_chain=2,
         **QUICK_EQUILIBRATION,
     )
     assert [fit.cooling_rate_k_per_ns for fit in fits] == [
         pytest.approx(12500.0),
         pytest.approx(6250.0),
     ]
-
-
-def test_two_passes_at_the_same_rate_are_refused(argon_scan_run: Any) -> None:
-    """They would be one measurement recorded under two names."""
-    with pytest.raises(TgError, match="not distinct"):
-        cooling_rate_series(
-            argon_scan_run, "run", rates_k_per_ns=(10.0, 10.0), spec=QUICK
-        )
-
-
-# --------------------------------------------------------------------------
-# Whether the melt had settled before it was cooled
-# --------------------------------------------------------------------------
-
-
-def test_the_melt_check_fails_honestly_when_the_stage_wrote_no_trajectory(
-    dimer_run_directory: Path,
-) -> None:
-    """Half the evidence missing is not a pass.
-
-    The NPT stage writes no trajectory unless it is asked to, so the chain
-    half of the check has nothing to read. The verdict then has to say that,
-    rather than quietly reporting on the volume alone.
-    """
-    manifest = json.loads((dimer_run_directory / "manifest.json").read_text())
-    stage = manifest["stages"]["02_nvt"]
-    for key in ("final_pdb",):
-        Path(str(stage[key])).replace(dimer_run_directory / "03_alone.pdb")
-    manifest["stages"] = {
-        "03_alone": {
-            "name": "03_alone",
-            "final_pdb": str(dimer_run_directory / "03_alone.pdb"),
-            "csv": stage["csv"],
-            "samples": {},
-        }
-    }
-    (dimer_run_directory / "manifest.json").write_text(json.dumps(manifest))
-
-    verdict = melt_equilibration(dimer_run_directory, "03_alone")
-
-    assert verdict.displacement is None
-    assert verdict.chains_moved is False
-    assert verdict.equilibrated is False
-    assert any("no trajectory" in reason for reason in verdict.unchecked)
-
-
-def test_the_melt_check_reads_a_real_trajectory(dimer_run_directory: Path) -> None:
-    """What this package writes is what the check has to be able to read."""
-    verdict = melt_equilibration(
-        dimer_run_directory, "02_nvt", radius_of_gyration_nm=0.02
-    )
-
-    assert verdict.displacement is not None
-    assert verdict.displacement_nm2 is not None
-    assert verdict.displacement_target_nm2 == pytest.approx(2.0 * 0.02**2)
-    assert verdict.displacement_lag_ps is not None
-
-
-def test_a_chain_that_moved_less_than_its_own_size_is_not_equilibrated(
-    dimer_run_directory: Path,
-) -> None:
-    """Two picoseconds of argon does not move a chain past its own radius."""
-    verdict = melt_equilibration(
-        dimer_run_directory, "02_nvt", radius_of_gyration_nm=100.0
-    )
-
-    assert verdict.chains_moved is False
-    assert verdict.equilibrated is False
-
-
-def test_the_melt_check_says_so_when_there_is_no_radius_of_gyration(
-    dimer_run_directory: Path,
-) -> None:
-    """There is then nothing to measure the displacement against."""
-    verdict = melt_equilibration(dimer_run_directory, "02_nvt")
-
-    assert verdict.radius_of_gyration_nm is None
-    assert verdict.chains_moved is False
-    assert any("radius of gyration" in reason for reason in verdict.unchecked)
-
-
-def test_the_melt_check_names_a_stage_the_manifest_does_not_have(
-    dimer_run_directory: Path,
-) -> None:
-    """Saying what is there is the difference between a hint and a dead end."""
-    verdict = melt_equilibration(dimer_run_directory, "09_missing")
-
-    assert verdict.volume is None
-    assert verdict.equilibrated is False
-    assert any("02_nvt" in reason for reason in verdict.unchecked)
-
-
-def test_the_melt_check_needs_a_manifest(tmp_path: Path) -> None:
-    """Without one there is no way to know what a directory even holds."""
-    with pytest.raises(AnalysisError, match="No manifest"):
-        melt_equilibration(tmp_path)
+    chains = json.loads(Path("run/manifest.json").read_text())["chains"]
+    assert chains["backbone"] == [0, 1]
+    assert chains["mean_radius_of_gyration_nm"] > 0.0
 
 
 # --------------------------------------------------------------------------
@@ -520,7 +402,7 @@ def two_pass_directory(directory: Path) -> Path:
 
 def test_the_chunks_of_one_pass_come_back_as_one_curve(tmp_path: Path) -> None:
     """The split is for resume; the pieces are one cooling history."""
-    report = analyse_run(two_pass_directory(tmp_path), melt_stage=None)
+    report = analyse_tg(two_pass_directory(tmp_path), melt_stage=None)
 
     assert len(report.curves) == 2
     assert [curve.n_points for curve in report.curves] == [11, 21]
@@ -531,7 +413,7 @@ def test_the_fine_pass_is_the_answer_and_the_coarse_one_is_the_evidence(
     tmp_path: Path,
 ) -> None:
     """Told apart by their temperature step, not by what they were called."""
-    report = analyse_run(two_pass_directory(tmp_path), melt_stage=None)
+    report = analyse_tg(two_pass_directory(tmp_path), melt_stage=None)
 
     assert report.coarse is not None
     assert report.fine is not None
@@ -563,7 +445,7 @@ def test_passes_are_found_by_shape_rather_than_by_the_names_they_were_given(
             },
         },
     )
-    report = analyse_run(tmp_path, melt_stage=None)
+    report = analyse_tg(tmp_path, melt_stage=None)
 
     assert report.stages == ("screen", "resolve")
     assert report.coarse is not None
@@ -578,7 +460,7 @@ def test_a_run_with_no_resolved_transition_reports_no_temperature(
     temperature, _ = two_line_curve()
     straight = 1.0 / (1.0 + 5.0e-4 * temperature)
     write_quench(tmp_path, temperature[::-1], straight[::-1])
-    report = analyse_run(tmp_path, melt_stage=None)
+    report = analyse_tg(tmp_path, melt_stage=None)
 
     assert report.temperature_k is None
     assert not report.resolved
@@ -590,7 +472,7 @@ def test_a_directory_with_no_quench_in_it_is_refused(
 ) -> None:
     """There is nothing here to read a transition off."""
     with pytest.raises(AnalysisError, match="stepped down a ladder"):
-        analyse_run(dimer_run_directory)
+        analyse_tg(dimer_run_directory)
 
 
 def test_several_rates_pooled_from_several_directories_give_one_fit(
@@ -613,7 +495,7 @@ def test_several_rates_pooled_from_several_directories_give_one_fit(
         )
         directories.append(directory)
 
-    report = analyse_run(
+    report = analyse_tg(
         directories[0],
         extra_run_dirs=directories[1:],
         melt_stage=None,
@@ -652,7 +534,7 @@ def test_only_the_finest_scans_are_weighed_against_each_other(
         }
     write_quenches(tmp_path, stages)
 
-    report = analyse_run(tmp_path, melt_stage=None)
+    report = analyse_tg(tmp_path, melt_stage=None)
 
     assert report.log_linear is not None
     assert report.log_linear.n_rates == 2
@@ -664,86 +546,11 @@ def test_one_quench_alone_has_no_rate_dependence_to_fit(tmp_path: Path) -> None:
     """And that is a silence, not an error."""
     temperature, density = two_line_curve(transition_k=340.0)
     write_quench(tmp_path, temperature[::-1], density[::-1])
-    report = analyse_run(tmp_path, melt_stage=None)
+    report = analyse_tg(tmp_path, melt_stage=None)
 
     assert report.coarse is None
     assert report.log_linear is None
     assert report.temperature_k == pytest.approx(340.0)
-
-
-# --------------------------------------------------------------------------
-# Writing the report
-# --------------------------------------------------------------------------
-
-
-def test_nothing_is_written_until_the_report_is(tmp_path: Path) -> None:
-    """The discipline plots.py keeps, one layer up: reading writes nothing."""
-    directory = two_pass_directory(tmp_path)
-    before = sorted(path.name for path in directory.iterdir())
-
-    analyse_run(directory, melt_stage=None)
-
-    assert sorted(path.name for path in directory.iterdir()) == before
-
-
-def test_the_report_writes_one_record_and_a_figure_per_pass(
-    tmp_path: Path,
-) -> None:
-    """Two quench figures and a rate figure, beside the machine-readable one."""
-    report = analyse_run(two_pass_directory(tmp_path), melt_stage=None)
-    files = write_report(report)
-
-    assert Path(files.json).name == "tg.json"
-    assert Path(files.json).parent.name == "analysis"
-    assert len(files.figures) == 2
-    assert all(Path(path).is_file() for path in files.figures)
-
-
-def test_the_record_carries_the_expansivities(tmp_path: Path) -> None:
-    """asdict drops them, because they are properties.
-
-    So the record is written out field by field, and this is what says the
-    two have not drifted apart.
-    """
-    report = analyse_run(two_pass_directory(tmp_path), melt_stage=None)
-    record = json.loads(Path(write_report(report, figures=False).json).read_text())
-
-    assert record["fine"]["melt_expansivity_per_k"] == pytest.approx(8.0e-4)
-    assert record["fine"]["glass_expansivity_per_k"] == pytest.approx(2.0e-4)
-    assert record["fine"]["expansivity_ordered"] is True
-
-
-def test_the_record_names_the_version_that_wrote_it(tmp_path: Path) -> None:
-    """A surprising number has to be placeable against what produced it."""
-    report = analyse_run(two_pass_directory(tmp_path), melt_stage=None)
-    record = json.loads(Path(write_report(report, figures=False).json).read_text())
-
-    assert record["openmmpolymer"]
-    assert record["stages"] == list(report.stages)
-
-
-def test_the_report_can_be_written_outside_the_run_directory(
-    tmp_path: Path,
-) -> None:
-    """For a run that has been archived, or is not writable any more."""
-    (tmp_path / "run").mkdir()
-    directory = two_pass_directory(tmp_path / "run")
-    report = analyse_run(directory, melt_stage=None)
-    files = write_report(report, tmp_path / "elsewhere", figures=False)
-
-    assert Path(files.json).parent == tmp_path / "elsewhere"
-    assert not (directory / "analysis").exists()
-
-
-def test_the_analysis_does_not_touch_the_manifest(tmp_path: Path) -> None:
-    """It is the resume ledger for a three-day run, and this is not that."""
-    directory = two_pass_directory(tmp_path)
-    manifest = directory / "manifest.json"
-    before = manifest.read_bytes()
-
-    write_report(analyse_run(directory, melt_stage=None))
-
-    assert manifest.read_bytes() == before
 
 
 def test_a_curve_too_short_to_fit_drops_out_without_shifting_the_others(
@@ -778,13 +585,60 @@ def test_a_curve_too_short_to_fit_drops_out_without_shifting_the_others(
             },
         },
     )
-    report = analyse_run(tmp_path, melt_stage=None)
+    report = analyse_tg(tmp_path, melt_stage=None)
 
     assert report.stages == ("06_coarse", "08_fine")
     assert len(report.curves) == len(report.transitions) == 2
     assert report.curves[1].temperature_step_k == pytest.approx(10.0)
     assert report.fine is report.transitions[1]
     assert any("07_stub" in note for note in report.notes)
+
+
+# --------------------------------------------------------------------------
+# Writing the report
+# --------------------------------------------------------------------------
+
+
+def test_nothing_is_written_until_the_report_is(tmp_path: Path) -> None:
+    """The discipline plots.py keeps, one layer up: reading writes nothing."""
+    directory = two_pass_directory(tmp_path)
+    before = sorted(path.name for path in directory.iterdir())
+
+    analyse_tg(directory, melt_stage=None)
+
+    assert sorted(path.name for path in directory.iterdir()) == before
+
+
+def test_the_report_writes_one_record_and_a_figure_per_pass(
+    tmp_path: Path,
+) -> None:
+    """Two quench figures and a rate figure, beside the machine-readable one.
+
+    And the manifest - the resume ledger of a three-day run - is left alone.
+    """
+    directory = two_pass_directory(tmp_path)
+    manifest = (directory / "manifest.json").read_bytes()
+    files = write_tg_report(analyse_tg(directory, melt_stage=None))
+
+    assert Path(files.json).name == "tg.json"
+    assert Path(files.json).parent.name == "analysis"
+    assert len(files.figures) == 2
+    assert all(Path(path).is_file() for path in files.figures)
+    assert (directory / "manifest.json").read_bytes() == manifest
+
+
+def test_the_record_carries_the_expansivities_and_what_wrote_it(
+    tmp_path: Path,
+) -> None:
+    """They are properties, which a record built with asdict would drop."""
+    report = analyse_tg(two_pass_directory(tmp_path), melt_stage=None)
+    record = json.loads(Path(write_tg_report(report, figures=False).json).read_text())
+
+    assert record["fine"]["melt_expansivity_per_k"] == pytest.approx(8.0e-4)
+    assert record["fine"]["glass_expansivity_per_k"] == pytest.approx(2.0e-4)
+    assert record["fine"]["expansivity_ordered"] is True
+    assert record["openmmpolymer"]
+    assert record["stages"] == list(report.stages)
 
 
 def test_the_equilibration_figure_is_drawn_when_the_melt_was_checked(
@@ -807,12 +661,12 @@ def test_the_equilibration_figure_is_drawn_when_the_melt_was_checked(
             },
         },
     )
-    report = analyse_run(tmp_path, melt_stage="05_npt")
+    report = analyse_tg(tmp_path, melt_stage="05_npt")
 
     assert report.melt is not None
     assert report.melt.volume is not None
     assert report.melt.displacement is None
     assert not report.melt.equilibrated
 
-    files = write_report(report)
+    files = write_tg_report(report)
     assert any(Path(path).name.startswith("equilibration") for path in files.figures)

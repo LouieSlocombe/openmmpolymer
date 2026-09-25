@@ -32,17 +32,26 @@ overclaiming the rest of this package is built to avoid.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
-from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ._files import ReportFiles, write_json
 from ._validation import require_integer, require_positive
-from .conformation import MeanSquaredDisplacement, centre_of_mass_msd
+from ._workflow import (
+    check_request,
+    optional,
+    remaining_ps,
+    require_positive_fields,
+    resume_chunks,
+    spec_request,
+    write_report_files,
+)
+from .melt_check import MeltEquilibration, melt_equilibration
+from .plots import plot_cooling_rate, plot_quench_curve, plot_state_data
 from .protocols import (
     Protocol,
     RunManifest,
@@ -57,36 +66,25 @@ from .simulate import RunContext, quench_temperatures, safe_timestep_fs
 from .timeseries import (
     DSC_COOLING_RATE_K_PER_NS,
     CoolingRateExtrapolation,
-    Equilibration,
     GlassTransition,
     QuenchCurve,
     cooling_rate_extrapolation,
-    equilibration,
     glass_transition,
     quench_curve,
     quench_stages,
     read_state_data,
 )
-from .trajectory import AnalysisError, open_run
+from .trajectory import AnalysisError
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 log = logging.getLogger(__name__)
 
-#: What both passes call themselves in the manifest, so an interrupted run
-#: still says which workflow it belongs to.
 PROTOCOL_NAME = "tg_two_pass"
-
-#: Stage-name stems. Numbered so the run directory sorts into run order, and
-#: free of dots because a stage's name becomes a file stem and
-#: ``Path.with_suffix`` would read a dot as an extension.
 COARSE_STEM = "06_coarse_quench"
 PRECOOL_STEM = "07_precool"
 FINE_STEM = "08_fine_quench"
-
-#: Where the workflow records what it derived, beside the manifest but not in
-#: it. The manifest is the resume ledger and is read by every version of this
-#: package; an analysis-shaped field in it would be stale after a later resume
-#: and would break an older install's ``RunManifest.load``, which passes every
-#: key it finds to the constructor.
 WORKFLOW_NAME = "tg_workflow.json"
 
 #: How far below the melt temperature each annealing cycle dips. The anneal
@@ -95,10 +93,6 @@ WORKFLOW_NAME = "tg_workflow.json"
 #: cold to begin with would otherwise be asked to cycle through zero kelvin,
 #: where a thermostat has nothing to hold and a barostat divides by it.
 ANNEAL_DEPTH_K = 150.0
-
-#: How far a chain's centre of mass has to travel, in units of its own squared
-#: radius of gyration, before a melt has plausibly forgotten how it was packed.
-MSD_RG_MULTIPLE = 2.0
 
 
 class TgError(RuntimeError):
@@ -122,15 +116,15 @@ class TgSpec:
             each hold is discarded, so this is twice the averaging window.
         pressure_bar: The pressure held throughout.
         stage_ps: Most dynamics one stage may hold before the ladder is split
-            into another. This is the resume granularity: an interrupted run
-            repeats at most this much.
+            into another; an interrupted run repeats at most this much.
         samples_per_segment: Density readings taken per temperature. The mean
             is over the second half, so this is twice the number of readings
             behind each point on the curve.
         min_points_per_branch: Passed to
             :func:`~openmmpolymer.timeseries.glass_transition`.
         npt_trajectory_ps: Frame interval for the equilibration stage, or None
-            for no trajectory. Needed for :func:`melt_equilibration` to say
+            for no trajectory. Needed for
+            :func:`~openmmpolymer.melt_check.melt_equilibration` to say
             anything about the chains, and off by default because it is frames
             of the whole cell.
         max_total_ns: Refuse to start if the two passes would exceed this.
@@ -152,24 +146,23 @@ class TgSpec:
 
     def __post_init__(self) -> None:
         """Reject a spec that cannot describe a quench, at the call site."""
-        for name in (
-            "melt_temperature_k",
-            "t_floor_k",
-            "coarse_step_k",
-            "coarse_hold_ps",
-            "window_k",
-            "fine_step_k",
-            "fine_hold_ps",
-            "pressure_bar",
-            "stage_ps",
-        ):
-            require_positive(getattr(self, name), None, name=name)
+        require_positive_fields(
+            self,
+            (
+                "melt_temperature_k",
+                "t_floor_k",
+                "coarse_step_k",
+                "coarse_hold_ps",
+                "window_k",
+                "fine_step_k",
+                "fine_hold_ps",
+                "pressure_bar",
+                "stage_ps",
+            ),
+            optional=("npt_trajectory_ps", "max_total_ns"),
+        )
         require_integer(self.samples_per_segment, name="samples_per_segment")
         require_integer(self.min_points_per_branch, name="min_points_per_branch")
-        if self.npt_trajectory_ps is not None:
-            require_positive(self.npt_trajectory_ps, None, name="npt_trajectory_ps")
-        if self.max_total_ns is not None:
-            require_positive(self.max_total_ns, None, name="max_total_ns")
         if self.t_floor_k >= self.melt_temperature_k:
             raise ValueError(
                 f"t_floor_k={self.t_floor_k} is not below "
@@ -177,8 +170,6 @@ class TgSpec:
             )
 
 
-#: The default settings, as a shared frozen singleton so it can be a default
-#: argument without being rebuilt on every call.
 DEFAULT_SPEC = TgSpec()
 
 
@@ -216,52 +207,6 @@ class TgSchedule:
 
 
 @dataclass(frozen=True)
-class MeltEquilibration:
-    """Whether a melt had settled before it was cooled.
-
-    Two conditions, and both have to be shown rather than assumed. The cell
-    volume has to have stopped drifting faster than its own noise, and the
-    chains' centres of mass have to have travelled further than the chains are
-    big, diffusively. The first says the density is a density; only the second
-    says anything about the chains, and a melt whose density settled in two
-    hundred picoseconds can still be exactly as packmol left it.
-
-    Args:
-        stage: Which stage was checked.
-        volume: What the cell volume did, or None if it could not be read.
-        displacement: What the chains did, or None for the same reason.
-        radius_of_gyration_nm: The chain size the displacement is measured
-            against.
-        displacement_target_nm2: :data:`MSD_RG_MULTIPLE` times its square.
-        displacement_nm2: How far the chains actually went, at the longest lag.
-        displacement_lag_ps: The lag that was read at. The longest lag has the
-            fewest time origins behind it, so it is worth knowing.
-        volume_settled: Whether the volume stopped drifting.
-        chains_moved: Whether the chains went further than
-            *displacement_target_nm2*, diffusively.
-        equilibrated: Both of the above. False whenever either could not be
-            measured - a verdict with half its evidence missing is not a pass,
-            and :attr:`unchecked` is where the difference between "this melt is
-            not equilibrated" and "the data that would say was never written"
-            is recorded.
-        unchecked: One sentence per thing that could not be measured, each
-            naming what to do about it.
-    """
-
-    stage: str
-    volume: Equilibration | None
-    displacement: MeanSquaredDisplacement | None
-    radius_of_gyration_nm: float | None
-    displacement_target_nm2: float | None
-    displacement_nm2: float | None
-    displacement_lag_ps: float | None
-    volume_settled: bool
-    chains_moved: bool
-    equilibrated: bool
-    unchecked: tuple[str, ...]
-
-
-@dataclass(frozen=True)
 class TgResult:
     """What a two-pass scan did and found.
 
@@ -279,7 +224,8 @@ class TgResult:
         coarse_schedule: The coarse ladder.
         fine_schedule: The fine ladder.
         restart: ``"waypoint"`` when the fine pass continued the coarse
-            cooling, ``"precool"`` when it had to start again from the melt.
+            cooling, ``"precool"`` when it had to start again from the melt,
+            and ``"melt"`` when its window starts at the melt temperature.
         start_state: The state the fine pass started from.
         coarse_summary: What the first pass ran.
         fine_summary: What the second pass ran.
@@ -377,25 +323,20 @@ def fine_schedule(
 
 
 def _chunks(schedule: TgSchedule, stage_ps: float) -> list[tuple[float, ...]]:
-    """Split a ladder into pieces no longer than *stage_ps* of dynamics.
+    """A ladder's temperatures split for resume, with none left on its own.
 
-    The split is bookkeeping, not physics: each piece starts from the state the
-    one before it left, so the cooling history is continuous. What it buys is
-    resume granularity, since a stage is the unit a run picks itself back up
-    at, and a hundred nanoseconds in one stage is a hundred nanoseconds to
-    repeat.
+    A trailing chunk of one temperature would be a stage with no temperature
+    step, which nothing downstream can tell apart from a pass with a
+    different step, so it is folded into the one before it.
     """
-    per_chunk = max(1, int(stage_ps // schedule.hold_ps))
     ladder = schedule.temperatures_k
     chunks = [
-        ladder[start : start + per_chunk] for start in range(0, len(ladder), per_chunk)
+        ladder[chunk.start : chunk.stop]
+        for chunk in resume_chunks(len(ladder), schedule.hold_ps, stage_ps)
     ]
-    # A trailing chunk of one temperature is a stage with no temperature step,
-    # which nothing downstream can tell apart from a pass with a different
-    # step. Fold it into the one before it rather than leave it stranded.
     if len(chunks) > 1 and len(chunks[-1]) == 1:
-        chunks[-2] = chunks[-2] + chunks[-1]
-        chunks.pop()
+        last = chunks.pop()
+        chunks[-1] += last
     return chunks
 
 
@@ -585,276 +526,6 @@ def pick_waypoint(
     return hottest
 
 
-def _remaining_ps(protocol: Protocol, manifest: RunManifest | None) -> float:
-    """How much of a protocol is not already recorded as done."""
-    done = set() if manifest is None else set(manifest.stages)
-    return sum(stage.duration_ps for stage in protocol.stages if stage.name not in done)
-
-
-def _report_cost(
-    coarse: Protocol,
-    coarse_ladder: TgSchedule,
-    fine_ladders: Sequence[TgSchedule],
-    spec: TgSpec,
-    manifest: RunManifest | None,
-) -> None:
-    """Say what the whole thing costs before any of it is spent.
-
-    The fine pass' point count is known before the coarse pass runs, because
-    it is the window divided by the step wherever the window lands. Two
-    numbers are reported: the total, and how much of it is still outstanding
-    given what the manifest already records - in a queue the second is the
-    only one anyone can act on.
-    """
-    fine_ps = sum(ladder.total_ps for ladder in fine_ladders)
-    equilibration_ps = coarse.total_duration_ps - coarse_ladder.total_ps
-    remaining_ps = _remaining_ps(coarse, manifest) + fine_ps
-    total_ps = coarse.total_duration_ps + fine_ps
-    log.info(
-        "Tg scan: %.1f ns equilibration, %.1f ns coarse (%d points at %.1f "
-        "K/ns), %.1f ns fine over %d pass(es) at %s K/ns, %d points each - "
-        "%.1f ns in total, %.1f ns of it still to run.",
-        equilibration_ps / 1000.0,
-        coarse_ladder.total_ps / 1000.0,
-        coarse_ladder.n_temperatures,
-        coarse_ladder.cooling_rate_k_per_ns,
-        fine_ps / 1000.0,
-        len(fine_ladders),
-        ", ".join(f"{ladder.cooling_rate_k_per_ns:.2f}" for ladder in fine_ladders),
-        fine_ladders[0].n_temperatures if fine_ladders else 0,
-        total_ps / 1000.0,
-        remaining_ps / 1000.0,
-    )
-    if spec.max_total_ns is not None and total_ps / 1000.0 > spec.max_total_ns:
-        raise TgError(
-            f"This scan is {total_ps / 1000.0:.1f} ns against a max_total_ns "
-            f"of {spec.max_total_ns:.1f}. Shorten the holds, widen the steps, "
-            "or raise the limit - but decide before it starts, not after."
-        )
-
-
-# --------------------------------------------------------------------------
-# The workflow record
-# --------------------------------------------------------------------------
-
-
-def _request(spec: TgSpec, tg_approx_k: float | None) -> dict[str, Any]:
-    """What the caller asked for, as the thing a resume is compared against."""
-    return {"spec": asdict(spec), "tg_approx_k": tg_approx_k}
-
-
-def _check_request(run_dir: Path, request: dict[str, Any]) -> dict[str, Any]:
-    """Refuse a resume that quietly asks for something else.
-
-    A stage's options are recorded nowhere, so a protocol rerun with different
-    settings resumes and keeps the old result without a word. That is survivable
-    for an equilibration and not for a measurement, where the number would then
-    belong to a schedule nobody ran.
-    """
-    path = run_dir / WORKFLOW_NAME
-    if not path.is_file():
-        return {}
-    record: dict[str, Any] = json.loads(path.read_text())
-    previous = record.get("request")
-    if previous is not None and previous != request:
-        changed = [
-            key
-            for key in set(previous.get("spec", {})) | set(request["spec"])
-            if previous.get("spec", {}).get(key) != request["spec"].get(key)
-        ]
-        if previous.get("tg_approx_k") != request["tg_approx_k"]:
-            changed.append("tg_approx_k")
-        raise TgError(
-            f"{path} records a scan run with different settings "
-            f"({', '.join(sorted(changed)) or 'unknown'}), and resuming would "
-            "keep results measured under the old ones. Run into a fresh "
-            "directory, or put the settings back."
-        )
-    return record
-
-
-def _save_workflow(run_dir: Path, record: dict[str, Any]) -> str:
-    """Write the workflow record."""
-    return write_json(run_dir / WORKFLOW_NAME, record, strict=False)
-
-
-# --------------------------------------------------------------------------
-# The melt check
-# --------------------------------------------------------------------------
-
-
-def _recorded_float(record: dict[str, Any] | None, key: str) -> float | None:
-    """Read one float out of the manifest, if it is there and usable."""
-    if not record:
-        return None
-    value = record.get(key)
-    try:
-        number = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) and number > 0.0 else None
-
-
-def _melt_verdict(
-    stage: str,
-    volume: Equilibration | None,
-    displacement: MeanSquaredDisplacement | None,
-    radius_of_gyration_nm: float | None,
-    unchecked: tuple[str, ...],
-) -> MeltEquilibration:
-    """Combine the two halves of the check into one verdict."""
-    settled = volume is not None and volume.equilibrated
-    target = (
-        None
-        if radius_of_gyration_nm is None
-        else MSD_RG_MULTIPLE * radius_of_gyration_nm**2
-    )
-    travelled: float | None = None
-    lag: float | None = None
-    if displacement is not None and displacement.msd_nm2.size:
-        travelled = float(displacement.msd_nm2[-1])
-        lag = float(displacement.lag_ps[-1])
-    moved = (
-        displacement is not None
-        and displacement.diffusive
-        and travelled is not None
-        and target is not None
-        and travelled > target
-    )
-    return MeltEquilibration(
-        stage=stage,
-        volume=volume,
-        displacement=displacement,
-        radius_of_gyration_nm=radius_of_gyration_nm,
-        displacement_target_nm2=target,
-        displacement_nm2=travelled,
-        displacement_lag_ps=lag,
-        volume_settled=settled,
-        chains_moved=moved,
-        equilibrated=settled and moved,
-        unchecked=unchecked,
-    )
-
-
-def melt_equilibration(
-    run_dir: str | Path,
-    stage: str = "05_npt",
-    *,
-    radius_of_gyration_nm: float | None = None,
-    max_lag_fraction: float = 0.5,
-    stride: int = 1,
-) -> MeltEquilibration:
-    """Check whether a melt had settled before it was cooled.
-
-    Reading a trajectory leaves MDAnalysis' offset and lock files beside it, so
-    this writes into the run directory even though it is an analysis, and it
-    cannot be pointed at a read-only archive.
-
-    Args:
-        run_dir: A directory :func:`~openmmpolymer.protocols.run_protocol`
-            wrote to.
-        stage: The equilibration stage to check.
-        radius_of_gyration_nm: Override the chain size recorded in the
-            manifest.
-        max_lag_fraction: Passed to
-            :func:`~openmmpolymer.conformation.centre_of_mass_msd`.
-        stride: Frames to skip when reading the trajectory.
-
-    Returns:
-        The verdict, and what could not be checked.
-
-    Raises:
-        AnalysisError: There is no manifest to read.
-    """
-    directory = Path(run_dir)
-    manifest = RunManifest.load(directory)
-    if manifest is None:
-        raise AnalysisError(f"No manifest in {directory}.")
-
-    unchecked: list[str] = []
-    volume = _volume_settling(stage, manifest, unchecked)
-    displacement = _chain_displacement(
-        directory, stage, max_lag_fraction, stride, unchecked
-    )
-    radius = radius_of_gyration_nm
-    if radius is None:
-        radius = _recorded_float(manifest.chains, "mean_radius_of_gyration_nm")
-        if radius is None:
-            unchecked.append(
-                "chain displacement: the manifest records no radius of "
-                "gyration, so there is nothing to measure the displacement "
-                "against. Give run_protocol a chain_backbone, or pass "
-                "radius_of_gyration_nm."
-            )
-    verdict = _melt_verdict(stage, volume, displacement, radius, tuple(unchecked))
-    for reason in verdict.unchecked:
-        log.info("%s", reason)
-    return verdict
-
-
-def _volume_settling(
-    stage: str,
-    manifest: RunManifest,
-    unchecked: list[str],
-) -> Equilibration | None:
-    """What the cell volume did over the stage, or None with a reason why not."""
-    recorded = manifest.stages.get(stage)
-    if recorded is None:
-        unchecked.append(
-            f"box volume: the manifest has no stage {stage!r}. It records: "
-            f"{', '.join(manifest.stages) or 'nothing'}."
-        )
-        return None
-    csv = recorded.get("csv")
-    if not csv or not Path(str(csv)).is_file():
-        unchecked.append(
-            f"box volume: stage {stage!r} left no state-data CSV to read, so "
-            "there is no volume series."
-        )
-        return None
-    try:
-        series = read_state_data(csv, stage=stage)
-        return equilibration(series.time_ps, series.volume_nm3)
-    except AnalysisError as error:
-        unchecked.append(f"box volume: {error}")
-        return None
-
-
-def _chain_displacement(
-    directory: Path,
-    stage: str,
-    max_lag_fraction: float,
-    stride: int,
-    unchecked: list[str],
-) -> MeanSquaredDisplacement | None:
-    """How far the chains went, or None with a reason why it is not known."""
-    try:
-        ensemble = open_run(directory, stage)
-    except AnalysisError as error:
-        unchecked.append(f"chain displacement: {error}")
-        return None
-    if ensemble.is_snapshot:
-        unchecked.append(
-            f"chain displacement: stage {stage!r} wrote no trajectory, so it "
-            "could not be measured. Give the equilibration stage a trajectory "
-            "- standard_melt_equilibration takes npt_trajectory, and TgSpec "
-            "takes npt_trajectory_ps."
-        )
-        return None
-    try:
-        return centre_of_mass_msd(
-            ensemble, max_lag_fraction=max_lag_fraction, stride=stride
-        )
-    except AnalysisError as error:
-        unchecked.append(f"chain displacement: {error}")
-        return None
-
-
-# --------------------------------------------------------------------------
-# The driver
-# --------------------------------------------------------------------------
-
-
 def nominal_fine_schedule(spec: TgSpec, *, hold_ps: float | None = None) -> TgSchedule:
     """How big the fine ladder will be, before it is known where it lands.
 
@@ -872,13 +543,53 @@ def nominal_fine_schedule(spec: TgSpec, *, hold_ps: float | None = None) -> TgSc
     )
 
 
-def _rate_label(rate_k_per_ns: float) -> str:
-    """A cooling rate as a filename-safe label.
+def _report_cost(
+    coarse: Protocol,
+    coarse_ladder: TgSchedule,
+    fine_ladders: Sequence[TgSchedule],
+    spec: TgSpec,
+    manifest: RunManifest | None,
+) -> None:
+    """Say what the whole thing costs before any of it is spent.
 
-    No dots: a stage's name becomes a file stem, and ``Path.with_suffix``
-    would read the first dot as the start of an extension and write
-    ``08_fine_quench_0.state.xml`` for every rate below one.
+    Two numbers: the total, and how much of it the manifest does not already
+    record - in a queue the second is the only one anyone can act on.
+
+    Raises:
+        TgError: The total is over ``max_total_ns``.
     """
+    fine_ps = sum(ladder.total_ps for ladder in fine_ladders)
+    total_ps = coarse.total_duration_ps + fine_ps
+    log.info(
+        "Tg scan: %.1f ns equilibration, %.1f ns coarse (%d points at %.1f "
+        "K/ns), %.1f ns fine over %d pass(es) at %s K/ns, %d points each - "
+        "%.1f ns in total, %.1f ns of it still to run.",
+        (coarse.total_duration_ps - coarse_ladder.total_ps) / 1000.0,
+        coarse_ladder.total_ps / 1000.0,
+        coarse_ladder.n_temperatures,
+        coarse_ladder.cooling_rate_k_per_ns,
+        fine_ps / 1000.0,
+        len(fine_ladders),
+        ", ".join(f"{ladder.cooling_rate_k_per_ns:.2f}" for ladder in fine_ladders),
+        fine_ladders[0].n_temperatures if fine_ladders else 0,
+        total_ps / 1000.0,
+        (remaining_ps(coarse.stages, manifest) + fine_ps) / 1000.0,
+    )
+    if spec.max_total_ns is not None and total_ps / 1000.0 > spec.max_total_ns:
+        raise TgError(
+            f"This scan is {total_ps / 1000.0:.1f} ns against a max_total_ns "
+            f"of {spec.max_total_ns:.1f}. Shorten the holds, widen the steps, "
+            "or raise the limit - but decide before it starts, not after."
+        )
+
+
+# --------------------------------------------------------------------------
+# The driver
+# --------------------------------------------------------------------------
+
+
+def _rate_label(rate_k_per_ns: float) -> str:
+    """A cooling rate as a stage-name label, which carries no dots."""
     return f"{rate_k_per_ns:g}".replace(".", "p").replace("-", "m")
 
 
@@ -886,12 +597,9 @@ def _rate_label(rate_k_per_ns: float) -> str:
 class _Approach:
     """Everything the coarse pass settled about how the fine pass should run."""
 
-    manifest: RunManifest
-    coarse_stages: tuple[str, ...]
     coarse_curve: QuenchCurve
     coarse_schedule: TgSchedule
     approximate: GlassTransition | None
-    transition_k: float
     window: tuple[float, float]
     restart: str
     start_state: str
@@ -899,7 +607,6 @@ class _Approach:
     precool: Stage | None
     timestep_fs: float
     summary: RunSummary
-    record: dict[str, Any]
 
 
 def _equilibration_state(protocol: Protocol, manifest: RunManifest) -> str | None:
@@ -914,51 +621,41 @@ def _equilibration_state(protocol: Protocol, manifest: RunManifest) -> str | Non
 
 def _approach(
     run: RunContext,
-    run_dir: str | Path,
+    directory: Path,
     spec: TgSpec,
     tg_approx_k: float | None,
     *,
-    rates_k_per_ns: Sequence[float] | None,
+    fine_holds: Sequence[float],
     resume: bool,
-    chain_backbone: Sequence[int] | None,
-    atoms_per_chain: int | None,
-    expected_characteristic_ratio: float,
+    chains: dict[str, Any],
     equilibration: dict[str, Any],
 ) -> _Approach:
-    """Run the coarse pass, fit it, and decide how the fine one begins."""
-    directory = Path(run_dir)
-    directory.mkdir(parents=True, exist_ok=True)
+    """Run the coarse pass, fit it, and decide how the fine one begins.
+
+    The request is recorded before the coarse pass runs, and what it derived
+    once it has, so a resume can check both. Nothing is written before the
+    budget and a resumed directory's settings have been checked.
+    """
     coarse = tg_coarse_scan(spec, **equilibration)
     ladder = coarse_schedule(spec)
-    holds = (
-        [spec.fine_hold_ps]
-        if rates_k_per_ns is None
-        else [spec.fine_step_k / float(rate) * 1000.0 for rate in rates_k_per_ns]
-    )
     _report_cost(
         coarse,
         ladder,
-        [nominal_fine_schedule(spec, hold_ps=hold) for hold in holds],
+        [nominal_fine_schedule(spec, hold_ps=hold) for hold in fine_holds],
         spec,
         RunManifest.load(directory) if resume else None,
     )
 
-    request = _request(spec, tg_approx_k)
-    record = _check_request(directory, request) if resume else {}
+    path = directory / WORKFLOW_NAME
+    request = spec_request(spec, tg_approx_k=tg_approx_k)
+    record = check_request(path, request, error=TgError) if resume else {}
     if resume:
         validate_run_inputs(run, directory)
     record["request"] = request
-    _save_workflow(directory, record)
+    directory.mkdir(parents=True, exist_ok=True)
+    write_json(path, record, strict=False)
 
-    summary = run_protocol(
-        coarse,
-        run,
-        directory,
-        resume=resume,
-        chain_backbone=chain_backbone,
-        atoms_per_chain=atoms_per_chain,
-        expected_characteristic_ratio=expected_characteristic_ratio,
-    )
+    summary = run_protocol(coarse, run, directory, resume=resume, **chains)
     manifest = RunManifest.load(directory)
     if manifest is None:  # pragma: no cover - run_protocol always writes one
         raise TgError(f"The coarse pass left no manifest in {directory}.")
@@ -986,15 +683,12 @@ def _approach(
             "coarse_stages": list(stages),
         }
     )
-    _save_workflow(directory, record)
+    write_json(path, record, strict=False)
 
     return _Approach(
-        manifest=manifest,
-        coarse_stages=stages,
         coarse_curve=curve,
         coarse_schedule=ladder,
         approximate=approximate,
-        transition_k=transition_k,
         window=window,
         restart=restart,
         start_state=start_state,
@@ -1002,7 +696,6 @@ def _approach(
         precool=precool,
         timestep_fs=timestep_fs,
         summary=summary,
-        record=record,
     )
 
 
@@ -1028,13 +721,11 @@ def _chosen_transition(
     tg_approx_k: float | None,
     spec: TgSpec,
 ) -> float:
-    """Where to centre the fine window, and refuse to guess if nothing says.
+    """Where to centre the fine window, refusing to guess if nothing says.
 
-    A fine pass is tens of nanoseconds. Spending them on a window derived from
-    a fit that already reported it found a corner in noise rather than a
-    transition is worse than stopping, because it produces a curve with
-    nothing in it and no way to tell that apart from a polymer that has no
-    transition in range.
+    A window derived from a fit that already reported a corner in noise
+    rather than a transition produces a curve with nothing in it, and no way
+    to tell that apart from a polymer that has no transition in range.
     """
     if tg_approx_k is not None:
         if (
@@ -1095,7 +786,7 @@ def _restart_from(
     )
     if started and record.get("start_state"):
         return (
-            str(record.get("restart", "waypoint")),
+            str(record["restart"]),
             str(record["start_state"]),
             float(record["start_temperature_k"]),
             None,
@@ -1145,7 +836,7 @@ def _fine_protocol(
     spec: TgSpec,
     approach: _Approach,
     *,
-    stem: str = FINE_STEM,
+    stem: str,
 ) -> Protocol:
     """The fine pass, with the pre-cool in front of it when there is one."""
     fine = tg_fine_scan(schedule, spec, timestep_fs=approach.timestep_fs, stem=stem)
@@ -1156,15 +847,20 @@ def _fine_protocol(
 
 def _run_fine(
     run: RunContext,
-    run_dir: Path,
+    directory: Path,
     approach: _Approach,
     spec: TgSpec,
     *,
+    chains: dict[str, Any],
     hold_ps: float | None = None,
     stem: str = FINE_STEM,
-    resume: bool = True,
 ) -> tuple[RunSummary, QuenchCurve, GlassTransition, TgSchedule]:
-    """Walk one fine ladder and fit what it recorded."""
+    """Walk one fine ladder and fit what it recorded.
+
+    Always resuming: the coarse pass already reset a forced rerun's manifest,
+    and the fine pass has to keep what it recorded, the waypoint it starts
+    from included.
+    """
     schedule = fine_schedule(
         approach.start_temperature_k, approach.window[1], spec, hold_ps=hold_ps
     )
@@ -1182,10 +878,15 @@ def _run_fine(
         approach.start_temperature_k,
     )
     summary = run_protocol(
-        protocol, run, run_dir, resume=resume, state_in=approach.start_state
+        protocol,
+        run,
+        directory,
+        resume=True,
+        state_in=approach.start_state,
+        **chains,
     )
     names = tuple(stage.name for stage in protocol.stages if stage.name != PRECOOL_STEM)
-    curve = quench_curve(run_dir, names)
+    curve = quench_curve(directory, names)
     return (
         summary,
         curve,
@@ -1212,8 +913,7 @@ def run_tg_scan(
     the manifest, re-fits the coarse pass - deterministic arithmetic over
     recorded numbers, and a matter of milliseconds - derives the same window,
     and runs only the stages that are not already recorded. That is what makes
-    an interrupted run resumable across the boundary between the two passes,
-    without a separate piece of workflow state to keep in step.
+    an interrupted run resumable across the boundary between the two passes.
 
     Args:
         run: The run context.
@@ -1223,7 +923,7 @@ def run_tg_scan(
             The coarse fit is still run and still reported.
         resume: Skip stages already recorded as complete.
         chain_backbone: Passed to
-            :func:`~openmmpolymer.protocols.run_protocol`.
+            :func:`~openmmpolymer.protocols.run_protocol`, for both passes.
         atoms_per_chain: Likewise.
         expected_characteristic_ratio: Likewise.
         **equilibration: Passed to
@@ -1238,22 +938,23 @@ def run_tg_scan(
             scan run with different settings.
     """
     directory = Path(run_dir)
+    chains: dict[str, Any] = {
+        "chain_backbone": chain_backbone,
+        "atoms_per_chain": atoms_per_chain,
+        "expected_characteristic_ratio": expected_characteristic_ratio,
+    }
     approach = _approach(
         run,
         directory,
         spec,
         tg_approx_k,
-        rates_k_per_ns=None,
+        fine_holds=(spec.fine_hold_ps,),
         resume=resume,
-        chain_backbone=chain_backbone,
-        atoms_per_chain=atoms_per_chain,
-        expected_characteristic_ratio=expected_characteristic_ratio,
+        chains=chains,
         equilibration=equilibration,
     )
-    # The coarse pass already reset a forced rerun's manifest. The fine pass
-    # must preserve it, including the waypoint it starts from.
     summary, curve, transition, schedule = _run_fine(
-        run, directory, approach, spec, resume=True
+        run, directory, approach, spec, chains=chains
     )
     coarse = approach.approximate
     temperature = (
@@ -1313,57 +1014,71 @@ def cooling_rate_series(
         run: The run context.
         run_dir: Where everything is written.
         rates_k_per_ns: The rates to measure at. Each sets its own hold,
-            ``fine_step_k / rate``.
-        spec: The rest of the settings; ``fine_hold_ps`` is overridden per rate.
-        tg_approx_k: Centre the window here instead of on the coarse fit.
-        resume: Skip stages already recorded as complete.
-        chain_backbone: Passed to
-            :func:`~openmmpolymer.protocols.run_protocol`.
+            ``fine_step_k / rate``, which overrides ``spec.fine_hold_ps``.
+        spec: The rest of the settings. It, and every argument after it, is
+            as for :func:`run_tg_scan`.
+        tg_approx_k: Likewise.
+        resume: Likewise.
+        chain_backbone: Likewise.
         atoms_per_chain: Likewise.
         expected_characteristic_ratio: Likewise.
-        **equilibration: Passed to
-            :func:`~openmmpolymer.protocols.standard_melt_equilibration`.
+        **equilibration: Likewise.
 
     Returns:
         One fit per rate, in the order the rates were given.
 
     Raises:
         TgError: As :func:`run_tg_scan`, or the rates are not distinct.
+        ValueError: A rate is not a positive number. Every rate is checked
+            before anything runs.
     """
-    if len(set(rates_k_per_ns)) != len(rates_k_per_ns):
-        raise TgError(
-            f"The rates {tuple(rates_k_per_ns)} are not distinct, so two "
-            "passes would be the same measurement under two names."
-        )
+    holds = _fine_holds(rates_k_per_ns, spec)
     directory = Path(run_dir)
+    chains: dict[str, Any] = {
+        "chain_backbone": chain_backbone,
+        "atoms_per_chain": atoms_per_chain,
+        "expected_characteristic_ratio": expected_characteristic_ratio,
+    }
     approach = _approach(
         run,
         directory,
         spec,
         tg_approx_k,
-        rates_k_per_ns=rates_k_per_ns,
+        fine_holds=holds,
         resume=resume,
-        chain_backbone=chain_backbone,
-        atoms_per_chain=atoms_per_chain,
-        expected_characteristic_ratio=expected_characteristic_ratio,
+        chains=chains,
         equilibration=equilibration,
     )
-    transitions: list[GlassTransition] = []
-    for rate in rates_k_per_ns:
-        hold_ps = require_positive(
-            spec.fine_step_k / float(rate) * 1000.0, None, name="hold_ps"
-        )
-        _, _, transition, _ = _run_fine(
+    return tuple(
+        _run_fine(
             run,
             directory,
             approach,
             spec,
+            chains=chains,
             hold_ps=hold_ps,
             stem=f"{FINE_STEM}_{_rate_label(float(rate))}",
-            resume=True,
+        )[2]
+        for rate, hold_ps in zip(rates_k_per_ns, holds, strict=True)
+    )
+
+
+def _fine_holds(rates_k_per_ns: Sequence[float], spec: TgSpec) -> tuple[float, ...]:
+    """The hold each cooling rate asks for, every rate checked up front."""
+    if len(set(rates_k_per_ns)) != len(rates_k_per_ns):
+        raise TgError(
+            f"The rates {tuple(rates_k_per_ns)} are not distinct, so two "
+            "passes would be the same measurement under two names."
         )
-        transitions.append(transition)
-    return tuple(transitions)
+    holds: list[float] = []
+    for rate in rates_k_per_ns:
+        rate_k_per_ns = require_positive(rate, None, name="rates_k_per_ns")
+        holds.append(
+            require_positive(
+                spec.fine_step_k / rate_k_per_ns * 1000.0, None, name="hold_ps"
+            )
+        )
+    return tuple(holds)
 
 
 # --------------------------------------------------------------------------
@@ -1371,7 +1086,7 @@ def cooling_rate_series(
 # --------------------------------------------------------------------------
 
 
-def analyse_run(
+def analyse_tg(
     run_dir: str | Path,
     *,
     extra_run_dirs: Sequence[str | Path] = (),
@@ -1382,23 +1097,20 @@ def analyse_run(
 ) -> TgReport:
     """Read everything a finished run has to say about its glass transition.
 
-    Reads and returns; writes nothing. That is the same discipline
-    :mod:`openmmpolymer.plots` keeps one layer down, for the same reason - it
-    makes the whole analysis testable without a filesystem, and it keeps every
-    write in :func:`write_report`.
-
-    Quench stages are found by what they recorded rather than by what they
-    were called, and the coarse pass is told from the fine one by its
-    temperature step. The rate fit uses only the finest-stepped family, so a
-    25 K screening scan is not weighed against 5 K measurements as though they
-    were the same quality of number.
+    Reads and returns; writes nothing of its own. Quench stages are found by
+    what they recorded rather than by what they were called, and the coarse
+    pass is told from the fine one by its temperature step. The rate fit uses
+    only the finest-stepped family, so a 25 K screening scan is not weighed
+    against 5 K measurements as though they were the same quality of number.
 
     Args:
         run_dir: A directory :func:`~openmmpolymer.protocols.run_protocol`
             wrote to.
         extra_run_dirs: More directories to pool quenches from, for a rate
             series run separately.
-        melt_stage: The equilibration stage to check, or None to skip it.
+        melt_stage: The equilibration stage to check with
+            :func:`~openmmpolymer.melt_check.melt_equilibration`, or None to
+            skip it.
         min_points_per_branch: Passed to
             :func:`~openmmpolymer.timeseries.glass_transition`.
         target_rate_k_per_ns: The rate to extrapolate to.
@@ -1462,7 +1174,17 @@ def analyse_run(
     coarse = paired[0][1] if paired[0][0] is not paired[-1][0] else None
 
     log_linear, vft = _rate_fits(paired, target_rate_k_per_ns, notes)
-    melt = _melt_report(directory, melt_stage, radius_of_gyration_nm, notes)
+    melt = (
+        None
+        if melt_stage is None
+        else optional(
+            lambda: melt_equilibration(
+                directory, melt_stage, radius_of_gyration_nm=radius_of_gyration_nm
+            ),
+            notes,
+            "melt check",
+        )
+    )
 
     headline = (
         fine
@@ -1499,12 +1221,10 @@ def analyse_run(
 def _group_passes(run_dir: str | Path, names: Sequence[str]) -> list[tuple[str, ...]]:
     """Group the stages that walked one ladder between them.
 
-    A long ladder is split into stages so that an interrupted run resumes at
-    the stage it stopped in rather than at the top of the ramp, and that split
-    is bookkeeping - the pieces are one cooling history and belong on one
-    curve. Two stages are taken to be pieces of the same pass when they
-    stepped the same way and held for the same time, which is a property of
-    what they recorded rather than of what they were named.
+    The pieces a ladder was split into for resume are one cooling history and
+    belong on one curve. Two stages are taken to be pieces of the same pass
+    when they stepped the same way and held for the same time, which is a
+    property of what they recorded rather than of what they were named.
     """
     grouped: dict[tuple[float, float], list[str]] = {}
     order: list[tuple[float, float]] = []
@@ -1549,32 +1269,8 @@ def _rate_fits(
     return fits[0], fits[1]
 
 
-def _melt_report(
-    directory: Path,
-    melt_stage: str | None,
-    radius_of_gyration_nm: float | None,
-    notes: list[str],
-) -> MeltEquilibration | None:
-    """Check the melt, turning a failure to check into a note."""
-    if melt_stage is None:
-        return None
-    try:
-        return melt_equilibration(
-            directory, melt_stage, radius_of_gyration_nm=radius_of_gyration_nm
-        )
-    except AnalysisError as error:
-        notes.append(f"melt check: {error}")
-        return None
-
-
 def _transition_record(transition: GlassTransition) -> dict[str, Any]:
-    """One fit as plain JSON types.
-
-    Written out field by field rather than with ``asdict``, which drops the
-    expansivities because they are properties, and which would render a
-    curve's numpy arrays as strings. Spelling the record out also pins what is
-    on disk independently of how the dataclasses happen to be laid out.
-    """
+    """One fit as plain JSON types, its expansivities included."""
     return {
         "temperature_k": transition.temperature_k,
         "specific_volume_cm3_g": transition.specific_volume_cm3_g,
@@ -1626,48 +1322,18 @@ def _melt_record(melt: MeltEquilibration) -> dict[str, Any]:
     }
 
 
-def write_report(
+def write_tg_report(
     report: TgReport,
     output_dir: str | Path | None = None,
     *,
     figures: bool = True,
     figure_format: str = "png",
 ) -> ReportFiles:
-    """Write a report out, as JSON and as figures.
+    """Write ``tg.json`` and its figures into ``<run_dir>/analysis``.
 
-    The only thing in the analysis half of this package that writes anything.
-    Unlike the manifest, which is written atomically because losing it costs a
-    three-day run, this record is a second of arithmetic away from being
-    rebuilt, so it is written plainly.
-
-    Args:
-        report: What :func:`analyse_run` found.
-        output_dir: Where to write, defaulting to ``<run_dir>/analysis``. Give
-            one when the run directory should not be touched.
-        figures: Write figures as well as the record.
-        figure_format: What matplotlib should save them as.
-
-    Returns:
-        Where everything went.
+    Or into *output_dir*, when the run directory should not be touched.
     """
-    from importlib.metadata import PackageNotFoundError, version
-
-    from .plots import plot_cooling_rate, plot_quench_curve, plot_state_data
-
-    directory = (
-        Path(report.run_dir) / "analysis" if output_dir is None else Path(output_dir)
-    )
-    directory.mkdir(parents=True, exist_ok=True)
-
-    try:
-        own = version("openmmpolymer")
-    except PackageNotFoundError:  # pragma: no cover - uninstalled checkout
-        own = "0.0.0+unknown"
-    manifest = RunManifest.load(report.run_dir)
-    record: dict[str, Any] = {
-        "openmmpolymer": own,
-        "run_dir": report.run_dir,
-        "versions": {} if manifest is None else manifest.versions,
+    fields: dict[str, Any] = {
         "stages": list(report.stages),
         "temperature_k": report.temperature_k,
         "cooling_rate_k_per_ns": report.cooling_rate_k_per_ns,
@@ -1684,56 +1350,35 @@ def write_report(
         "melt": None if report.melt is None else _melt_record(report.melt),
         "notes": list(report.notes),
     }
-    json_path = directory / "tg.json"
-    write_json(json_path, record, strict=False)
+    return write_report_files(
+        report.run_dir,
+        output_dir,
+        "tg.json",
+        fields,
+        _figures(report) if figures else (),
+        figure_format,
+    )
 
-    written: list[str] = []
-    if figures:
-        for curve, transition in zip(report.curves, report.transitions, strict=False):
-            stem = curve.stage.replace(", ", "_").replace(" ", "_")
-            written.append(
-                _save(
-                    plot_quench_curve(curve, transition=transition),
-                    directory / f"quench_{stem}.{figure_format}",
-                )
-            )
-        for fit in (report.log_linear, report.vft):
-            if fit is not None:
-                written.append(
-                    _save(
-                        plot_cooling_rate(fit),
-                        directory / f"cooling_rate_{fit.form}.{figure_format}",
-                    )
-                )
-        written.extend(
-            _melt_figure(report, manifest, directory, figure_format, plot_state_data)
+
+def _figures(report: TgReport) -> Iterator[tuple[str, Figure]]:
+    """A figure per quench and per rate fit, and the melt's volume series."""
+    for curve, transition in zip(report.curves, report.transitions, strict=False):
+        stem = curve.stage.replace(", ", "_").replace(" ", "_")
+        yield f"quench_{stem}", plot_quench_curve(curve, transition=transition)
+    for fit in (report.log_linear, report.vft):
+        if fit is not None:
+            yield f"cooling_rate_{fit.form}", plot_cooling_rate(fit)
+    melt = report.melt
+    if melt is None or melt.volume is None:
+        return
+    manifest = RunManifest.load(report.run_dir)
+    csv = (
+        None if manifest is None else (manifest.stages.get(melt.stage) or {}).get("csv")
+    )
+    if csv:
+        yield (
+            "equilibration",
+            plot_state_data(
+                read_state_data(csv, stage=melt.stage), settled=melt.volume
+            ),
         )
-    return ReportFiles(json=str(json_path), figures=tuple(written))
-
-
-def _melt_figure(
-    report: TgReport,
-    manifest: RunManifest | None,
-    directory: Path,
-    figure_format: str,
-    plot_state_data: Any,
-) -> list[str]:
-    """The equilibration figure, when its series is still there to plot."""
-    if report.melt is None or report.melt.volume is None or manifest is None:
-        return []
-    csv = (manifest.stages.get(report.melt.stage) or {}).get("csv")
-    if not csv:
-        return []
-    series = read_state_data(csv, stage=report.melt.stage)
-    return [
-        _save(
-            plot_state_data(series, settled=report.melt.volume),
-            directory / f"equilibration.{figure_format}",
-        )
-    ]
-
-
-def _save(figure: Any, path: Path) -> str:
-    """Save a figure and close it, returning where it went."""
-    figure.savefig(path, bbox_inches="tight")
-    return str(path)

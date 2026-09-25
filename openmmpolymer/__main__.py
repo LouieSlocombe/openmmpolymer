@@ -112,11 +112,11 @@ from .tensile import (
 )
 from .tg import (
     TgSpec,
-    analyse_run,
+    analyse_tg,
     cooling_rate_series,
     run_tg_scan,
     tg_coarse_scan,
-    write_report,
+    write_tg_report,
 )
 from .timeseries import (
     DSC_COOLING_RATE_K_PER_NS,
@@ -364,7 +364,7 @@ def _relaxation_spec(
 
 
 def _relax_protocol(**options: Any) -> Protocol:
-    """The equilibration and one relaxation, so --dry-run can price it."""
+    """Every stage of the relaxation scan, so --dry-run can price it."""
     return relaxation_scan(_relaxation_spec(**options))
 
 
@@ -416,7 +416,7 @@ def _modulus_spec(
 
 
 def _modulus_protocol(**options: Any) -> Protocol:
-    """The equilibration and one extension, so --dry-run can price it."""
+    """Every stage of the mechanical scan, so --dry-run can price it."""
     return mechanical_scan(_modulus_spec(**options))
 
 
@@ -2308,10 +2308,11 @@ def _modulus_lines(result: Any) -> list[str]:
         if result.replica_spread_mpa is None
         else f" +/- {result.replica_spread_mpa:.0f} over {len(result.replicas)}"
     )
-    rate = result.schedule.strain_rate_per_ns
+    rate = result.youngs.strain_rate_per_ns
     lines.append(
-        f"E = {result.youngs.modulus_mpa:.0f} MPa{spread} at {rate:.3g} "
-        f"strain/ns, {result.youngs.temperature_k:.0f} K"
+        f"E = {result.youngs.modulus_mpa:.0f} MPa{spread} at "
+        + ("rate unknown" if rate is None else f"{rate:.3g} strain/ns")
+        + f", {result.youngs.temperature_k:.0f} K"
         f"{'' if result.resolved else ' (not resolved)'}"
     )
     return lines + _additional_modulus_lines(result)
@@ -2599,13 +2600,8 @@ def _run_relaxation_scan(
 def _relaxation_lines(result: Any) -> list[str]:
     """One line per fitted quantity, each carrying what qualifies it.
 
-    Takes either a :class:`~openmmpolymer.viscoelastic.RelaxationResult` from a
-    scan or a :class:`~openmmpolymer.viscoelastic.RelaxationReport` from
-    ``--analyse``. They carry the same measurements, and only the scan carries
-    an overall verdict: deciding whether a run resolved needs the replica
-    spread and the baseline weighed together, which is the driver's job and not
-    something reading a directory back should invent. So the verdict is asked
-    for rather than assumed, and left off when there is none.
+    Takes the :class:`~openmmpolymer.viscoelastic.RelaxationReport` a scan
+    returns or ``--analyse`` reads back; both carry the overall verdict.
     """
     if result.mean is None:
         return ["relax: nothing was strained"]
@@ -2615,12 +2611,11 @@ def _relaxation_lines(result: Any) -> list[str]:
         if result.replica_spread_mpa is None
         else f" +/- {result.replica_spread_mpa:.3g} over {len(result.curves)}"
     )
-    resolved = getattr(result, "resolved", None)
     lines = [
         f"G(0) = {mean.initial_modulus_mpa:.4g} MPa{spread} at "
         f"{mean.step_strain:+.3f} strain, {mean.temperature_k:.0f} K, over "
         f"{mean.decades:.1f} decades"
-        f"{'' if resolved is not False else ' (not resolved)'}"
+        f"{'' if result.resolved else ' (not resolved)'}"
     ]
     if result.kww is not None:
         lines.append(
@@ -2925,7 +2920,7 @@ def _analyse_mechanics(arguments: argparse.Namespace, run_dir: Path) -> None:
 
 def _analyse_tg(arguments: argparse.Namespace, directories: Sequence[Path]) -> None:
     """Report the glass transition from finished run directories."""
-    report = analyse_run(
+    report = analyse_tg(
         directories[0],
         extra_run_dirs=directories[1:],
         melt_stage=None if arguments.no_melt_check else arguments.melt_stage,
@@ -2964,7 +2959,7 @@ def _analyse_tg(arguments: argparse.Namespace, directories: Sequence[Path]) -> N
     for note in report.notes:
         print(f"note: {note}", flush=True)
 
-    files = write_report(
+    files = write_tg_report(
         report,
         arguments.output_dir,
         figures=not arguments.no_figures,

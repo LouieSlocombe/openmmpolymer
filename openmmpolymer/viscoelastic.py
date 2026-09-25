@@ -35,13 +35,12 @@ because it doubles the cost of the whole scan.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
-from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -54,18 +53,21 @@ from ._validation import (
     require_positive,
 )
 from ._workflow import (
-    equilibrated_box_nm,
+    check_request,
+    equilibrate,
+    equilibration_at,
     group_by_stem,
+    remaining_ps,
+    require_positive_fields,
+    run_branches,
     sample_spread,
-    settled_state,
+    scan_listing,
+    spec_request,
+    with_reference_box,
+    write_report_files,
 )
-from .protocols import (
-    Protocol,
-    RunManifest,
-    Stage,
-    run_protocol,
-    standard_melt_equilibration,
-)
+from .plots import plot_relaxation, plot_relaxation_spectrum
+from .protocols import Protocol, RunManifest, Stage
 from .relaxation import (
     MIN_RELAXATION_POINTS,
     KWWFit,
@@ -80,23 +82,14 @@ from .relaxation import (
 from .simulate import RELAX_MODES, RunContext, relax_bin_edges_ps, safe_timestep_fs
 from .trajectory import AnalysisError
 
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
+
 log = logging.getLogger(__name__)
 
-#: What every pass calls itself in the manifest, so an interrupted run still
-#: says which workflow it belongs to.
 PROTOCOL_NAME = "viscoelastic"
-
-#: Stage-name stems. Numbered so the run directory sorts into run order, and
-#: free of dots because a stage's name becomes a file stem.
 RELAX_STEM = "06_relax"
 LINEARITY_STEM = "07_linearity"
-
-#: The equilibrated stage every replica branches from.
-EQUILIBRATION_STAGE = "05_npt"
-
-#: Where the workflow records what it derived, beside the manifest but not in
-#: it: the manifest is the record of what ran, and an analysis-shaped field in
-#: it would be stale after a later resume.
 WORKFLOW_NAME = "viscoelastic_workflow.json"
 
 #: How far the replicas may disagree about the initial modulus, relative to
@@ -158,9 +151,8 @@ class RelaxationSpec:
             is read against, so this sets how far down the curve is legible.
         relax_ps: The whole relaxation, per replica.
         n_replicas: Independent runs from the same configuration with fresh
-            velocities. The first knob to turn: their spread is the only
-            honest error bar, and averaging them is what makes the early bins
-            - which hold one reading each - mean anything.
+            velocities. The first knob to turn: averaging them is what widens
+            the usable window at both ends.
         sample_every_ps: Time between stress readings, early on.
         late_sample_every_ps: Time between them after *late_after_ps*.
         late_after_ps: When to change down. Each reading costs about six
@@ -168,14 +160,10 @@ class RelaxationSpec:
             a tenth of the run's cost and this pair is a thousandth.
         bins_per_decade: Logarithmic time bins per decade.
         stage_ps: Most relaxation one stage may hold before it is split into
-            another. This is the resume granularity and nothing else: the
-            chunks are continuous, and each is told where it sits on the
-            clock.
+            another, for resume.
         linearity_strains: Other strains to repeat the whole measurement at,
-            or None to skip. Inside the linear region the moduli coincide;
-            outside it they do not, and there is no other way to find out from
-            one strain alone. Off by default because each strain costs another
-            full set of replicas.
+            or None to skip, as :class:`LinearityCheck` compares them. Off by
+            default because each strain costs another full set of replicas.
         write_raw: Write every stress reading beside the binned curve.
         max_total_ns: Refuse to start if the scan would exceed this.
     """
@@ -202,17 +190,20 @@ class RelaxationSpec:
 
     def __post_init__(self) -> None:
         """Reject a spec that cannot describe a relaxation, at the call site."""
-        for name in (
-            "temperature_k",
-            "pressure_bar",
-            "baseline_ps",
-            "relax_ps",
-            "sample_every_ps",
-            "late_sample_every_ps",
-            "late_after_ps",
-            "stage_ps",
-        ):
-            require_positive(getattr(self, name), None, name=name)
+        require_positive_fields(
+            self,
+            (
+                "temperature_k",
+                "pressure_bar",
+                "baseline_ps",
+                "relax_ps",
+                "sample_every_ps",
+                "late_sample_every_ps",
+                "late_after_ps",
+                "stage_ps",
+            ),
+            optional=("max_total_ns",),
+        )
         require_positive(abs(self.step_strain), None, name="step_strain")
         require_integer(self.n_replicas, minimum=1, name="n_replicas")
         require_integer(self.bins_per_decade, minimum=1, name="bins_per_decade")
@@ -236,12 +227,8 @@ class RelaxationSpec:
                     f"linearity_strains={self.linearity_strains} must all be "
                     "non-zero strains."
                 )
-        if self.max_total_ns is not None:
-            require_positive(self.max_total_ns, None, name="max_total_ns")
 
 
-#: The default settings, as a shared frozen singleton so it can be a default
-#: argument without being rebuilt on every call.
 DEFAULT_SPEC = RelaxationSpec()
 
 
@@ -268,7 +255,7 @@ class RelaxationSchedule:
 
     @property
     def total_ps(self) -> float:
-        """How much dynamics one replica is."""
+        """How much dynamics one replica is, before any ramp."""
         return self.baseline_ps + self.relax_ps
 
     @property
@@ -282,9 +269,10 @@ class LinearityCheck:
     """Whether two or more strains gave the same modulus.
 
     The only test of the linear viscoelastic region there is from inside a
-    simulation. A relaxation modulus is a material property only where it does
-    not depend on the strain that produced it; below that it does, and the
-    number is about the deformation instead.
+    simulation. Inside it the curves coincide, because a relaxation modulus is
+    a property of the material there; outside it they separate, and the number
+    is about the deformation instead - which no amount of looking at one strain
+    would have said.
 
     Args:
         strains: The strains compared.
@@ -303,12 +291,13 @@ class LinearityCheck:
 
 @dataclass(frozen=True)
 class RelaxationReport:
-    """What a finished run directory says about its stress relaxation.
+    """What a scan, or a finished run directory, says about its relaxation.
 
     Args:
         run_dir: The directory read.
         curves: Every replica's curve, in the order they were found.
-        mean: Their ensemble average, or None when there was nothing to read.
+        mean: The ensemble average of the measurement's replicas, or None
+            when there was nothing to read.
         kww: The stretched exponential fitted to that average, or None.
         prony: The relaxation spectrum fitted to it, or None.
         replica_spread_mpa: How far the replicas disagreed about the initial
@@ -321,6 +310,9 @@ class RelaxationReport:
             either of them agreeing with itself.
         baseline_fraction: The pre-strain deviatoric stress over the initial
             response. Large means the cell was not isotropic to begin with.
+        resolved: There is a decay whose stretched exponential resolved
+            without contradicting the spectrum, whose replicas agree, and
+            which was measured from a cell that was not already stressed.
         notes: Anything that could not be read, in plain English.
     """
 
@@ -333,44 +325,8 @@ class RelaxationReport:
     linearity: LinearityCheck | None
     plateau_conflict: bool
     baseline_fraction: float
-    notes: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class RelaxationResult:
-    """What one relaxation scan measured.
-
-    Args:
-        run_dir: Where it ran.
-        manifest_path: The manifest it wrote.
-        mean: The ensemble-averaged ``G(t)``, or None when nothing ran.
-        kww: The stretched exponential, or None.
-        prony: The relaxation spectrum, or None.
-        curves: One curve per replica.
-        replica_spread_mpa: Their spread about the initial modulus.
-        linearity: The strain-dependence check, or None if it was skipped.
-        schedule: What each replica walked.
-        resolved: There is a decay whose fits resolved, whose replicas agree,
-            and which was measured from a cell that was not already stressed.
-    """
-
-    run_dir: str
-    manifest_path: str
-    mean: RelaxationCurve | None
-    kww: KWWFit | None
-    prony: PronyFit | None
-    curves: tuple[RelaxationCurve, ...]
-    replica_spread_mpa: float | None
-    linearity: LinearityCheck | None
-    schedule: RelaxationSchedule
     resolved: bool
-
-    @property
-    def mean_tau_ps(self) -> float | None:
-        """The headline number, or None when nothing resolved."""
-        if self.kww is None or not self.resolved:
-            return None
-        return self.kww.mean_tau_ps
+    notes: tuple[str, ...]
 
 
 # --------------------------------------------------------------------------
@@ -379,14 +335,7 @@ class RelaxationResult:
 
 
 def relax_schedule(spec: RelaxationSpec) -> RelaxationSchedule:
-    """What one replica walks, and how it is split for resume.
-
-    Args:
-        spec: What to run.
-
-    Returns:
-        The schedule.
-    """
+    """What one replica walks, and how it is split for resume."""
     chunk_ps = min(spec.stage_ps, spec.relax_ps)
     edges = relax_bin_edges_ps(
         spec.sample_every_ps, spec.relax_ps, spec.bins_per_decade
@@ -404,21 +353,15 @@ def relax_schedule(spec: RelaxationSpec) -> RelaxationSchedule:
 def _relax_stages(
     stem: str, spec: RelaxationSpec, *, timestep_fs: float, strain: float
 ) -> tuple[Stage, ...]:
-    """Turn one relaxation into the stages that run it.
+    """Turn one relaxation into the stages that run it, split for resume.
 
-    Split into chunks no longer than ``stage_ps``, which is bookkeeping and
-    not physics: each chunk starts from the state the one before it left, so
-    the hold is continuous and the cell never knows. What it buys is resume
-    granularity, a stage being the unit a run picks itself back up at.
-
-    Each chunk is told where it sits on the relaxation clock and that the
+    Each chunk is told where it sits on the relaxation clock and whether the
     strain is already applied, because neither survives in a state file. A
     resumed chunk that called its own start time zero would fold the slow end
     of the decay back on top of the fast end, and one that strained again
-    would measure the response to six per cent while reporting three.
-
-    Only the first chunk measures a baseline, ramps, or draws fresh
-    velocities - the rest are a continuation of it, not a repeat.
+    would measure the response to six per cent while reporting three. Only
+    the first chunk measures a baseline, ramps, or draws fresh velocities -
+    the rest are a continuation of it, not a repeat.
     """
     schedule = relax_schedule(spec)
     stages: list[Stage] = []
@@ -468,10 +411,6 @@ def relax_protocol(
 ) -> Protocol:
     """One replica's relaxation, and nothing else.
 
-    One timestep is pinned across every chunk rather than let each derate to
-    its own temperature, because this is a measurement and chunks integrated
-    differently are a confound nobody would choose.
-
     Args:
         spec: What to run.
         timestep_fs: The timestep every chunk uses.
@@ -481,8 +420,7 @@ def relax_protocol(
         strain: The strain to apply, or None for the spec's own. The linearity
             pass gives a different one.
         stem: What to call the stages.
-        reference_box_nm: The unstrained cell, recorded by every chunk so a
-            resumed one reports the same origin as the first.
+        reference_box_nm: The unstrained cell, recorded by every chunk.
 
     Returns:
         The protocol.
@@ -491,13 +429,7 @@ def relax_protocol(
     stages = _relax_stages(
         f"{stem}_r{replica}", spec, timestep_fs=timestep_fs, strain=applied
     )
-    if reference_box_nm is not None:
-        origin = [float(value) for value in reference_box_nm]
-        stages = tuple(
-            Stage(stage.name, stage.kind, {**stage.options, "reference_box_nm": origin})
-            for stage in stages
-        )
-    return Protocol(name=PROTOCOL_NAME, stages=stages)
+    return Protocol(PROTOCOL_NAME, with_reference_box(stages, reference_box_nm))
 
 
 def equilibration_protocol(
@@ -505,102 +437,12 @@ def equilibration_protocol(
 ) -> Protocol:
     """Settle the melt at the temperature the relaxation will be measured at.
 
-    Args:
-        spec: What to run.
-        **equilibration: Passed to
-            :func:`~openmmpolymer.protocols.standard_melt_equilibration`.
-
-    Returns:
-        The protocol.
+    *equilibration* is passed to
+    :func:`~openmmpolymer.protocols.standard_melt_equilibration`.
     """
-    base = standard_melt_equilibration(
-        target_temperature_k=spec.temperature_k,
-        pressure_bar=spec.pressure_bar,
-        **equilibration,
+    return equilibration_at(
+        PROTOCOL_NAME, spec.temperature_k, spec.pressure_bar, **equilibration
     )
-    return Protocol(name=PROTOCOL_NAME, stages=base.stages)
-
-
-def relaxation_scan(
-    spec: RelaxationSpec = DEFAULT_SPEC, **equilibration: Any
-) -> Protocol:
-    """Equilibrate, then run one relaxation - what ``--dry-run`` prices.
-
-    The whole scan is several protocols, because every replica branches from
-    the same equilibrated cell rather than following the one before it. This
-    is the first two of them, which is what a cost estimate can be built from
-    without running anything.
-
-    Args:
-        spec: What to run.
-        **equilibration: Passed to
-            :func:`~openmmpolymer.protocols.standard_melt_equilibration`.
-
-    Returns:
-        The protocol.
-    """
-    base = equilibration_protocol(spec, **equilibration)
-    return Protocol(
-        name=PROTOCOL_NAME,
-        stages=(
-            *base.stages,
-            *_relax_stages(
-                f"{RELAX_STEM}_r0", spec, timestep_fs=2.0, strain=spec.step_strain
-            ),
-        ),
-    )
-
-
-# --------------------------------------------------------------------------
-# The workflow record and the cost
-# --------------------------------------------------------------------------
-
-
-def _request(spec: RelaxationSpec) -> dict[str, Any]:
-    """What the caller asked for, as the thing a resume is compared against.
-
-    Round-tripped through JSON before it is compared with anything, because
-    that is the form it is stored in. Several of these fields are tuples, and
-    a tuple comes back from a file as a list: comparing the two directly makes
-    every second run look like a change of settings and refuse to resume.
-    """
-    stored = json.loads(json.dumps(asdict(spec), default=str))
-    return {"spec": cast("dict[str, Any]", stored)}
-
-
-def _check_request(run_dir: Path, request: dict[str, Any]) -> dict[str, Any]:
-    """Refuse a resume that quietly asks for something else.
-
-    A stage's options are recorded nowhere, so a protocol rerun with different
-    settings resumes and keeps the old result without a word. That is
-    survivable for an equilibration and not for a measurement - and here it is
-    worse than elsewhere, because the bin edges come from the settings, so a
-    changed duration or bin count would merge two incompatible grids into one
-    curve.
-    """
-    path = run_dir / WORKFLOW_NAME
-    if not path.is_file():
-        return {}
-    record: dict[str, Any] = json.loads(path.read_text())
-    previous = record.get("request")
-    if previous is not None and previous != request:
-        changed = sorted(
-            key
-            for key in set(previous.get("spec", {})) | set(request["spec"])
-            if previous.get("spec", {}).get(key) != request["spec"].get(key)
-        )
-        raise ViscoelasticError(
-            f"{path} records a scan run with different settings "
-            f"({', '.join(changed) or 'unknown'}), and resuming would keep "
-            "results measured under the old ones. Run into a fresh directory, "
-            "or put the settings back."
-        )
-    return record
-
-
-def _save_workflow(run_dir: Path, record: dict[str, Any]) -> str:
-    """Write the workflow record."""
-    return write_json(run_dir / WORKFLOW_NAME, record, strict=False)
 
 
 def _strains(spec: RelaxationSpec) -> tuple[tuple[str, float], ...]:
@@ -611,51 +453,88 @@ def _strains(spec: RelaxationSpec) -> tuple[tuple[str, float], ...]:
     return tuple(passes)
 
 
-def _report_cost(
-    equilibration: Protocol,
-    schedule: RelaxationSchedule,
+def _branches(
     spec: RelaxationSpec,
-    manifest: RunManifest | None,
+    *,
+    timestep_fs: float,
+    reference_box_nm: Sequence[float] | None = None,
+) -> list[Protocol]:
+    """Every replica at every strain, each starting from the equilibrated cell."""
+    return [
+        relax_protocol(
+            spec,
+            timestep_fs=timestep_fs,
+            replica=replica,
+            strain=strain,
+            stem=stem,
+            reference_box_nm=reference_box_nm,
+        )
+        for stem, strain in _strains(spec)
+        for replica in range(spec.n_replicas)
+    ]
+
+
+def relaxation_scan(
+    spec: RelaxationSpec = DEFAULT_SPEC, **equilibration: Any
+) -> Protocol:
+    """Every stage the scan runs, for inspection and dry-run cost estimation.
+
+    The equilibration and every replica at every strain, the linearity pass
+    included, at a 2 fs timestep that changes no duration.
+    :func:`run_relaxation_scan` runs each replica as a separate protocol from
+    the equilibrated cell, rather than one after another as they are listed
+    here.
+
+    Args:
+        spec: What to run.
+        **equilibration: Passed to
+            :func:`~openmmpolymer.protocols.standard_melt_equilibration`.
+
+    Returns:
+        The listing.
+    """
+    return scan_listing(
+        PROTOCOL_NAME,
+        [
+            equilibration_protocol(spec, **equilibration),
+            *_branches(spec, timestep_fs=2.0),
+        ],
+    )
+
+
+# --------------------------------------------------------------------------
+# The driver
+# --------------------------------------------------------------------------
+
+
+def _report_cost(
+    spec: RelaxationSpec, settle: Protocol, manifest: RunManifest | None
 ) -> None:
-    """Say what the whole thing costs before any of it runs.
+    """Say what the whole scan costs before any of it runs.
 
     Raises:
         ViscoelasticError: The total is over ``max_total_ns``.
     """
-    settle_ps = equilibration.total_duration_ps
+    schedule = relax_schedule(spec)
+    listing = scan_listing(PROTOCOL_NAME, [settle, *_branches(spec, timestep_fs=2.0)])
+    total_ps = listing.total_duration_ps
+    relax_ps = total_ps - settle.total_duration_ps
     passes = len(_strains(spec))
-    relax_ps = schedule.total_ps * spec.n_replicas * passes
-    total_ps = settle_ps + relax_ps
-
-    done = set(manifest.stages) if manifest is not None else set()
-    remaining = total_ps - sum(
-        stage.duration_ps for stage in equilibration.stages if stage.name in done
-    )
-    for stem, strain in _strains(spec):
-        for replica in range(spec.n_replicas):
-            remaining -= sum(
-                stage.duration_ps
-                for stage in _relax_stages(
-                    f"{stem}_r{replica}", spec, timestep_fs=2.0, strain=strain
-                )
-                if stage.name in done
-            )
-
     log.info(
         "Relaxation scan: %.1f ns equilibration, %.1f ns of relaxation (%d "
         "replicas of %.1f ns at %+.3f strain%s, %d chunks each, %d bins over "
         "%.1f decades) - %.1f ns in total, %.1f ns of it still to run.",
-        settle_ps / 1000.0,
+        settle.total_duration_ps / 1000.0,
         relax_ps / 1000.0,
         spec.n_replicas,
-        schedule.total_ps / 1000.0,
+        relax_ps / (spec.n_replicas * passes) / 1000.0,
         spec.step_strain,
         "" if passes == 1 else f" and {passes - 1} more for linearity",
         schedule.n_chunks,
         schedule.n_bins,
         schedule.decades,
         total_ps / 1000.0,
-        max(0.0, remaining) / 1000.0,
+        remaining_ps(listing.stages, manifest) / 1000.0,
     )
     if spec.max_total_ns is not None and total_ps / 1000.0 > spec.max_total_ns:
         raise ViscoelasticError(
@@ -663,11 +542,6 @@ def _report_cost(
             f"{spec.max_total_ns:.1f} ns budget. Shorten relax_ps, drop a "
             "replica, skip the linearity pass, or raise max_total_ns."
         )
-
-
-# --------------------------------------------------------------------------
-# The driver
-# --------------------------------------------------------------------------
 
 
 def run_relaxation_scan(
@@ -680,16 +554,13 @@ def run_relaxation_scan(
     atoms_per_chain: int | None = None,
     expected_characteristic_ratio: float = 7.0,
     **equilibration: Any,
-) -> RelaxationResult:
+) -> RelaxationReport:
     """Equilibrate a cell, strain it once, and watch the stress decay.
 
-    Every replica branches from the equilibrated cell, not from the replica
-    before it, so each is run as its own protocol with that state named
-    explicitly and fresh velocities drawn. A cell that has spent ten
-    nanoseconds held at three per cent strain is not the cell the next
-    measurement wants, and inheriting its velocities as well as its positions
-    would give the same trajectory every time - a spread of zero dressed up as
-    an error bar.
+    Every replica, at every strain, branches from the equilibrated cell with
+    fresh velocities. Nothing is written before the budget and a resumed
+    directory's settings have been checked; the workflow record is written
+    once the scan is done.
 
     Args:
         run: The run context.
@@ -703,58 +574,46 @@ def run_relaxation_scan(
             :func:`~openmmpolymer.protocols.standard_melt_equilibration`.
 
     Returns:
-        What was measured.
+        What :func:`analyse_relaxation` reads back from the finished run.
 
     Raises:
         ViscoelasticError: The scan is over budget, or this directory holds one
-            run with different settings.
+            run with different settings. The bin edges come from the settings,
+            so resuming under changed ones would merge incompatible grids into
+            one curve.
     """
     directory = Path(run_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    request = _request(spec)
-    record = _check_request(directory, request) if resume else {}
-
-    settle = equilibration_protocol(spec, **equilibration)
-    schedule = relax_schedule(spec)
-    timestep_fs = safe_timestep_fs(spec.temperature_k, run.spec)
-    _report_cost(
-        settle, schedule, spec, RunManifest.load(directory) if resume else None
+    request = spec_request(spec)
+    record = (
+        check_request(directory / WORKFLOW_NAME, request, error=ViscoelasticError)
+        if resume
+        else {}
     )
+    settle = equilibration_protocol(spec, **equilibration)
+    _report_cost(spec, settle, RunManifest.load(directory) if resume else None)
 
+    timestep_fs = safe_timestep_fs(spec.temperature_k, run.spec)
     chains: dict[str, Any] = {
         "chain_backbone": chain_backbone,
         "atoms_per_chain": atoms_per_chain,
         "expected_characteristic_ratio": expected_characteristic_ratio,
     }
-    settled = run_protocol(settle, run, directory, resume=resume, **chains)
-    start_state = settled_state(
-        settled, directory, error=ViscoelasticError, verb="strain"
+    start_state, origin = equilibrate(
+        settle,
+        run,
+        directory,
+        resume=resume,
+        error=ViscoelasticError,
+        verb="strain",
+        **chains,
     )
-    origin = equilibrated_box_nm(start_state)
-    log.info(
-        "Equilibrated cell is %s nm; every replica starts from %s.",
-        [round(value, 4) for value in origin],
-        Path(start_state).name,
+    run_branches(
+        _branches(spec, timestep_fs=timestep_fs, reference_box_nm=origin),
+        run,
+        directory,
+        start_state,
+        **chains,
     )
-
-    for stem, strain in _strains(spec):
-        for replica in range(spec.n_replicas):
-            run_protocol(
-                relax_protocol(
-                    spec,
-                    timestep_fs=timestep_fs,
-                    replica=replica,
-                    strain=strain,
-                    stem=stem,
-                    reference_box_nm=origin,
-                ),
-                run,
-                directory,
-                # Only preparation resets the manifest for a forced rerun.
-                resume=True,
-                state_in=start_state,
-                **chains,
-            )
 
     report = analyse_relaxation(directory)
     record.update(
@@ -766,39 +625,12 @@ def run_relaxation_scan(
             "n_replicas": spec.n_replicas,
         }
     )
-    _save_workflow(directory, record)
-
-    initial = report.mean.initial_modulus_mpa if report.mean is not None else math.nan
-    resolved = bool(
-        report.kww is not None
-        and report.kww.resolved
-        and not report.plateau_conflict
-        and report.baseline_fraction <= MAX_BASELINE_FRACTION
-        and (
-            report.replica_spread_mpa is None
-            or not math.isfinite(initial)
-            or abs(initial) <= _TINY
-            or report.replica_spread_mpa <= MAX_REPLICA_SPREAD * abs(initial)
-        )
-    )
-    _log_result(report, schedule, resolved)
-    return RelaxationResult(
-        run_dir=str(directory),
-        manifest_path=str(directory / "manifest.json"),
-        mean=report.mean,
-        kww=report.kww,
-        prony=report.prony,
-        curves=report.curves,
-        replica_spread_mpa=report.replica_spread_mpa,
-        linearity=report.linearity,
-        schedule=schedule,
-        resolved=resolved,
-    )
+    write_json(directory / WORKFLOW_NAME, record, strict=False)
+    _log_result(report)
+    return report
 
 
-def _log_result(
-    report: RelaxationReport, schedule: RelaxationSchedule, resolved: bool
-) -> None:
+def _log_result(report: RelaxationReport) -> None:
     """One line per measured quantity, each with what qualifies it."""
     if report.mean is None:
         log.info("Relaxation scan: nothing was strained.")
@@ -811,7 +643,7 @@ def _log_result(
         report.mean.n_replicas,
         report.mean.step_strain,
         report.mean.temperature_k,
-        "" if resolved else " (not resolved)",
+        "" if report.resolved else " (not resolved)",
     )
     if report.kww is not None:
         log.info(
@@ -847,7 +679,6 @@ def _log_result(
             "  the cell started at %.0f%% of the initial response.",
             100.0 * report.baseline_fraction,
         )
-    del schedule
 
 
 # --------------------------------------------------------------------------
@@ -858,20 +689,16 @@ def _log_result(
 def _primary_strain(by_strain: dict[float, list[RelaxationCurve]]) -> float:
     """Which strain's ensemble is the measurement, and which are the check.
 
-    Named rather than found by shape, and this is the one place that rule is
-    inverted - the same inversion
+    Named rather than found by shape - the same inversion
     :func:`~openmmpolymer.mechanical.analyse_mechanics` makes for its bulk
-    pass, and for the same reason. A linearity pass records *exactly* what the
-    measurement records, because it is the same measurement at another strain;
-    nothing in the samples distinguishes them, and the workflow runs the same
-    number of replicas of each, so counting replicas cannot either. Left to
-    tie-break on the strain itself, a linearity pass at a larger strain would
-    quietly become the headline result: the reported modulus and both fits
-    would belong to the pass that only existed to check the other one.
-
-    So this asks for the stages this workflow writes the measurement under. A
-    directory assembled some other way has no such stages, and then the
-    ensemble with the most replicas is the best guess available.
+    pass. A linearity pass records exactly what the measurement records,
+    because it is the same measurement at another strain, and the workflow
+    runs as many replicas of each, so neither the samples nor the counts tell
+    them apart. Left to tie-break on the strain itself, a linearity pass at a
+    larger strain would quietly become the headline result. So this asks for
+    the stages this workflow writes the measurement under; a directory
+    assembled some other way has none, and then the ensemble with the most
+    replicas is the best guess available.
     """
     for strain, curves in by_strain.items():
         if all(curve.stage.startswith(RELAX_STEM) for curve in curves):
@@ -880,13 +707,7 @@ def _primary_strain(by_strain: dict[float, list[RelaxationCurve]]) -> float:
 
 
 def _linearity(by_strain: dict[float, RelaxationCurve]) -> LinearityCheck | None:
-    """Compare the initial modulus measured at each strain.
-
-    Inside the linear viscoelastic region the curves coincide, because a
-    relaxation modulus is a property of the material there and not of the
-    deformation. Outside it they separate, and no amount of looking at one
-    strain would have said so.
-    """
+    """Compare the initial modulus measured at each strain, if there are two."""
     if len(by_strain) < 2:
         return None
     strains = tuple(sorted(by_strain))
@@ -950,8 +771,7 @@ def analyse_relaxation(
     by_strain: dict[float, list[RelaxationCurve]] = {}
     for curve in curves:
         by_strain.setdefault(round(curve.step_strain, 9), []).append(curve)
-    primary = _primary_strain(by_strain)
-    ensemble = by_strain[primary]
+    ensemble = by_strain[_primary_strain(by_strain)]
 
     mean = mean_curve(ensemble)
     kww = fit_kww(mean, min_points=min_points)
@@ -962,11 +782,8 @@ def analyse_relaxation(
     )
 
     initial = mean.initial_modulus_mpa
-    fraction = (
-        abs(mean.baseline_mpa / initial)
-        if math.isfinite(initial) and abs(initial) > _TINY
-        else math.inf
-    )
+    measurable = math.isfinite(initial) and abs(initial) > _TINY
+    fraction = abs(mean.baseline_mpa / initial) if measurable else math.inf
     if fraction > MAX_BASELINE_FRACTION:
         notes.append(
             f"The cell was already carrying {100.0 * fraction:.0f}% of the "
@@ -982,8 +799,7 @@ def analyse_relaxation(
     # flatly contradict each other about whether the material ever relaxes.
     plateau = bool(
         prony.resolved
-        and math.isfinite(initial)
-        and abs(initial) > _TINY
+        and measurable
         and prony.equilibrium_mpa / abs(initial) > MIN_PLATEAU_FRACTION
     )
     conflict = bool(plateau and kww.resolved)
@@ -1020,6 +836,16 @@ def analyse_relaxation(
         linearity=linearity,
         plateau_conflict=conflict,
         baseline_fraction=fraction,
+        resolved=bool(
+            kww.resolved
+            and not conflict
+            and fraction <= MAX_BASELINE_FRACTION
+            and (
+                spread is None
+                or not measurable
+                or spread <= MAX_REPLICA_SPREAD * abs(initial)
+            )
+        ),
         notes=tuple(notes),
     )
 
@@ -1030,12 +856,7 @@ def analyse_relaxation(
 
 
 def _curve_record(curve: RelaxationCurve) -> dict[str, Any]:
-    """One curve as plain JSON types.
-
-    Written out field by field rather than with ``asdict``, which would drop
-    the properties and render the arrays unhelpfully. Spelling it out also
-    pins what is on disk independently of how the dataclasses are laid out.
-    """
+    """One curve as plain JSON types."""
     return {
         "stage": curve.stage,
         "mode": curve.mode,
@@ -1103,36 +924,11 @@ def write_relaxation_report(
     figures: bool = True,
     figure_format: str = "png",
 ) -> ReportFiles:
-    """Write a relaxation report out, as JSON and as figures.
+    """Write ``relaxation.json`` and its figures into ``<run_dir>/analysis``.
 
-    Args:
-        report: What :func:`analyse_relaxation` found.
-        output_dir: Where to write, defaulting to ``<run_dir>/analysis``. Give
-            one when the run directory should not be touched.
-        figures: Write figures as well as the record.
-        figure_format: What matplotlib should save them as.
-
-    Returns:
-        Where everything went.
+    Or into *output_dir*, when the run directory should not be touched.
     """
-    from importlib.metadata import PackageNotFoundError, version
-
-    from .plots import plot_relaxation, plot_relaxation_spectrum
-
-    directory = (
-        Path(report.run_dir) / "analysis" if output_dir is None else Path(output_dir)
-    )
-    directory.mkdir(parents=True, exist_ok=True)
-
-    try:
-        own = version("openmmpolymer")
-    except PackageNotFoundError:  # pragma: no cover - uninstalled checkout
-        own = "0.0.0+unknown"
-    manifest = RunManifest.load(report.run_dir)
-    record: dict[str, Any] = {
-        "openmmpolymer": own,
-        "run_dir": report.run_dir,
-        "versions": {} if manifest is None else manifest.versions,
+    fields: dict[str, Any] = {
         "stages": [curve.stage for curve in report.curves],
         "mean": None if report.mean is None else _curve_record(report.mean),
         "kww": None if report.kww is None else _kww_record(report.kww),
@@ -1151,35 +947,28 @@ def write_relaxation_report(
         ),
         "plateau_conflict": report.plateau_conflict,
         "baseline_fraction": report.baseline_fraction,
+        "resolved": report.resolved,
         "notes": list(report.notes),
     }
-    json_path = directory / "relaxation.json"
-    write_json(json_path, record, strict=False)
-
-    written: list[str] = []
-    if figures and report.mean is not None:
-        written.append(
-            _save(
-                plot_relaxation(
-                    report.mean,
-                    kww=report.kww,
-                    prony=report.prony,
-                    replicas=report.curves,
-                ),
-                directory / f"relaxation.{figure_format}",
-            )
-        )
-        if report.prony is not None and report.prony.n_terms:
-            written.append(
-                _save(
-                    plot_relaxation_spectrum(report.prony),
-                    directory / f"relaxation_spectrum.{figure_format}",
-                )
-            )
-    return ReportFiles(json=str(json_path), figures=tuple(written))
+    return write_report_files(
+        report.run_dir,
+        output_dir,
+        "relaxation.json",
+        fields,
+        _figures(report) if figures else (),
+        figure_format,
+    )
 
 
-def _save(figure: Any, path: Path) -> str:
-    """Save a figure and close it, returning where it went."""
-    figure.savefig(path, bbox_inches="tight")
-    return str(path)
+def _figures(report: RelaxationReport) -> Iterator[tuple[str, Figure]]:
+    """The decay with both fits over its replicas, and the spectrum."""
+    if report.mean is None:
+        return
+    yield (
+        "relaxation",
+        plot_relaxation(
+            report.mean, kww=report.kww, prony=report.prony, replicas=report.curves
+        ),
+    )
+    if report.prony is not None and report.prony.n_terms:
+        yield "relaxation_spectrum", plot_relaxation_spectrum(report.prony)

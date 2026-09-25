@@ -31,23 +31,32 @@ second is not the one a datasheet quotes.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
-from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from ._files import ReportFiles, write_json
-from ._validation import require_axis, require_integer, require_positive
+from ._validation import require_axis, require_integer
 from ._workflow import (
-    equilibrated_box_nm,
+    check_request,
+    equilibrate,
+    equilibration_at,
     group_by_stem,
+    optional,
+    remaining_ps,
+    require_positive_fields,
+    resume_chunks,
+    run_branches,
     sample_spread,
-    settled_state,
+    scan_listing,
+    spec_request,
+    with_reference_box,
+    write_report_files,
 )
 from .elasticity import (
     BulkModulus,
@@ -65,36 +74,21 @@ from .elasticity import (
     stress_strain,
     youngs_modulus,
 )
-from .protocols import (
-    Protocol,
-    RunManifest,
-    Stage,
-    run_protocol,
-    standard_melt_equilibration,
-)
+from .plots import plot_moduli, plot_stress_strain
+from .protocols import Protocol, RunManifest, Stage
 from .simulate import RunContext, safe_timestep_fs
 from .trajectory import AnalysisError
 
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
+
 log = logging.getLogger(__name__)
 
-#: What every pass calls itself in the manifest, so an interrupted run still
-#: says which workflow it belongs to.
 PROTOCOL_NAME = "mechanical"
-
-#: Stage-name stems. Numbered so the run directory sorts into run order, and
-#: free of dots because a stage's name becomes a file stem and
-#: ``Path.with_suffix`` would read a dot as an extension.
 DEFORM_STEM = "06_deform"
 LOAD_STEM = "07_load"
 BULK_STEM = "08_bulk"
 SHEAR_STEM = "09_shear"
-
-#: The equilibrated stage every pass branches from.
-EQUILIBRATION_STAGE = "05_npt"
-
-#: Where the workflow records what it derived, beside the manifest but not in
-#: it: the manifest is the record of what ran, and an analysis-shaped field in
-#: it would be stale after a later resume.
 WORKFLOW_NAME = "mechanical_workflow.json"
 
 #: How far the replicas may disagree, relative to their mean, before the
@@ -128,16 +122,11 @@ class ModulusSpec:
         n_replicas: How many times to repeat the extension from the same
             configuration with fresh velocities. The spread across them is
             the error bar; one replica has none.
-        samples_per_step: Stress readings per increment. High on purpose.
-            The instantaneous pressure decorrelates in well under a
-            picosecond, so a handful of readings spread over a 50 ps window
-            throws away almost all of the statistics the window already paid
-            for. Each reading costs OpenMM about six energy evaluations,
-            which against a relaxation window of tens of thousands of steps
-            is single-figure per cent - a cheap way to take the standard
-            error on the modulus down by a factor of several.
+        samples_per_step: Stress readings per increment. High on purpose, for
+            the reason :func:`~openmmpolymer.simulate.run_deform` gives: the
+            readings are cheap and the pressure decorrelates fast.
         stage_ps: Most dynamics one stage may hold before the ladder is split
-            into another. This is the resume granularity.
+            into another.
         load_stresses_bar: Applied stresses for the constant-stress
             cross-check, or None to skip it. It shares no machinery with the
             extension - the stress is imposed and only the box is measured -
@@ -182,16 +171,22 @@ class ModulusSpec:
 
     def __post_init__(self) -> None:
         """Reject a spec that cannot describe a deformation, at the call site."""
-        for name in (
-            "temperature_k",
-            "pressure_bar",
-            "strain_increment",
-            "max_strain",
-            "relax_ps",
-            "elastic_strain_limit",
-            "stage_ps",
-        ):
-            require_positive(getattr(self, name), None, name=name)
+        require_positive_fields(
+            self,
+            (
+                "temperature_k",
+                "pressure_bar",
+                "strain_increment",
+                "max_strain",
+                "relax_ps",
+                "elastic_strain_limit",
+                "stage_ps",
+                "load_ps_each",
+                "bulk_ps_each",
+                "shear_ps_each",
+            ),
+            optional=("max_total_ns",),
+        )
         require_integer(self.n_replicas, name="n_replicas")
         require_integer(self.samples_per_step, name="samples_per_step")
         require_axis(self.axis)
@@ -207,10 +202,6 @@ class ModulusSpec:
                 f"max_strain={self.max_strain}, so the fit would run past the "
                 "end of the curve."
             )
-        for name in ("load_ps_each", "bulk_ps_each", "shear_ps_each"):
-            require_positive(getattr(self, name), None, name=name)
-        if self.max_total_ns is not None:
-            require_positive(self.max_total_ns, None, name="max_total_ns")
         if self.shear_strains is not None and not self.shear_strains:
             raise ValueError("shear_strains is empty; pass None to skip the pass.")
         if self.load_stresses_bar is not None and not self.load_stresses_bar:
@@ -221,8 +212,6 @@ class ModulusSpec:
             )
 
 
-#: The default settings, as a shared frozen singleton so it can be a default
-#: argument without being rebuilt on every call.
 DEFAULT_SPEC = ModulusSpec()
 
 
@@ -257,73 +246,29 @@ class ModulusSchedule:
 
 
 @dataclass(frozen=True)
-class ModulusResult:
-    """What one mechanical scan measured.
-
-    Args:
-        run_dir: Where it ran.
-        manifest_path: The manifest it wrote.
-        youngs: Young's modulus, fitted to every replica's points together,
-            or None when no extension ran.
-        poisson: Poisson's ratio, likewise pooled.
-        bulk: The measured bulk modulus, or None if that pass was skipped.
-        shear: The measured shear modulus, or None likewise.
-        consistency: The measured constants against the ones ``E`` and ``nu``
-            imply, or None when there was nothing to compare.
-        replicas: One fit per replica, in the order they ran.
-        replica_spread_mpa: The spread across them - the honest error bar,
-            and the reason to run more than one.
-        load_modulus: The constant-stress cross-check, or None if skipped.
-            It shares no machinery with :attr:`youngs`, so the two agreeing
-            is evidence that both are right.
-        schedule: The ladder each replica walked.
-        curves: Each replica's stress-strain curve.
-        resolved: There is a Young's modulus whose fit resolved and whose
-            replicas agree.
-    """
-
-    run_dir: str
-    manifest_path: str
-    youngs: ElasticModulus | None
-    poisson: PoissonRatio | None
-    bulk: BulkModulus | None
-    shear: ShearModulus | None
-    consistency: ElasticConsistency | None
-    replicas: tuple[ElasticModulus, ...]
-    replica_spread_mpa: float | None
-    load_modulus: ElasticModulus | None
-    schedule: ModulusSchedule
-    curves: tuple[StressStrain, ...]
-    resolved: bool
-
-    @property
-    def modulus_mpa(self) -> float | None:
-        """The headline number, or None when nothing resolved."""
-        if self.youngs is None or not self.resolved:
-            return None
-        return self.youngs.modulus_mpa
-
-
-@dataclass(frozen=True)
 class ModulusReport:
-    """What a finished run directory says about its mechanics.
+    """What a scan, or a finished run directory, says about its mechanics.
 
     Args:
         run_dir: The directory read.
-        curves: Every stress-strain curve found, one per deformation pass.
+        curves: Every stress-strain curve found, one per replica.
         replicas: The fit to each.
-        youngs: The pooled fit, or None.
-        poisson: The pooled Poisson's ratio, or None.
+        youngs: Young's modulus fitted to every replica's points together, or
+            None when nothing was extended.
+        poisson: Poisson's ratio, pooled likewise, or None.
         bulk: The measured bulk modulus, or None.
         shear: The measured shear modulus, or None.
         load: The constant-stress curve, or None.
         load_modulus: The fit to it, or None.
         consistency: The four constants against each other, or None.
-        replica_spread_mpa: Spread across the replicas, or None.
+        replica_spread_mpa: Spread across the replicas - the honest error
+            bar - or None below two.
         method_gap: Relative gap between the strain-controlled and
             stress-controlled moduli, or NaN when only one was measured. The
             two share no machinery, so this is the strongest single check in
             the report.
+        resolved: There is a Young's modulus whose fit resolved and whose
+            replicas agree to within :data:`MAX_REPLICA_SPREAD`.
         notes: Anything that could not be read, in plain English.
     """
 
@@ -339,6 +284,7 @@ class ModulusReport:
     consistency: ElasticConsistency | None
     replica_spread_mpa: float | None
     method_gap: float
+    resolved: bool
     notes: tuple[str, ...]
 
 
@@ -353,12 +299,6 @@ def deform_schedule(spec: ModulusSpec) -> ModulusSchedule:
     The step count is what it takes to reach ``max_strain`` by compounding
     increments, because that is what the deformation actually does: each
     increment scales a cell that the last one already scaled.
-
-    Args:
-        spec: What to run.
-
-    Returns:
-        The schedule.
     """
     steps = math.ceil(math.log1p(spec.max_strain) / math.log1p(spec.strain_increment))
     return ModulusSchedule(
@@ -366,53 +306,6 @@ def deform_schedule(spec: ModulusSpec) -> ModulusSchedule:
         increment=spec.strain_increment,
         relax_ps=spec.relax_ps,
     )
-
-
-def _deform_stages(
-    stem: str, schedule: ModulusSchedule, spec: ModulusSpec, *, timestep_fs: float
-) -> tuple[Stage, ...]:
-    """Turn one ladder into the stages that walk it.
-
-    Split into chunks no longer than ``stage_ps``, which is bookkeeping and
-    not physics: each chunk starts from the state the one before it left, so
-    the deformation is continuous. What it buys is resume granularity, a
-    stage being the unit a run picks itself back up at.
-
-    Each chunk is told the strain it starts at and the cell the strain is
-    measured against, because neither survives in the state file: a resumed
-    chunk opens an already-stretched cell and would otherwise call that
-    stretch the origin.
-    """
-    per_chunk = max(1, int(spec.stage_ps // schedule.relax_ps))
-    stages: list[Stage] = []
-    done = 0
-    index = 0
-    while done < schedule.n_steps:
-        count = min(per_chunk, schedule.n_steps - done)
-        stages.append(
-            Stage(
-                f"{stem}_{index:02d}",
-                "deform",
-                {
-                    "temperature_k": spec.temperature_k,
-                    "pressure_bar": spec.pressure_bar,
-                    "axis": spec.axis,
-                    "strain_increment": spec.strain_increment,
-                    "n_steps": count,
-                    "relax_ps": spec.relax_ps,
-                    "strain_start": (1.0 + spec.strain_increment) ** done - 1.0,
-                    "samples_per_step": spec.samples_per_step,
-                    "timestep_fs": timestep_fs,
-                    # Only the first chunk may take the current cell as the
-                    # origin; the rest are handed it by the driver, which
-                    # knows what the equilibrated cell was.
-                    "new_velocities": index == 0,
-                },
-            )
-        )
-        done += count
-        index += 1
-    return tuple(stages)
 
 
 def deform_protocol(
@@ -424,9 +317,9 @@ def deform_protocol(
 ) -> Protocol:
     """One replica's extension, and nothing else.
 
-    One timestep is pinned across every chunk rather than let each derate to
-    its own temperature, because this is a measurement and chunks integrated
-    differently are a confound nobody would choose.
+    Each chunk is told the strain it starts at, because a state file does not
+    carry one; only the first draws fresh velocities, and the rest continue
+    its trajectory.
 
     Args:
         spec: What to run.
@@ -434,22 +327,34 @@ def deform_protocol(
         replica: Which repeat this is. It only changes the stage names, which
             is enough: every random stream is derived from the stage label,
             so a differently-named replica is a differently-seeded one.
-        reference_box_nm: The unstrained cell, passed to every chunk so that
-            a resumed one measures strain against the same origin as the
-            first.
+        reference_box_nm: The unstrained cell, passed to every chunk.
 
     Returns:
         The protocol.
     """
-    stem = f"{DEFORM_STEM}_r{replica}"
-    stages = _deform_stages(stem, deform_schedule(spec), spec, timestep_fs=timestep_fs)
-    if reference_box_nm is not None:
-        origin = [float(value) for value in reference_box_nm]
-        stages = tuple(
-            Stage(stage.name, stage.kind, {**stage.options, "reference_box_nm": origin})
-            for stage in stages
+    schedule = deform_schedule(spec)
+    stages = [
+        Stage(
+            f"{DEFORM_STEM}_r{replica}_{index:02d}",
+            "deform",
+            {
+                "temperature_k": spec.temperature_k,
+                "pressure_bar": spec.pressure_bar,
+                "axis": spec.axis,
+                "strain_increment": spec.strain_increment,
+                "n_steps": len(steps),
+                "relax_ps": spec.relax_ps,
+                "strain_start": (1.0 + spec.strain_increment) ** steps.start - 1.0,
+                "samples_per_step": spec.samples_per_step,
+                "timestep_fs": timestep_fs,
+                "new_velocities": index == 0,
+            },
         )
-    return Protocol(name=PROTOCOL_NAME, stages=stages)
+        for index, steps in enumerate(
+            resume_chunks(schedule.n_steps, spec.relax_ps, spec.stage_ps)
+        )
+    ]
+    return Protocol(PROTOCOL_NAME, with_reference_box(stages, reference_box_nm))
 
 
 def equilibration_protocol(
@@ -457,69 +362,20 @@ def equilibration_protocol(
 ) -> Protocol:
     """Settle the melt at the temperature the mechanics will be measured at.
 
-    Args:
-        spec: What to run.
-        **equilibration: Passed to
-            :func:`~openmmpolymer.protocols.standard_melt_equilibration`.
-
-    Returns:
-        The protocol.
+    *equilibration* is passed to
+    :func:`~openmmpolymer.protocols.standard_melt_equilibration`.
     """
-    base = standard_melt_equilibration(
-        target_temperature_k=spec.temperature_k,
-        pressure_bar=spec.pressure_bar,
-        **equilibration,
-    )
-    return Protocol(name=PROTOCOL_NAME, stages=base.stages)
-
-
-def mechanical_scan(spec: ModulusSpec = DEFAULT_SPEC, **equilibration: Any) -> Protocol:
-    """Equilibrate, then walk one extension - what ``--dry-run`` prices.
-
-    The whole scan is several protocols, because each pass branches from the
-    same equilibrated cell rather than following the one before it. This is
-    the first two of them, which is what a cost estimate can be built from
-    without running anything.
-
-    Args:
-        spec: What to run.
-        **equilibration: Passed to
-            :func:`~openmmpolymer.protocols.standard_melt_equilibration`.
-
-    Returns:
-        The protocol.
-    """
-    base = equilibration_protocol(spec, **equilibration)
-    timestep_fs = 2.0
-    return Protocol(
-        name=PROTOCOL_NAME,
-        stages=(
-            *base.stages,
-            *_deform_stages(
-                f"{DEFORM_STEM}_r0",
-                deform_schedule(spec),
-                spec,
-                timestep_fs=timestep_fs,
-            ),
-        ),
+    return equilibration_at(
+        PROTOCOL_NAME, spec.temperature_k, spec.pressure_bar, **equilibration
     )
 
 
 def extra_stages(spec: ModulusSpec, *, timestep_fs: float) -> tuple[Stage, ...]:
-    """The load, bulk and shear passes, in that order.
+    """The load, bulk and shear passes, in that order, and possibly none.
 
     Stages rather than a protocol, because each starts from the equilibrated
-    cell rather than from the one before it: the driver runs each as its own
-    one-stage protocol. Returned as a tuple for the same reason - skipping
-    all three is a legitimate request, and an empty ``Protocol`` is not a
-    thing this package allows.
-
-    Args:
-        spec: What to run.
-        timestep_fs: The timestep each uses.
-
-    Returns:
-        The stages, which may be none.
+    cell rather than from the one before it, and because skipping all three
+    is a legitimate request that an empty ``Protocol`` could not express.
     """
     stages: list[Stage] = []
     if spec.load_stresses_bar is not None:
@@ -569,101 +425,86 @@ def extra_stages(spec: ModulusSpec, *, timestep_fs: float) -> tuple[Stage, ...]:
     return tuple(stages)
 
 
-# --------------------------------------------------------------------------
-# The workflow record and the cost
-# --------------------------------------------------------------------------
+def _branches(
+    spec: ModulusSpec,
+    *,
+    timestep_fs: float,
+    reference_box_nm: Sequence[float] | None = None,
+) -> list[Protocol]:
+    """Every pass that starts from the equilibrated cell, in the order run."""
+    return [
+        *(
+            deform_protocol(
+                spec,
+                timestep_fs=timestep_fs,
+                replica=replica,
+                reference_box_nm=reference_box_nm,
+            )
+            for replica in range(spec.n_replicas)
+        ),
+        *(
+            Protocol(PROTOCOL_NAME, (stage,))
+            for stage in extra_stages(spec, timestep_fs=timestep_fs)
+        ),
+    ]
 
 
-def _request(spec: ModulusSpec) -> dict[str, Any]:
-    """What the caller asked for, as the thing a resume is compared against.
+def mechanical_scan(spec: ModulusSpec = DEFAULT_SPEC, **equilibration: Any) -> Protocol:
+    """Every stage the scan runs, for inspection and dry-run cost estimation.
 
-    Round-tripped through JSON before it is compared with anything, because
-    that is the form it is stored in. Several of these fields are tuples,
-    and a tuple comes back from a file as a list: comparing the two directly
-    makes every second run look like a change of settings and refuse to
-    resume.
+    The equilibration, each replica's extension and the load, bulk and shear
+    passes, at a 2 fs timestep that changes no duration.
+    :func:`run_modulus_scan` runs the passes as separate protocols, each
+    branching from the equilibrated cell, rather than one after another as
+    they are listed here.
+
+    Args:
+        spec: What to run.
+        **equilibration: Passed to
+            :func:`~openmmpolymer.protocols.standard_melt_equilibration`.
+
+    Returns:
+        The listing.
     """
-    stored = json.loads(json.dumps(asdict(spec), default=str))
-    return {"spec": cast("dict[str, Any]", stored)}
+    return scan_listing(
+        PROTOCOL_NAME,
+        [
+            equilibration_protocol(spec, **equilibration),
+            *_branches(spec, timestep_fs=2.0),
+        ],
+    )
 
 
-def _check_request(run_dir: Path, request: dict[str, Any]) -> dict[str, Any]:
-    """Refuse a resume that quietly asks for something else.
-
-    A stage's options are recorded nowhere, so a protocol rerun with
-    different settings resumes and keeps the old result without a word. That
-    is survivable for an equilibration and not for a measurement, where the
-    modulus would then belong to a ladder nobody walked.
-    """
-    path = run_dir / WORKFLOW_NAME
-    if not path.is_file():
-        return {}
-    record: dict[str, Any] = json.loads(path.read_text())
-    previous = record.get("request")
-    if previous is not None and previous != request:
-        changed = sorted(
-            key
-            for key in set(previous.get("spec", {})) | set(request["spec"])
-            if previous.get("spec", {}).get(key) != request["spec"].get(key)
-        )
-        raise MechanicalError(
-            f"{path} records a scan run with different settings "
-            f"({', '.join(changed) or 'unknown'}), and resuming would keep "
-            "results measured under the old ones. Run into a fresh "
-            "directory, or put the settings back."
-        )
-    return record
-
-
-def _save_workflow(run_dir: Path, record: dict[str, Any]) -> str:
-    """Write the workflow record."""
-    return write_json(run_dir / WORKFLOW_NAME, record, strict=False)
+# --------------------------------------------------------------------------
+# The driver
+# --------------------------------------------------------------------------
 
 
 def _report_cost(
-    equilibration: Protocol,
-    schedule: ModulusSchedule,
-    spec: ModulusSpec,
-    extras: Sequence[Stage],
-    manifest: RunManifest | None,
+    spec: ModulusSpec, settle: Protocol, manifest: RunManifest | None
 ) -> None:
-    """Say what the whole thing costs before any of it runs.
+    """Say what the whole scan costs before any of it runs.
 
     Raises:
         MechanicalError: The total is over ``max_total_ns``.
     """
-    settle_ps = equilibration.total_duration_ps
-    deform_ps = schedule.total_ps * spec.n_replicas
-    extra_ps = sum(stage.duration_ps for stage in extras)
-    total_ps = settle_ps + deform_ps + extra_ps
-
-    done = set(manifest.stages) if manifest is not None else set()
-    remaining = total_ps - sum(
-        stage.duration_ps
-        for stage in (*equilibration.stages, *extras)
-        if stage.name in done
-    )
-    for replica in range(spec.n_replicas):
-        stem = f"{DEFORM_STEM}_r{replica}"
-        remaining -= sum(
-            schedule.relax_ps * int(stage.options["n_steps"])
-            for stage in _deform_stages(stem, schedule, spec, timestep_fs=2.0)
-            if stage.name in done
-        )
-
+    schedule = deform_schedule(spec)
+    listing = scan_listing(PROTOCOL_NAME, [settle, *_branches(spec, timestep_fs=2.0)])
+    total_ps = listing.total_duration_ps
     log.info(
         "Mechanical scan: %.1f ns equilibration, %.1f ns of extension (%d "
         "replicas of %d steps to %.1f%% strain at %.3g /ns), %.1f ns of "
         "load, bulk and shear - %.1f ns in total, %.1f ns of it still to run.",
-        settle_ps / 1000.0,
-        deform_ps / 1000.0,
+        settle.total_duration_ps / 1000.0,
+        schedule.total_ps * spec.n_replicas / 1000.0,
         spec.n_replicas,
         schedule.n_steps,
         100.0 * schedule.max_strain,
         schedule.strain_rate_per_ns,
-        extra_ps / 1000.0,
+        sum(stage.duration_ps for stage in extra_stages(spec, timestep_fs=2.0))
+        / 1000.0,
         total_ps / 1000.0,
-        max(0.0, remaining) / 1000.0,
+        remaining_ps(listing.stages, manifest) / 1000.0,
     )
     if spec.max_total_ns is not None and total_ps / 1000.0 > spec.max_total_ns:
         raise MechanicalError(
@@ -671,11 +512,6 @@ def _report_cost(
             f"{spec.max_total_ns:.1f} ns budget. Shorten relax_ps, drop a "
             "replica, skip a pass, or raise max_total_ns."
         )
-
-
-# --------------------------------------------------------------------------
-# The driver
-# --------------------------------------------------------------------------
 
 
 def run_modulus_scan(
@@ -688,13 +524,11 @@ def run_modulus_scan(
     atoms_per_chain: int | None = None,
     expected_characteristic_ratio: float = 7.0,
     **equilibration: Any,
-) -> ModulusResult:
-    """Equilibrate a cell and measure its elastic constants.
+) -> ModulusReport:
+    """Equilibrate a cell, measure its elastic constants, and report them.
 
-    Every pass branches from the equilibrated cell, not from the pass before
-    it, so each is run as its own protocol with that state named explicitly.
-    A cell that has just been stretched is not the cell the next measurement
-    wants.
+    Nothing is written before the budget and a resumed directory's settings
+    have been checked. The workflow record is written once the scan is done.
 
     Args:
         run: The run context.
@@ -708,71 +542,44 @@ def run_modulus_scan(
             :func:`~openmmpolymer.protocols.standard_melt_equilibration`.
 
     Returns:
-        What was measured.
+        What :func:`analyse_mechanics` reads back from the finished run.
 
     Raises:
         MechanicalError: The scan is over budget, or this directory holds one
             run with different settings.
     """
     directory = Path(run_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    request = _request(spec)
-    record = _check_request(directory, request) if resume else {}
-
-    settle = equilibration_protocol(spec, **equilibration)
-    schedule = deform_schedule(spec)
-    timestep_fs = safe_timestep_fs(spec.temperature_k, run.spec)
-    extras = extra_stages(spec, timestep_fs=timestep_fs)
-    _report_cost(
-        settle,
-        schedule,
-        spec,
-        extras,
-        RunManifest.load(directory) if resume else None,
+    request = spec_request(spec)
+    record = (
+        check_request(directory / WORKFLOW_NAME, request, error=MechanicalError)
+        if resume
+        else {}
     )
+    settle = equilibration_protocol(spec, **equilibration)
+    _report_cost(spec, settle, RunManifest.load(directory) if resume else None)
 
+    timestep_fs = safe_timestep_fs(spec.temperature_k, run.spec)
     chains: dict[str, Any] = {
         "chain_backbone": chain_backbone,
         "atoms_per_chain": atoms_per_chain,
         "expected_characteristic_ratio": expected_characteristic_ratio,
     }
-    settled = run_protocol(settle, run, directory, resume=resume, **chains)
-    start_state = settled_state(
-        settled, directory, error=MechanicalError, verb="deform"
+    start_state, origin = equilibrate(
+        settle,
+        run,
+        directory,
+        resume=resume,
+        error=MechanicalError,
+        verb="deform",
+        **chains,
     )
-    origin = equilibrated_box_nm(start_state)
-    log.info(
-        "Equilibrated cell is %s nm; every pass starts from %s.",
-        [round(value, 4) for value in origin],
-        Path(start_state).name,
+    run_branches(
+        _branches(spec, timestep_fs=timestep_fs, reference_box_nm=origin),
+        run,
+        directory,
+        start_state,
+        **chains,
     )
-
-    for replica in range(spec.n_replicas):
-        run_protocol(
-            deform_protocol(
-                spec,
-                timestep_fs=timestep_fs,
-                replica=replica,
-                reference_box_nm=origin,
-            ),
-            run,
-            directory,
-            # Preparation already reset a forced rerun's manifest. Keep all
-            # newly completed preparation and replica stages from here on.
-            resume=True,
-            state_in=start_state,
-            **chains,
-        )
-
-    for stage in extras:
-        run_protocol(
-            Protocol(name=PROTOCOL_NAME, stages=(stage,)),
-            run,
-            directory,
-            resume=True,
-            state_in=start_state,
-            **chains,
-        )
 
     report = analyse_mechanics(directory, strain_limit=spec.elastic_strain_limit)
     record.update(
@@ -784,39 +591,12 @@ def run_modulus_scan(
             "n_replicas": spec.n_replicas,
         }
     )
-    _save_workflow(directory, record)
-
-    resolved = bool(
-        report.youngs is not None
-        and report.youngs.resolved
-        and (
-            report.replica_spread_mpa is None
-            or report.youngs.modulus_mpa <= 0.0
-            or report.replica_spread_mpa
-            <= MAX_REPLICA_SPREAD * report.youngs.modulus_mpa
-        )
-    )
-    _log_result(report, schedule, resolved)
-    return ModulusResult(
-        run_dir=str(directory),
-        manifest_path=str(directory / "manifest.json"),
-        youngs=report.youngs,
-        poisson=report.poisson,
-        bulk=report.bulk,
-        shear=report.shear,
-        consistency=report.consistency,
-        replicas=report.replicas,
-        replica_spread_mpa=report.replica_spread_mpa,
-        load_modulus=report.load_modulus,
-        schedule=schedule,
-        curves=report.curves,
-        resolved=resolved,
-    )
+    write_json(directory / WORKFLOW_NAME, record, strict=False)
+    _log_result(report, deform_schedule(spec))
+    return report
 
 
-def _log_result(
-    report: ModulusReport, schedule: ModulusSchedule, resolved: bool
-) -> None:
+def _log_result(report: ModulusReport, schedule: ModulusSchedule) -> None:
     """One line per measured constant, each with what qualifies it."""
     if report.youngs is None:
         log.info("Mechanical scan: no extension to fit.")
@@ -830,7 +610,7 @@ def _log_result(
         f"{len(report.replicas)} replicas",
         schedule.strain_rate_per_ns,
         report.youngs.temperature_k,
-        "" if resolved else " (not resolved)",
+        "" if report.resolved else " (not resolved)",
     )
     if report.poisson is not None:
         log.info(
@@ -910,9 +690,10 @@ def analyse_mechanics(
 
     for group in groups:
         curve = stress_strain(directory, group)
-        fit = youngs_modulus(curve, strain_limit=strain_limit, min_points=min_points)
         curves.append(curve)
-        replicas.append(fit)
+        replicas.append(
+            youngs_modulus(curve, strain_limit=strain_limit, min_points=min_points)
+        )
 
     pooled = _pool(curves)
     youngs = (
@@ -928,16 +709,14 @@ def analyse_mechanics(
     spread = sample_spread([fit.modulus_mpa for fit in replicas])
 
     # Named rather than found by shape, and this is the one place that rule
-    # is inverted. A bulk ladder is run by the shared `compress` runner, so
-    # it records exactly what the equilibration's compression ladder records
-    # - and that one climbs to a kilobar at the melt temperature, which
-    # fitted as a bulk modulus is a confident number about nothing. Two
-    # different measurements that record the same shape cannot be told apart
-    # by their shape, so this asks for the stage this workflow wrote.
+    # is inverted. A bulk ladder is run by the shared `compress` runner, so it
+    # records exactly what the equilibration's compression ladder records -
+    # and that one climbs to a kilobar at the melt temperature, which fitted
+    # as a bulk modulus is a confident number about nothing.
     manifest = RunManifest.load(directory)
     stage_names = list(manifest.stages) if manifest is not None else []
     if BULK_STEM in stage_names:
-        bulk = _optional(
+        bulk = optional(
             lambda: bulk_modulus(directory, BULK_STEM),
             notes,
             "No bulk-modulus pass to fit",
@@ -949,8 +728,8 @@ def analyse_mechanics(
             "compression ladder run as part of equilibration is not one - it "
             "is far outside linear response and at the wrong temperature."
         )
-    shear = _optional(lambda: shear_modulus(directory), notes, "No shear ladder to fit")
-    load = _optional(lambda: load_curve(directory), notes, "No constant-stress pass")
+    shear = optional(lambda: shear_modulus(directory), notes, "No shear ladder to fit")
+    load = optional(lambda: load_curve(directory), notes, "No constant-stress pass")
     load_fit = (
         youngs_modulus(load, strain_limit=strain_limit, min_points=2)
         if load is not None
@@ -989,21 +768,17 @@ def analyse_mechanics(
         consistency=consistency,
         replica_spread_mpa=spread,
         method_gap=gap,
+        resolved=bool(
+            youngs is not None
+            and youngs.resolved
+            and (
+                spread is None
+                or youngs.modulus_mpa <= 0.0
+                or spread <= MAX_REPLICA_SPREAD * youngs.modulus_mpa
+            )
+        ),
         notes=tuple(notes),
     )
-
-
-def _optional[T](read: Callable[[], T], notes: list[str], what: str) -> T | None:
-    """Run a reader, turning "there is nothing there" into a note.
-
-    A skipped pass and a broken one look identical from the outside, so the
-    distinction is drawn here once rather than at each of three call sites.
-    """
-    try:
-        return read()
-    except AnalysisError as error:
-        notes.append(f"{what}: {error}")
-        return None
 
 
 def _pool(curves: Sequence[StressStrain]) -> StressStrain | None:
@@ -1042,13 +817,7 @@ def _pool(curves: Sequence[StressStrain]) -> StressStrain | None:
 
 
 def _modulus_record(fit: ElasticModulus) -> dict[str, Any]:
-    """One modulus fit as plain JSON types.
-
-    Written out field by field rather than with ``asdict``, which would drop
-    the properties and render nothing helpfully. Spelling it out also pins
-    what is on disk independently of how the dataclasses happen to be laid
-    out.
-    """
+    """One modulus fit as plain JSON types."""
     return {
         "modulus_mpa": fit.modulus_mpa,
         "intercept_mpa": fit.intercept_mpa,
@@ -1125,36 +894,11 @@ def write_mechanical_report(
     figures: bool = True,
     figure_format: str = "png",
 ) -> ReportFiles:
-    """Write a mechanical report out, as JSON and as figures.
+    """Write ``mechanics.json`` and its figures into ``<run_dir>/analysis``.
 
-    Args:
-        report: What :func:`analyse_mechanics` found.
-        output_dir: Where to write, defaulting to ``<run_dir>/analysis``.
-            Give one when the run directory should not be touched.
-        figures: Write figures as well as the record.
-        figure_format: What matplotlib should save them as.
-
-    Returns:
-        Where everything went.
+    Or into *output_dir*, when the run directory should not be touched.
     """
-    from importlib.metadata import PackageNotFoundError, version
-
-    from .plots import plot_moduli, plot_stress_strain
-
-    directory = (
-        Path(report.run_dir) / "analysis" if output_dir is None else Path(output_dir)
-    )
-    directory.mkdir(parents=True, exist_ok=True)
-
-    try:
-        own = version("openmmpolymer")
-    except PackageNotFoundError:  # pragma: no cover - uninstalled checkout
-        own = "0.0.0+unknown"
-    manifest = RunManifest.load(report.run_dir)
-    record: dict[str, Any] = {
-        "openmmpolymer": own,
-        "run_dir": report.run_dir,
-        "versions": {} if manifest is None else manifest.versions,
+    fields: dict[str, Any] = {
         "stages": [curve.stage for curve in report.curves],
         "youngs": None if report.youngs is None else _modulus_record(report.youngs),
         "poisson": None if report.poisson is None else _poisson_record(report.poisson),
@@ -1173,36 +917,28 @@ def write_mechanical_report(
             if report.consistency is None
             else _consistency_record(report.consistency)
         ),
+        "resolved": report.resolved,
         "notes": list(report.notes),
     }
-    json_path = directory / "mechanics.json"
-    write_json(json_path, record, strict=False)
-
-    written: list[str] = []
-    if figures:
-        for curve, fit in zip(report.curves, report.replicas, strict=False):
-            stem = curve.stage.replace(", ", "_").replace(" ", "_")
-            written.append(
-                _save(
-                    plot_stress_strain(curve, fit=fit, poisson=report.poisson),
-                    directory / f"stress_strain_{stem}.{figure_format}",
-                )
-            )
-        if report.load is not None:
-            written.append(
-                _save(
-                    plot_stress_strain(report.load, fit=report.load_modulus),
-                    directory / f"load_curve.{figure_format}",
-                )
-            )
-        if report.youngs is not None:
-            written.append(
-                _save(plot_moduli(report), directory / f"moduli.{figure_format}")
-            )
-    return ReportFiles(json=str(json_path), figures=tuple(written))
+    return write_report_files(
+        report.run_dir,
+        output_dir,
+        "mechanics.json",
+        fields,
+        _figures(report) if figures else (),
+        figure_format,
+    )
 
 
-def _save(figure: Any, path: Path) -> str:
-    """Save a figure and close it, returning where it went."""
-    figure.savefig(path, bbox_inches="tight")
-    return str(path)
+def _figures(report: ModulusReport) -> Iterator[tuple[str, Figure]]:
+    """Each replica's stress-strain curve, the constant-stress one, the moduli."""
+    for curve, fit in zip(report.curves, report.replicas, strict=False):
+        stem = curve.stage.replace(", ", "_").replace(" ", "_")
+        yield (
+            f"stress_strain_{stem}",
+            plot_stress_strain(curve, fit=fit, poisson=report.poisson),
+        )
+    if report.load is not None:
+        yield "load_curve", plot_stress_strain(report.load, fit=report.load_modulus)
+    if report.youngs is not None:
+        yield "moduli", plot_moduli(report)

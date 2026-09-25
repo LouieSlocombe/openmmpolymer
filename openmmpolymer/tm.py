@@ -19,8 +19,13 @@ import numpy as np
 import numpy.typing as npt
 
 from ._files import ReportFiles, file_sha256, write_json
-from ._validation import require_integer, require_positive
-from ._workflow import run_fingerprint
+from ._validation import require_integer
+from ._workflow import (
+    require_positive_fields,
+    resume_chunks,
+    run_fingerprint,
+    spec_request,
+)
 from .protocols import (
     Protocol,
     RunManifest,
@@ -75,24 +80,23 @@ class TmSpec:
 
     def __post_init__(self) -> None:
         """Reject invalid schedules before any files or dynamics are created."""
-        for name in (
-            "t_start_k",
-            "t_end_k",
-            "step_k",
-            "hold_ps",
-            "equilibration_ps",
-            "pressure_bar",
-            "stage_ps",
-        ):
-            require_positive(getattr(self, name), None, name=name)
+        require_positive_fields(
+            self,
+            (
+                "t_start_k",
+                "t_end_k",
+                "step_k",
+                "hold_ps",
+                "equilibration_ps",
+                "pressure_bar",
+                "stage_ps",
+            ),
+            optional=("trajectory_ps", "max_total_ns"),
+        )
         require_integer(self.samples_per_segment, minimum=4, name="samples_per_segment")
         require_integer(
             self.min_points_per_branch, minimum=3, name="min_points_per_branch"
         )
-        for name in ("trajectory_ps", "max_total_ns"):
-            value = getattr(self, name)
-            if value is not None:
-                require_positive(value, None, name=name)
         if self.barostat not in ("isotropic", "anisotropic"):
             raise ValueError("barostat must be 'isotropic' or 'anisotropic'.")
         if self.stage_ps < self.hold_ps:
@@ -261,15 +265,19 @@ def melting_scan(spec: TmSpec = DEFAULT_SPEC) -> Protocol:
         ),
     ]
     ladder = spec.temperatures_k
-    chunk = max(1, int(spec.stage_ps // spec.hold_ps))
-    for index, start in enumerate(range(0, len(ladder), chunk)):
+    # Unlike a quench ladder's, a trailing chunk of one temperature is left
+    # alone: heating stages are found by the enthalpy they record rather than
+    # by their step, so a one-point chunk still reads as part of the history.
+    for index, chunk in enumerate(
+        resume_chunks(len(ladder), spec.hold_ps, spec.stage_ps)
+    ):
         stages.append(
             Stage(
                 f"{HEAT_STEM}_{index:02d}",
                 "heat",
                 {
                     **common,
-                    "temperatures_k": ladder[start : start + chunk],
+                    "temperatures_k": ladder[chunk.start : chunk.stop],
                     "hold_ps": spec.hold_ps,
                 },
             )
@@ -573,15 +581,12 @@ def run_tm_scan(
             for stage in protocol.stages
         ),
     )
-    settings = asdict(spec)
-    settings.pop("max_total_ns")
-    request = {
-        "spec": settings,
+    request = spec_request(
+        spec,
+        drop=("max_total_ns",),
         **run_fingerprint(run, spec_key="system_spec"),
-        "state_sha256": None if state_in is None else file_sha256(state_in),
-    }
-    # Round-trip tuple-valued SystemSpec fields before comparing to saved JSON.
-    request = json.loads(json.dumps(request, allow_nan=False))
+        state_sha256=None if state_in is None else file_sha256(state_in),
+    )
     directory = Path(run_dir)
     path = directory / WORKFLOW_NAME
     manifest = RunManifest.load(directory)

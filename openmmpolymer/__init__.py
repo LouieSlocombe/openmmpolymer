@@ -132,7 +132,6 @@ from .mdsystem import (
 from .mechanical import (
     MechanicalError,
     ModulusReport,
-    ModulusResult,
     ModulusSchedule,
     ModulusSpec,
     analyse_mechanics,
@@ -141,6 +140,7 @@ from .mechanical import (
     write_mechanical_report,
 )
 from .melt import build_melt
+from .melt_check import MeltEquilibration, melt_equilibration
 from .modulus_rate_report import write_modulus_rate_report
 from .modulus_rates import (
     ModulusRatePlan,
@@ -311,19 +311,17 @@ from .tensile_rates import (
     validate_tensile_rate_scan,
 )
 from .tg import (
-    MeltEquilibration,
     TgError,
     TgReport,
     TgResult,
     TgSchedule,
     TgSpec,
-    analyse_run,
+    analyse_tg,
     cooling_rate_series,
-    melt_equilibration,
     run_tg_scan,
     tg_coarse_scan,
     tg_fine_scan,
-    write_report,
+    write_tg_report,
 )
 from .thermal_rates import (
     THERMAL_RATE_PROPERTIES,
@@ -374,7 +372,6 @@ from .trajectory import (
 from .viscoelastic import (
     LinearityCheck,
     RelaxationReport,
-    RelaxationResult,
     RelaxationSchedule,
     RelaxationSpec,
     ViscoelasticError,
@@ -443,7 +440,6 @@ __all__ = [
     "ModulusRatePlan",
     "ModulusRateReport",
     "ModulusReport",
-    "ModulusResult",
     "ModulusSchedule",
     "ModulusSpec",
     "PackResult",
@@ -465,7 +461,6 @@ __all__ = [
     "RateReport",
     "RelaxationCurve",
     "RelaxationReport",
-    "RelaxationResult",
     "RelaxationSchedule",
     "RelaxationSpec",
     "RelaxationWindowConvergence",
@@ -523,9 +518,9 @@ __all__ = [
     "analyse_property_rates",
     "analyse_rate_observations",
     "analyse_relaxation",
-    "analyse_run",
     "analyse_structure",
     "analyse_tensile_rates",
+    "analyse_tg",
     "analyse_thermal_rates",
     "analyse_yield",
     "assemble_box",
@@ -682,8 +677,8 @@ __all__ = [
     "write_modulus_rate_report",
     "write_rate_report",
     "write_relaxation_report",
-    "write_report",
     "write_structure_report",
+    "write_tg_report",
     "write_yield_report",
     "yield_stages",
     "yield_strength",

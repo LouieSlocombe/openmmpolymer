@@ -5,7 +5,7 @@ something - how the hold is chunked, which chunk measures a baseline, what a
 resume refuses, how replicas are grouped, when a fit is contradicted - is
 tested against manifests written by hand, because those are arithmetic over
 recorded numbers. The plumbing that has to survive a real Context is tested
-once, on argon, which runs the whole stage in a couple of seconds.
+on argon, which runs the whole stage in a couple of seconds.
 
 Argon is a liquid at these settings, so it has no relaxation modulus worth
 quoting and every fit over it should refuse. That is deliberate: the argon
@@ -35,18 +35,34 @@ from openmmpolymer.viscoelastic import (
     MAX_LINEARITY_GAP,
     RELAX_STEM,
     WORKFLOW_NAME,
+    RelaxationReport,
     RelaxationSpec,
     ViscoelasticError,
-    _relax_stages,
-    _strains,
     analyse_relaxation,
     relax_protocol,
     relax_schedule,
     relaxation_scan,
+    run_relaxation_scan,
     write_relaxation_report,
 )
 
-from .helpers import write_relaxation
+from .helpers import QUICK_EQUILIBRATION, argon_context, write_relaxation
+
+#: The smallest thing that exercises the driver end to end: two replicas so
+#: there is a spread, and one linearity strain so there is a comparison.
+SCAN = RelaxationSpec(
+    temperature_k=120.0,
+    step_strain=0.04,
+    baseline_ps=0.5,
+    relax_ps=3.0,
+    stage_ps=3.0,
+    n_replicas=2,
+    sample_every_ps=0.05,
+    late_sample_every_ps=0.2,
+    late_after_ps=1.0,
+    bins_per_decade=8,
+    linearity_strains=(0.02,),
+)
 
 # --------------------------------------------------------------------------
 # The spec
@@ -77,16 +93,15 @@ def test_a_spec_that_cannot_describe_a_relaxation_is_refused(
 
 
 # --------------------------------------------------------------------------
-# Chunking
+# Chunking, and what a scan costs
 # --------------------------------------------------------------------------
 
 
 def test_the_hold_is_split_into_chunks_no_longer_than_stage_ps() -> None:
     """Resume granularity, and nothing else: the chunks are continuous."""
     spec = RelaxationSpec(relax_ps=1000.0, stage_ps=300.0)
-    schedule = relax_schedule(spec)
-    assert schedule.n_chunks == 4
-    stages = _relax_stages("06_relax_r0", spec, timestep_fs=2.0, strain=0.03)
+    assert relax_schedule(spec).n_chunks == 4
+    stages = relax_protocol(spec, timestep_fs=2.0).stages
     assert [stage.name for stage in stages] == [
         "06_relax_r0_00",
         "06_relax_r0_01",
@@ -106,8 +121,7 @@ def test_only_the_first_chunk_strains_baselines_and_redraws_velocities() -> None
     would restart the trajectory in the middle of the decay.
     """
     spec = RelaxationSpec(relax_ps=1000.0, stage_ps=300.0, baseline_ps=500.0)
-    stages = _relax_stages("06_relax_r0", spec, timestep_fs=2.0, strain=0.03)
-    first, *rest = stages
+    first, *rest = relax_protocol(spec, timestep_fs=2.0).stages
     assert first.options["baseline_ps"] == 500.0
     assert first.options["new_velocities"] is True
     assert first.options["strain_applied"] is False
@@ -122,14 +136,14 @@ def test_every_chunk_is_told_where_it_sits_on_the_relaxation_clock() -> None:
     """A state file does not carry it, and a chunk that assumed zero would
     fold the slow end of the decay onto the fast end."""
     spec = RelaxationSpec(relax_ps=900.0, stage_ps=300.0)
-    stages = _relax_stages("06_relax_r0", spec, timestep_fs=2.0, strain=0.03)
+    stages = relax_protocol(spec, timestep_fs=2.0).stages
     assert [stage.options["time_offset_ps"] for stage in stages] == [0.0, 300.0, 600.0]
 
 
 def test_every_chunk_spans_the_whole_relaxation_in_its_bins() -> None:
     """Which is what puts chunks and replicas on one grid, so they merge."""
     spec = RelaxationSpec(relax_ps=900.0, stage_ps=300.0)
-    stages = _relax_stages("06_relax_r0", spec, timestep_fs=2.0, strain=0.03)
+    stages = relax_protocol(spec, timestep_fs=2.0).stages
     assert {stage.options["total_ps"] for stage in stages} == {900.0}
 
 
@@ -143,67 +157,50 @@ def test_replicas_differ_only_in_their_names_which_is_enough() -> None:
     assert first.stages[0].options == second.stages[0].options
 
 
-def test_the_linearity_pass_runs_the_same_measurement_at_other_strains() -> None:
-    """And is off unless asked for, because it doubles the scan."""
-    assert _strains(RelaxationSpec()) == ((RELAX_STEM, 0.03),)
-    spec = RelaxationSpec(step_strain=0.03, linearity_strains=(0.01, 0.06))
-    assert _strains(spec) == (
-        (RELAX_STEM, 0.03),
-        (f"{LINEARITY_STEM}_e0", 0.01),
-        (f"{LINEARITY_STEM}_e1", 0.06),
+def test_the_listing_prices_every_replica_at_every_strain() -> None:
+    """What a dry run quotes is what the scan runs - ramps and the linearity
+    pass included, which is off unless asked for because it doubles the scan.
+
+    A stage kind the estimator did not know would price at zero, quietly
+    omitting the most expensive thing in the protocol.
+    """
+    default = relaxation_scan(RelaxationSpec(), nvt_ps=10.0, npt_ps=10.0)
+    assert not any(stage.name.startswith(LINEARITY_STEM) for stage in default.stages)
+
+    spec = RelaxationSpec(
+        relax_ps=5000.0,
+        baseline_ps=1000.0,
+        ramp_ps=10.0,
+        stage_ps=5000.0,
+        n_replicas=2,
+        linearity_strains=(0.01,),
     )
+    protocol = relaxation_scan(spec, nvt_ps=10.0, npt_ps=10.0)
+    relaxations = [stage for stage in protocol.stages if stage.kind == "relax"]
+    assert [stage.name for stage in relaxations] == [
+        f"{RELAX_STEM}_r0_00",
+        f"{RELAX_STEM}_r1_00",
+        f"{LINEARITY_STEM}_e0_r0_00",
+        f"{LINEARITY_STEM}_e0_r1_00",
+    ]
+    assert [stage.options["step_strain"] for stage in relaxations] == [
+        0.03,
+        0.03,
+        0.01,
+        0.01,
+    ]
+    assert sum(stage.duration_ps for stage in relaxations) == pytest.approx(4 * 6010.0)
+    assert protocol.total_duration_ps > 4 * 6010.0
 
 
-def test_a_scan_over_budget_is_refused_before_it_starts(tmp_path: Path) -> None:
+def test_a_scan_over_budget_is_refused_before_it_creates_anything(
+    argon_run: Any,
+) -> None:
     """The point of a budget is that it is checked first."""
-    from openmmpolymer.viscoelastic import _report_cost, equilibration_protocol
-
     spec = RelaxationSpec(relax_ps=100_000.0, n_replicas=8, max_total_ns=1.0)
     with pytest.raises(ViscoelasticError, match="over the"):
-        _report_cost(equilibration_protocol(spec), relax_schedule(spec), spec, None)
-
-
-def test_the_dry_run_protocol_prices_the_relaxation(tmp_path: Path) -> None:
-    """A stage kind the estimator does not know prices at zero, which would
-    quietly omit the most expensive thing in the protocol."""
-    spec = RelaxationSpec(relax_ps=5000.0, baseline_ps=1000.0, stage_ps=5000.0)
-    protocol = relaxation_scan(spec, nvt_ps=10.0, npt_ps=10.0)
-    relax_only = sum(
-        stage.options["duration_ps"] + stage.options["baseline_ps"]
-        for stage in protocol.stages
-        if stage.kind == "relax"
-    )
-    assert relax_only == pytest.approx(6000.0)
-    assert protocol.total_duration_ps > 6000.0
-
-
-# --------------------------------------------------------------------------
-# Resume
-# --------------------------------------------------------------------------
-
-
-def test_a_resume_with_changed_settings_is_refused(tmp_path: Path) -> None:
-    """Resuming would keep results measured under the old ones - and here the
-    bin edges come from the settings, so it would merge two grids into one."""
-    from openmmpolymer.viscoelastic import _check_request, _request
-
-    spec = RelaxationSpec()
-    (tmp_path / WORKFLOW_NAME).write_text(json.dumps({"request": _request(spec)}))
-    _check_request(tmp_path, _request(spec))
-    with pytest.raises(ViscoelasticError, match="step_strain"):
-        _check_request(tmp_path, _request(replace(spec, step_strain=0.09)))
-
-
-def test_a_spec_round_trips_through_json_before_it_is_compared(
-    tmp_path: Path,
-) -> None:
-    """Its tuples come back as lists, which would make every second run look
-    like a change of settings."""
-    from openmmpolymer.viscoelastic import _check_request, _request
-
-    spec = RelaxationSpec(linearity_strains=(0.01, 0.06), plane=(0, 2))
-    (tmp_path / WORKFLOW_NAME).write_text(json.dumps({"request": _request(spec)}))
-    assert _check_request(tmp_path, _request(spec)) is not None
+        run_relaxation_scan(argon_run, "run", spec=spec)
+    assert not Path("run").exists()
 
 
 # --------------------------------------------------------------------------
@@ -256,6 +253,49 @@ def test_a_linearity_pass_is_reported_rather_than_averaged_in(
     assert not report.linearity.linear
 
 
+def test_the_linearity_pass_does_not_become_the_headline_result(
+    tmp_path: Path,
+) -> None:
+    """The check must not displace the thing it was checking.
+
+    A linearity pass records exactly what the measurement records - it is the
+    same measurement at another strain - and the workflow runs the same number
+    of replicas of each. So nothing in the samples and nothing in the counts
+    tells them apart, and tie-breaking on the strain itself would quietly make
+    a larger linearity strain the reported answer: the headline modulus and
+    both fits would belong to the pass that only existed to check the other.
+    """
+    stages: dict[str, Any] | None = None
+    for replica in range(2):
+        write_relaxation(
+            tmp_path,
+            stem=f"{RELAX_STEM}_r{replica}",
+            step_strain=0.03,
+            modulus_mpa=1000.0,
+            merge=stages,
+        )
+        stages = json.loads((tmp_path / "manifest.json").read_text())["stages"]
+    for replica in range(2):
+        write_relaxation(
+            tmp_path,
+            stem=f"{LINEARITY_STEM}_e0_r{replica}",
+            step_strain=0.06,
+            modulus_mpa=4000.0,
+            merge=stages,
+        )
+        stages = json.loads((tmp_path / "manifest.json").read_text())["stages"]
+
+    report = analyse_relaxation(tmp_path)
+    assert report.mean is not None
+    assert report.mean.step_strain == pytest.approx(0.03)
+    assert report.mean.initial_modulus_mpa < 1100.0
+    assert RELAX_STEM in report.mean.stage
+    assert LINEARITY_STEM not in report.mean.stage
+    # Both still appear in the comparison, which is the pass's actual job.
+    assert report.linearity is not None
+    assert report.linearity.strains == (0.03, 0.06)
+
+
 def test_a_plateau_the_stretched_exponential_cannot_hold_is_reported(
     tmp_path: Path,
 ) -> None:
@@ -272,6 +312,7 @@ def test_a_plateau_the_stretched_exponential_cannot_hold_is_reported(
     # which is the same statement made by the fit that cannot hold a plateau.
     assert report.kww is not None and not report.kww.resolved
     assert not report.plateau_conflict
+    assert not report.resolved
 
 
 def test_a_curve_that_relaxes_to_zero_raises_no_conflict(tmp_path: Path) -> None:
@@ -283,15 +324,18 @@ def test_a_curve_that_relaxes_to_zero_raises_no_conflict(tmp_path: Path) -> None
     assert not report.plateau_conflict
     assert not any("quote the spectrum" in note for note in report.notes)
     assert report.kww is not None and report.kww.resolved
+    assert report.resolved
 
 
 def test_a_cell_that_was_already_stressed_says_so(tmp_path: Path) -> None:
     """The differential stress cancels an isotropic background, not a
-    deviatoric one, so this is a caveat and not a correction."""
+    deviatoric one, so this is a caveat and not a correction - and a decay
+    measured from such a cell is not a resolved one."""
     write_relaxation(tmp_path, modulus_mpa=10.0, baseline_bar=500.0)
     report = analyse_relaxation(tmp_path)
     assert report.baseline_fraction > 0.25
     assert any("not the isotropic cell" in note for note in report.notes)
+    assert not report.resolved
 
 
 def test_a_directory_with_nothing_to_read_refuses(tmp_path: Path) -> None:
@@ -322,6 +366,7 @@ def test_the_written_record_spells_out_what_is_on_disk(tmp_path: Path) -> None:
         "linearity",
         "plateau_conflict",
         "baseline_fraction",
+        "resolved",
         "notes",
     }
     assert record["kww"]["resolved"] is True
@@ -491,10 +536,9 @@ def test_a_resumed_chunk_carries_on_the_clock_rather_than_restarting_it(
     assert _box_nm(second.final_state) == pytest.approx(_box_nm(first.final_state))
 
 
-def test_every_replica_and_chunk_lands_on_one_grid(argon_run: Any) -> None:
+def test_every_replica_and_chunk_lands_on_one_grid() -> None:
     """Derived from the settings and never from the data, which is what makes
     merging chunks and averaging replicas the same addition."""
-    del argon_run
     grid = relax_bin_edges_ps(0.05, 10.0, 10)
     # Bit-identical, not merely close: the bins are added together by index,
     # so a grid that drifted would silently line up different times.
@@ -538,162 +582,70 @@ def test_a_relaxation_run_through_the_protocol_reads_back(argon_run: Any) -> Non
     assert report.kww is not None and not report.kww.resolved
 
 
-@pytest.fixture
-def scanned_argon(argon_run: Any, request: pytest.FixtureRequest) -> Any:
-    """A whole relaxation scan over argon, equilibration and all.
+@pytest.fixture(scope="module")
+def scanned_argon(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Path, RelaxationReport]:
+    """One whole relaxation scan over argon, equilibration and all, shared.
 
-    Deliberately the smallest thing that exercises the driver end to end: two
-    replicas so there is a spread, one linearity strain so there is a
-    comparison, and an equilibration cut to the bone because what is being
-    tested is the wiring and not the melt.
+    Run without resuming, so that path is exercised here and a resume of the
+    same directory can be tested against it.
     """
-    from openmmpolymer.viscoelastic import run_relaxation_scan
-
-    spec = RelaxationSpec(
-        temperature_k=120.0,
-        step_strain=0.04,
-        baseline_ps=0.5,
-        relax_ps=3.0,
-        stage_ps=3.0,
-        n_replicas=2,
-        sample_every_ps=0.05,
-        late_sample_every_ps=0.2,
-        late_after_ps=1.0,
-        bins_per_decade=8,
-        linearity_strains=(0.02,),
-    )
-    return spec, run_relaxation_scan(
-        argon_run,
-        "run",
-        spec=spec,
-        resume=getattr(request, "param", True),
-        melt_temperature_k=150.0,
-        nvt_ps=0.5,
-        compress_ps_each=0.2,
-        npt_ps=0.5,
-        anneal_cycles=1,
-        anneal_window_ps=0.1,
-        anneal_hold_ps=0.1,
-        compress_pressures_bar=(1.0, 50.0),
-    )
+    directory = tmp_path_factory.mktemp("relaxation")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.chdir(directory)
+        report = run_relaxation_scan(
+            argon_context(216, 2.8),
+            directory / "run",
+            spec=SCAN,
+            resume=False,
+            **QUICK_EQUILIBRATION,
+        )
+    return directory / "run", report
 
 
-@pytest.mark.parametrize("scanned_argon", [True, False], indirect=True)
-def test_a_whole_scan_runs_and_reports(scanned_argon: Any) -> None:
-    """Every replica branches from the equilibrated cell, and the record says
-    which one."""
-    spec, result = scanned_argon
-    assert len(result.curves) == spec.n_replicas * len(_strains(spec))
-    assert result.mean is not None and result.mean.n_replicas == spec.n_replicas
-    assert result.replica_spread_mpa is not None
-    assert result.linearity is not None
-    record = json.loads((Path("run") / WORKFLOW_NAME).read_text())
-    assert record["n_replicas"] == spec.n_replicas
-    assert Path(record["start_state"]).name == "05_npt.state.xml"
+def test_a_whole_scan_branches_every_replica_from_the_equilibrated_cell(
+    scanned_argon: tuple[Path, RelaxationReport],
+) -> None:
+    """And the record says which cell that was, and the report is written.
+
+    The manifest is in run order, so the last entry of a finished scan is the
+    end of somebody's strained hold. Branching from that would measure a cell
+    that had already been pulled, and the reference length would be its
+    stretched one rather than the equilibrated one - which is still cubic.
+    """
+    run_dir, report = scanned_argon
+    assert len(report.curves) == SCAN.n_replicas * 2
+    assert report.mean is not None and report.mean.n_replicas == SCAN.n_replicas
+    assert report.replica_spread_mpa is not None
+    assert report.linearity is not None
     # Argon is a liquid; nothing about it should come back resolved.
-    assert not result.resolved
+    assert not report.resolved
 
-
-def test_every_replica_starts_from_the_equilibrated_cell_not_a_strained_one(
-    scanned_argon: Any,
-) -> None:
-    """The manifest is in run order, so the last entry of a finished scan is
-    the end of somebody's strained hold. Branching from that would measure a
-    cell that had already been pulled, and the reference length would be its
-    stretched one rather than the equilibrated one."""
-    _, result = scanned_argon
-    record = json.loads((Path("run") / WORKFLOW_NAME).read_text())
+    record = json.loads((run_dir / WORKFLOW_NAME).read_text())
+    assert record["n_replicas"] == SCAN.n_replicas
+    assert Path(record["start_state"]).name == "05_npt.state.xml"
     origin = np.asarray(record["reference_box_nm"])
-    assert origin == pytest.approx(origin[0])  # equilibrated, so still cubic
-    del result
+    assert origin == pytest.approx(origin[0])
 
-
-def test_a_scan_resumes_without_repeating_anything(
-    argon_run: Any, scanned_argon: Any
-) -> None:
-    """The curve has to come back identical, not merely similar: a resumed
-    chunk that redid any work would change it."""
-    from openmmpolymer.viscoelastic import run_relaxation_scan
-
-    spec, first = scanned_argon
-    again = run_relaxation_scan(
-        argon_run,
-        "run",
-        spec=spec,
-        melt_temperature_k=150.0,
-        nvt_ps=0.5,
-        compress_ps_each=0.2,
-        npt_ps=0.5,
-        anneal_cycles=1,
-        anneal_window_ps=0.1,
-        anneal_hold_ps=0.1,
-        compress_pressures_bar=(1.0, 50.0),
-    )
-    assert first.mean is not None and again.mean is not None
-    assert np.array_equal(again.mean.modulus_mpa, first.mean.modulus_mpa)
-
-
-def test_a_resumed_scan_with_different_settings_is_refused(
-    argon_run: Any, scanned_argon: Any
-) -> None:
-    """Otherwise it would keep results measured under the old ones - and the
-    bin edges come from the settings, so it would merge two grids."""
-    from openmmpolymer.viscoelastic import run_relaxation_scan
-
-    spec, _ = scanned_argon
-    with pytest.raises(ViscoelasticError, match="different settings"):
-        run_relaxation_scan(argon_run, "run", spec=replace(spec, step_strain=0.09))
-
-
-def test_the_report_writes_its_figures_beside_the_record(
-    scanned_argon: Any,
-) -> None:
-    """Saving is the driver's job; the plotting helpers only build figures."""
-    del scanned_argon
-    files = write_relaxation_report(analyse_relaxation("run"))
-    assert Path(files.json).name == "relaxation.json"
+    files = write_relaxation_report(report)
+    assert Path(files.json) == run_dir / "analysis" / "relaxation.json"
     assert files.figures
     assert all(Path(path).is_file() for path in files.figures)
 
 
-def test_the_linearity_pass_does_not_become_the_headline_result(
-    tmp_path: Path,
+def test_a_scan_resumes_without_repeating_anything_and_refuses_other_settings(
+    scanned_argon: tuple[Path, RelaxationReport],
 ) -> None:
-    """The check must not displace the thing it was checking.
+    """The curve has to come back identical, not merely similar: a resumed
+    chunk that redid any work would change it. A resume under other settings
+    would keep results measured under the old ones - and the bin edges come
+    from the settings, so it would merge two grids."""
+    run_dir, first = scanned_argon
+    run = argon_context(216, 2.8)
+    again = run_relaxation_scan(run, run_dir, spec=SCAN, **QUICK_EQUILIBRATION)
+    assert first.mean is not None and again.mean is not None
+    assert np.array_equal(again.mean.modulus_mpa, first.mean.modulus_mpa)
 
-    A linearity pass records exactly what the measurement records - it is the
-    same measurement at another strain - and the workflow runs the same number
-    of replicas of each. So nothing in the samples and nothing in the counts
-    tells them apart, and tie-breaking on the strain itself would quietly make
-    a larger linearity strain the reported answer: the headline modulus and
-    both fits would belong to the pass that only existed to check the other.
-    """
-    stages: dict[str, Any] | None = None
-    for replica in range(2):
-        write_relaxation(
-            tmp_path,
-            stem=f"{RELAX_STEM}_r{replica}",
-            step_strain=0.03,
-            modulus_mpa=1000.0,
-            merge=stages,
-        )
-        stages = json.loads((tmp_path / "manifest.json").read_text())["stages"]
-    for replica in range(2):
-        write_relaxation(
-            tmp_path,
-            stem=f"{LINEARITY_STEM}_e0_r{replica}",
-            step_strain=0.06,
-            modulus_mpa=4000.0,
-            merge=stages,
-        )
-        stages = json.loads((tmp_path / "manifest.json").read_text())["stages"]
-
-    report = analyse_relaxation(tmp_path)
-    assert report.mean is not None
-    assert report.mean.step_strain == pytest.approx(0.03)
-    assert report.mean.initial_modulus_mpa < 1100.0
-    assert RELAX_STEM in report.mean.stage
-    assert LINEARITY_STEM not in report.mean.stage
-    # Both still appear in the comparison, which is the pass's actual job.
-    assert report.linearity is not None
-    assert report.linearity.strains == (0.03, 0.06)
+    with pytest.raises(ViscoelasticError, match="different settings"):
+        run_relaxation_scan(run, run_dir, spec=replace(SCAN, step_strain=0.09))
