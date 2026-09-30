@@ -447,8 +447,10 @@ def fine_window(transition_k: float, spec: TgSpec) -> tuple[float, float]:
         ``(top, bottom)``.
 
     Raises:
+        ValueError: The transition temperature is not finite and positive.
         TgError: Clamping left nothing between them.
     """
+    transition_k = require_positive(transition_k, None, name="transition_k")
     top = min(transition_k + spec.window_k, spec.melt_temperature_k)
     bottom = max(transition_k - spec.window_k, spec.t_floor_k)
     if top < transition_k + spec.window_k:
@@ -634,8 +636,9 @@ def _approach(
 
     The request is recorded before the coarse pass runs, and what it derived
     once it has, so a resume can check both. Nothing is written before the
-    budget and a resumed directory's settings have been checked.
+    explicit window, budget and resumed directory's settings have been checked.
     """
+    window = None if tg_approx_k is None else fine_window(tg_approx_k, spec)
     coarse = tg_coarse_scan(spec, **equilibration)
     ladder = coarse_schedule(spec)
     _report_cost(
@@ -664,7 +667,8 @@ def _approach(
     curve = quench_curve(directory, stages)
     approximate, reason = _fit_coarse(curve, spec)
     transition_k = _chosen_transition(approximate, reason, tg_approx_k, spec)
-    window = fine_window(transition_k, spec)
+    if window is None:
+        window = fine_window(transition_k, spec)
 
     restart, start_state, start_temperature_k, precool = _restart_from(
         coarse, manifest, spec, window, record
@@ -920,7 +924,9 @@ def run_tg_scan(
         run_dir: Where everything is written.
         spec: What to run.
         tg_approx_k: Centre the fine window here instead of on the coarse fit.
-            The coarse fit is still run and still reported.
+            Must be finite, positive and leave a nonempty window after
+            clamping to the scanned range. Checked before any dynamics;
+            the coarse fit is still run and still reported.
         resume: Skip stages already recorded as complete.
         chain_backbone: Passed to
             :func:`~openmmpolymer.protocols.run_protocol`, for both passes.
@@ -933,9 +939,10 @@ def run_tg_scan(
         What both passes did and what they found.
 
     Raises:
+        ValueError: An explicit approximate temperature is not finite and positive.
         TgError: The coarse fit did not resolve and no window was named, the
             scan exceeds ``spec.max_total_ns``, or the directory records a
-            scan run with different settings.
+            scan run with different settings or an explicit window is empty.
     """
     directory = Path(run_dir)
     chains: dict[str, Any] = {

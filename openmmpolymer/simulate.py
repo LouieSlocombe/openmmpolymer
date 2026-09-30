@@ -21,6 +21,7 @@ import math
 import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, ExitStack
+from copy import copy
 from dataclasses import dataclass, field
 from functools import cached_property, partial
 from pathlib import Path
@@ -598,12 +599,21 @@ def temperature_k_of(
 
 
 def _degrees_of_freedom(system: Any) -> int:
-    """Count the degrees used to convert kinetic energy to temperature."""
-    return int(
-        3 * system.getNumParticles()
-        - system.getNumConstraints()
-        - (3 if _has_cm_remover(system) else 0)
-    )
+    """Count moving coordinates, as OpenMM's StateDataReporter does.
+
+    Virtual sites and fixed particles carry no kinetic energy. Constraints
+    between two fixed particles likewise remove no moving coordinates.
+    """
+    moving: list[bool] = [
+        system.getParticleMass(index) > 0 * unit.dalton
+        for index in range(system.getNumParticles())
+    ]
+    constrained = 0
+    for index in range(system.getNumConstraints()):
+        first, second, _ = system.getConstraintParameters(index)
+        if moving[first] or moving[second]:
+            constrained += 1
+    return 3 * sum(moving) - constrained - (3 if _has_cm_remover(system) else 0)
 
 
 def _has_cm_remover(system: Any) -> bool:
@@ -642,9 +652,12 @@ def _save_final(simulation: Any, prefix: Path) -> tuple[str, str]:
     simulation.saveState(str(state_path))
 
     state = simulation.context.getState(getPositions=True)
-    simulation.topology.setPeriodicBoxVectors(state.getPeriodicBoxVectors())
+    # The Simulation shares the packed topology with every stage in this run.
+    # Only the final PDB should inherit this stage's changed cell.
+    topology = copy(simulation.topology)
+    topology.setPeriodicBoxVectors(state.getPeriodicBoxVectors())
     with pdb_path.open("w") as handle:
-        app.PDBFile.writeFile(simulation.topology, state.getPositions(), handle)
+        app.PDBFile.writeFile(topology, state.getPositions(), handle)
     return str(state_path), str(pdb_path)
 
 

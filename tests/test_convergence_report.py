@@ -191,6 +191,36 @@ def test_report_writes_stationary_and_relaxation_figures(tmp_path: Path) -> None
     )
 
 
+def test_figure_names_preserve_colliding_and_reserved_observables(
+    tmp_path: Path,
+) -> None:
+    results = {
+        name: time_window_convergence(
+            [0.0], [float(index)], property_name=name, value_unit="nm"
+        )
+        for index, name in enumerate(
+            ("radius/nm", "radius nm", "radius_nm_2", "relaxation", "///")
+        )
+    }
+    times = np.geomspace(0.1, 10000.0, 140)
+    relaxation = relaxation_window_convergence(
+        planted(times, 1000.0 * np.exp(-times / 50.0))
+    )
+    report = ConvergenceReport(str(tmp_path), "hold", results, relaxation, ())
+    files = write_convergence_report(report, tmp_path, figure_format="svg")
+    assert [Path(path).name for path in files.figures] == [
+        "convergence_radius_nm.svg",
+        "convergence_radius_nm_2.svg",
+        "convergence_radius_nm_2_2.svg",
+        "convergence_relaxation_2.svg",
+        "convergence_observable.svg",
+        "convergence_relaxation.svg",
+    ]
+    for name, path in zip(results, files.figures, strict=False):
+        assert name in Path(path).read_text()
+    assert "Relaxation window sensitivity" in Path(files.figures[-1]).read_text()
+
+
 def test_json_only_report_does_not_plot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

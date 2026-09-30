@@ -367,7 +367,10 @@ def test_the_monomer_is_the_one_required_argument() -> None:
         ),
         ["--protocol", "anneal-forever"],
         ["--charge-method", "am1bbc"],
-        *(["--cooling-rates", rates] for rates in ("10,fast,2", "10", "10,10", "0,10")),
+        *(
+            ["--cooling-rates", rates]
+            for rates in ("10,fast,2", "10", "10,10", "0,10", "nan,10", "inf,10")
+        ),
         ["--load-stresses", "not,numbers"],
         ["--check-melt", "0"],
         ["--backbone", "0,x"],

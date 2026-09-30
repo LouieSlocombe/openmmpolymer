@@ -173,11 +173,12 @@ class Ensemble:
     def frames(
         self, *, start: int = 0, stop: int | None = None, stride: int = 1
     ) -> Iterator[Frame]:
-        """Iterate over frames, converting to nanometres.
+        """Iterate over a Python-style frame slice, converting to nanometres.
 
         Args:
-            start: First frame to yield.
-            stop: One past the last, or None for all of them.
+            start: First frame to yield; negative counts from the end.
+            stop: One past the last, or None for all of them. Negative counts
+                from the end, as in an ordinary slice.
             stride: Yield every *stride*-th frame.
 
         Yields:
@@ -187,11 +188,12 @@ class Ensemble:
             ValueError: *stride* is not a positive integer.
         """
         require_integer(stride, name="stride")
-        last = self.n_frames if stop is None else min(stop, self.n_frames)
+        start, last, stride = slice(start, stop, stride).indices(self.n_frames)
         for index, step in enumerate(self.universe.trajectory[start:last:stride]):
+            frame_index = start + index * stride
             yield Frame(
-                index=start + index * stride,
-                time_ps=self._time_ps(start + index * stride),
+                index=frame_index,
+                time_ps=self._time_ps(frame_index),
                 positions_nm=np.asarray(self.universe.atoms.positions, dtype=np.float64)
                 / _ANGSTROM_PER_NM,
                 box_nm=np.asarray(step.dimensions[:3], dtype=np.float64)
@@ -374,12 +376,13 @@ def open_run(
             whose residues do not describe its molecules.
 
     Returns:
-        The stage's coordinates and block structure.
+        The stage's coordinates and block structure. Frames are streamed;
+        bulk coordinate loading checks its memory budget after applying the
+        stride. Suspiciously wrapped coordinates produce a warning.
 
     Raises:
         AnalysisError: The stage wrote no coordinates, the topology does not
-            divide into equal molecules, the trajectory is empty, it has been
-            wrapped into the cell, or it is too large to load.
+            divide into equal molecules, or the trajectory is empty.
     """
     return open_stage(stage_files(run_dir, stage), atoms_per_chain=atoms_per_chain)
 
@@ -485,7 +488,6 @@ def _open_stage(files: StageFiles, *, atoms_per_chain: int | None = None) -> Ens
 
     universe = _universe(files.topology, files.trajectory)
     n_frames = len(universe.trajectory)
-    _check_size(universe.atoms.n_atoms, n_frames)
 
     masses, hydrogen = _chain_atoms(topology, block)
     interval_ps = _interval_ps(universe, files.trajectory)
@@ -709,7 +711,10 @@ def chain_positions(
 def _load_chain_frames(
     ensemble: Ensemble, *, stride: int = 1, heavy_atoms_only: bool = False
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-    """Read chain positions, times and cell edges in one trajectory pass.
+    """Read selected frames directly into their final arrays in one pass.
+
+    Check the selected coordinates against the memory budget before reading,
+    so large trajectories remain usable with a stride or an atom filter.
 
     Returns:
         ``(n_frames, n_chains, atoms, 3)`` positions in nanometres,
@@ -717,20 +722,20 @@ def _load_chain_frames(
         in nanometres, all sampled at the same stride. Only positions are
         filtered by *heavy_atoms_only*.
     """
+    require_integer(stride, name="stride")
     keep = ~ensemble.is_hydrogen if heavy_atoms_only else None
-    positions: list[npt.NDArray[np.float64]] = []
-    times: list[float] = []
-    boxes: list[npt.NDArray[np.float64]] = []
-    for frame in ensemble.frames(stride=stride):
+    n_atoms = ensemble.atoms_per_chain if keep is None else int(np.count_nonzero(keep))
+    n_frames = len(range(0, ensemble.n_frames, stride))
+    _check_size(ensemble.n_chains * n_atoms, n_frames)
+    positions = np.empty((n_frames, ensemble.n_chains, n_atoms, 3), dtype=np.float64)
+    times = np.empty(n_frames, dtype=np.float64)
+    boxes = np.empty((n_frames, 3), dtype=np.float64)
+    for index, frame in enumerate(ensemble.frames(stride=stride)):
         chains = ensemble.per_chain(frame.positions_nm)
-        positions.append(chains if keep is None else chains[:, keep])
-        times.append(frame.time_ps)
-        boxes.append(frame.box_nm)
-    return (
-        np.asarray(positions, dtype=np.float64),
-        np.asarray(times, dtype=np.float64),
-        np.asarray(boxes, dtype=np.float64),
-    )
+        positions[index] = chains if keep is None else chains[:, keep]
+        times[index] = frame.time_ps
+        boxes[index] = frame.box_nm
+    return positions, times, boxes
 
 
 def boxes_nm(ensemble: Ensemble, *, stride: int = 1) -> npt.NDArray[np.float64]:

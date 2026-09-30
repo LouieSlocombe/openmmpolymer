@@ -53,7 +53,11 @@ from .timeseries import (
 )
 
 if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+
     from .convergence import RelaxationWindowConvergence, WindowConvergence
+    from .mechanical import ModulusReport
     from .rate_dependence import RateExtrapolation
     from .strength import BreakingStrength, ElongationAtBreak, YieldStrength
     from .structural_convergence import StructuralWindowConvergence
@@ -81,7 +85,7 @@ _ALTERNATIVE_COLOUR = "#6c3483"
 # --------------------------------------------------------------------------
 
 
-def plot_state_data(data: StateData, *, settled: Equilibration | None = None) -> Any:
+def plot_state_data(data: StateData, *, settled: Equilibration | None = None) -> Figure:
     """Plot a stage's temperature, density, energy and volume against time.
 
     Args:
@@ -114,7 +118,7 @@ def plot_state_data(data: StateData, *, settled: Equilibration | None = None) ->
 
 def plot_quench_curve(
     curve: QuenchCurve, *, transition: GlassTransition | None = None
-) -> Any:
+) -> Figure:
     """Plot specific volume against temperature, with the two fitted branches.
 
     Args:
@@ -155,7 +159,7 @@ def plot_quench_curve(
     return figure
 
 
-def plot_cooling_rate(extrapolation: CoolingRateExtrapolation) -> Any:
+def plot_cooling_rate(extrapolation: CoolingRateExtrapolation) -> Figure:
     """Plot the transition against cooling rate, and where the fit points.
 
     The fitted curve is drawn all the way from the target rate to the fastest
@@ -268,7 +272,7 @@ def _branch_offset(transition: GlassTransition, slope: float) -> float:
 # --------------------------------------------------------------------------
 
 
-def plot_conformation(series: ConformationSeries) -> Any:
+def plot_conformation(series: ConformationSeries) -> Figure:
     """Plot chain dimensions against time.
 
     Args:
@@ -306,7 +310,7 @@ def plot_conformation(series: ConformationSeries) -> Any:
 
 def plot_correlations(
     distribution: RadialDistribution, *, structure: StructureFactor | None = None
-) -> Any:
+) -> Figure:
     """Plot the pair distribution, and the structure factor beside it.
 
     Args:
@@ -345,7 +349,7 @@ def plot_correlations(
 
 def plot_dynamics(
     msd: MeanSquaredDisplacement, *, relaxation: EndToEndRelaxation | None = None
-) -> Any:
+) -> Figure:
     """Plot the mean-squared displacement, and the end-to-end decay beside it.
 
     A slope-one guide is drawn through the displacement, so a sub-diffusive
@@ -399,7 +403,7 @@ def plot_dynamics(
     return figure
 
 
-def plot_persistence(length: PersistenceLength) -> Any:
+def plot_persistence(length: PersistenceLength) -> Figure:
     """Plot the bond-direction correlation along the backbone, and its decay.
 
     The 1/e line is where the persistence length is read off, so it is drawn.
@@ -516,7 +520,7 @@ def plot_stress_strain(
     *,
     fit: ElasticModulus | None = None,
     poisson: PoissonRatio | None = None,
-) -> Any:
+) -> Figure:
     """Plot stress and transverse strain against axial strain.
 
     Two panels. The upper one is the stress-strain curve with the fitted
@@ -569,7 +573,7 @@ def plot_stress_strain(
     return figure
 
 
-def plot_moduli(report: Any) -> Any:
+def plot_moduli(report: ModulusReport) -> Figure:
     """Plot the measured elastic constants against the ones E and nu imply.
 
     The bars are what was measured; the markers are what Young's modulus and
@@ -656,7 +660,7 @@ def plot_moduli(report: Any) -> Any:
     return figure
 
 
-def plot_breaking_strength(curve: StressStrain, result: BreakingStrength) -> Any:
+def plot_breaking_strength(curve: StressStrain, result: BreakingStrength) -> Figure:
     """Plot the nominal tensile response, its peak and a resolved stress drop.
 
     The nominal stress includes the measured change in lateral area. A
@@ -689,7 +693,7 @@ def plot_breaking_strength(curve: StressStrain, result: BreakingStrength) -> Any
     )
 
 
-def plot_elongation_at_break(curve: StressStrain, result: ElongationAtBreak) -> Any:
+def plot_elongation_at_break(curve: StressStrain, result: ElongationAtBreak) -> Figure:
     """Plot apparent elongation at break on the nominal tensile response.
 
     The horizontal axis and the break bracket use percent engineering strain.
@@ -723,7 +727,7 @@ def plot_elongation_at_break(curve: StressStrain, result: ElongationAtBreak) -> 
     )
 
 
-def plot_yield_strength(curve: StressStrain, result: YieldStrength) -> Any:
+def plot_yield_strength(curve: StressStrain, result: YieldStrength) -> Figure:
     """Plot an offset yield construction on the nominal tensile response.
 
     The fit window and the offset line show how the criterion was chosen.
@@ -823,7 +827,7 @@ def _failure_figure(
     failure: tuple[float | None, float | None],
     failure_label: str,
     verdict: str,
-) -> Any:
+) -> Figure:
     """The nominal response, its sampled peak, and a resolved loss of stress.
 
     What a breaking strength and an elongation at break are both read off:
@@ -868,7 +872,7 @@ def _failure_figure(
 
 def _nominal_stress_figure(
     strain: npt.NDArray[np.float64], stress_mpa: npt.NDArray[np.float64]
-) -> tuple[Any, Any]:
+) -> tuple[Figure, Axes]:
     """Start a tensile-strength figure with its measured nominal response."""
     figure, axis = _panel()
     _measured(axis, strain, stress_mpa, label="nominal tensile stress")
@@ -913,7 +917,7 @@ def _stress_title(curve: StressStrain, fit: ElasticModulus | None) -> str:
     )
 
 
-def _moduli_title(report: Any) -> str:
+def _moduli_title(report: ModulusReport) -> str:
     """A title saying whether the constants describe one isotropic solid."""
     check = report.consistency
     if check is None:
@@ -940,7 +944,7 @@ def plot_relaxation(
     kww: KWWFit | None = None,
     prony: PronyFit | None = None,
     replicas: Sequence[RelaxationCurve] = (),
-) -> Any:
+) -> Figure:
     """Plot a relaxation modulus against time, with whatever was fitted to it.
 
     Two panels, and the lower one is the point. The upper is ``G(t)`` on log
@@ -1049,7 +1053,7 @@ def plot_relaxation(
     return figure
 
 
-def plot_relaxation_spectrum(prony: PronyFit) -> Any:
+def plot_relaxation_spectrum(prony: PronyFit) -> Figure:
     """Plot the discrete relaxation spectrum a Prony fit found.
 
     The weights against their time constants, with the equilibrium modulus
@@ -1114,7 +1118,7 @@ def _relaxation_modulus_title(curve: RelaxationCurve) -> str:
 # --------------------------------------------------------------------------
 
 
-def plot_rate_dependence(fit: RateExtrapolation) -> Any:
+def plot_rate_dependence(fit: RateExtrapolation) -> Figure:
     """Plot a property against the rate it was measured at, and the fit's target.
 
     Each measured rate carries one standard error - the replicas' spread
@@ -1213,7 +1217,7 @@ def plot_rate_dependence(fit: RateExtrapolation) -> Any:
 
 def _figure(
     n_rows: int = 1, n_columns: int = 1, *, height_per_row: float | None = None
-) -> tuple[Any, list[Any]]:
+) -> tuple[Figure, list[Axes]]:
     """Build a figure and return it with its axes flattened.
 
     Constructed rather than obtained from ``pyplot``, so no backend is chosen
@@ -1234,24 +1238,24 @@ def _figure(
     return figure, [axis for row in grid for axis in row]
 
 
-def _panel() -> tuple[Any, Any]:
+def _panel() -> tuple[Figure, Axes]:
     """A figure of one panel, and that panel."""
     figure, axes = _figure()
     return figure, axes[0]
 
 
-def _title(axis: Any, text: str) -> None:
+def _title(axis: Axes, text: str) -> None:
     """Title a panel, in the size every panel is titled in."""
     axis.set_title(text, fontsize=9)
 
 
-def _legend(axis: Any) -> None:
+def _legend(axis: Axes) -> None:
     """Add a panel's legend, small and unframed."""
     axis.legend(fontsize=7, frameon=False)
 
 
 def _measured(
-    axis: Any, x: Any, y: Any, *, markersize: float | None = 3.5, **style: Any
+    axis: Axes, x: Any, y: Any, *, markersize: float | None = 3.5, **style: Any
 ) -> None:
     """Draw what was measured, with a marker at each point unless told not to."""
     marker = {} if markersize is None else {"marker": "o", "markersize": markersize}
@@ -1259,14 +1263,14 @@ def _measured(
 
 
 def _guide(
-    axis: Any, x: Any, y: Any, *, colour: str = _REFERENCE_COLOUR, **style: Any
+    axis: Axes, x: Any, y: Any, *, colour: str = _REFERENCE_COLOUR, **style: Any
 ) -> None:
     """Draw a fitted or reference line through the data, dashed."""
     axis.plot(x, y, **{"color": colour, "linewidth": 0.8, "linestyle": "--", **style})
 
 
 def _level(
-    axis: Any, value: float, colour: str = _REFERENCE_COLOUR, **style: Any
+    axis: Axes, value: float, colour: str = _REFERENCE_COLOUR, **style: Any
 ) -> None:
     """Draw a horizontal reference level across the panel, dashed."""
     axis.axhline(
@@ -1274,18 +1278,18 @@ def _level(
     )
 
 
-def _zero_line(axis: Any) -> None:
+def _zero_line(axis: Axes) -> None:
     """Draw the zero a stress or a strain is read against."""
     _level(axis, 0.0, linewidth=0.6, linestyle="-")
 
 
-def _settling(axis: Any, settled: Equilibration) -> None:
+def _settling(axis: Axes, settled: Equilibration) -> None:
     """Mark where a series settled, which is what it is discarded up to."""
     axis.axvline(settled.start_ps, color=_GUIDE_COLOUR, linewidth=0.9, linestyle="--")
 
 
 def _point(
-    axis: Any,
+    axis: Axes,
     x: float,
     y: float,
     marker: str,
@@ -1309,7 +1313,7 @@ def _point(
 
 
 def _error_bars(
-    axis: Any, x: Any, y: Any, errors: Any, *, colour: str = _DATA_COLOUR, **style: Any
+    axis: Axes, x: Any, y: Any, errors: Any, *, colour: str = _DATA_COLOUR, **style: Any
 ) -> None:
     """Mark points with one standard error each, or none when *errors* is None."""
     axis.errorbar(
@@ -1326,7 +1330,7 @@ def _error_bars(
     )
 
 
-def _span(axis: Any, low: float, high: float, colour: str, **style: Any) -> None:
+def _span(axis: Axes, low: float, high: float, colour: str, **style: Any) -> None:
     """Shade the stretch of the horizontal axis between *low* and *high*."""
     axis.axvspan(low, high, **{"color": colour, "alpha": 0.12, "linewidth": 0, **style})
 
@@ -1341,7 +1345,7 @@ def _strain_axis(curve: StressStrain, quantity: str = "strain", unit: str = "") 
     return f"Engineering {quantity} along {'xyz'[curve.axis]}{unit}"
 
 
-def plot_window_convergence(result: WindowConvergence) -> Any:
+def plot_window_convergence(result: WindowConvergence) -> Figure:
     """Show prefix means/errors and disjoint tail-block estimates side by side.
 
     A mean whose error is unknown is drawn as a cross rather than left out.
@@ -1404,7 +1408,7 @@ def plot_window_convergence(result: WindowConvergence) -> Any:
     return figure
 
 
-def plot_relaxation_convergence(result: RelaxationWindowConvergence) -> Any:
+def plot_relaxation_convergence(result: RelaxationWindowConvergence) -> Figure:
     """Show model parameters as the observed decay window increases.
 
     One panel per refitted parameter, and no error bars: the windows overlap,
@@ -1444,7 +1448,7 @@ def plot_relaxation_convergence(result: RelaxationWindowConvergence) -> Any:
     return figure
 
 
-def plot_structural_convergence(result: StructuralWindowConvergence) -> Any:
+def plot_structural_convergence(result: StructuralWindowConvergence) -> Figure:
     """Show structural prefix estimates without treating their spread as SE.
 
     One panel per parameter, with the windows that did not resolve crossed.

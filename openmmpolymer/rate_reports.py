@@ -34,10 +34,6 @@ def write_rate_report(
     """
     if output_dir is None and not report.run_dirs:
         raise ValueError("output_dir is required when the report has no run_dirs.")
-    if not re.fullmatch(r"[A-Za-z0-9]+", figure_format):
-        raise ValueError(
-            "figure_format must be a filename extension such as png or svg."
-        )
     directory = (
         Path(report.run_dirs[0]) / "analysis"
         if output_dir is None

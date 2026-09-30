@@ -237,10 +237,6 @@ def write_convergence_report(
     Raises:
         ValueError: *figure_format* is not a plain filename extension.
     """
-    if not re.fullmatch(r"[A-Za-z0-9]+", figure_format):
-        raise ValueError(
-            "figure_format must be a filename extension such as png or svg."
-        )
     directory = (
         Path(report.run_dir) / "analysis" if output_dir is None else Path(output_dir)
     )
@@ -263,12 +259,18 @@ def write_convergence_report(
 
 def _figures(report: ConvergenceReport) -> Iterator[tuple[str, Figure]]:
     """Figures for the available stationary, relaxation and structural diagnostics."""
-    drawn: dict[str, Figure] = {}
+    used = {"convergence_relaxation", "convergence_structural"}
     for name, result in report.results.items():
-        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_")
-        drawn[f"convergence_{safe}"] = plot_window_convergence(result)
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "observable"
+        stem = f"convergence_{safe}"
+        candidate = stem
+        suffix = 2
+        while candidate in used:
+            candidate = f"{stem}_{suffix}"
+            suffix += 1
+        used.add(candidate)
+        yield candidate, plot_window_convergence(result)
     if report.relaxation is not None:
-        drawn["convergence_relaxation"] = plot_relaxation_convergence(report.relaxation)
+        yield "convergence_relaxation", plot_relaxation_convergence(report.relaxation)
     if report.structural is not None:
-        drawn["convergence_structural"] = plot_structural_convergence(report.structural)
-    yield from drawn.items()
+        yield "convergence_structural", plot_structural_convergence(report.structural)

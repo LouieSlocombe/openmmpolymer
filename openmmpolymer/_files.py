@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,10 @@ def write_report(
     schema, filenames and figure selection; an iterable can defer plotting
     until after the JSON has been written.
     """
+    if not re.fullmatch(r"[A-Za-z0-9]+", figure_format):
+        raise ValueError(
+            "figure_format must be a filename extension such as png or svg."
+        )
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     json_path = write_json(directory / name, json_value(record))

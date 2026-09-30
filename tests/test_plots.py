@@ -282,7 +282,7 @@ def test_state_data_panels_plot_the_recorded_quantities(state_data: StateData) -
     figure = plot_state_data(state_data)
     assert len(figure.axes) == 4
     assert figure.axes[-1].get_xlabel() == "Time (ps)"
-    plotted = figure.axes[1].get_lines()[0].get_xydata()
+    plotted = np.asarray(figure.axes[1].get_lines()[0].get_xydata(), dtype=float)
     assert plotted[:, 0] == pytest.approx(state_data.time_ps)
     assert plotted[:, 1] == pytest.approx(state_data.density_g_cm3)
 
@@ -316,7 +316,7 @@ def test_quench_fit_branches_meet_at_the_reported_transition(
     assert "melt fit" in labels
     assert any("Tg" in label for label in labels)
     for line in axis.get_lines()[1:3]:
-        x, y = line.get_xydata().T
+        x, y = np.asarray(line.get_xydata(), dtype=float).T
         at_crossing = np.interp(transition.temperature_k, x, y)
         assert at_crossing == pytest.approx(transition.specific_volume_cm3_g, rel=1e-6)
     title = axis.get_title()
@@ -343,7 +343,7 @@ def test_cooling_rate_figure_marks_measurements_and_unresolved_extrapolation() -
     axis = plot_cooling_rate(fit).axes[0]
     measured = next(line for line in axis.get_lines() if line.get_label() == "measured")
     assert axis.get_xscale() == "log"
-    assert len(measured.get_xdata()) == 3
+    assert len(np.asarray(measured.get_xdata(), dtype=float)) == 3
     assert axis.patches
     assert "not resolved" in axis.get_title()
     assert "decades" in axis.get_title()
@@ -579,8 +579,12 @@ def test_relaxation_panels_show_decay_samples_and_optional_fits(
         assert "KWW" in labels and "beta" in labels
         assert "Prony" in labels and "G_inf" in labels
     for line, replica in zip(axis.get_lines()[: len(replicas)], replicas, strict=True):
-        np.testing.assert_allclose(line.get_xdata(), replica.time_ps)
-        np.testing.assert_allclose(line.get_ydata(), replica.modulus_mpa)
+        np.testing.assert_allclose(
+            np.asarray(line.get_xdata(), dtype=float), replica.time_ps
+        )
+        np.testing.assert_allclose(
+            np.asarray(line.get_ydata(), dtype=float), replica.modulus_mpa
+        )
 
 
 def test_a_spectrum_figure_marks_what_lies_past_the_end_of_the_run() -> None:
@@ -589,9 +593,9 @@ def test_a_spectrum_figure_marks_what_lies_past_the_end_of_the_run() -> None:
     figure = plot_relaxation_spectrum(fit_prony(decay()))
     assert figure.axes[0].get_xlabel() == "Relaxation time (ps)"
     assert figure.axes[0].get_xscale() == "log"
-    labels = " ".join(
-        text.get_text() for text in figure.axes[0].get_legend().get_texts()
-    )
+    legend = figure.axes[0].get_legend()
+    assert legend is not None
+    labels = " ".join(text.get_text() for text in legend.get_texts())
     assert "past the end of the run" in labels
 
 

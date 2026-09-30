@@ -44,6 +44,37 @@ def test_spec_rejects_a_switch_at_or_beyond_the_cutoff() -> None:
         SystemSpec(nonbonded_cutoff_nm=1.0, switch_distance_nm=1.0)
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "nonbonded_cutoff_nm",
+        "hydrogen_mass_amu",
+        "ewald_error_tolerance",
+        "minimum_box_factor",
+    ],
+)
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_spec_rejects_invalid_positive_settings(field: str, value: float) -> None:
+    with pytest.raises(ValueError, match=field):
+        SystemSpec(**{field: value})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("distance", [-0.1, float("nan"), float("inf")])
+def test_spec_rejects_invalid_switch_distances(distance: float) -> None:
+    with pytest.raises(ValueError, match="switch_distance_nm"):
+        SystemSpec(switch_distance_nm=distance)
+
+
+def test_spec_allows_switching_from_zero_and_the_minimum_cutoff_margin() -> None:
+    spec = SystemSpec(switch_distance_nm=0.0, minimum_box_factor=2.0)
+    check_box((2.4, 2.4, 2.4), spec)
+
+
+def test_spec_cannot_disable_openmms_cutoff_requirement() -> None:
+    with pytest.raises(ValueError, match=r"minimum_box_factor.*at least 2"):
+        SystemSpec(minimum_box_factor=1.5)
+
+
 def test_spec_rejects_an_unknown_constraint_setting() -> None:
     """A typo here would silently change the dynamics."""
     with pytest.raises(ValueError, match="constraints"):

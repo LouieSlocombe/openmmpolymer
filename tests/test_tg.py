@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -165,6 +166,35 @@ def test_a_fine_window_that_does_not_cool_is_refused() -> None:
 # --------------------------------------------------------------------------
 # What a scan refuses, and when
 # --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("scan", [run_tg_scan, cooling_rate_series])
+@pytest.mark.parametrize(
+    ("approximate", "error", "message"),
+    [
+        *(
+            (value, ValueError, "transition_k")
+            for value in (0.0, -1.0, float("nan"), float("inf"), -float("inf"))
+        ),
+        (70.0, TgError, "empty"),
+        (170.0, TgError, "empty"),
+    ],
+)
+def test_an_invalid_explicit_window_stops_before_files_or_dynamics(
+    scan: Callable[..., Any],
+    approximate: float,
+    error: type[Exception],
+    message: str,
+    argon_run: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_dynamics(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("an invalid explicit window started dynamics")
+
+    monkeypatch.setattr("openmmpolymer.tg.run_protocol", unexpected_dynamics)
+    with pytest.raises(error, match=message):
+        scan(argon_run, "run", spec=QUICK, tg_approx_k=approximate)
+    assert not Path("run").exists()
 
 
 def test_an_unresolved_coarse_fit_refuses_and_names_the_ways_out(

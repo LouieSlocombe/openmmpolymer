@@ -1,4 +1,4 @@
-"""The README's examples use names, keywords and flags that exist."""
+"""The documentation's examples use names, keywords and flags that exist."""
 
 from __future__ import annotations
 
@@ -13,11 +13,18 @@ import pytest
 import openmmpolymer
 from openmmpolymer.__main__ import build_parser
 
-README = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+ROOT = Path(__file__).resolve().parent.parent
+DOCUMENTATION = [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]
 
 
 def _blocks(language: str) -> list[str]:
-    return re.findall(rf"```{language}\n(.*?)```", README, flags=re.DOTALL)
+    return [
+        block
+        for path in DOCUMENTATION
+        for block in re.findall(
+            rf"```{language}\n(.*?)```", path.read_text(), flags=re.DOTALL
+        )
+    ]
 
 
 PYTHON = _blocks("python")

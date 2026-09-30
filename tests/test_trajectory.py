@@ -281,6 +281,58 @@ def test_every_frame_reports_its_own_box(dimer_run_directory: Path) -> None:
     assert boxes_nm(open_run(dimer_run_directory, "02_nvt")).shape == (10, 3)
 
 
+@pytest.mark.parametrize(
+    ("start", "stop", "stride"),
+    [(-3, None, 1), (-20, -1, 2), (2, -1, 3), (20, None, 1)],
+)
+def test_frame_slices_keep_absolute_indices_and_times(
+    dimer_run_directory: Path, start: int, stop: int | None, stride: int
+) -> None:
+    """Negative bounds select from the end without changing frame metadata."""
+    ensemble = open_run(dimer_run_directory, "02_nvt")
+    expected = list(ensemble.frames())[start:stop:stride]
+    actual = list(ensemble.frames(start=start, stop=stop, stride=stride))
+    assert [frame.index for frame in actual] == [frame.index for frame in expected]
+    assert [frame.time_ps for frame in actual] == [frame.time_ps for frame in expected]
+    for frame, reference in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(frame.positions_nm, reference.positions_nm)
+
+
+def test_large_trajectories_can_be_streamed_or_loaded_at_a_stride(
+    dimer_run_directory: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The memory limit applies to selected coordinates, not the file on disk."""
+    monkeypatch.setattr(
+        "openmmpolymer.trajectory.MAX_POSITIONS_GIB", 64 * 5 * 3 * 8 / 1024**3
+    )
+    ensemble = open_run(dimer_run_directory, "02_nvt")
+    assert sum(1 for _ in ensemble.frames()) == 10
+    with pytest.raises(AnalysisError, match="GiB of positions"):
+        chain_positions(ensemble)
+    positions, times = chain_positions(ensemble, stride=2)
+    assert positions.shape == (5, 32, 2, 3)
+    assert times.shape == (5,)
+
+
+def test_the_memory_limit_accounts_for_filtered_atoms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discarded hydrogens need no space in the collected coordinate array."""
+    coordinates = np.arange(5 * 6 * 3, dtype=np.float64).reshape(5, 6, 3)
+    ensemble = synthetic_ensemble(
+        coordinates,
+        n_chains=2,
+        is_hydrogen=np.array([False, True, True]),
+    )
+    monkeypatch.setattr(
+        "openmmpolymer.trajectory.MAX_POSITIONS_GIB", 2 * 5 * 3 * 8 / 1024**3
+    )
+    with pytest.raises(AnalysisError, match="GiB of positions"):
+        chain_positions(ensemble)
+    positions, _ = chain_positions(ensemble, heavy_atoms_only=True)
+    np.testing.assert_array_equal(positions, coordinates.reshape(5, 2, 3, 3)[:, :, :1])
+
+
 @pytest.mark.parametrize("n_frames", [1, 5])
 @pytest.mark.parametrize("heavy_atoms_only", [False, True])
 def test_coordinates_times_and_boxes_follow_the_same_stride(

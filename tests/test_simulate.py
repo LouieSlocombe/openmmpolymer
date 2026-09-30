@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from functools import partial
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,7 +19,7 @@ from typing import Any
 import numpy as np
 import openmm as mm
 import pytest
-from openmm import unit
+from openmm import app, unit
 
 import openmmpolymer.simulate as simulate
 from openmmpolymer.forcefield import PolymerForceField
@@ -101,6 +102,26 @@ def _probe(
 def test_prepare_run_measures_the_cell_mass(argon_run: Any) -> None:
     """64 argon atoms, and the density arithmetic depends on it."""
     assert argon_run.total_mass_g_mol == pytest.approx(64 * 39.948, rel=1e-3)
+
+
+def test_final_pdb_uses_the_live_cell_without_changing_the_packed_topology(
+    argon_run: Any, tmp_path: Path
+) -> None:
+    simulation = _probe(argon_run)
+    vectors = np.diag([3.0, 3.2, 3.4])
+    simulation.context.setPeriodicBoxVectors(*(vectors * unit.nanometer))
+    state_path, pdb_path = simulate._save_final(simulation, tmp_path / "changed")
+
+    written = app.PDBFile(pdb_path).topology.getPeriodicBoxVectors()
+    np.testing.assert_allclose(written.value_in_unit(unit.nanometer), vectors)
+    state = mm.XmlSerializer.deserialize(Path(state_path).read_text())
+    np.testing.assert_allclose(
+        state.getPeriodicBoxVectors().value_in_unit(unit.nanometer), vectors
+    )
+    packed = argon_run.box.topology.getPeriodicBoxVectors()
+    np.testing.assert_allclose(
+        packed.value_in_unit(unit.nanometer), np.diag(argon_run.box.box_nm)
+    )
 
 
 def test_safe_timestep_is_quantised_and_derated() -> None:
@@ -489,6 +510,45 @@ def test_density_and_temperature_helpers_agree_with_openmm(
         simulation, argon_run.total_mass_g_mol, state=state
     ) == pytest.approx(expected)
     assert temperature_k_of(simulation, state=state) == pytest.approx(temperature)
+
+
+@pytest.mark.parametrize("remove_cm", [False, True])
+def test_temperature_excludes_virtual_sites_and_fixed_coordinates(
+    remove_cm: bool,
+) -> None:
+    """Massless sites must not cool the reported temperature artificially."""
+    system = mm.System()
+    topology = app.Topology()
+    residue = topology.addResidue("MOL", topology.addChain())
+    for index, mass in enumerate((10.0, 10.0, 0.0, 0.0, 0.0)):
+        system.addParticle(mass)
+        topology.addAtom(str(index), None, residue)
+    system.setVirtualSite(2, mm.TwoParticleAverageSite(0, 1, 0.5, 0.5))
+    system.addConstraint(0, 1, 0.1)
+    system.addConstraint(3, 4, 1.0)
+    if remove_cm:
+        system.addForce(mm.CMMotionRemover())
+    simulation = bare_simulation(
+        system,
+        topology,
+        np.array([[0, 0, 0], [0.1, 0, 0], [0.05, 0, 0], [2, 0, 0], [3, 0, 0]]),
+    )
+    simulation.context.setVelocities(
+        np.array([[0, 1, 0], [0, -1, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]])
+        * unit.nanometer
+        / unit.picosecond
+    )
+    state = simulation.context.getState(getEnergy=True)
+    output = StringIO()
+    app.StateDataReporter(output, 1, temperature=True).report(simulation, state)
+    reported = float(output.getvalue().splitlines()[-1])
+    degrees = 2 if remove_cm else 5
+    expected = 20.0 / (
+        degrees
+        * unit.MOLAR_GAS_CONSTANT_R.value_in_unit(unit.kilojoule_per_mole / unit.kelvin)
+    )
+    assert temperature_k_of(simulation, state=state) == pytest.approx(expected)
+    assert reported == pytest.approx(expected)
 
 
 # --------------------------------------------------------------------------

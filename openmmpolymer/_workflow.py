@@ -578,10 +578,14 @@ def resumable_record(
         return {}
     directory = workflow.parent
     record = check_request(workflow, request, error=error)
-    if not record and directory.is_dir() and any(directory.rglob(MANIFEST_NAME)):
+    if (
+        record.get("request") is None
+        and directory.is_dir()
+        and any(directory.rglob(MANIFEST_NAME))
+    ):
         raise error(
-            f"{directory} already holds runs but no {workflow.name}, so their "
-            "settings cannot be verified. Use a fresh directory."
+            f"{directory} already holds runs without a request in {workflow.name}, "
+            "so their settings cannot be verified. Use a fresh directory."
         )
     runs = [directory / "equilibration", *(directory / name for name in branches)]
     for path in runs:

@@ -65,6 +65,7 @@ from .trajectory import (
     Ensemble,
     StageFiles,
     backbone_indices,
+    capped_stride,
     load_manifest,
     open_stage,
     stage_files,
@@ -395,11 +396,6 @@ def _recorded_backbone(
 # --------------------------------------------------------------------------
 
 
-def _capped_stride(n_frames: int, stride: int, cap: int) -> int:
-    """The stride that keeps a measurement to at most *cap* frames."""
-    return max(stride, -(-n_frames // cap))
-
-
 def _recorded_chains(manifest: RunManifest | None) -> ChainDimensions | None:
     """The dimensions the run recorded at its end, if they are all there.
 
@@ -519,8 +515,8 @@ def analyse_structure(
         directory, manifest, ensemble, backbone, infer_backbone, notes
     )
 
-    pair_stride = _capped_stride(ensemble.n_frames, stride, MAX_DISTRIBUTION_FRAMES)
-    factor_stride = _capped_stride(
+    pair_stride = capped_stride(ensemble.n_frames, stride, MAX_DISTRIBUTION_FRAMES)
+    factor_stride = capped_stride(
         ensemble.n_frames, stride, MAX_STRUCTURE_FACTOR_FRAMES
     )
     distribution = optional(

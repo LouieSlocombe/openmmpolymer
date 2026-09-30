@@ -16,6 +16,27 @@ YOUNGS_RATE = "--modulus-relax-times 10,50,100 --target-strain-rate 0.01"
 @pytest.mark.parametrize(
     ("mode", "flags"),
     [
+        # Build controls must fail before the request itself is recorded.
+        *(
+            ("[*]CC[*] --dry-run", f"{flag} {value}")
+            for flag in ("--chains", "--conformers", "--degree-of-polymerization")
+            for value in ("0", "-1")
+        ),
+        *(
+            ("[*]CC[*] --dry-run", f"{flag} {value}")
+            for flag in ("--pack-density", "--target-density", "--max-total-ns")
+            for value in ("0", "-1", "nan", "inf")
+        ),
+        *(
+            ("[*]CC[*] --protocol tg --cooling-rates 10,5", f"--target-rate {value}")
+            for value in ("0", "-1", "nan", "inf")
+        ),
+        ("[*]CC[*] --protocol tg", "--cooling-rates 10,5 --rate-form vft"),
+        *(
+            (f"[*]CC[*] --protocol tg {rates}", f"--tg-approx {value}")
+            for rates in ("", "--cooling-rates 10,5")
+            for value in ("0", "-1", "nan", "inf", "140", "660")
+        ),
         # Every protocol validates its full budget, including during a dry run.
         *(
             (

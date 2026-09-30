@@ -94,6 +94,7 @@ def _files(directory: Path) -> dict[Path, tuple[bytes, int]]:
     [
         ("request", "different settings", ValueError),
         ("orphan", "settings cannot be verified", ValueError),
+        ("missing_request", "settings cannot be verified", ValueError),
         ("stage_state", "completed stages with missing states", ValueError),
         ("start_state", "recorded fingerprint", ValueError),
         ("fingerprint", "no preparation-state fingerprint", ValueError),
@@ -121,6 +122,8 @@ def test_forced_rerun_ignores_records_that_cannot_be_resumed(
     manifest = RunManifest(protocol="scan", seed=argon_run.seed)
     if damage == "request":
         record["request"] = {"spec": {"n_replicas": 2}}
+    elif damage == "missing_request":
+        del record["request"]
     elif damage == "stage_state":
         manifest.stages = {"finished": {"final_state": str(tmp_path / "gone.xml")}}
     elif damage == "start_state":

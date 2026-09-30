@@ -26,7 +26,7 @@ import openmm as mm
 from openmm import unit
 
 from ._seeds import seed_random_stream
-from ._validation import require_choice, require_positive
+from ._validation import require_choice, require_finite, require_positive
 from .forcefield import PolymerForceField
 from .packing import (
     AVOGADRO,
@@ -155,14 +155,25 @@ class SystemSpec:
     def __post_init__(self) -> None:
         """Reject a spec that could not build a System."""
         require_choice(self.constraints, CONSTRAINTS, name="constraints")
-        require_positive(self.nonbonded_cutoff_nm, None, name="nonbonded_cutoff_nm")
-        if (
-            self.switch_distance_nm is not None
-            and self.switch_distance_nm >= self.nonbonded_cutoff_nm
+        for name in (
+            "nonbonded_cutoff_nm",
+            "ewald_error_tolerance",
+            "minimum_box_factor",
         ):
+            require_positive(getattr(self, name), None, name=name)
+        if self.hydrogen_mass_amu is not None:
+            require_positive(self.hydrogen_mass_amu, None, name="hydrogen_mass_amu")
+        if self.switch_distance_nm is not None:
+            require_finite(self.switch_distance_nm, None, name="switch_distance_nm")
+            if not 0.0 <= self.switch_distance_nm < self.nonbonded_cutoff_nm:
+                raise ValueError(
+                    f"switch_distance_nm={self.switch_distance_nm} must be below "
+                    f"nonbonded_cutoff_nm={self.nonbonded_cutoff_nm} and nonnegative."
+                )
+        if self.minimum_box_factor < 2.0:
             raise ValueError(
-                f"switch_distance_nm={self.switch_distance_nm} must be below "
-                f"nonbonded_cutoff_nm={self.nonbonded_cutoff_nm}."
+                f"minimum_box_factor={self.minimum_box_factor} must be at least 2: "
+                "OpenMM requires a cell edge at least twice the cutoff."
             )
         if not self.scale_molecules_as_rigid and self.constraints != "none":
             raise ValueError(

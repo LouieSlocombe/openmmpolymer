@@ -96,8 +96,13 @@ _SPECS: dict[str, type[RateScanSpec]] = {
 
 def default_rate_spec(property_name: str) -> RateScanSpec:
     """Return the ordinary measurement settings for a registered property."""
+    return _spec_type(property_name)()
+
+
+def _spec_type(property_name: str) -> type[RateScanSpec]:
+    """Look up settings without constructing and validating a default instance."""
     try:
-        return _SPECS[property_name]()
+        return _SPECS[property_name]
     except KeyError:
         raise ValueError(
             f"Unknown rate property {property_name!r}; choose {tuple(RATE_PROPERTIES)}."
@@ -106,7 +111,7 @@ def default_rate_spec(property_name: str) -> RateScanSpec:
 
 def _family(property_name: str, spec: RateScanSpec | None = None) -> _Family:
     """The family measuring *property_name*, refusing settings of another type."""
-    expected = type(default_rate_spec(property_name))
+    expected = _spec_type(property_name)
     if spec is not None and type(spec) is not expected:
         raise ValueError(f"{property_name} requires {expected.__name__}.")
     return _FAMILIES[property_name]

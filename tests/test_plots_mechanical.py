@@ -113,7 +113,9 @@ def test_an_unresolved_fit_is_labelled_as_one() -> None:
     fit = youngs_modulus(curve, strain_limit=0.02)
     assert not fit.resolved
     figure = plot_stress_strain(curve, fit=fit)
-    labels = [text.get_text() for text in figure.axes[0].get_legend().get_texts()]
+    legend = figure.axes[0].get_legend()
+    assert legend is not None
+    labels = [text.get_text() for text in legend.get_texts()]
     assert any("unresolved" in label for label in labels)
 
 
@@ -144,16 +146,20 @@ def test_strength_figure_plots_nominal_stress_and_marks_the_sampled_peak() -> No
     result = breaking_strength(curve)
     assert result.resolved
     axis = plot_breaking_strength(curve, result).axes[0]
-    lines = {line.get_label(): line for line in axis.get_lines()}
+    lines = {str(line.get_label()): line for line in axis.get_lines()}
     measured = lines["nominal tensile stress"]
-    np.testing.assert_allclose(measured.get_xdata(), curve.strain)
-    np.testing.assert_allclose(measured.get_ydata(), FAILING)
-    assert not np.allclose(measured.get_ydata(), curve.tensile_stress_mpa)
+    np.testing.assert_allclose(
+        np.asarray(measured.get_xdata(), dtype=float), curve.strain
+    )
+    np.testing.assert_allclose(np.asarray(measured.get_ydata(), dtype=float), FAILING)
+    assert not np.allclose(
+        np.asarray(measured.get_ydata(), dtype=float), curve.tensile_stress_mpa
+    )
     peak = next(
         line for label, line in lines.items() if label.startswith("sampled peak")
     )
-    np.testing.assert_allclose(peak.get_xdata(), [0.3])
-    np.testing.assert_allclose(peak.get_ydata(), [100.0])
+    np.testing.assert_allclose(np.asarray(peak.get_xdata(), dtype=float), [0.3])
+    np.testing.assert_allclose(np.asarray(peak.get_ydata(), dtype=float), [100.0])
     assert axis.get_ylabel() == "Nominal tensile stress (MPa)"
     assert axis.get_xlabel() == "Engineering strain along z"
     assert "0.2 strain/ns" in axis.get_title()
@@ -168,8 +174,12 @@ def test_strength_figure_plots_nominal_stress_and_marks_the_sampled_peak() -> No
     drop = next(
         line for line in axis.get_lines() if line.get_label() == "sustained stress drop"
     )
-    np.testing.assert_allclose(drop.get_xdata(), [result.failure_strain])
-    np.testing.assert_allclose(drop.get_ydata(), [result.failure_stress_mpa])
+    np.testing.assert_allclose(
+        np.asarray(drop.get_xdata(), dtype=float), [result.failure_strain]
+    )
+    np.testing.assert_allclose(
+        np.asarray(drop.get_ydata(), dtype=float), [result.failure_stress_mpa]
+    )
 
 
 def test_elongation_figure_uses_percent_and_marks_break_separately_from_peak() -> None:
@@ -177,19 +187,22 @@ def test_elongation_figure_uses_percent_and_marks_break_separately_from_peak() -
     and the bracket shares the curve's percentage units."""
     curve = failure_curve()
     axis = plot_elongation_at_break(curve, elongation_at_break(curve)).axes[0]
-    lines = {line.get_label(): line for line in axis.get_lines()}
+    lines = {str(line.get_label()): line for line in axis.get_lines()}
     np.testing.assert_allclose(
-        lines["nominal tensile stress"].get_xdata(), 100.0 * curve.strain
+        np.asarray(lines["nominal tensile stress"].get_xdata(), dtype=float),
+        100.0 * curve.strain,
     )
-    np.testing.assert_allclose(lines["nominal tensile stress"].get_ydata(), FAILING)
+    np.testing.assert_allclose(
+        np.asarray(lines["nominal tensile stress"].get_ydata(), dtype=float), FAILING
+    )
     peak = next(
         line for label, line in lines.items() if label.startswith("sampled peak")
     )
-    np.testing.assert_allclose(peak.get_xdata(), [30.0])
-    np.testing.assert_allclose(peak.get_ydata(), [100.0])
+    np.testing.assert_allclose(np.asarray(peak.get_xdata(), dtype=float), [30.0])
+    np.testing.assert_allclose(np.asarray(peak.get_ydata(), dtype=float), [100.0])
     onset = lines["onset of sustained stress drop"]
-    np.testing.assert_allclose(onset.get_xdata(), [50.0])
-    np.testing.assert_allclose(onset.get_ydata(), [35.0])
+    np.testing.assert_allclose(np.asarray(onset.get_xdata(), dtype=float), [50.0])
+    np.testing.assert_allclose(np.asarray(onset.get_ydata(), dtype=float), [35.0])
     assert [patch.get_label() for patch in axis.patches] == ["break elongation bracket"]
     assert span_extent(axis, axis.patches[0]) == pytest.approx([40.0, 50.0])
     assert axis.get_xlabel() == "Engineering elongation along z (%)"
@@ -232,17 +245,23 @@ def test_yield_figure_plots_nominal_response_and_the_offset_construction() -> No
     result = yield_strength(curve)
     assert result.resolved
     axis = plot_yield_strength(curve, result).axes[0]
-    lines = {line.get_label(): line for line in axis.get_lines()}
+    lines = {str(line.get_label()): line for line in axis.get_lines()}
     measured = lines["nominal tensile stress"]
-    np.testing.assert_allclose(measured.get_xdata(), curve.strain)
-    np.testing.assert_allclose(measured.get_ydata(), YIELDING)
-    assert not np.allclose(measured.get_ydata(), curve.tensile_stress_mpa)
+    np.testing.assert_allclose(
+        np.asarray(measured.get_xdata(), dtype=float), curve.strain
+    )
+    np.testing.assert_allclose(np.asarray(measured.get_ydata(), dtype=float), YIELDING)
+    assert not np.allclose(
+        np.asarray(measured.get_ydata(), dtype=float), curve.tensile_stress_mpa
+    )
     fit = next(line for label, line in lines.items() if label.startswith("elastic fit"))
-    np.testing.assert_allclose(fit.get_xdata(), [0.0, 0.02])
-    np.testing.assert_allclose(fit.get_ydata(), [2.0, 22.0])
+    np.testing.assert_allclose(np.asarray(fit.get_xdata(), dtype=float), [0.0, 0.02])
+    np.testing.assert_allclose(np.asarray(fit.get_ydata(), dtype=float), [2.0, 22.0])
     offset = lines["0.2% offset line"]
     np.testing.assert_allclose(
-        offset.get_ydata(), 1000.0 * offset.get_xdata(), atol=1e-12
+        np.asarray(offset.get_ydata(), dtype=float),
+        1000.0 * np.asarray(offset.get_xdata(), dtype=float),
+        atol=1e-12,
     )
     assert axis.get_ylim()[1] < 30.0
     assert axis.get_ylabel() == "Nominal tensile stress (MPa)"
@@ -263,8 +282,12 @@ def test_yield_figure_plots_nominal_response_and_the_offset_construction() -> No
         for line in axis.get_lines()
         if line.get_label() == "interpolated offset intersection"
     )
-    np.testing.assert_allclose(point.get_xdata(), [0.0233333333333333])
-    np.testing.assert_allclose(point.get_ydata(), [23.3333333333333])
+    np.testing.assert_allclose(
+        np.asarray(point.get_xdata(), dtype=float), [0.0233333333333333]
+    )
+    np.testing.assert_allclose(
+        np.asarray(point.get_ydata(), dtype=float), [23.3333333333333]
+    )
 
 
 def test_an_elastic_curve_reports_no_yield_point_or_bracket() -> None:
