@@ -91,7 +91,7 @@ def melt_equilibration(
             manifest.
         max_lag_fraction: Passed to
             :func:`~openmmpolymer.conformation.centre_of_mass_msd`.
-        stride: Frames to skip when reading the trajectory.
+        stride: Read every *stride*-th frame of the trajectory.
 
     Returns:
         The verdict, and what could not be checked.
@@ -117,7 +117,7 @@ def melt_equilibration(
                 "chain displacement: the manifest records no radius of "
                 "gyration, so there is nothing to measure the displacement "
                 "against. Give run_protocol a chain_backbone, or pass "
-                "radius_of_gyration_nm."
+                "radius_of_gyration_nm (--rg on the command line)."
             )
     verdict = _verdict(stage, volume, displacement, radius, tuple(unchecked))
     for reason in verdict.unchecked:
@@ -170,8 +170,8 @@ def _chain_displacement(
         unchecked.append(
             f"chain displacement: stage {stage!r} wrote no trajectory, so it "
             "could not be measured. Give the equilibration stage a trajectory "
-            "- standard_melt_equilibration takes npt_trajectory, and TgSpec "
-            "takes npt_trajectory_ps."
+            "- standard_melt_equilibration takes npt_trajectory, TgSpec takes "
+            "npt_trajectory_ps, and the command line takes --check-melt."
         )
         return None
     try:

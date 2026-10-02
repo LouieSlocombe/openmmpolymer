@@ -111,8 +111,8 @@ class ChainSpec:
             head, or None to choose one from the attachment chemistry.
         tail_cap: The same for the last unit's open tail.
         residue_name: Residue name for the PDB and the force-field template.
-            Three characters, because forcefill truncates to three and a
-            collision there is a hard failure.
+            One to three alphanumeric characters, because forcefill truncates
+            to three and a collision there is a hard failure.
         characteristic_ratio: The chain's expected C-infinity, used to set the
             grown embedder's trans fraction and to check what it produced.
             The default is polyethylene's.
@@ -165,8 +165,8 @@ class ChainResult:
             run manifest measures chain dimensions with these, and nothing
             downstream can recover them: they come from the attachment points,
             which the caps consumed.
-        characteristic_ratio: Measured over the conformers, or None when the
-            chain is too short for the number to mean anything.
+        characteristic_ratio: Measured over the conformers, or None for a
+            single-bond backbone, whose ratio is 1 whatever its geometry.
         embedder: Which embedder ran, ``"etkdg"`` or ``"grown"``.
     """
 
@@ -201,7 +201,8 @@ def _parse_monomer(smiles: str) -> Chem.Mol:
 
     Raises:
         ChainError: The SMILES does not parse, or does not carry exactly two
-            attachment points each bonded to one real atom by a single bond.
+            attachment points each bonded to one real atom by a single bond,
+            the two on different atoms.
     """
     monomer: Chem.Mol | None = Chem.MolFromSmiles(smiles)
     if monomer is None:
@@ -373,7 +374,8 @@ def assemble_chain(spec: ChainSpec, n_units: int | None = None) -> Chem.Mol:
         an ``_omp_unit`` integer property.
 
     Raises:
-        ChainError: The monomer or a cap is malformed.
+        ChainError: The monomer or a cap is malformed, or an end on a carbonyl
+            carbon was left to the default cap.
     """
     monomer = _parse_monomer(spec.monomer_smiles)
     units = spec.degree_of_polymerization if n_units is None else n_units
@@ -437,7 +439,8 @@ def _trans_fraction(characteristic_ratio: float) -> float:
     states at plus and minus 120 degrees contribute ``-0.5`` each, so the whole
     dependence collapses onto the trans fraction. Hard-coding a weight triplet
     instead is how chains come out a quarter too compact: the common
-    ``(0.55, 0.225, 0.225)`` gives C = 4.3, not the 7.4 polyethylene has.
+    ``(0.55, 0.225, 0.225)`` gives C = 4.3, not the 7.0 polyethylene has, which
+    wants a trans fraction of 0.68.
 
     Returns:
         A trans probability, clamped to ``[0.05, 0.95]``.
@@ -525,8 +528,9 @@ def _frame(
 
     The frame sits at the unit's tail anchor, points its first axis along the
     unit's own backbone bond, and takes its second axis from *reference* - the
-    previous unit's head anchor, which is what makes the frame carry the
-    backbone torsion rather than an arbitrary spin.
+    previous unit's tail anchor, the backbone atom bonded to this unit's head,
+    which is what makes the frame carry the backbone torsion rather than an
+    arbitrary spin.
     """
     e1 = tail - head
     e1 /= np.linalg.norm(e1)
@@ -591,13 +595,13 @@ def _to_world(
 
 @dataclass(frozen=True)
 class _Template:
-    """One unit's geometry, ready to be stamped down the chain.
+    """Per-unit geometry, ready to be stamped down the chain.
 
-    Each block holds a unit's atom positions in the *previous* unit's local
-    frame, so placing a unit is one rigid transform plus the sampled backbone
-    torsion. The geometry itself - bond lengths, bond angles, side-group
-    placement - comes from a force-field-relaxed tetramer, so none of it has to
-    be tabulated here.
+    Each block but *first* holds a unit's atom positions in the *previous*
+    unit's local frame, so placing a unit is one rigid transform plus the
+    sampled backbone torsions; *first* is the head unit in its own frame. The
+    geometry itself - bond lengths, bond angles, side-group placement - comes
+    from a force-field-relaxed tetramer, so none of it has to be tabulated here.
     """
 
     first: npt.NDArray[np.float64]
@@ -721,9 +725,11 @@ def _grow_conformer(
     """Grow a self-avoiding conformer by stamping the template down the chain.
 
     Each unit is placed by one rigid transform from the previous unit's frame,
-    spun about the previous unit's backbone bond by a torsion drawn from the
-    trans/gauche set. A placement that puts a heavy atom within
-    :data:`_OVERLAP_ANGSTROM` of any already-placed unit before last is
+    then spun about the previous unit's backbone bond and about the junction
+    bond joining the two, each by a torsion drawn from the trans/gauche set -
+    except the second unit's first spin, which has nothing before it to be
+    trans to and is drawn uniformly. A placement that puts a heavy atom within
+    :data:`_OVERLAP_ANGSTROM` of a heavy atom two or more units back is
     rejected and redrawn; when a unit runs out of draws, growth backs up two
     units and tries again.
 
@@ -875,7 +881,7 @@ def _atom_names(mol: Chem.Mol) -> list[str]:
 
     PDB atom names are four columns wide and ``PDBFile.writeModel`` truncates
     to four without complaint, so a naive ``C1000`` scheme silently produces
-    duplicates. Counting per element in base 36 fits 46656 carbons.
+    duplicates. Counting per element in base 36 fits 46655 carbons.
 
     Raises:
         ChainError: An element has more atoms than four columns can name.
@@ -970,7 +976,8 @@ def build_chain(
         parameterisation.
 
     Raises:
-        ChainError: The monomer, a cap or the embedding failed.
+        ChainError: The monomer, a cap or the embedding failed, or the chain is
+            too short for ``embedder="grown"`` or too long to name its atoms.
     """
     require_integer(n_conformers, name="n_conformers")
     require_choice(embedder, EMBEDDERS, name="embedder")

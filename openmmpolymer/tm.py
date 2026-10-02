@@ -60,7 +60,11 @@ _LIMITATIONS = (
 
 
 class TmError(RuntimeError):
-    """A melting scan lacks a crystal or conflicts with an existing run."""
+    """A melting scan cannot run as asked, or conflicts with an existing run.
+
+    As asked: without a declared crystal, with a System that brings its own
+    barostat or Andersen thermostat, or over ``max_total_ns``.
+    """
 
 
 @dataclass(frozen=True)
@@ -196,7 +200,9 @@ class MeltingTransition:
 
     ``bracket_k`` is the adjacent pair of sampled temperatures, not a
     confidence interval. Its midpoint is ``temperature_k``; no sub-grid
-    precision is inferred. Jump sizes are extrapolated to that midpoint.
+    precision is inferred. Jump sizes are extrapolated to that midpoint. An
+    unresolved result keeps each observable's jump at its own best split, or
+    None when the curve was too short to fit.
     """
 
     temperature_k: float | None
@@ -252,7 +258,11 @@ class TmResult:
 
 
 def melting_scan(spec: TmSpec = DEFAULT_SPEC) -> Protocol:
-    """Minimise a supplied crystal, settle it cold, then heat in NPT chunks."""
+    """Minimise a supplied crystal, settle it cold, then heat in NPT chunks.
+
+    Raises :class:`TmError` when the whole protocol, equilibration included,
+    is longer than ``spec.max_total_ns``.
+    """
     common: dict[str, object] = {
         "pressure_bar": spec.pressure_bar,
         "barostat": spec.barostat,
@@ -557,18 +567,18 @@ def load_crystal(
     parameters, masses and constraints, and the force field the run records is
     provenance only. What is checked is everything a heating scan would
     otherwise trip over later, before it writes a file: the PDB and the System
-    hold the same atoms, in a periodic cell of positive volume with finite
-    coordinates; the System brings no barostat or Andersen thermostat of its
-    own; and its bonded molecules are equal, contiguous blocks of atoms, which
-    is how the reports divide a cell into chains.
+    hold the same number of atoms, in a periodic cell of positive volume with
+    finite coordinates; the System brings no barostat or Andersen thermostat
+    of its own; and the PDB's bonded molecules are equal, contiguous blocks of
+    atoms, which is how the reports divide a cell into chains.
 
     Args:
         crystal_pdb: The crystalline or semicrystalline cell, with its box
             vectors (CRYST1) and bonds, in the System's atom order.
-        system_xml: A serialized OpenMM System for exactly that cell.
-        state_in: A serialized State of the cell for the scan to start from,
+        system_xml: A serialised OpenMM System for exactly that cell.
+        state_in: A serialised State of the cell for the scan to start from,
             checked here; the scan is handed it separately.
-        platform: OpenMM platform, or None for the fastest available.
+        platform: OpenMM platform, or None for the fastest that works.
         seed: Master seed.
 
     Returns:
@@ -585,7 +595,7 @@ def load_crystal(
             f"Could not read the prepared crystal and System: {error}"
         ) from error
     if not isinstance(system, mm.System):
-        raise ValueError("system_xml must contain a serialized OpenMM System")
+        raise ValueError("system_xml must contain a serialised OpenMM System")
     if system.getNumParticles() != pdb.topology.getNumAtoms():
         raise ValueError("Crystal PDB and System must contain the same number of atoms")
     _refuse_ensemble_controls(system, ValueError)
@@ -605,7 +615,7 @@ def load_crystal(
         try:
             state = mm.XmlSerializer.deserialize(Path(state_in).read_text())
             if not isinstance(state, mm.State):
-                raise ValueError("state_in must contain a serialized OpenMM State")
+                raise ValueError("state_in must contain a serialised OpenMM State")
             saved_positions = np.asarray(
                 state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
                 dtype=float,
@@ -734,6 +744,9 @@ def run_tm_scan(
     _refuse_ensemble_controls(mm.XmlSerializer.deserialize(run.system_xml), TmError)
     protocol = melting_scan(spec)
     total_ns = protocol.total_duration_ps / 1000.0
+    # Pinned for every stage that integrates, at the hottest hold's safe step:
+    # left alone, each chunk would derate to its own hottest temperature, and
+    # one heating curve integrated several ways is a confound.
     timestep = safe_timestep_fs(spec.t_end_k, run.spec)
     protocol = replace(
         protocol,
@@ -801,7 +814,11 @@ def write_melting_report(
     figures: bool = True,
     figure_format: str = "png",
 ) -> ReportFiles:
-    """Write ``tm.json`` and a paired volume/enthalpy plot, outside the manifest."""
+    """Write ``tm.json`` and a paired volume/enthalpy plot, outside the manifest.
+
+    Into ``<run_dir>/analysis``, or into *output_dir*. The plot is
+    ``melting.<figure_format>``, which must be png, pdf or svg.
+    """
     from . import __version__
 
     directory = (
@@ -841,7 +858,7 @@ def write_melting_report(
         rate = curve.heating_rate_k_per_ns
         label = "irregular heating schedule" if rate is None else f"{rate:g} K/ns"
         figure.suptitle(
-            f"Apparent melting scan — {label}, {curve.pressure_bar[0]:g} bar"
+            f"Apparent melting scan - {label}, {curve.pressure_bar[0]:g} bar"
         )
         figure_path = directory / f"melting.{figure_format}"
         figure.savefig(figure_path)

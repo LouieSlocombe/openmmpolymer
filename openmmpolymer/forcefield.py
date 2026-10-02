@@ -152,15 +152,17 @@ def build_polymer_forcefield(
             :func:`cache_key`. Parameterising a long chain is minutes; nothing
             about it depends on the run, so a cache hit is the difference
             between iterating and waiting.
-        workdir: forcefill's intermediate directory. Kept on failure, because
-            ``sqm.out`` is the post-mortem.
+        workdir: forcefill's intermediate directory, or None for a fresh
+            temporary one. Either is kept afterwards, success or failure,
+            because ``sqm.out`` is the post-mortem.
 
     Returns:
         The force field, ready to hand to :mod:`openmmpolymer.mdsystem`.
 
     Raises:
-        ForceFieldError: The SDF does not hold one molecule, forcefill declined
-            the chain, or the result does not build a working System.
+        ValueError: *backend* is not one of :data:`BACKENDS`.
+        ForceFieldError: The SDF holds more than one molecule, forcefill
+            declined the chain, or the result does not build a working System.
     """
     require_choice(backend, BACKENDS, name="backend")
     source = Path(chain_sdf)

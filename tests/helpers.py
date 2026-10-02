@@ -202,16 +202,6 @@ def lattice(n_atoms: int, box_nm: float) -> np.ndarray:
     return np.asarray(points[:n_atoms], dtype=np.float64)
 
 
-def requires(module: str) -> Any:
-    """Skip the importing test module unless *module* is available.
-
-    Called at module scope. Collection imports a test module before any
-    per-test hook runs, so a capability that a module's imports depend on has
-    to be checked here rather than in ``pytest_runtest_setup``.
-    """
-    return pytest.importorskip(module)
-
-
 def rod_positions(n_beads: int, spacing_nm: float, *, axis: int = 0) -> np.ndarray:
     """A straight chain of *n_beads*, so its radius of gyration is exact.
 
@@ -222,23 +212,6 @@ def rod_positions(n_beads: int, spacing_nm: float, *, axis: int = 0) -> np.ndarr
     positions = np.zeros((n_beads, 3), dtype=np.float64)
     positions[:, axis] = np.arange(n_beads, dtype=np.float64) * spacing_nm
     return positions
-
-
-def drifting_frames(
-    positions_nm: np.ndarray,
-    velocity_nm_ps: tuple[float, float, float],
-    n_frames: int,
-    interval_ps: float,
-) -> np.ndarray:
-    """Frames of one cell translating at constant velocity.
-
-    Uniform drift gives ``MSD(tau) = |v|^2 tau^2`` exactly, which is the
-    ballistic answer a displacement measurement has to reproduce - and the
-    log-log slope of two that stops it reporting a diffusion coefficient.
-    """
-    velocity = np.asarray(velocity_nm_ps, dtype=np.float64)
-    times = np.arange(n_frames, dtype=np.float64) * interval_ps
-    return positions_nm[None, :, :] + times[:, None, None] * velocity[None, None, :]
 
 
 def state_data_csv(rows: Sequence[Sequence[float]]) -> str:
@@ -356,7 +329,7 @@ def two_line_curve(
     glass_slope: float = 2.0e-4,
     melt_slope: float = 8.0e-4,
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-    """A specific-volume curve made of two exact straight lines.
+    """Temperatures and densities whose specific volume is two exact lines.
 
     The grid is ``linspace(200, 600, n_points)``. Put *transition_k* on a grid
     point and the fit recovers it exactly: both branches are exactly linear,
@@ -789,13 +762,11 @@ def write_shear(
     strains: Sequence[float] = (0.005, 0.010, 0.015, 0.020),
     stage: str = "09_shear",
     temperature_k: float = 298.15,
-    merge: dict[str, Any] | None = None,
 ) -> Path:
     """Write a manifest holding an exactly linear shear ladder."""
     from openmmpolymer.stress import STRESS_ESTIMATOR_VERSION
 
-    stages = dict(merge or {})
-    stages[stage] = {
+    stage_record = {
         "samples": {
             "stress_estimator_version": [float(STRESS_ESTIMATOR_VERSION)],
             "segment_shear_strain": list(strains),
@@ -805,7 +776,7 @@ def write_shear(
         },
         "mean_temperature_k": temperature_k,
     }
-    return write_manifest(run_dir, stages)
+    return write_manifest(run_dir, {stage: stage_record})
 
 
 def write_manifest(run_dir: Path, stages: dict[str, Any]) -> Path:
@@ -849,7 +820,6 @@ def write_relaxation(
     temperature_k: float = 298.15,
     mode: str = "tensile",
     poisson: float = 0.5,
-    merge: dict[str, Any] | None = None,
 ) -> Path:
     """Write a manifest holding an exact stretched-exponential relaxation.
 
@@ -880,7 +850,7 @@ def write_relaxation(
     # strain, so plant the stress that comes back out as exactly `moduli`.
     stresses = moduli * strain_measure / MPA_PER_BAR + baseline_bar
 
-    stages = dict(merge or {})
+    stages: dict[str, Any] = {}
     groups = np.array_split(np.arange(centres.size), max(1, chunks))
     for index, group in enumerate(groups):
         samples: dict[str, Any] = {
@@ -1224,7 +1194,7 @@ def log_linear_transitions(
     ]
 
 
-#: The VFT melt the rate fits are checked against: T0, B and R0.
+#: The VFT relation the rate fits are checked against: T0, B and R0.
 VFT_PLANTED = (300.0, 400.0, 1.0e4)
 
 
@@ -1419,7 +1389,10 @@ def write_heating(
     *,
     chunks: tuple[int, ...] = (9, 10, 1),
 ) -> Path:
-    """Store the public stage-result schema without running dynamics."""
+    """Write *curve* as heating stages of *chunks* holds each, without dynamics.
+
+    The manifest has the schema a real heating stage records.
+    """
     from openmmpolymer.protocols import RunManifest
 
     directory.mkdir(parents=True, exist_ok=True)

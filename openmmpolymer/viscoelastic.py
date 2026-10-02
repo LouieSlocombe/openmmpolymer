@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from ._files import ReportFiles
+from ._fitting import NEGLIGIBLE
 from ._validation import (
     require_axis,
     require_choice,
@@ -92,7 +93,7 @@ LINEARITY_STEM = "07_linearity"
 WORKFLOW_NAME = "viscoelastic_workflow.json"
 
 #: How far the replicas may disagree about the initial modulus, relative to
-#: their mean, before the curve stops claiming to be resolved.
+#: their mean, before the report stops claiming to be resolved.
 MAX_REPLICA_SPREAD = 0.3
 
 #: How large the pre-strain deviatoric stress may be, as a fraction of the
@@ -107,9 +108,6 @@ MAX_LINEARITY_GAP = 0.2
 #: before a stretched exponential - which decays to zero - is the wrong shape
 #: for the curve.
 MIN_PLATEAU_FRACTION = 0.05
-
-#: Smallest denominator worth dividing by.
-_TINY = 1.0e-12
 
 
 class ViscoelasticError(RuntimeError):
@@ -154,9 +152,10 @@ class RelaxationSpec:
             the usable window at both ends.
         sample_every_ps: Time between stress readings, early on.
         late_sample_every_ps: Time between them after *late_after_ps*.
-        late_after_ps: When to change down. Each reading costs about six
-            energy evaluations, so a single dense cadence over a long run is
-            a tenth of the run's cost and this pair is a thousandth.
+        late_after_ps: When to change down. Each reading costs six energy
+            evaluations, twelve for a shear step, so at a 2 fs timestep a
+            single dense cadence over a long run adds a quarter to the run's
+            cost - half for shear - and the default pair about one per cent.
         bins_per_decade: Logarithmic time bins per decade.
         stage_ps: Most relaxation one stage may hold before it is split into
             another, for resume.
@@ -295,8 +294,9 @@ class RelaxationReport:
     Args:
         run_dir: The directory read.
         curves: Every replica's curve, in the order they were found.
-        mean: The ensemble average of the measurement's replicas, or None
-            when there was nothing to read.
+        mean: The ensemble average of the measurement's replicas. Never None
+            from :func:`analyse_relaxation`, which refuses a directory with
+            nothing to read rather than reporting on it.
         kww: The stretched exponential fitted to that average, or None.
         prony: The relaxation spectrum fitted to it, or None.
         replica_spread_mpa: How far the replicas disagreed about the initial
@@ -376,7 +376,7 @@ def _relax_stages(
             "duration_ps": length,
             # The grid spans the whole relaxation and not this chunk of it,
             # which is what puts every chunk and every replica on one set of
-            # bins and makes merging them the same addition.
+            # bins: chunks merge, and replicas line up, bin for bin.
             "total_ps": spec.relax_ps,
             "time_offset_ps": done,
             "strain_applied": not first,
@@ -578,10 +578,11 @@ def run_relaxation_scan(
         What :func:`analyse_relaxation` reads back from the finished run.
 
     Raises:
-        ViscoelasticError: The scan is over budget, or this directory holds one
-            run with different settings. The bin edges come from the settings,
-            so resuming under changed ones would merge incompatible grids into
-            one curve.
+        ViscoelasticError: The scan is over budget, or this directory holds a
+            run with different settings, another protocol's run, or - when
+            resuming - runs with no saved request to check. The bin edges come
+            from the settings, so resuming under changed ones would merge
+            incompatible grids into one curve.
     """
     directory = Path(run_dir)
     settle = equilibration_protocol(spec, **equilibration)
@@ -694,7 +695,7 @@ def _linearity(by_strain: dict[float, RelaxationCurve]) -> LinearityCheck | None
     strains = tuple(sorted(by_strain))
     initial = tuple(by_strain[value].initial_modulus_mpa for value in strains)
     usable = [value for value in initial if math.isfinite(value)]
-    if len(usable) < 2 or abs(float(np.mean(usable))) < _TINY:
+    if len(usable) < 2 or abs(float(np.mean(usable))) < NEGLIGIBLE:
         return LinearityCheck(strains, initial, math.nan, False)
     gap = (max(usable) - min(usable)) / abs(float(np.mean(usable)))
     return LinearityCheck(strains, initial, gap, gap <= MAX_LINEARITY_GAP)
@@ -763,7 +764,7 @@ def analyse_relaxation(
     )
 
     initial = mean.initial_modulus_mpa
-    measurable = math.isfinite(initial) and abs(initial) > _TINY
+    measurable = math.isfinite(initial) and abs(initial) > NEGLIGIBLE
     fraction = abs(mean.baseline_mpa / initial) if measurable else math.inf
     if fraction > MAX_BASELINE_FRACTION:
         notes.append(

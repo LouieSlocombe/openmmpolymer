@@ -1,8 +1,8 @@
 """Tests for the figures, asserting structure and data rather than pixels.
 
 The mechanical figures are in ``test_plots_mechanical.py``; this module has the
-thermal, structural, relaxation and rate ones, and the one test that renders
-every figure the package draws.
+thermal, structural, relaxation, rate and window-convergence ones, and the one
+test that renders every figure in ``openmmpolymer.plots``.
 """
 
 from __future__ import annotations
@@ -401,9 +401,8 @@ def test_a_conformation_with_no_measured_ratio_draws_no_reference_line() -> None
     """The expected mean square is scaled from the measured one, so a measured
     characteristic ratio of zero leaves nothing to scale and no line to draw.
 
-    Built by hand rather than measured: chain_dimensions divides by the mean
-    bond length, so a cell degenerate enough to give a ratio of zero never
-    gets as far as returning one.
+    Built by hand rather than measured: a measured ratio is zero only when
+    every chain's ends coincide, and no cell here is built that way.
     """
     series = ConformationSeries(
         stage="synthetic",
@@ -680,6 +679,11 @@ def test_a_nonfinite_target_keeps_its_rate_but_draws_no_value() -> None:
         "target estimate not finite" in label
         for label in axis.get_legend_handles_labels()[1]
     )
+
+
+# --------------------------------------------------------------------------
+# Observation-window convergence
+# --------------------------------------------------------------------------
 
 
 def test_prefix_and_disjoint_block_figure_retains_errors_and_verdict() -> None:

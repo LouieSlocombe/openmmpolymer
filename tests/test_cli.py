@@ -125,8 +125,8 @@ TENSILE_LADDER: dict[str, Any] = {
     "max_total_ns": 900.0,
 }
 
-#: For each protocol, a command line setting every flag it takes, and the
-#: settings those have to make.
+#: For each protocol, a command line setting every flag it takes but --skip,
+#: and the settings those have to make.
 EVERY_FLAG: dict[str, tuple[str, Any]] = {
     "equilibrate": (
         "-t 320 --melt-temperature 620 --pressure 2 --check-melt 5",
@@ -332,8 +332,8 @@ def test_a_changed_request_is_refused_before_it_can_overwrite_the_build(
     with pytest.raises(SystemExit, match="2"):
         main([*arguments, *changed])
     assert artifact.read_text() == "existing parameters"
-    # Presentation, device selection and switching from build-only to dynamics
-    # do not change the prepared physical system.
+    # Presentation, device selection and switching between dynamics and
+    # build-only do not change the prepared physical system.
     with pytest.raises(BuildReached):
         main([*arguments, "--platform", "CPU", "--dry-run", "-v"])
 
@@ -655,7 +655,7 @@ def test_a_tg_run_hands_the_flat_flags_to_the_scan_as_a_spec(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The translation from seventeen flags to one spec, checked end to end."""
+    """The translation from flat flags to one spec, checked end to end."""
     seen: dict[str, Any] = {}
 
     def scan(run: Any, run_dir: Any, **kwargs: Any) -> Any:
@@ -1124,11 +1124,9 @@ def test_analysing_a_relaxation_directory_reports_and_writes_it(
 ) -> None:
     """--analyse dispatches on what the directory recorded, not on a flag.
 
-    It also crosses the one seam where the scan and the reader differ: a scan
-    carries an overall verdict and a directory read back does not, and the
-    shared printer has to cope with both rather than assuming the richer one.
+    Three replicas, each in the two chunks a resumed relaxation leaves, are
+    read back and merged into one report.
     """
-    stages: dict[str, Any] | None = None
     for replica in range(3):
         write_relaxation(
             tmp_path,
@@ -1137,9 +1135,7 @@ def test_analysing_a_relaxation_directory_reports_and_writes_it(
             tau_ps=150.0,
             beta=0.45,
             chunks=2,
-            merge=stages,
         )
-        stages = json.loads((tmp_path / "manifest.json").read_text())["stages"]
 
     assert main(["--analyse", str(tmp_path)]) == 0
     captured = capsys.readouterr().out

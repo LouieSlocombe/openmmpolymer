@@ -44,7 +44,8 @@ def write_report(
     the strict JSON record atomically. Then save each ``(stem, figure)`` pair
     as ``<stem>.<figure_format>`` in iteration order. The caller owns the
     schema, filenames and figure selection; an iterable can defer plotting
-    until after the JSON has been written.
+    until after the JSON has been written. A *figure_format* that is not a
+    bare filename extension raises ValueError before anything is written.
     """
     if not re.fullmatch(r"[A-Za-z0-9]+", figure_format):
         raise ValueError(

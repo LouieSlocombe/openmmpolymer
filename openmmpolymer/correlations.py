@@ -1,13 +1,15 @@
 """How the cell is arranged, in real space and in reciprocal space.
 
-Both measurements here need the minimum image convention, and this is the one
+The pair distribution needs the minimum image convention, and this is the one
 part of the analysis where the trajectory works against you: stages write
 unwrapped coordinates on purpose, because wrapping splits a chain across a cell
 face and a split chain has a meaningless radius of gyration. Everything
 conformational wants that. A pair distribution does not - it needs each pair's
 shortest separation through the periodic boundaries - so it applies the
-convention itself, through MDAnalysis's distance kernels, which handle a
-triclinic cell and build a neighbour list rather than an N-by-N matrix.
+convention itself, through MDAnalysis's distance kernels, which build a
+neighbour list rather than an N-by-N matrix. Both measurements take the cell to
+be rectangular, its three edges at right angles, so the tilt of a sheared cell
+is not accounted for.
 
 The pair distribution is deliberately **inter**molecular. A polymer's
 intramolecular g(r) is dominated by its own bonded geometry, which is a
@@ -18,14 +20,17 @@ chain is a contiguous block of atoms.
 
 ``r_max`` defaults to half the smallest cell edge and is refused above it. Past
 that distance the minimum image convention is simply wrong - and MDAnalysis
-applies it anyway, with no warning - so a g(r) plotted out to the cell edge
-would show structure that is an artefact of the arithmetic.
+applies it anyway on a cell of under a hundred atoms, with no warning - so a
+g(r) plotted out to the cell edge would show structure that is an artefact of
+the arithmetic.
 
 The structure factor is summed directly on the wavevectors the cell can
 actually hold, ``q = 2 pi n / L``. Fourier-transforming a g(r) truncated at
 half the box would put ringing into the answer; summing on commensurate
-wavevectors has no truncation to ring. The cost is a resolution floor, and the
-result reports it rather than drawing a curve below it.
+wavevectors has no truncation to ring, and gives every periodic image of an
+atom the same phase, so unwrapped coordinates need no folding. The cost is a
+resolution floor, and the result reports it rather than drawing a curve below
+it.
 """
 
 from __future__ import annotations
@@ -146,7 +151,7 @@ def radial_distribution(
         n_bins: Bins between zero and *r_max_nm*.
         heavy_atoms_only: Drop hydrogens. On by default: a polymer melt's
             hydrogens trace the same structure as the carbons they hang off
-            and quadruple the pair count.
+            and multiply the pair count - by nine, on polyethylene.
         stride: Use every *stride*-th frame.
 
     Returns:
@@ -343,8 +348,8 @@ def _pair_limit(boxes: npt.NDArray[np.float64], r_max_nm: float | None) -> float
         raise AnalysisError(
             f"r_max_nm={limit:.3f} is more than half the smallest cell edge "
             f"({2 * half:.3f} nm, so {half:.3f} nm). Past that the minimum "
-            "image convention counts the same neighbour twice, and the "
-            "distance kernel applies it anyway without complaining."
+            "image convention no longer counts every neighbour in a shell, so "
+            "the g(r) there would be an artefact of the arithmetic."
         )
     return limit
 

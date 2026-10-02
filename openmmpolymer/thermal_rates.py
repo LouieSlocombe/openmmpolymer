@@ -24,6 +24,7 @@ from ._workflow import (
     record_scan_request,
     require_distinct,
     resumable_record,
+    resume_chunks,
     run_fingerprint,
     settled_state,
     start_fingerprint,
@@ -103,11 +104,13 @@ def _property(property_name: str) -> RateProperty:
 def _thermal_protocol(
     temperatures: tuple[float, ...], hold: float, spec: TgSpec | TmSpec
 ) -> Protocol:
-    size = max(1, int(spec.stage_ps // hold))
     chunks = [
-        temperatures[index : index + size]
-        for index in range(0, len(temperatures), size)
+        temperatures[chunk.start : chunk.stop]
+        for chunk in resume_chunks(len(temperatures), hold, spec.stage_ps)
     ]
+    # As in a Tg scan, a trailing one-temperature quench chunk has no step of
+    # its own to be grouped by, so it joins the one before; a heating chunk
+    # is found by the enthalpy it records and stays as it is.
     if isinstance(spec, TgSpec) and len(chunks) > 1 and len(chunks[-1]) == 1:
         tail = chunks.pop()
         chunks[-1] += tail

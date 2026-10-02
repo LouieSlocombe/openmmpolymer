@@ -335,7 +335,7 @@ def test_a_structure_factor_the_cell_cannot_afford_is_a_note(tmp_path: Path) -> 
 
 def test_a_trajectory_gets_the_dynamic_half(dimer_run_directory: Path) -> None:
     """Dimers have one bond, too few for a persistence length, and that is a
-    note beside four measurements that went ahead."""
+    note beside five measurements that went ahead."""
     report = analyse_structure(dimer_run_directory, backbone=(0, 1))
     assert report.persistence is None
     assert any("No persistence length" in note for note in report.notes)

@@ -2,10 +2,10 @@
 
 The readout is OpenMM's, so what is tested here is the adapter around it -
 the sign, the units, where each component lands, and which barostat can
-answer at all - plus the two exact cases that pin the physics with no
-statistics in them: a force-free gas, where the pressure is a closed-form
-kinetic sum, and a gas of constrained rotors, where the molecular and atomic
-virials differ by a factor anyone can write down.
+answer at all - plus the two cases that pin the physics against a closed
+form: a force-free gas, where the pressure is an exact kinetic sum, and a gas
+of constrained rotors, where the molecular and atomic virials differ by a
+factor anyone can write down.
 
 The strain half is tested by invariance rather than by value. An affine map
 of a periodic cell commutes with the choice of image, so re-imaging a

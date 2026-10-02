@@ -2,10 +2,10 @@
 
 Split the way the mechanical tests are split. Everything that decides
 something - how chunks merge, what the baseline does, which points a fit rests
-on, when a fit refuses - is tested against manifests written by hand, because
-those are arithmetic over recorded numbers and running dynamics to reach them
-would hide what is being checked. The planted answers are exact, so the
-assertions are equalities.
+on, when a fit refuses - is tested against manifests and curves written by
+hand, because those are arithmetic over recorded numbers and running dynamics
+to reach them would hide what is being checked. The planted answers are exact,
+so the assertions are equalities.
 
 The two fits get the same treatment and one thing more: both are hand-rolled
 numerics standing in for a library this package does not depend on, so they are
@@ -137,7 +137,7 @@ def test_a_bin_straddling_a_chunk_boundary_merges_exactly() -> None:
     # And the error that falls out of them is the one the whole sample gives.
     error = _standard_error(merged["mean"], merged["mean_sq"], merged["n"])
     assert error[0] == pytest.approx(whole.std(ddof=0) / np.sqrt(whole.size))
-    # An unweighted average of the two means would have given 19.0, not 19.5.
+    # An unweighted average of the two means would have given 18.0, not 19.5.
     assert merged["mean"][0] != pytest.approx(
         0.5 * (early.mean() + late.mean()), abs=1e-6
     )
@@ -155,13 +155,10 @@ def test_the_baseline_is_subtracted_once_and_only_once(tmp_path: Path) -> None:
 
 def test_two_different_strains_are_not_read_as_one_curve(tmp_path: Path) -> None:
     """They measure different things, and averaging them would hide that."""
-    first = write_relaxation(tmp_path, step_strain=0.02, stem="06_relax_r0")
-    write_relaxation(tmp_path, step_strain=0.05, stem="06_relax_r0", chunks=1, merge={})
-    del first
-    stages = relax_stages(tmp_path)
+    write_relaxation(tmp_path, step_strain=0.05, stem="06_relax_r0")
     write_relaxation(tmp_path, step_strain=0.02, stem="07_other")
     with pytest.raises(AnalysisError, match="strained by different amounts"):
-        relaxation_curve(tmp_path, (*stages, "07_other_00"))
+        relaxation_curve(tmp_path, ("06_relax_r0_00", "07_other_00"))
 
 
 def test_a_shear_step_is_told_from_a_tensile_one_by_what_it_recorded(
@@ -201,8 +198,13 @@ def test_replicas_average_and_carry_their_own_spread(tmp_path: Path) -> None:
     assert np.all(mean.standard_error_mpa > 0.0)
 
 
-def test_replicas_on_different_grids_are_refused(tmp_path: Path) -> None:
-    """Averaging them bin for bin would line up times that are not the same."""
+def test_replicas_that_share_no_bin_are_refused(tmp_path: Path) -> None:
+    """There is nothing to average them over.
+
+    Every grid numbers its bins from zero, so replicas binned on different
+    grids still share indices; the second curve's are moved clear of the
+    first's here to leave the two with none in common.
+    """
     first = relaxation_curve(write_relaxation(tmp_path / "a").parent)
     second = relaxation_curve(
         write_relaxation(tmp_path / "b", first_ps=50.0, total_ps=80.0).parent

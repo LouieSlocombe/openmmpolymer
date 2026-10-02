@@ -70,8 +70,10 @@ Every measurement follows the same pattern:
   `write_*_report` writes its JSON and figures to `<run>/analysis`.
   `openmmpolymer --analyse RUN_DIR` works out from what a directory recorded
   which reports it can produce - a quench gets a glass transition, a heating
-  scan a melting report, a deformation its mechanical report, any stage with
-  coordinates a structure report - and never modifies the manifest.
+  scan a melting report, a tensile ladder its yield, breaking or elongation
+  report, any other deformation its mechanical report, a step strain its
+  relaxation report, any stage with coordinates a structure report - and never
+  modifies the manifest.
 - Molecular dynamics rates are some ten decades faster than experiment, so
   every number is an apparent one at its rate, and the rate travels with it.
 
@@ -241,18 +243,19 @@ print(yield_report.strength_mpa, breaking.strength_mpa, elongation.elongation_pe
   permanent deformation - see
   [Instron's offset yield definition](https://www.instron.com/en/resources/glossary/offset-yield-strength/).
 - **Breaking strength** is the peak nominal stress, confirmed only when the
-  curve ends with `confirmation_steps` consecutive holds below
-  `failure_fraction` of the peak (three below half, by default). A curve still
-  rising, one that recovers, or one that never drops that far stays
-  unresolved.
+  curve ends with `confirmation_steps` consecutive holds at or below
+  `failure_fraction` of the peak (three at or below half, by default). A
+  curve still rising, one that recovers, or one that never drops that far
+  stays unresolved.
 - **Elongation at break** is `100 (L_break - L0) / L0` at the *first* hold of
   that confirmed terminal drop, with `L0` the equilibrated length - distinct
   from the strain at the peak. The preceding hold and the first low hold form
   `break_bracket`; nothing is interpolated, and the maximum imposed strain is
   never substituted for a break that did not happen.
 
-A missing or incomplete replica keeps its curve and diagnostics but leaves the
-headline `None`, and reanalysis always uses the criterion the scan recorded.
+A missing or incomplete replica leaves the headline `None`, while the curves
+and diagnostics that were recorded are kept, and reanalysis always uses the
+criterion the scan recorded.
 
 ```bash
 openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol yield -t 298 \
@@ -297,9 +300,10 @@ What comes back is `G(t)`. For an isotropic solid the differential stress
 step measures the shear modulus with no assumption about Poisson's ratio;
 `E(t) = 2(1 + ν)G(t)` is derived, and `mode="shear"` reads `G(t)` off the
 off-diagonal directly. Two fits read it, both in numpy: a stretched exponential
-(KWW) and a Prony series with non-negative weights. The decay is read against
-the scatter of a baseline measured before the strain (`noise_floor_mpa`), a
-run that stops before the decay does reports `plateau_reached` False, and
+(KWW) and a Prony series with non-negative weights. Each fit stops where the
+decay sinks into its own error bars, the figure marks the scatter of a
+baseline measured before the strain (`noise_floor_mpa`), a run that stops
+before the decay does reports `plateau_reached` False, and
 replicas are what make the fast end mean anything - turn `n_replicas` up
 before `sample_every_ps` down. A relaxation modulus is a material property only
 inside the linear region, and `linearity_strains` repeats the measurement at
@@ -452,8 +456,10 @@ openmmpolymer --analyse run --convergence --convergence-stage 05_npt \
 
 `time_window_convergence` and `relaxation_window_convergence` check a raw
 series or an existing `RelaxationCurve`, and `structural_window_convergence`
-takes an `open_run` ensemble with explicit frame caps when the defaults leave
-`S(q)` unresolved. Window differences are stability diagnostics, not standard
+takes an `open_run` ensemble with explicit frame caps: at the default caps
+and `min_frames`, the `g(r)` and `S(q)` peaks can never resolve, so
+`analyse_convergence` always leaves them unresolved. Window differences are
+stability diagnostics, not standard
 errors; a snapshot cannot establish convergence, and none of these checks
 proves equilibrium.
 

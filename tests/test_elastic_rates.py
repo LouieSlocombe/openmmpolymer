@@ -723,7 +723,7 @@ def test_saved_rates_recover_a_planted_logarithmic_law(tmp_path: Path) -> None:
 
 
 def test_each_rate_keeps_only_its_own_notes(tmp_path: Path) -> None:
-    """Report notes were copied onto every rate, where they read as its own."""
+    """Report-wide notes stay off each rate, where they would read as its own."""
     directories = write_modulus_rate_series(tmp_path)
     report = _youngs(directories)
     for item in report.observations:

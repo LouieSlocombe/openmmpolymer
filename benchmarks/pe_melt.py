@@ -31,7 +31,7 @@ from openmmpolymer import (
     run_protocol,
     standard_melt_equilibration,
 )
-from openmmpolymer._files import json_value
+from openmmpolymer._files import json_value, write_json
 from openmmpolymer.packing import PACKMOL_TIMEOUT_S
 from openmmpolymer.protocols import RunManifest, record_build_request
 
@@ -308,9 +308,7 @@ def run_benchmark(
         "replicas": observations,
         "comparison": comparison(observations, reference, smoke=smoke),
     }
-    (output / "benchmark.json").write_text(
-        json.dumps(json_value(report), indent=2, allow_nan=False) + "\n"
-    )
+    write_json(output / "benchmark.json", json_value(report))
     return report
 
 

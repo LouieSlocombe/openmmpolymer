@@ -89,7 +89,13 @@ _BLEW_UP_HOLDING = (
 _BLEW_UP_STRAINING = (
     "The potential energy went to NaN during a deformation. The strain "
     "increment is too large for the relaxation time, or the timestep is too "
-    "long. Lower strain_increment, raise relax_ps, or minimise after each step."
+    "long. Lower strain_increment or raise relax_ps; run_deform can also "
+    "minimise after each step, with minimise_each_step=True."
+)
+_BLEW_UP_SHEARING = (
+    "The potential energy went to NaN under shear. The strain is too large "
+    "for this cell, or the timestep is too long. Shear by less, or shorten "
+    "the timestep."
 )
 _BLEW_UP_LOADING = (
     "The potential energy went to NaN under load. The applied stress is large "
@@ -151,7 +157,7 @@ class RunContext:
             adds whatever barostat it needs, because a barostat cannot be
             changed once a Context exists.
         spec: How the System was built.
-        platform_name: Platform to use, or None for the fastest available.
+        platform_name: Platform to use, or None for the fastest that works.
         precision: Precision for the GPU platforms.
         seed: Master seed. Every stream derives from this.
         total_mass_g_mol: The cell's total mass, for the density arithmetic.
@@ -184,7 +190,7 @@ def prepare_run(
             :func:`openmmpolymer.mdsystem.prepare_box`.
         forcefield: Its force field.
         spec: How to build the System.
-        platform: Platform name, or None for the fastest available.
+        platform: Platform name, or None for the fastest that works.
         precision: Precision for the GPU platforms.
         seed: Master seed.
         system: A System to use instead of building one. For a System prepared
@@ -249,7 +255,9 @@ class _Live:
         """Attach the stage's reporters, first saying so if no frame would land.
 
         A stage shorter than its frame interval writes a trajectory with no
-        frames in it, which nothing can read afterwards.
+        frames in it, which nothing can read afterwards. Only an interval
+        given as ``TrajectoryOptions.interval_ps`` is checked; the default,
+        ten times the state-data interval, is not.
         """
         frames = _frame_interval(trajectory, self.timestep_fs)
         if frames is not None and frames > total_steps:
@@ -547,8 +555,8 @@ def set_pressures(
         barostat: Which barostat is attached.
 
     Raises:
-        ValueError: Three different pressures were given to a barostat that
-            holds one.
+        ValueError: *pressures_bar* does not have three entries, or three
+            different pressures were given to a barostat that holds one.
     """
     values = tuple(float(value) for value in pressures_bar)
     if len(values) != 3:
@@ -629,7 +637,7 @@ class Segment:
         temperature_k: The temperature to hold.
         duration_ps: How long to hold it.
         pressure_bar: The pressure, for a stage that has a barostat.
-        label: What to call it in the log and in the samples.
+        label: What to call it in the log.
     """
 
     temperature_k: float
@@ -706,7 +714,8 @@ def run_minimise(
         What the stage did.
 
     Raises:
-        SimulationError: The minimised cell still carries impossible forces.
+        SimulationError: The starting energy is not finite, the minimiser
+            failed, or the minimised cell still carries impossible forces.
     """
     live = _open(
         run,
@@ -858,7 +867,8 @@ def run_segments(
 
     Raises:
         SimulationError: The run produced a non-finite energy.
-        ValueError: The timestep is too long for the hottest segment.
+        ValueError: There are no segments, or the timestep is too long for
+            the hottest segment.
     """
     if not segments:
         raise ValueError(f"Stage {name!r} has no segments to run.")
@@ -1003,8 +1013,7 @@ def safe_timestep_fs(temperature_k: float, spec: SystemSpec) -> float:
     """Return the longest sensible timestep for this temperature.
 
     The limit derated for temperature, rounded down to a quarter of a
-    femtosecond so that what ends up in the manifest is a number someone can
-    read.
+    femtosecond so that what a workflow records is a number someone can read.
 
     Args:
         temperature_k: The hottest temperature the stage reaches.
@@ -1251,7 +1260,7 @@ def _anneal_segments(
     hold_ps: float,
     pressure_bar: float,
 ) -> list[Segment]:
-    """Build every ramp window and endpoint hold in an annealing cycle."""
+    """Build every ramp window and endpoint hold of every annealing cycle."""
     segments: list[Segment] = []
     for cycle in range(n_cycles):
         for direction, label in ((1, "heat"), (-1, "cool")):
@@ -1791,7 +1800,10 @@ def run_deform(
             are on.
         pressure_bar: The pressure the two lateral axes are held at.
         axis: The axis to stretch, 0, 1 or 2.
-        strain_increment: Engineering strain added per step.
+        strain_increment: The stretch applied per step, as a fraction of the
+            cell's length at that step. Steps compound rather than add: *n_steps*
+            of them take the strain from *strain_start* to
+            ``(1 + strain_start) * (1 + strain_increment) ** n_steps - 1``.
         n_steps: How many increments to apply.
         relax_ps: Time to relax after each increment. The mean is over the
             second half, so this is twice the averaging window.
@@ -1806,7 +1818,8 @@ def run_deform(
         minimise_each_step: Minimise briefly after each increment. Off by
             default: an increment of a couple of parts in a thousand moves no
             atom far enough to create an overlap, and a minimisation between
-            samples costs a thermalised cell its velocities.
+            samples drains a thermalised cell's potential energy, which the
+            thermostat then has to put back.
         new_velocities: Draw fresh velocities rather than inheriting the
             starting state's. This is what makes replicas independent.
         samples_per_step: Stress readings per increment. The mean is over
@@ -1824,12 +1837,13 @@ def run_deform(
         waypoints: Write a state at the end of every increment.
 
     Returns:
-        What the stage did, with a strain, a stress tensor and the three box
-        lengths recorded per increment.
+        What the stage did, with a strain, the three diagonal stresses and the
+        three box lengths recorded per increment.
 
     Raises:
-        SimulationError: The cell blew up, or stretching it took an edge below
-            what the cutoff allows.
+        SimulationError: The cell blew up, stretching it took an edge below
+            what the cutoff allows, or *reference_box_nm* is not three
+            positive edges.
         ValueError: The axis or the increment is not usable.
     """
     require_axis(axis)
@@ -2009,8 +2023,8 @@ def _check_deformed_box(
             f"{edges.round(3).tolist()} nm, and its shortest edge is below "
             f"twice the {cutoff_nm:.2f} nm cutoff. Stretching one axis "
             "contracts the other two, so a cell that was comfortable "
-            "unstrained need not stay so. Pack more chains, shorten the "
-            "strain ladder, or lower the cutoff."
+            "unstrained need not stay so. Pack more chains, deform the cell "
+            "less, or lower the cutoff."
         )
 
 
@@ -2114,9 +2128,9 @@ def run_load(
 
     What it costs is time. The cell's length is its slowest coordinate, so
     each rung needs long enough for the box to actually settle, and a rung
-    that has not settled is a point on the wrong curve.
-    :func:`openmmpolymer.elasticity.load_curve` checks that per rung rather
-    than assuming it.
+    that has not settled is a point on the wrong curve. Nothing checks that
+    afterwards: :func:`openmmpolymer.elasticity.load_curve` takes each rung's
+    mean box as it stands.
 
     Args:
         run: The run context.
@@ -2144,6 +2158,8 @@ def run_load(
         recorded per rung.
 
     Raises:
+        SimulationError: The cell blew up under load, or crept until an edge
+            was below twice the cutoff.
         ValueError: The axis is not 0, 1 or 2, or no stresses were given.
     """
     require_axis(axis)
@@ -2275,8 +2291,9 @@ def run_shear(
         per step.
 
     Raises:
-        SimulationError: A strain would tilt the box past what OpenMM's
-            reduced form allows.
+        SimulationError: The cell blew up.
+        StressError: A strain would tilt the box past what OpenMM's reduced
+            form allows.
         ValueError: The plane or the strain ladder is not usable.
     """
     driven, gradient = require_plane(plane)
@@ -2345,7 +2362,7 @@ def run_shear(
                 temperature_k,
                 duration_ps_each,
                 samples_per_step,
-                _BLEW_UP_STRAINING,
+                _BLEW_UP_SHEARING,
                 lambda _: stress_tensor_bar(simulation),
             )
             stress, error = _mean_stress(stresses)
@@ -2535,11 +2552,12 @@ def _strain_increment(
 ) -> None:
     """Strain the cell by one more increment, affinely, from where it is now.
 
-    Composes: applying this twice with half the strain each time leaves the
-    cell where applying it once with the whole strain would, which is what
-    lets a ramp be a loop. For the tensile case the three scale factors
-    multiply; for the shear case the tilts add, because the gradient axis is
-    the one the displacement is read off and the increment never touches it.
+    Composes: two increments leave the cell where one increment of their
+    combined strain would, which is what lets a ramp be a loop. For the
+    tensile case the three scale factors multiply, so engineering strains
+    compound rather than add; for the shear case the tilts add, because the
+    gradient axis is the one the displacement is read off and the increment
+    never touches it.
     """
     vectors = simulation.context.getState().getPeriodicBoxVectors()
     if mode == "shear":
@@ -2667,10 +2685,10 @@ def run_relax(
             default of 0.5 preserves the volume exactly, which is the usual
             assumption for a melt.
         ramp_ps: Apply the strain over this long instead of instantaneously.
-            Zero by default, because an instantaneous step is what ``E(t)`` is
-            defined against; a short ramp trades a sharper time origin for a
-            gentler perturbation. The relaxation clock starts when the ramp
-            ends either way.
+            Zero by default, because an instantaneous step is what a
+            relaxation modulus is defined against; a short ramp trades a
+            sharper time origin for a gentler perturbation. The relaxation
+            clock starts when the ramp ends either way.
         baseline_ps: Time held at the locked box before straining, to measure
             what the cell was already carrying.
         duration_ps: How much relaxation *this stage* runs.
@@ -2685,8 +2703,8 @@ def run_relax(
         reference_box_nm: The unstrained cell edges. None reads them from the
             cell, which is right only when the strain has not been applied yet.
         sample_every_ps: Time between stress readings, early on. Each reading
-            costs OpenMM about six energy evaluations, so this is the knob that
-            sets the stage's overhead.
+            costs OpenMM six energy evaluations, twelve for a shear step, so
+            this is the knob that sets the stage's overhead.
         late_sample_every_ps: Time between readings after *late_after_ps*. The
             decay is slow by then and the bins are wide, so a dense cadence
             buys very little.
@@ -2698,9 +2716,9 @@ def run_relax(
         friction_ps: Langevin friction.
         trajectory: Trajectory settings.
         report_interval_ps: Time between state-data rows.
-        write_raw: Write every reading to ``<stem>_stress.csv`` beside the
-            binned curve, so it can be re-binned or analysed some other way
-            without running the whole thing again.
+        write_raw: Write every reading of the decay to ``<stem>_stress.csv``
+            beside the binned curve, so it can be re-binned or analysed some
+            other way without running the whole thing again.
         state_in: The previous stage's state.
 
     Returns:
@@ -2710,6 +2728,8 @@ def run_relax(
     Raises:
         SimulationError: The cell blew up, or the strain took an edge below
             what the cutoff allows.
+        StressError: A shear step would tilt the box past what OpenMM's
+            reduced form allows.
         ValueError: The mode, the axes or one of the times is not usable.
     """
     require_choice(mode, RELAX_MODES, name="mode")
@@ -2871,10 +2891,12 @@ def run_relax(
                     simulation.step(per_increment)
                     ran_steps += per_increment
             _check_deformed_box(live.name, simulation, cutoff_nm, step_strain)
-            # The response before anything has moved: the affine part of the
-            # modulus, and the one point of the decay no amount of dynamics
-            # can give back, since every later reading is already relaxing.
-            # It has no time to be binned at, so it is recorded on its own.
+            # The response the moment the strain is complete - for a step,
+            # before anything has moved: the affine part of the modulus, and
+            # the one point of the decay no amount of dynamics can give back,
+            # since every later reading is already relaxing. After a ramp it
+            # is the end of the ramp, which has already relaxed some. It has
+            # no time to be binned at, so it is recorded on its own.
             _, instant_bar = read()
 
         # The box is locked from here, so the density cannot change and is

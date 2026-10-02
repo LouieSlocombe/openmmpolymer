@@ -168,8 +168,8 @@ def test_both_readable_trajectory_formats_are_found(
 
 
 def test_a_pdb_is_never_taken_for_a_trajectory(tmp_path: Path) -> None:
-    """A stage's final snapshot goes to <stem>.pdb, and so would a pdb-format
-    trajectory, so that path is not reliably either one."""
+    """<stem>.pdb is a stage's closing snapshot, never its trajectory: a
+    pdb-format trajectory is written to <stem>_trajectory.pdb instead."""
     (tmp_path / "02_nvt.pdb").write_text("")
     write_manifest(tmp_path, {"02_nvt": {"final_pdb": str(tmp_path / "02_nvt.pdb")}})
     found = stage_files(tmp_path, "02_nvt")
@@ -374,8 +374,8 @@ def test_coordinates_times_and_boxes_follow_the_same_stride(
 def test_a_stage_with_no_trajectory_reads_back_as_a_single_snapshot(
     dimer_trajectory: Any, tmp_path: Path
 ) -> None:
-    """The ordinary case: no shipped protocol writes a trajectory at all, and
-    every stage still leaves a final PDB."""
+    """The ordinary case: no shipped protocol writes a trajectory unless asked,
+    and every stage still leaves a final PDB."""
     write_manifest(
         tmp_path,
         {"00_minimise": {"final_pdb": str(Path("00_minimise.pdb").resolve())}},
@@ -398,8 +398,9 @@ def test_a_snapshot_is_refused_where_a_trajectory_is_needed() -> None:
 def test_an_explicit_block_size_overrides_what_the_residues_say(
     dimer_run_directory: Path,
 ) -> None:
-    """The argon cell's residues are one atom each, and the dimers it stands in
-    for are defined by index arithmetic, not by its topology."""
+    """The dimer cell's residues are two atoms each, and a block size passed in
+    is used as given rather than checked against them: a topology can stand in
+    for molecules its residues do not describe."""
     ensemble = open_run(dimer_run_directory, "02_nvt", atoms_per_chain=4)
     assert ensemble.n_chains == 16
     assert ensemble.atoms_per_chain == 4

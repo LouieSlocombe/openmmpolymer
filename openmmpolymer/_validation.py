@@ -1,13 +1,14 @@
 """Small, shared runtime validators for public numeric arguments.
 
-Nothing here is public. Every value that crosses into this package as a number
-goes through one of these first, so a typo or a negative temperature fails at
-the call site rather than a hundred picoseconds into a run.
+Nothing here is public. Numbers crossing into this package go through one of
+these first, so a typo or a negative temperature fails at the call site rather
+than a hundred picoseconds into a run.
 
 Public signatures in this package take plain floats with the unit in the name
-(``temperature_k``, ``duration_ps``). These helpers additionally accept an
-``openmm.unit.Quantity``, because callers coming from ``openmmnqe`` will reach
-for one, and convert it to the float the rest of the package works in.
+(``temperature_k``, ``duration_ps``). Given an *expected_unit*, the numeric
+helpers also convert an ``openmm.unit.Quantity`` into it. Every caller in the
+package passes None, which takes a bare number only, so a quantity handed to a
+public function is refused rather than read in the wrong unit.
 """
 
 from __future__ import annotations
@@ -23,7 +24,8 @@ def _as_float(value: object, expected_unit: Any, *, name: str) -> float:
     Args:
         value: An ``openmm.unit.Quantity`` or anything ``float()`` accepts.
         expected_unit: The unit a quantity is converted into. Ignored for a
-            bare number, which is taken to already be in that unit.
+            bare number, which is taken to already be in that unit. None
+            accepts a bare number only.
         name: Parameter name, used in the error message.
 
     Returns:
@@ -41,6 +43,11 @@ def _as_float(value: object, expected_unit: Any, *, name: str) -> float:
             return float(cast(Any, value).value_in_unit(expected_unit))
         return float(cast(Any, value))
     except (AttributeError, TypeError, ValueError) as error:
+        if expected_unit is None:
+            raise TypeError(
+                f"{name}={value!r} is not a number. Pass a plain number, in the "
+                "unit the name gives."
+            ) from error
         raise TypeError(
             f"{name}={value!r} is not a number or a quantity in "
             f"{expected_unit}. Pass a plain float in {expected_unit}, or an "
@@ -53,13 +60,15 @@ def require_finite(value: object, expected_unit: Any, *, name: str) -> float:
 
     Args:
         value: An ``openmm.unit.Quantity`` or a bare number.
-        expected_unit: The unit the result is expressed in.
+        expected_unit: The unit the result is expressed in, or None to accept
+            a bare number only.
         name: Parameter name, used in the error message.
 
     Returns:
         The finite value as a float.
 
     Raises:
+        TypeError: The value is neither a compatible quantity nor a number.
         ValueError: The value is NaN or infinite.
     """
     number = _as_float(value, expected_unit, name=name)
@@ -73,13 +82,15 @@ def require_positive(value: object, expected_unit: Any, *, name: str) -> float:
 
     Args:
         value: An ``openmm.unit.Quantity`` or a bare number.
-        expected_unit: The unit the result is expressed in.
+        expected_unit: The unit the result is expressed in, or None to accept
+            a bare number only.
         name: Parameter name, used in the error message.
 
     Returns:
         The positive value as a float.
 
     Raises:
+        TypeError: The value is neither a compatible quantity nor a number.
         ValueError: The value is not strictly positive, NaN or infinite.
     """
     number = require_finite(value, expected_unit, name=name)
@@ -92,7 +103,8 @@ def require_integer(value: object, *, name: str, minimum: int = 1) -> int:
     """Return *value* as an integer no smaller than *minimum*.
 
     Args:
-        value: Anything ``int()`` accepts without losing information.
+        value: The candidate. Only a plain ``int`` passes: a ``bool``, a
+            float and a NumPy integer are all refused.
         name: Parameter name, used in the error message.
         minimum: Smallest value accepted.
 
@@ -100,7 +112,7 @@ def require_integer(value: object, *, name: str, minimum: int = 1) -> int:
         The value as an int.
 
     Raises:
-        TypeError: The value is not an integer.
+        TypeError: The value is not an ``int``, or is a ``bool``.
         ValueError: The value is below *minimum*.
     """
     if isinstance(value, bool) or not isinstance(value, int):

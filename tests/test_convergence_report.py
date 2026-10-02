@@ -91,7 +91,7 @@ def test_saved_relaxation_bins_are_analysed_separately(tmp_path: Path) -> None:
 def test_relaxation_replicas_subtract_their_own_baselines_before_averaging(
     tmp_path: Path,
 ) -> None:
-    manifest = write_relaxation(
+    write_relaxation(
         tmp_path,
         stem="06_relax_r0",
         mode="shear",
@@ -99,7 +99,6 @@ def test_relaxation_replicas_subtract_their_own_baselines_before_averaging(
         tau_ps=50.0,
         baseline_bar=0.0,
     )
-    stages = json.loads(manifest.read_text())["stages"]
     write_relaxation(
         tmp_path,
         stem="06_relax_r1",
@@ -107,7 +106,6 @@ def test_relaxation_replicas_subtract_their_own_baselines_before_averaging(
         beta=1.0,
         tau_ps=50.0,
         baseline_bar=60.0,
-        merge=stages,
     )
     result = analyse_convergence(tmp_path)
     assert result.relaxation is not None

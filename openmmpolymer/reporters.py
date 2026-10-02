@@ -92,7 +92,8 @@ class ReporterPaths:
         trajectory: The trajectory, if one was written.
         topology: The topology written beside a binary trajectory. None for a
             PDB trajectory, which carries its own.
-        state: The portable restart state.
+        state: The pointer file naming the latest portable restart state -
+            see :class:`AtomicStateReporter`.
     """
 
     csv: str
@@ -105,10 +106,12 @@ class ReporterPaths:
 class AtomicStateReporter:
     """Writes a portable restart state, alternating between two files.
 
-    ``CheckpointReporter`` overwrites in place, so a crash during a write
-    destroys the only checkpoint there was - a poor way to end a three-day
-    run. Alternating between two files and recording which is current only
-    after the write completes means there is always one good state on disk.
+    Alternating between two files and recording which is current only after
+    the write completes means there is always one good state on disk. That
+    predates the OpenMM floor: at 8.6.1, ``Simulation.saveState`` - and so
+    ``CheckpointReporter``, given a path - already writes through a temporary
+    file and renames it into place, so a crash during a write no longer costs
+    the previous state either way.
 
     Serialised state rather than a binary checkpoint because a checkpoint is
     tied to the platform that wrote it, and a run that has to move from a GPU
@@ -173,10 +176,10 @@ def steps_for(duration_ps: float, timestep_fs: float) -> int:
 def rotate_existing(path: str | Path) -> str | None:
     """Move an existing file aside, returning where it went.
 
-    ``XTCReporter`` refuses to open a file that already exists and is not
-    empty, so a stage restarted after a crash dies while building its
-    reporters rather than while running. Nothing is deleted: a partial
-    trajectory is still evidence.
+    OpenMM's trajectory reporters truncate an existing file when they are
+    built, so a stage restarted after a crash would silently overwrite what
+    the crashed attempt wrote. Nothing is deleted: a partial trajectory is
+    still evidence. An empty file has nothing in it to keep, and is left.
 
     Args:
         path: The file that is about to be written.

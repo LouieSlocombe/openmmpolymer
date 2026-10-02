@@ -175,7 +175,7 @@ def test_protocol_records_stages_cell_and_output_files(quick_run: RunSummary) ->
         "box_nm": [2.4, 2.4, 2.4],
     }
 
-    # Record both the requested temperature and what the dynamics reached.
+    # What the dynamics reached, not just what was asked for.
     entry = manifest["stages"]["01_nvt"]
     assert entry["steps"] > 0
     assert entry["mean_temperature_k"] == pytest.approx(100.0, abs=40.0)

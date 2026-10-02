@@ -12,8 +12,8 @@ So these return a figure and write nothing. Saving it, showing it or embedding
 it is the caller's business - ``figure.savefig("density.png")`` - and the code
 in this package that writes files stays the code that runs simulations and the
 driver that reports on them. For the same reason no function takes an ``ax``
-to draw into: each one owns a multi-panel layout, and passing axes in would
-break that while inviting ``pyplot`` back.
+to draw into: each one owns its layout, often of several panels, and passing
+axes in would break that while inviting ``pyplot`` back.
 
 Where a result carries a caveat, the caveat is drawn. The rate a number was
 measured at goes in the title, because a transition or a modulus read off a
@@ -228,7 +228,7 @@ def _quench_title(curve: QuenchCurve, transition: GlassTransition | None) -> str
     """A title carrying the cooling rate, so the caveat travels with the plot.
 
     The expansion coefficients go on a second line rather than into the
-    legend, which names the two fitted branches and nothing else.
+    legend, whose entries for the two fitted branches carry only their names.
     """
     rate = (
         "cooling rate unknown"
@@ -579,8 +579,9 @@ def plot_moduli(report: ModulusReport) -> Figure:
     The bars are what was measured; the markers are what Young's modulus and
     Poisson's ratio say ``K`` and ``G`` have to be for an isotropic solid.
     The figure exists for the gap between them, which is the one check here
-    that is not a straight line through points someone chose the ends of. An
-    unresolved constant is drawn hollow, so a report full of numbers the
+    that is not a straight line through points someone chose the ends of. A
+    cross on ``E`` marks the constant-stress cross-check, when there was one.
+    An unresolved constant is drawn hollow, so a report full of numbers the
     noise does not support looks like one.
 
     Args:
@@ -1345,13 +1346,18 @@ def _strain_axis(curve: StressStrain, quantity: str = "strain", unit: str = "") 
     return f"Engineering {quantity} along {'xyz'[curve.axis]}{unit}"
 
 
+# --------------------------------------------------------------------------
+# Observation-window convergence
+# --------------------------------------------------------------------------
+
+
 def plot_window_convergence(result: WindowConvergence) -> Figure:
     """Show prefix means/errors and disjoint tail-block estimates side by side.
 
     A mean whose error is unknown is drawn as a cross rather than left out.
 
     Args:
-        result: A stationary trace from
+        result: The windows of a stationary trace, from
             :func:`~openmmpolymer.convergence.time_window_convergence`.
 
     Returns:
@@ -1451,7 +1457,9 @@ def plot_relaxation_convergence(result: RelaxationWindowConvergence) -> Figure:
 def plot_structural_convergence(result: StructuralWindowConvergence) -> Figure:
     """Show structural prefix estimates without treating their spread as SE.
 
-    One panel per parameter, with the windows that did not resolve crossed.
+    One panel per parameter. A window's value is a point where it is one to
+    compare and a cross where it is not; a window that stayed censored, or
+    measured nothing, has no value and draws nothing.
 
     Args:
         result: The windows from

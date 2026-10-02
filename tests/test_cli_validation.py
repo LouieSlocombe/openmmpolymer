@@ -45,6 +45,7 @@ YOUNGS_RATE = "--modulus-relax-times 10,50,100 --target-strain-rate 0.01"
             )
             for name in sorted(cli.PROTOCOLS)
         ),
+        # And its settings, which the spec or chain refuses as it is made.
         *(
             (f"[*]CC[*] --protocol {name} --dry-run", flags)
             for name, flags in (

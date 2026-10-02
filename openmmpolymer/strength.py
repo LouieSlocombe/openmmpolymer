@@ -141,7 +141,8 @@ def breaking_strength(
             increasing, nonnegative engineering strain.
         failure_fraction: Fraction of the peak defining stress loss, strictly
             between zero and one.
-        confirmation_steps: At least two terminal samples below the threshold.
+        confirmation_steps: How many terminal samples at or below the
+            threshold confirm the loss; at least two.
 
     Raises:
         ValueError: The curve is empty, malformed, nonfinite, not tensile or
@@ -330,7 +331,9 @@ def yield_strength(
     The elastic fit must contain at least five points and pass the positive
     slope, relative standard error and half-window slope checks used by
     :func:`~openmmpolymer.elasticity.youngs_modulus`. A missing crossing, an
-    unreliable fit or a crossing within the fit window is unresolved.
+    unreliable fit, a curve already at or below the offset line at the end of
+    the window, or a crossing within the window or at nonpositive stress is
+    unresolved.
 
     Args:
         curve: Finite tensile samples with strictly increasing, nonnegative

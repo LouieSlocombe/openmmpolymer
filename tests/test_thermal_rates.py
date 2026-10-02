@@ -334,12 +334,18 @@ def test_melting_needs_explicit_crystal_assertion_before_writing(
 
 @pytest.mark.parametrize(
     "controls",
-    [("isotropic",), ("flexible",), ("isotropic", "anisotropic"), ("andersen",)],
+    [
+        ("isotropic",),
+        ("flexible",),
+        ("membrane",),
+        ("isotropic", "anisotropic"),
+        ("andersen",),
+    ],
 )
 def test_a_system_that_controls_its_own_state_is_refused_before_writing(
     tmp_path: Path, argon_run: Any, controls: tuple[str, ...]
 ) -> None:
-    """The stages attach their own barostat; a second would act beside it."""
+    """The stages bring their own thermostat and barostat; a second would fight them."""
     import openmm as mm
 
     forces = {

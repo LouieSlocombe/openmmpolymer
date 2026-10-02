@@ -101,7 +101,6 @@ module = [
   "openmm",
   "openmm.*",
   "openff.*",
-  "openmmforcefields.*",
   "MDAnalysis",
   "MDAnalysis.*",
 ]

@@ -1,11 +1,12 @@
 """Tests for the relaxation scan and what it reports.
 
 Split the way the mechanical tests are split. Everything that decides
-something - how the hold is chunked, which chunk measures a baseline, what a
-resume refuses, how replicas are grouped, when a fit is contradicted - is
-tested against manifests written by hand, because those are arithmetic over
-recorded numbers. The plumbing that has to survive a real Context is tested
-on argon, which runs the whole stage in a couple of seconds.
+something - how the hold is chunked, which chunk measures a baseline, how
+replicas are grouped, when a fit is contradicted - is tested against the stages
+a protocol builds or manifests written by hand, because those are arithmetic
+over recorded numbers. The plumbing that has to survive a real Context, a
+resume included, is tested on argon, which runs the whole stage in a couple of
+seconds.
 
 Argon is a liquid at these settings, so it has no relaxation modulus worth
 quoting and every fit over it should refuse. That is deliberate: the argon
@@ -212,13 +213,7 @@ def test_replicas_are_grouped_by_their_stems_and_averaged(tmp_path: Path) -> Non
     """A hold split for resume is one curve; two replicas are not one."""
     for replica, modulus in enumerate((900.0, 1000.0, 1100.0)):
         write_relaxation(
-            tmp_path,
-            stem=f"{RELAX_STEM}_r{replica}",
-            chunks=2,
-            modulus_mpa=modulus,
-            merge=json.loads((tmp_path / "manifest.json").read_text())["stages"]
-            if (tmp_path / "manifest.json").is_file()
-            else None,
+            tmp_path, stem=f"{RELAX_STEM}_r{replica}", chunks=2, modulus_mpa=modulus
         )
     report = analyse_relaxation(tmp_path)
     assert len(report.curves) == 3
@@ -233,16 +228,10 @@ def test_a_linearity_pass_is_reported_rather_than_averaged_in(
     """Two strains measure different things, and a mean over them would hide
     exactly the difference the pass exists to show."""
     write_relaxation(tmp_path, stem=f"{RELAX_STEM}_r0", step_strain=0.03)
-    stages = json.loads((tmp_path / "manifest.json").read_text())["stages"]
-    write_relaxation(tmp_path, stem=f"{RELAX_STEM}_r1", step_strain=0.03, merge=stages)
-    stages = json.loads((tmp_path / "manifest.json").read_text())["stages"]
+    write_relaxation(tmp_path, stem=f"{RELAX_STEM}_r1", step_strain=0.03)
     # A modulus twice as large at the other strain: firmly non-linear.
     write_relaxation(
-        tmp_path,
-        stem=f"{LINEARITY_STEM}_e0_r0",
-        step_strain=0.06,
-        modulus_mpa=2000.0,
-        merge=stages,
+        tmp_path, stem=f"{LINEARITY_STEM}_e0_r0", step_strain=0.06, modulus_mpa=2000.0
     )
     report = analyse_relaxation(tmp_path)
     assert report.mean is not None
@@ -265,25 +254,20 @@ def test_the_linearity_pass_does_not_become_the_headline_result(
     a larger linearity strain the reported answer: the headline modulus and
     both fits would belong to the pass that only existed to check the other.
     """
-    stages: dict[str, Any] | None = None
     for replica in range(2):
         write_relaxation(
             tmp_path,
             stem=f"{RELAX_STEM}_r{replica}",
             step_strain=0.03,
             modulus_mpa=1000.0,
-            merge=stages,
         )
-        stages = json.loads((tmp_path / "manifest.json").read_text())["stages"]
     for replica in range(2):
         write_relaxation(
             tmp_path,
             stem=f"{LINEARITY_STEM}_e0_r{replica}",
             step_strain=0.06,
             modulus_mpa=4000.0,
-            merge=stages,
         )
-        stages = json.loads((tmp_path / "manifest.json").read_text())["stages"]
 
     report = analyse_relaxation(tmp_path)
     assert report.mean is not None
@@ -425,7 +409,9 @@ def test_the_cell_does_not_move_again_for_the_whole_hold(
 ) -> None:
     """The one thing this stage must guarantee. The applied strain is the
     measurement, so a barostat that moves the box is measuring something else
-    - and the runner raises rather than reporting it."""
+    - and the runner raises rather than reporting it, so a stage that reported
+    at all held its box. What it reports is the locked cell's volume over the
+    unstrained one's, which a volume-preserving step leaves at one."""
     recorded = relaxed_argon.samples["relax_volume_ratio"][0]
     assert recorded == pytest.approx(1.0, abs=1e-9)
 
@@ -537,8 +523,8 @@ def test_a_resumed_chunk_carries_on_the_clock_rather_than_restarting_it(
 
 
 def test_every_replica_and_chunk_lands_on_one_grid() -> None:
-    """Derived from the settings and never from the data, which is what makes
-    merging chunks and averaging replicas the same addition."""
+    """Derived from the settings and never from the data, which is what lets
+    chunks merge, and replicas be averaged, bin for bin."""
     grid = relax_bin_edges_ps(0.05, 10.0, 10)
     # Bit-identical, not merely close: the bins are added together by index,
     # so a grid that drifted would silently line up different times.

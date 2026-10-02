@@ -86,7 +86,8 @@ class StressStrain:
     Args:
         stage: Which stage or stages produced it.
         axis: The axis that was driven, 0, 1 or 2.
-        strain: Engineering strain along that axis, ascending.
+        strain: Engineering strain along that axis, ascending - or, for a
+            stress-controlled curve, in order of applied stress.
         stress_mpa: The stress along it, tension positive.
         lateral_strain: ``(n, 2)`` - engineering strain on the two other axes,
             in ascending axis order.
@@ -212,11 +213,14 @@ class BulkModulus:
         modulus_mpa: ``-V (dP/dV)``, fitted as ``-1 / (d ln V / dP)`` over the
             whole ladder.
         pressure_bar: The pressures held.
-        volume_nm3: The mean volume at each.
+        volume_nm3: One over the mean density at each - a specific volume in
+            cm^3/g, not the nm^3 the name says. It is proportional to the
+            cell's volume, which is all the fit needs.
         compression_mpa: The same fit over the rising half of the ladder only.
         decompression_mpa: And over the falling half. A ladder that goes up
             and comes back down gives these for free.
-        hysteresis: The relative gap between those two. Large means the cell
+        hysteresis: The relative gap between those two, or NaN when either
+            could not be fitted, as on a one-way ladder. Large means the cell
             did not come back, so the ladder was a deformation rather than a
             measurement.
         n_points: Points in the whole fit.
@@ -373,6 +377,9 @@ def shear_stages(run_dir: str | Path) -> tuple[str, ...]:
 def bulk_stages(run_dir: str | Path) -> tuple[str, ...]:
     """Name every stage that stepped through a ladder of pressures.
 
+    Found by its ``segment_pressure_bar``, which a heating scan records too,
+    beside its enthalpy - so on a run that heated, name the stage instead.
+
     Raises:
         AnalysisError: There is no manifest, or nothing in it was a ladder.
     """
@@ -441,8 +448,8 @@ def stress_strain(
     Args:
         run_dir: A directory a run wrote to.
         stage: The stage or stages to read, or None for every deformation
-            stage in the manifest, in order. Several chunks of one ladder
-            read as one curve.
+            stage in the manifest, in order - every replica's, on a run that
+            has several. Several chunks of one ladder read as one curve.
 
     Returns:
         The curve.
@@ -543,7 +550,7 @@ def load_curve(
         strain=strain,
         stress_mpa=applied[order] * MPA_PER_BAR,
         lateral_strain=(boxes[:, lateral] / origin[lateral] - 1.0)[order],
-        # Zero rather than NaN, and measured rather than missing: the
+        # Zero rather than NaN, and imposed rather than missing: the
         # applied stress was set as `lateral_pressure - sigma`, so it is
         # already expressed relative to what the lateral axes are held at.
         # Subtracting them again in `tensile_stress_mpa` would double-count.
@@ -742,7 +749,8 @@ def bulk_modulus(
         between independently prepared cells.
 
     Raises:
-        AnalysisError: There is nothing there to read.
+        AnalysisError: There is nothing there to read, or the pressures and
+            densities do not pair up as finite numbers.
     """
     names = bulk_stages(run_dir) if stage is None else stage_names(stage)
     samples, temperature = _gather(run_dir, names)
@@ -768,7 +776,7 @@ def bulk_modulus(
         x, y = pressure[mask], log_volume[mask]
         if x.size < 2 or np.ptp(x) < NEGLIGIBLE:
             return None, math.inf, math.nan
-        # Centering protects the slope fit when absolute pressure dwarfs the
+        # Centring protects the slope fit when absolute pressure dwarfs the
         # ladder's pressure increments.
         x = x - x.mean()
         (slope, _), residual_sum = fit_line(x, y)

@@ -74,7 +74,10 @@ class RateObservation:
     ``conditions`` must describe all relevant shared settings, such as strain
     window, deformation direction, fit method, and thermal branch. Conditions
     are compared before fitting. Material identity and preparation remain the
-    caller's responsibility. ``None`` is an unknown error, not a zero error.
+    caller's responsibility. A ``None`` value is a missing or censored
+    measurement - an event that was never observed - which leaves every fit
+    unavailable rather than being dropped from it. A ``None`` error is an
+    unknown error, not a zero error.
     """
 
     rate: float
@@ -103,9 +106,9 @@ class RateExtrapolation:
     ``sensitivity_per_decade`` the derivative with respect to log10(rate)
     there. ``residual_to_error_ratio`` compares RMS residual with RMS reported
     error in the fitted response scale (the value, or its logarithm); it is
-    None when no error is known and nonzero. ``relative_residual`` uses the
-    mean absolute measured value, so signed responses cannot conceal
-    disagreement by cancelling their mean.
+    None unless every rate's error is known and at least one is nonzero.
+    ``relative_residual`` uses the mean absolute measured value, so signed
+    responses cannot conceal disagreement by cancelling their mean.
     """
 
     property: RateProperty
@@ -202,7 +205,7 @@ def _regression(
     errors: npt.NDArray[np.float64],
     target_x: float,
 ) -> tuple[float, float, npt.NDArray[np.float64], float, float]:
-    """Centered OLS with known-error covariance and excess residual scatter.
+    """Centred OLS with known-error covariance and excess residual scatter.
 
     Equal weight per rate avoids arbitrarily infinite weight when an input
     fit reports zero error. With hat matrix H and input variance D, the
@@ -269,6 +272,11 @@ def _same_conditions(left: Any, right: Any) -> bool:
 def _pool_observations(
     observations: Sequence[RateObservation], property: RateProperty
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Validate the observations and pool them into one point per distinct rate.
+
+    Returns the ascending rates, the replica means and their errors; an error
+    is NaN where it is unknown, never zero.
+    """
     temperatures: list[float] = []
     grouped: dict[float, list[RateObservation]] = {}
     for index, observation in enumerate(observations):
@@ -368,10 +376,11 @@ def rate_extrapolation(
 
     Three distinct rates are required; rates within a relative 1e-8 of each
     other are one rate. Replicas are pooled without counting them as
-    independent rates. Missing/censored measurements, incompatible conditions,
-    or temperatures spanning more than 1 K raise ``AnalysisError``. Invalid
-    requests raise ``ValueError``. Unresolved finite observations remain in
-    the fit and prevent it from being reported as resolved.
+    independent rates. Missing/censored or out-of-bounds measurements,
+    incompatible conditions, or temperatures spanning more than 1 K raise
+    ``AnalysisError``. Invalid requests raise ``ValueError``. Unresolved
+    finite observations remain in the fit and prevent it from being reported
+    as resolved.
 
     A small target error does not establish that the model fits the data, so
     two residual guards apply independently: the RMS residual must be at most

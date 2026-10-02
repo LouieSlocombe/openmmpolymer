@@ -94,7 +94,8 @@ class StageFiles:
         final_pdb: The end-of-stage structure.
         final_state: The end-of-stage serialised state.
         trajectory: The trajectory, if one was asked for and is readable.
-        topology: The topology to read *trajectory* against.
+        topology: The topology to read *trajectory* against, or with no
+            trajectory the end-of-stage snapshot, which is read as one frame.
         n_molecules: Molecules in the cell, as the run recorded them, or None
             for a manifest written before that was recorded.
         atoms_per_chain: Atoms in each one, likewise. Preferred over counting
@@ -185,7 +186,8 @@ class Ensemble:
             Each frame in turn.
 
         Raises:
-            ValueError: *stride* is not a positive integer.
+            TypeError: *stride* is not an integer.
+            ValueError: *stride* is not positive.
         """
         require_integer(stride, name="stride")
         start, last, stride = slice(start, stop, stride).indices(self.n_frames)
@@ -381,8 +383,9 @@ def open_run(
         stride. Suspiciously wrapped coordinates produce a warning.
 
     Raises:
-        AnalysisError: The stage wrote no coordinates, the topology does not
-            divide into equal molecules, or the trajectory is empty.
+        AnalysisError: There is no manifest or it lacks the stage, the stage
+            wrote no coordinates, the topology does not divide into equal
+            molecules, or the trajectory is empty or cannot be read.
     """
     return open_stage(stage_files(run_dir, stage), atoms_per_chain=atoms_per_chain)
 
@@ -654,7 +657,7 @@ def _check_size(n_atoms: int, n_frames: int) -> None:
         raise AnalysisError(
             f"{n_frames} frames of {n_atoms} atoms is {gib:.1f} GiB of "
             f"positions, over the {MAX_POSITIONS_GIB} GiB this will load. Pass "
-            "a stride to the analysis, which reads frames one at a time."
+            "the analysis a stride, so that it loads fewer frames."
         )
 
 
@@ -780,8 +783,9 @@ def require_trajectory(ensemble: Ensemble, what: str) -> None:
     if ensemble.is_snapshot:
         raise AnalysisError(
             f"{what} needs a trajectory, and stage {ensemble.stage!r} has only "
-            "a single frame. No shipped protocol writes a trajectory: add a "
-            "production stage, or pass trajectory= to the stage's options."
+            "a single frame. No shipped protocol writes one unless asked: pass "
+            "npt_trajectory to standard_melt_equilibration, add a production "
+            "stage, or pass trajectory= to the stage's options."
         )
 
 

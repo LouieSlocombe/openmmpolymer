@@ -73,7 +73,7 @@ def test_units_are_joined_head_to_tail_and_capped() -> None:
 @pytest.mark.parametrize(
     ("smiles", "message"),
     [
-        # One or three is not a linear repeat unit.
+        # Anything but two is not a linear repeat unit.
         ("CC", "exactly two"),
         ("[*]C(C[*]", "not valid SMILES"),
         # Both on one atom leaves no backbone bond to build a frame on.

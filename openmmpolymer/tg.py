@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 from ._files import ReportFiles, write_json
 from ._validation import require_integer, require_positive
 from ._workflow import (
+    chain_options,
     check_request,
     optional,
     remaining_ps,
@@ -127,7 +128,8 @@ class TgSpec:
             :func:`~openmmpolymer.melt_check.melt_equilibration` to say
             anything about the chains, and off by default because it is frames
             of the whole cell.
-        max_total_ns: Refuse to start if the two passes would exceed this.
+        max_total_ns: Refuse to start if the whole scan - equilibration and
+            every pass - would exceed this.
     """
 
     melt_temperature_k: float = 650.0
@@ -224,8 +226,10 @@ class TgResult:
         coarse_schedule: The coarse ladder.
         fine_schedule: The fine ladder.
         restart: ``"waypoint"`` when the fine pass continued the coarse
-            cooling, ``"precool"`` when it had to start again from the melt,
-            and ``"melt"`` when its window starts at the melt temperature.
+            cooling. With no waypoint left on disk, ``"precool"`` when it had
+            to be cooled again from the equilibrated melt, and ``"melt"`` when
+            its window starts at the melt temperature, so it starts from the
+            equilibrated melt as it is.
         start_state: The state the fine pass started from.
         coarse_summary: What the first pass ran.
         fine_summary: What the second pass ran.
@@ -254,13 +258,18 @@ class TgReport:
 
     Args:
         run_dir: The directory read.
-        stages: The quench stages found, in the order they were read.
-        curves: One curve per quench stage.
+        stages: One entry per curve, naming the quench stages pooled into it,
+            in the order they were read. An entry from one of
+            *extra_run_dirs* is prefixed with its directory.
+        curves: One curve per pass, its resume chunks pooled, for every pass
+            long enough to fit.
         transitions: One fit per curve.
         coarse: The fit from the widest-stepped curve, when there is more than
             one curve.
-        fine: The fit from the finest-stepped curve, slowest-cooled first.
-        log_linear: Tg against log rate, when there were several rates.
+        fine: The fit from the finest-stepped curve - the slowest-cooled one,
+            when several share that step.
+        log_linear: Tg against log rate over the finest-stepped curves, when
+            those span several rates.
         vft: The same data under the Vogel-Fulcher-Tammann relation, when
             there were at least three.
         melt: Whether the melt had settled before cooling, if it was checked.
@@ -325,9 +334,10 @@ def fine_schedule(
 def _chunks(schedule: TgSchedule, stage_ps: float) -> list[tuple[float, ...]]:
     """A ladder's temperatures split for resume, with none left on its own.
 
-    A trailing chunk of one temperature would be a stage with no temperature
-    step, which nothing downstream can tell apart from a pass with a
-    different step, so it is folded into the one before it.
+    A trailing chunk of one temperature would be a stage that never stepped,
+    which :func:`~openmmpolymer.timeseries.quench_stages` does not count as a
+    quench, so a curve read back from the directory would lose its coldest
+    point. It is folded into the one before it instead.
     """
     ladder = schedule.temperatures_k
     chunks = [
@@ -469,9 +479,9 @@ def fine_window(transition_k: float, spec: TgSpec) -> tuple[float, float]:
     if top <= bottom:
         raise TgError(
             f"A window of +/-{spec.window_k:.0f} K around {transition_k:.0f} K "
-            f"clamps to {top:.0f}-{bottom:.0f} K, which is empty. The coarse "
-            "transition sits outside the range that was scanned; widen it with "
-            "melt_temperature_k and t_floor_k."
+            f"clamps to {top:.0f}-{bottom:.0f} K, which is empty. The "
+            "transition sits outside the range the coarse ladder covers; widen "
+            "it with melt_temperature_k and t_floor_k."
         )
     return top, bottom
 
@@ -511,7 +521,9 @@ def pick_waypoint(
         window_top_k: The top of the fine window.
 
     Returns:
-        The chosen pair, or None when there are no candidates at all.
+        The chosen pair - the hottest there is, with a warning, when none sits
+        at or above the window's top - or None when there are no candidates
+        at all.
     """
     if not candidates:
         return None
@@ -554,8 +566,11 @@ def _report_cost(
 ) -> None:
     """Say what the whole thing costs before any of it is spent.
 
-    Two numbers: the total, and how much of it the manifest does not already
-    record - in a queue the second is the only one anyone can act on.
+    Two numbers: the total, and how much of it is still to run - in a queue
+    the second is the only one anyone can act on. That counts the coarse
+    stages the manifest does not already record and every fine pass in full,
+    because which fine stages there will be is not known until the coarse
+    pass has been fitted.
 
     Raises:
         TgError: The total is over ``max_total_ns``.
@@ -634,8 +649,9 @@ def _approach(
 ) -> _Approach:
     """Run the coarse pass, fit it, and decide how the fine one begins.
 
-    The request is recorded before the coarse pass runs, and what it derived
-    once it has, so a resume can check both. Nothing is written before the
+    The request is recorded before the coarse pass runs, so a resume can
+    check it, and what it derived once it has, so a resume whose fine pass is
+    under way keeps the start it chose. Nothing is written before the
     explicit window, budget and resumed directory's settings have been checked.
     """
     window = None if tg_approx_k is None else fine_window(tg_approx_k, spec)
@@ -758,7 +774,8 @@ def _chosen_transition(
             f"with slopes {approximate.melt_expansion_per_k:.3g} (melt) and "
             f"{approximate.glass_expansion_per_k:.3g} (glass) cm^3/g/K, and "
             "did not resolve: either the glassy branch is not flat enough "
-            "relative to the melt, or the two lines cross outside the data. "
+            "relative to the melt, or the two lines cross away from where the "
+            "data changes slope. "
             "Fitting two lines to a straight one always finds a corner, so "
             "this is not a transition to centre a window on. Extend the "
             "coarse ladder past the transition, quench in smaller steps, "
@@ -807,7 +824,7 @@ def _restart_from(
     state = _equilibration_state(coarse, manifest)
     if state is None:
         raise TgError(
-            "The coarse pass recorded no waypoints and left no equilibrated "
+            "The coarse pass left no waypoint on disk and no equilibrated "
             "state to fall back on, so the fine pass has nowhere to start. "
             "Rerun the coarse pass - it saves a waypoint at every temperature "
             "when tg_coarse_scan builds it."
@@ -940,16 +957,16 @@ def run_tg_scan(
 
     Raises:
         ValueError: An explicit approximate temperature is not finite and positive.
-        TgError: The coarse fit did not resolve and no window was named, the
-            scan exceeds ``spec.max_total_ns``, or the directory records a
-            scan run with different settings or an explicit window is empty.
+        TgError: The coarse fit did not resolve and no window was named, an
+            explicit window is empty, the scan exceeds ``spec.max_total_ns``,
+            or the directory records a scan run with different settings.
+        AnalysisError: The fine pass recorded too few temperatures to give
+            both branches ``spec.min_points_per_branch`` points.
     """
     directory = Path(run_dir)
-    chains: dict[str, Any] = {
-        "chain_backbone": chain_backbone,
-        "atoms_per_chain": atoms_per_chain,
-        "expected_characteristic_ratio": expected_characteristic_ratio,
-    }
+    chains = chain_options(
+        chain_backbone, atoms_per_chain, expected_characteristic_ratio
+    )
     approach = _approach(
         run,
         directory,
@@ -1020,8 +1037,9 @@ def cooling_rate_series(
     Args:
         run: The run context.
         run_dir: Where everything is written.
-        rates_k_per_ns: The rates to measure at. Each sets its own hold,
-            ``fine_step_k / rate``, which overrides ``spec.fine_hold_ps``.
+        rates_k_per_ns: The rates to measure at, in K/ns. Each sets its own
+            hold, ``1000 * fine_step_k / rate`` ps, which overrides
+            ``spec.fine_hold_ps``.
         spec: The rest of the settings. It, and every argument after it, is
             as for :func:`run_tg_scan`.
         tg_approx_k: Likewise.
@@ -1036,16 +1054,15 @@ def cooling_rate_series(
 
     Raises:
         TgError: As :func:`run_tg_scan`, or the rates are not distinct.
-        ValueError: A rate is not a positive number. Every rate is checked
-            before anything runs.
+        ValueError: As :func:`run_tg_scan`, or a rate is not a positive
+            number. Every rate is checked before anything runs.
+        AnalysisError: As :func:`run_tg_scan`, for any of the fine passes.
     """
     holds = _fine_holds(rates_k_per_ns, spec)
     directory = Path(run_dir)
-    chains: dict[str, Any] = {
-        "chain_backbone": chain_backbone,
-        "atoms_per_chain": atoms_per_chain,
-        "expected_characteristic_ratio": expected_characteristic_ratio,
-    }
+    chains = chain_options(
+        chain_backbone, atoms_per_chain, expected_characteristic_ratio
+    )
     approach = _approach(
         run,
         directory,
@@ -1127,7 +1144,8 @@ def analyse_tg(
         The report.
 
     Raises:
-        AnalysisError: There is no manifest, or nothing in it was a quench.
+        AnalysisError: A directory has no manifest or no quench in it, or no
+            quench gave a curve long enough to fit.
     """
     directory = Path(run_dir)
     notes: list[str] = []

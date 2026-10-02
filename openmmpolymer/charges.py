@@ -141,13 +141,16 @@ def assign_charges(
         method: One of :data:`CHARGE_METHODS`. ``nagl`` uses the newest
             released model installed.
         output_sdf: Where to write. Defaults to overwriting *sdf_path*.
+            ``none`` writes nothing anywhere: its result points at *sdf_path*
+            and gives the formal charge as the total.
 
     Returns:
         What was assigned.
 
     Raises:
-        ChargeError: The file does not hold one molecule, the method is not
-            available, or the charges do not sum to the formal charge.
+        ValueError: *method* is not one of :data:`CHARGE_METHODS`.
+        ChargeError: The file holds more than one molecule, ``nagl`` has no
+            model installed, or the charges do not sum to the formal charge.
     """
     require_choice(method, CHARGE_METHODS, name="method")
     source = Path(sdf_path)

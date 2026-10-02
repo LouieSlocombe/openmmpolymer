@@ -80,8 +80,9 @@ class ConformationSeries:
         settled: The equilibration of the ``<R^2>`` series.
             :attr:`~openmmpolymer.protocols.ChainDimensions.consistent` on
             :attr:`mean` says the dimensions look like a melt's; this says
-            whether they had stopped moving while being measured. For a single
-            snapshot there is no series, so this is None.
+            whether they had stopped moving while being measured. With fewer
+            than three frames - a single snapshot, say - there is no series to
+            judge, so this is None.
         n_chains: How many molecules were averaged over.
         n_frames: How many frames were measured.
     """
@@ -165,8 +166,9 @@ class MeanSquaredDisplacement:
             lag, over every chain and time origin.
         log_slope: Slope of log MSD against log lag over the last decade. One
             is diffusion, two is ballistic, well below one is caged.
-        diffusion_coefficient_cm2_s: ``MSD / 6 tau`` from a fit over the
-            diffusive part, or None when :attr:`diffusive` is False.
+        diffusion_coefficient_cm2_s: ``MSD / 6 tau``, from a straight-line
+            fit over the second half of the lags, or None when
+            :attr:`diffusive` is False.
         box_drift_fraction: How much the cell edge changed over the frames
             used, as a fraction of its mean. What ``remove_box_scaling``
             had to take out.
@@ -211,7 +213,8 @@ def chain_conformation(
 
     Raises:
         AnalysisError: The backbone does not fit the chains.
-        ValueError: *stride* is not a positive integer.
+        TypeError: *stride* is not an integer.
+        ValueError: *stride* is not positive.
     """
     path = backbone_indices(backbone, ensemble.atoms_per_chain)
     require_integer(stride, name="stride")
@@ -272,8 +275,10 @@ def persistence_length(
         The correlation curve and the length fitted to it.
 
     Raises:
-        AnalysisError: The backbone has fewer than three bonds, so there is no
-            curve to fit.
+        AnalysisError: The backbone does not fit the chains, or has fewer than
+            three bonds, so there is no curve to fit.
+        TypeError: *stride* is not an integer.
+        ValueError: *stride* is not positive.
     """
     path = backbone_indices(backbone, ensemble.atoms_per_chain)
     require_integer(stride, name="stride")
@@ -334,8 +339,8 @@ def end_to_end_relaxation(
         The correlation function and, if it decayed, the time it decayed in.
 
     Raises:
-        AnalysisError: *ensemble* is a single snapshot, or *max_lag_fraction*
-            leaves no lags to measure.
+        AnalysisError: *ensemble* is a single snapshot, the backbone does not
+            fit the chains, or *max_lag_fraction* leaves no lags to measure.
     """
     require_trajectory(ensemble, "An end-to-end relaxation time")
     path = backbone_indices(backbone, ensemble.atoms_per_chain)
@@ -391,8 +396,10 @@ def centre_of_mass_msd(
         max_lag_fraction: Longest lag to measure, as a fraction of the
             trajectory.
         stride: Use every *stride*-th frame.
-        remove_box_scaling: Undo the barostat's affine scaling of the cell.
-            Exact rather than approximate, because
+        remove_box_scaling: Undo the barostat's affine scaling of the cell,
+            taken as isotropic: each frame's centres are scaled by the cube
+            root of the first frame's volume over its own. Exact rather than
+            approximate for an isotropic barostat, because
             :attr:`~openmmpolymer.mdsystem.SystemSpec.scale_molecules_as_rigid`
             is on by default, so a volume move translates each molecule
             rigidly and is a pure affine map on the centres of mass.
@@ -499,7 +506,7 @@ def _crossing(
 def _decay_length(
     distance: npt.NDArray[np.float64], correlation: npt.NDArray[np.float64]
 ) -> float:
-    """Fit ``log(correlation) = -distance / length`` and return the length.
+    """Fit ``log(correlation) = a - distance / length`` and return the length.
 
     Fitted over the first decay only - down to
     :data:`DECORRELATION_THRESHOLD` and one point past it - rather than over
@@ -544,7 +551,7 @@ def _log_slope(lag_ps: npt.NDArray[np.float64], msd: npt.NDArray[np.float64]) ->
 def _diffusion_cm2_s(
     lag_ps: npt.NDArray[np.float64], msd: npt.NDArray[np.float64]
 ) -> float | None:
-    """Fit ``MSD = 6 D tau`` over the second half of the lags.
+    """Fit ``MSD = 6 D tau + c`` over the second half of the lags.
 
     The early lags carry the ballistic and caged parts, so the fit starts
     halfway along where the motion has settled into its long-time behaviour.
@@ -560,9 +567,9 @@ def _diffusion_cm2_s(
     return slope / 6.0 * NM2_PS_TO_CM2_S
 
 
-def _box_drift(boxes_nm_: npt.NDArray[np.float64]) -> float:
+def _box_drift(boxes: npt.NDArray[np.float64]) -> float:
     """Spread of the cell edge over the frames used, over its mean."""
-    edges = boxes_nm_.mean(axis=1)
+    edges = boxes.mean(axis=1)
     mean = float(edges.mean())
     if mean <= TINY:
         return 0.0

@@ -121,6 +121,8 @@ def validate_tensile_rate_scan(
         raise ValueError(f"{property_name} requires {measurement.spec.__name__}.")
     validate_rate_request(target_rate, max_extrapolation_decades)
     holds = validate_hold_times(hold_times_ps)
+    # A spec refuses a stage shorter than one hold, and the budget below
+    # covers the whole scan rather than any one rate.
     specs = tuple(
         replace(
             spec, relax_ps=hold, stage_ps=max(spec.stage_ps, hold), max_total_ns=None
@@ -233,6 +235,8 @@ def run_tensile_rate_scan(
             )
             for replica in range(rate_spec.n_replicas)
         )
+        # Each rate directory is an ordinary scan of its measurement, which
+        # that measurement's own analysis reads under the criterion it ran.
         write_json(
             rate_dir / measurement.workflow_name,
             {
@@ -284,6 +288,7 @@ def _directories(
             continue
         record = json.loads(path.read_text())
         recorded_property = record.get("request", {}).get("property_name")
+        # A yield scan measures its strength and its strain alike.
         if recorded_property != property_name and {
             recorded_property,
             property_name,
@@ -322,12 +327,13 @@ def analyse_tensile_rates(
     target_rate: float,
     max_extrapolation_decades: float = 2.0,
 ) -> RateReport:
-    """Compare completed saved scans with matching ladders and event criteria.
+    """Compare saved scans with matching ladders and event criteria.
 
     Single-replica event uncertainty is unknown. Independent repeated rates
     supply the between-replica spread; event brackets remain diagnostics and
     are never relabelled as standard errors. All censored replicas survive
-    in the report and prevent a confidently extrapolated event.
+    in the report and prevent a confidently extrapolated event, and a scan
+    missing replicas or chunks is still read but never resolves.
     """
     measurement, analyse, field = _event(property_name)
     validate_rate_request(target_rate, max_extrapolation_decades)

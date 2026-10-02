@@ -263,7 +263,7 @@ def assemble_box(
             " Atoms are missing rather than extra, which means the packed "
             "file has molecules sharing a chain and residue number and the "
             "parser dropped the duplicates. Every structure block needs "
-            "`resnumbers 3`, which render_packmol_input() emits - so this "
+            "`resnumbers 3`, which pack_box() emits - so this "
             "file was packed by something else, or by an older version."
             if short > 0
             else ""
@@ -315,8 +315,9 @@ def check_box(box_nm: Sequence[float], spec: SystemSpec) -> None:
 
     OpenMM refuses a cutoff over half the box - and refuses it again, mid-run,
     when the barostat has shrunk the cell far enough. That second failure is
-    the expensive one, so this is checked against the density the cell is
-    heading for rather than the one it starts at.
+    the expensive one. The margin *spec* sets above OpenMM's own limit is
+    there for it, and :func:`check_target_density` applies the same margin to
+    the cell the barostat is heading for rather than the one given here.
 
     Args:
         box_nm: The cell edges.
@@ -419,12 +420,13 @@ def build_system(
         box: The assembled cell, already through :func:`prepare_box`.
         forcefield: The force field to build it with.
         spec: How to build it.
-        use_residue_templates: Name each residue's template explicitly.
-            ``ForceField`` matches residues by graph isomorphism once per
-            residue with nothing cached between them, so a cell of five hundred
-            chains pays five hundred backtracking searches over a
-            thousand-atom graph. Naming the template skips all of it. Falls
-            back to the search if the names do not line up.
+        use_residue_templates: Name each residue's template explicitly, so
+            each residue is matched against its own template only, rather than
+            against every template sharing its composition, and a second
+            template that also fits cannot make the match ambiguous. Each
+            residue is still matched atom by atom: OpenMM needs the mapping
+            either way. Falls back to OpenMM's own search if the names do not
+            line up.
 
     Returns:
         The System, with a barostat still to be added by whichever stage wants
@@ -475,11 +477,10 @@ def build_system(
 def _create_system(forcefield: Any, topology: Any, kwargs: dict[str, Any]) -> Any:
     """Call ``createSystem``, retrying past the two shortcuts that can conflict.
 
-    Both retries are for settings this package adds for speed or for
-    correctness that a particular force-field file may already have an opinion
-    about, and each drops its setting, so there are at most two. Anything else
-    is the caller's problem, and is re-raised with the context OpenMM's own
-    message leaves out.
+    Both retries are for settings this package adds on its own account that a
+    particular force-field file may already have an opinion about, and each
+    drops its setting, so there are at most two. Anything else is the caller's
+    problem, and is re-raised with the context OpenMM's own message leaves out.
     """
     while True:
         try:
@@ -502,7 +503,7 @@ def _create_system(forcefield: Any, topology: Any, kwargs: dict[str, Any]) -> An
             if "residueTemplates" in kwargs:
                 log.warning(
                     "Naming residue templates explicitly did not work (%s); "
-                    "falling back to matching them by graph, which is slower.",
+                    "falling back to OpenMM's own template search.",
                     error,
                 )
                 kwargs.pop("residueTemplates")
@@ -514,7 +515,7 @@ def _create_system(forcefield: Any, topology: Any, kwargs: dict[str, Any]) -> An
 
 
 def _verify_dispersion_correction(system: Any, spec: SystemSpec) -> None:
-    """Log the correction that is actually in force, whatever was asked for."""
+    """Warn when the correction actually in force is not the one asked for."""
     for force in system.getForces():
         if isinstance(force, mm.NonbondedForce):
             actual = force.getUseDispersionCorrection()
@@ -555,8 +556,8 @@ def make_barostat(
             or ``computeStressTensor``, and refuses both for a force that is
             not in the Context. A barostat at zero frequency never moves the
             box and exists purely to be asked.
-        seed: Its random seed. Must be non-zero, or OpenMM chooses its own and
-            the run stops being reproducible.
+        seed: Its random seed. Zero is refused: OpenMM would read it as
+            "choose your own", and the run would stop being reproducible.
         scale_molecules_as_rigid: Whether a volume move translates each
             molecule rigidly. See :class:`SystemSpec` for why this is on by
             default and why turning it off needs ``constraints="none"``. It
@@ -575,7 +576,8 @@ def make_barostat(
 
     Raises:
         ValueError: *kind* is not one of :data:`BAROSTATS`, a per-axis setting
-            was given for a barostat that has no axes, or no axis may move.
+            does not have three entries or was given for a barostat that has no
+            axes, no axis may move, or *seed* is zero.
     """
     require_choice(kind, tuple(BAROSTATS), name="kind")
     axes = tuple(bool(flag) for flag in scale_axes)
@@ -718,10 +720,10 @@ def select_platform(
     """Choose an OpenMM platform and its properties.
 
     Args:
-        name: A platform name, or None to take the fastest that works. Named
-            explicitly, the platform is used as asked and any failure is the
-            caller's to see; chosen automatically, each candidate is tried
-            before it is picked.
+        name: A platform name, or None to take the first in
+            :data:`PLATFORM_PREFERENCE` that works. Named explicitly, the
+            platform is used as asked and any failure is the caller's to see;
+            chosen automatically, each candidate is tried before it is picked.
         precision: ``Precision`` for the GPU platforms. Mixed rather than
             single, deliberately: these runs are long enough that single
             precision drifts, and double costs more than the accuracy is
@@ -853,7 +855,8 @@ def max_timestep_fs(temperature_k: float, spec: SystemSpec) -> float:
 
     Returns:
         The limit in femtoseconds. Constrained hydrogens allow 2 fs; 1.5 amu of
-        repartitioning allows 3; 3.5 amu or more allows 4. Above the reference
+        repartitioning allows 3; 3.5 amu or more allows 4. With no constraints
+        at all it is 1 fs, whatever the hydrogen mass. Above the reference
         temperature each is derated by the square root of the ratio, because
         that is how the fastest velocities scale.
     """

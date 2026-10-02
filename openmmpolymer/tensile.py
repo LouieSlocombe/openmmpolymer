@@ -19,12 +19,12 @@ propagate: they are never read as material failure.
 Analysis never runs dynamics or modifies recorded results. Replicas are fitted
 separately - pooling their points would mix different event strains - with the
 criterion the scan recorded, and that record must be complete and agree with
-the ladder it lists. A missing or incomplete replica keeps its curve and fit
-diagnostics but leaves the headline ``None``. The headline is the mean over
-replicas and the spread their sample standard deviation, which measures
-trajectory variability at one starting structure, not morphology uncertainty.
-Reports record each curve's differential Cauchy stress beside its nominal
-stress, so every event is auditable.
+the ladder it lists. A missing or incomplete replica leaves the headline
+``None``, while the curves and fit diagnostics that were recorded are kept.
+The headline is the mean over replicas and the spread their sample standard
+deviation, which measures trajectory variability at one starting structure,
+not morphology uncertainty. Reports record each curve's axial and lateral
+Cauchy stresses beside its nominal stress, so every event is auditable.
 
 Fixed-topology force fields cannot break bonds, so these are apparent
 properties of the simulated cell rather than chemical fracture tests, and an
@@ -48,21 +48,18 @@ from ._files import ReportFiles, json_value, write_json
 from ._validation import require_axis, require_finite, require_integer, require_positive
 from ._workflow import (
     StrainSchedule,
+    chain_options,
     deformation_stages,
     equilibrated_box_nm,
+    equilibration_at,
     run_fingerprint,
     sample_spread,
+    scan_listing,
     settled_state,
 )
 from .elasticity import StressStrain, stress_strain
 from .plots import plot_breaking_strength, plot_elongation_at_break, plot_yield_strength
-from .protocols import (
-    Protocol,
-    RunManifest,
-    run_protocol,
-    standard_melt_equilibration,
-    validate_run_inputs,
-)
+from .protocols import Protocol, RunManifest, run_protocol, validate_run_inputs
 from .simulate import RunContext, safe_timestep_fs
 from .strength import (
     BreakingStrength,
@@ -78,15 +75,24 @@ log = logging.getLogger(__name__)
 
 
 class BreakingError(RuntimeError):
-    """A tensile-strength scan cannot safely start or resume."""
+    """A tensile-strength scan cannot safely start or resume.
+
+    Also what reading one back raises when its workflow record is unreadable.
+    """
 
 
 class ElongationError(RuntimeError):
-    """An elongation-at-break scan cannot safely start or resume."""
+    """An elongation-at-break scan cannot safely start or resume.
+
+    Also what reading one back raises when its workflow record is unreadable.
+    """
 
 
 class YieldError(RuntimeError):
-    """A yield-strength scan cannot safely start or resume."""
+    """A yield-strength scan cannot safely start or resume.
+
+    Also what reading one back raises when its workflow record is unreadable.
+    """
 
 
 @dataclass(frozen=True)
@@ -292,7 +298,8 @@ class TensileMeasurement[R: BreakingReport | ElongationReport | YieldReport]:
     Args:
         name: One of ``breaking``, ``elongation`` and ``yield``.
         label: The measured property, as a missing-stages error names it.
-        error: What a scan that cannot safely start or resume raises.
+        error: What a scan that cannot safely start or resume raises, and
+            what analysis raises for an unreadable workflow record.
         spec: The settings, whose exact type selects this measurement.
         fit: Reads one replica's curve, given the ``criterion`` settings.
         criterion: The spec fields the fit takes, which the report records.
@@ -472,12 +479,9 @@ def tensile_protocol(
 
 
 def _equilibration(spec: TensileSpec, options: dict[str, Any]) -> Protocol:
-    base = standard_melt_equilibration(
-        target_temperature_k=spec.temperature_k,
-        pressure_bar=spec.pressure_bar,
-        **options,
+    return equilibration_at(
+        _measurement(spec).name, spec.temperature_k, spec.pressure_bar, **options
     )
-    return Protocol(_measurement(spec).name, base.stages)
 
 
 def tensile_scan(spec: TensileSpec, **equilibration: Any) -> Protocol:
@@ -488,16 +492,15 @@ def tensile_scan(spec: TensileSpec, **equilibration: Any) -> Protocol:
     of the cost has them.
     """
     settle = _equilibration(spec, equilibration)
-    return Protocol(
+    return scan_listing(
         settle.name,
-        (
-            *settle.stages,
+        [
+            settle,
             *(
-                stage
+                tensile_protocol(spec, replica=replica)
                 for replica in range(spec.n_replicas)
-                for stage in tensile_protocol(spec, replica=replica).stages
             ),
-        ),
+        ],
     )
 
 
@@ -652,11 +655,9 @@ def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
         total_ns,
         schedule.strain_rate_per_ns,
     )
-    chains: dict[str, Any] = {
-        "chain_backbone": chain_backbone,
-        "atoms_per_chain": atoms_per_chain,
-        "expected_characteristic_ratio": expected_characteristic_ratio,
-    }
+    chains = chain_options(
+        chain_backbone, atoms_per_chain, expected_characteristic_ratio
+    )
     start_state = settled_state(
         run_protocol(settle, run, directory, resume=resume, **chains),
         directory,
@@ -976,7 +977,7 @@ def analyse_elongation(run_dir: str | Path) -> ElongationReport:
 
 
 def analyse_yield(run_dir: str | Path) -> YieldReport:
-    """Read a yield scan's offset proof stress under its saved fit window."""
+    """Read a yield scan's offset proof stress under its saved offset and fit window."""
     return _analyse(YIELD, run_dir)
 
 

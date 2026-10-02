@@ -91,7 +91,7 @@ class PackedComponent:
     count: int = 1
 
     def __post_init__(self) -> None:
-        """Reject a count that would make an empty or negative block."""
+        """Reject a count that is negative or not an int. Zero writes no block."""
         require_integer(self.count, name="count", minimum=0)
 
 
@@ -104,7 +104,7 @@ class PackResult:
             trustworthy: packmol writes no bonds, so the topology has to come
             from replicating the single-chain one.
         box_nm: The periodic cell edges.
-        n_molecules: How many molecules were placed, in placement order.
+        n_molecules: How many molecules were placed.
         input_path: The generated packmol input, kept for inspection.
         log_path: packmol's output.
         seed: The seed packmol was given.
@@ -165,7 +165,9 @@ def distribute_conformers(
         n_molecules: How many molecules the cell holds.
 
     Returns:
-        One component per conformer, with counts summing to *n_molecules*.
+        One component per conformer used, with counts summing to
+        *n_molecules*. Given more conformers than molecules, only the first
+        *n_molecules* are used.
 
     Raises:
         ValueError: There are no conformers, or nothing to place.
@@ -468,7 +470,10 @@ class CellList:
     """Points bucketed on a uniform grid, for near-neighbour queries.
 
     Not periodic, which suits both users: a packed cell holds whole molecules,
-    and a chain being grown has no boundary at all.
+    and a chain being grown has no boundary at all. *spacing* is the cell edge,
+    and so the reach of :meth:`CellList.neighbours`: it returns every point
+    within *spacing* of the query, and some further out, so a caller filters by
+    a distance no greater than *spacing*.
     """
 
     def __init__(self, spacing: float) -> None:
@@ -502,7 +507,8 @@ def _check_contacts(topology: Any, positions_nm: npt.NDArray[np.float64]) -> Non
 
     Only pairs in *different* molecules are considered. packmol's tolerance is
     an intermolecular constraint and says nothing about bonded neighbours, so a
-    test that included them would fail on every C-H bond at 0.11 nm.
+    test that included them would fail on every C-H bond at 0.11 nm. Molecules
+    are told apart by residue, which holds because every chain is one residue.
     """
     molecule = np.empty(topology.getNumAtoms(), dtype=np.int64)
     is_hydrogen = np.zeros(topology.getNumAtoms(), dtype=bool)
@@ -542,7 +548,8 @@ def _find_rings(
     Every molecule in a packed cell is a copy of the same chain, so the rings
     are found once on the first residue and shifted onto the rest. Falling back
     to a per-residue search when the residues differ in size keeps this honest
-    for a mixed cell.
+    for a cell mixing chains of different sizes; residues of one size are taken
+    to be copies of one chain, atom for atom.
     """
     residues = [
         [atom.index for atom in residue.atoms()] for residue in topology.residues()
@@ -597,7 +604,8 @@ def _shortest_path_avoiding(
 
     *goal* is never entered as an intermediate node, only reached as the last
     step. Letting the search pass through it instead returns paths that leave
-    the goal and come back, which read as rings and are not.
+    the goal and come back, which read as rings and are not. The path returned
+    stops at the atom bonded to *goal*, leaving *goal* itself off.
     """
     queue: deque[tuple[int, tuple[int, ...]]] = deque([(start, (start,))])
     visited = {start, goal}

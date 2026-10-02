@@ -52,7 +52,7 @@ def test_charges_must_sum_to_the_formal_charge() -> None:
     ],
 )
 def test_model_names_sort_by_their_digits(name: str, expected: tuple[int, ...]) -> None:
-    """So that 1.0.0 beats 0.1.0, rather than losing a string comparison."""
+    """As numbers, so that 0.10.0 beats 0.9.0 rather than losing a string comparison."""
     assert _version_key(name) == expected
 
 

@@ -10,9 +10,10 @@ measured and implied checks every one of them at once.
 Every pass branches from the *same* equilibrated cell rather than running one
 after another. A cell that has just been stretched to five per cent is not the
 cell the next measurement wants, and chaining them would measure the shear
-modulus of something with a deformation history. So this module calls
-:func:`~openmmpolymer.protocols.run_protocol` once per pass with an explicit
-starting state, which is also what makes the replicas replicas.
+modulus of something with a deformation history. So each pass is a protocol
+of its own, which :func:`~openmmpolymer._workflow.run_branched_scan` starts
+from the equilibrated state, and that is also what makes the replicas
+replicas.
 
 Two things it will not do. It will not call three runs from one configuration
 an error bar unless they were given different velocities - inheriting the
@@ -91,11 +92,11 @@ BULK_STEM = "08_bulk"
 SHEAR_STEM = "09_shear"
 WORKFLOW_NAME = "mechanical_workflow.json"
 
-#: How far the replicas may disagree, relative to their mean, before the
-#: pooled modulus stops claiming to be resolved. Generous, because three
-#: replicas of a forty-chain cell is a small sample of a noisy quantity - and
-#: still worth having, because the alternative is quoting one run's number
-#: with no spread at all.
+#: How far the replicas may disagree - their sample standard deviation,
+#: relative to the pooled modulus - before that modulus stops claiming to be
+#: resolved. Generous, because three replicas of a forty-chain cell is a small
+#: sample of a noisy quantity - and still worth having, because the
+#: alternative is quoting one run's number with no spread at all.
 MAX_REPLICA_SPREAD = 0.3
 
 
@@ -114,15 +115,18 @@ class ModulusSpec:
             knows which side of it you are on, so find the transition first.
         pressure_bar: The pressure held on every axis that is not driven.
         axis: The axis to stretch, 0, 1 or 2.
-        strain_increment: Engineering strain added per step.
-        max_strain: The strain the ladder stops at.
+        strain_increment: The fractional extension of the current cell at
+            each step. Increments compound - see :func:`deform_schedule`.
+        max_strain: The engineering strain the ladder runs to, reached or
+            slightly passed by its last increment.
         relax_ps: Time to relax after each increment. The mean is over the
             second half, so this is twice the averaging window.
         elastic_strain_limit: The strain the modulus is fitted up to.
         n_replicas: How many times to repeat the extension from the same
             configuration with fresh velocities. The spread across them is
             the error bar; one replica has none.
-        samples_per_step: Stress readings per increment. High on purpose, for
+        samples_per_step: Stress readings per increment, and readings per
+            rung of the load, bulk and shear passes. High on purpose, for
             the reason :func:`~openmmpolymer.simulate.run_deform` gives: the
             readings are cheap and the pressure decorrelates fast.
         stage_ps: Most dynamics one stage may hold before the ladder is split
@@ -140,7 +144,8 @@ class ModulusSpec:
         bulk_ps_each: Time at each pressure.
         shear_strains: Shear strains for the shear modulus, or None to skip.
         shear_ps_each: Time at each shear strain.
-        max_total_ns: Refuse to start if the passes would exceed this.
+        max_total_ns: Refuse to start if the whole scan, equilibration
+            included, would exceed this.
     """
 
     temperature_k: float = 298.15
@@ -221,7 +226,8 @@ class ModulusSchedule(StrainSchedule):
 
     Args:
         n_steps: How many increments it applies.
-        increment: Engineering strain added per step.
+        increment: The fractional extension of the current cell per step.
+            Steps compound rather than add.
         relax_ps: Time held at each.
     """
 
@@ -515,8 +521,9 @@ def run_modulus_scan(
         What :func:`analyse_mechanics` reads back from the finished run.
 
     Raises:
-        MechanicalError: The scan is over budget, or this directory holds one
-            run with different settings.
+        MechanicalError: The scan is over budget, or this directory holds a
+            run it cannot resume: another protocol's, one without a saved
+            request, or one with different settings.
     """
     directory = Path(run_dir)
     settle = equilibration_protocol(spec, **equilibration)
@@ -721,11 +728,7 @@ def analyse_mechanics(
         resolved=bool(
             youngs is not None
             and youngs.resolved
-            and (
-                spread is None
-                or youngs.modulus_mpa <= 0.0
-                or spread <= MAX_REPLICA_SPREAD * youngs.modulus_mpa
-            )
+            and (spread is None or spread <= MAX_REPLICA_SPREAD * youngs.modulus_mpa)
         ),
         notes=tuple(notes),
     )

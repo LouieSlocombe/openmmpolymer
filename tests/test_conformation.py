@@ -534,8 +534,8 @@ def test_a_displacement_with_too_few_usable_points_has_no_slope() -> None:
 
 
 def test_a_slope_over_fewer_than_a_decade_uses_every_lag_it_has() -> None:
-    """A short trajectory does not span a decade of lag times, and refusing to
-    report a slope at all would be worse than widening the window."""
+    """A short trajectory does not span a decade of lag times, so every lag it
+    has sits inside the last decade and the slope is read over all of them."""
     from openmmpolymer.conformation import _log_slope
 
     lags = np.array([1.0, 1.2, 1.4])

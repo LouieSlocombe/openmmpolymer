@@ -75,7 +75,7 @@ def test_rotate_existing_ignores_a_file_that_is_not_there(tmp_path: Path) -> Non
 
 
 def test_rotate_existing_ignores_an_empty_file(tmp_path: Path) -> None:
-    """XTCReporter only refuses a file with something in it."""
+    """An empty file holds no frames, so there is nothing to keep."""
     target = tmp_path / "traj.xtc"
     target.touch()
     assert rotate_existing(target) is None
@@ -253,8 +253,8 @@ def test_naming_a_format_as_a_string_keeps_the_interval_it_always_had(
 def test_a_stage_too_short_to_reach_a_frame_says_so(
     dimer_argon_run: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """It writes an unreadable empty trajectory, and the default interval of
-    ten picoseconds does it to any stage shorter than that."""
+    """It writes an unreadable empty trajectory, which is what a frame interval
+    of ten picoseconds does to any stage shorter than that."""
     with caplog.at_level(logging.WARNING, logger="openmmpolymer.simulate"):
         run_nvt(
             dimer_argon_run,

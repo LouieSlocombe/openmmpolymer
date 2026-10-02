@@ -1,8 +1,9 @@
 """Rate controls on the command line keep their units, old flags and reports.
 
 ``--modulus-relax-times`` and ``--target-strain-rate`` predate the other rate
-properties; they are the Young's modulus spellings of ``--rate-hold-times``
-and ``--target-property-rate``, and report through the same writer.
+properties; they are the Young's modulus spelling of ``--rate-hold-times``
+and the strain/ns spelling of ``--target-property-rate``, and report through
+the same writer.
 """
 
 from __future__ import annotations

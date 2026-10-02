@@ -340,8 +340,8 @@ def test_interrupted_replicas_resume_consistently_and_force_rerun_replaces_them(
     """Exercise the two-to-one replica bug against real CPU state files.
 
     The interruption comes after both replicas wrote their measurements but
-    before the scan can analyse them or finish its metadata. An unchanged
-    resume must retain two; only an explicit rerun may replace them with one.
+    before the scan can analyse them. An unchanged resume must retain two;
+    only an explicit rerun may replace them with one.
     """
     interrupted = False
 

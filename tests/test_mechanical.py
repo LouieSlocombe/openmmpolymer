@@ -1,12 +1,13 @@
 """Tests for the mechanical scan and what it reports.
 
 Split the way the glass-transition tests are split. Everything that decides
-something - how long the ladder is, which pass is skipped, what a resume
-refuses, how replicas are grouped - is tested against manifests written by
-hand, because those are arithmetic over recorded numbers and running
-dynamics to reach them would hide what is being checked. The plumbing that
-has to survive a real Context is tested on an argon cell, which runs the
-whole workflow in a couple of seconds.
+something - how long the ladder is, which pass is skipped, how replicas are
+grouped and when they agree - is tested on the protocols the builders return
+or against manifests written by hand, because those are arithmetic over
+settings and recorded numbers and running dynamics to reach them would hide
+what is being checked. The plumbing that has to survive a real Context -
+the budget, resume and what it refuses, the branching - is tested on an
+argon cell, which runs the whole workflow in a couple of seconds.
 
 Argon is a liquid at these settings, so it has no shear modulus and its
 Young's modulus is meaningless. That is deliberate: the argon tests assert
@@ -159,10 +160,10 @@ def test_each_pass_can_be_skipped_on_its_own() -> None:
         (BULK_STEM, replace(QUICK, bulk_pressures_bar=None)),
         (SHEAR_STEM, replace(QUICK, shear_strains=None)),
     )
+    every = [LOAD_STEM, BULK_STEM, SHEAR_STEM]
     for stem, spec in cases:
-        stages = extra_stages(spec, timestep_fs=2.0)
-        assert stem not in [stage.name for stage in stages]
-        assert len(stages) == 2
+        names = [stage.name for stage in extra_stages(spec, timestep_fs=2.0)]
+        assert names == [name for name in every if name != stem]
 
 
 def test_the_listing_prices_every_replica_and_every_pass() -> None:
@@ -210,9 +211,9 @@ def test_one_extension_moves_the_box_by_exactly_the_strain_it_records(
     """Strain is bookkeeping, and bookkeeping should be exact.
 
     The driven axis is held at the strain while the lateral two stay at
-    pressure - the uniaxial-strain ensemble. The cost is reported before any
-    of it runs. And a resume that asks for something else is refused, or the
-    modulus belongs to a ladder nobody walked.
+    pressure - uniaxial stress, under strain control. The cost is reported
+    before any of it runs. And a resume that asks for something else is
+    refused, or the modulus belongs to a ladder nobody walked.
     """
     with caplog.at_level(logging.INFO, logger="openmmpolymer.mechanical"):
         run_modulus_scan(
@@ -285,10 +286,10 @@ def test_every_pass_starts_from_the_equilibrated_cell_even_on_a_resume(
     finished would branch from a cell that was already at the top of the
     ladder, and the strain origin read off that state is a stretched cell.
 
-    Asserted on the box rather than only on the file name, because the cubic
-    shape is what says it is the equilibrated cell and not a deformed one -
-    a shear pass leaves the volume alone and would pass a name-only check by
-    luck.
+    Asserted on the file name and on the box: the cubic shape is what says
+    the strain origin is the equilibrated cell and not a stretched one, and
+    the name is what rules out a shear pass, whose box lengths are the
+    equilibrated ones and would pass a box-only check by luck.
     """
     spec = replace(QUICK, load_stresses_bar=None, bulk_pressures_bar=None)
     run_modulus_scan(argon_scan_run, "run", spec=spec, **QUICK_EQUILIBRATION)
@@ -424,7 +425,7 @@ def test_analysing_writes_nothing(tmp_path: Path) -> None:
 
 
 def test_the_report_writes_a_record_and_its_figures(tmp_path: Path) -> None:
-    """One JSON, pinned field by field, and a figure per curve."""
+    """One JSON, pinned field by field, and its figures."""
     write_deformation(tmp_path, modulus_mpa=2000.0, poisson=0.35)
     write_bulk(tmp_path, stage=BULK_STEM, modulus_mpa=2222.0)
     write_shear(tmp_path, modulus_mpa=741.0)

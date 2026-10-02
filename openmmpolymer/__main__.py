@@ -6,16 +6,17 @@ facts. Anything more selective is better done from Python, where the four
 layers - chain, force field, packing, protocol - are separately callable.
 
 ``--analyse`` reads a finished run without rebuilding it. ``--protocol tm``
-heats an explicitly supplied crystal and serialized System: packing an
+heats an explicitly supplied crystal and serialised System: packing an
 amorphous melt from a monomer cannot provide a crystalline melting point.
 
 The flags each protocol takes are a table, :data:`PROTOCOLS`, rather than a
 chain of conditionals, because the alternative failed quietly: a flag that no
 protocol took was parsed, ignored, and never reached the run. From the table
-every run is checked and priced before anything is built. Every flag is also
-part of what a rerun must repeat - :func:`main` records the parsed namespace
-beside the build - so no destination or default can change without leaving
-the runs already on disk unable to resume.
+every run is checked and priced before anything is built. Every flag but the
+few saying where and how a run goes is also part of what a rerun must
+repeat - :func:`main` records the parsed namespace beside the build - so no
+destination or default can change without leaving the runs already on disk
+unable to resume.
 """
 
 from __future__ import annotations
@@ -140,8 +141,8 @@ from .viscoelastic import (
 )
 
 #: What is reported as a usage error rather than a traceback: a request the
-#: library refuses before running anything. Every error it raises is a
-#: RuntimeError.
+#: library refuses before running anything. Every error class the library
+#: defines is a RuntimeError.
 _REFUSED = (OSError, ValueError, TypeError, RuntimeError)
 
 # --------------------------------------------------------------------------
@@ -398,7 +399,7 @@ _LADDER = {
 
 
 def _tensile(prefix: str, **criterion: str) -> dict[str, str]:
-    """A tensile measurement's flags: its own ladder's, then its criterion's."""
+    """A tensile measurement's flags: where it is made, its ladder, its criterion."""
     ladder = {f"{prefix}_{flag}": field for flag, field in _LADDER.items()}
     return {**_MEASURED, **ladder, **criterion}
 
@@ -619,7 +620,7 @@ def _tensile_flags(
         group,
         f"{flag}-strain-increment",
         defaults.strain_increment,
-        "fractional extension of the current cell at each step",
+        "fractional extension of the current cell at each step; increments compound",
     )
     _flag(
         group,
@@ -792,12 +793,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     melting.add_argument(
         "--system-xml",
-        help="serialized OpenMM System for --crystal-pdb, without a thermostat "
+        help="serialised OpenMM System for --crystal-pdb, without a thermostat "
         "or barostat",
     )
     melting.add_argument(
         "--state-in",
-        help="optional serialized OpenMM State for the same crystalline cell",
+        help="optional serialised OpenMM State for the same crystalline cell",
     )
     _flag(
         melting,
@@ -826,7 +827,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("atactic", "isotactic", "syndiotactic"),
     )
     parser.add_argument(
-        "--platform", help="OpenMM platform (default: the fastest available)"
+        "--platform", help="OpenMM platform (default: the fastest that works)"
     )
     parser.add_argument(
         "-o",
@@ -851,8 +852,18 @@ def build_parser() -> argparse.ArgumentParser:
         "mechanics",
         "the extension the modulus protocol walks, and the passes beside it",
     )
-    _flag(mechanics, "--strain-increment", 0.002, "engineering strain added per step")
-    _flag(mechanics, "--max-strain", 0.05, "strain the ladder stops at")
+    _flag(
+        mechanics,
+        "--strain-increment",
+        0.002,
+        "fractional extension of the current cell at each step; increments compound",
+    )
+    _flag(
+        mechanics,
+        "--max-strain",
+        0.05,
+        "engineering strain to reach; the last increment may pass it",
+    )
     _flag(
         mechanics,
         "--relax-ps",
@@ -1057,8 +1068,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--analyse",
         nargs="+",
         metavar="RUN_DIR",
-        help="report the transition from these finished run directories; the "
-        "first owns the output. No monomer is needed",
+        help="report what these finished run directories recorded; the first "
+        "owns the output, and the rest add only to its glass transition or "
+        "rate series. No monomer is needed",
     )
     _flag(analysis, "--melt-stage", "05_npt", "the equilibration stage to check")
     convergence = parser.add_argument_group(
@@ -1072,8 +1084,8 @@ def build_parser() -> argparse.ArgumentParser:
     convergence.add_argument(
         "--convergence-stage",
         metavar="STAGE",
-        help="saved stage to check (default: --structure-stage or the last "
-        "available stage)",
+        help="saved stage to check (default: --structure-stage, else the last "
+        "stage with a trajectory, else the last stage)",
     )
     convergence.add_argument(
         "--window-fractions",
@@ -1180,8 +1192,8 @@ def _floats(text: str) -> tuple[float, ...]:
     values = _split(text, float, "numbers", "0,100,200")
     if not values:
         raise argparse.ArgumentTypeError(
-            f"{text!r} is empty. Leave the flag out for the default, or name "
-            "the pass in --skip to drop it."
+            f"{text!r} is empty. Leave the flag out for the default; to drop a "
+            "modulus pass, name it in --skip."
         )
     return values
 
@@ -1438,7 +1450,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.analyse:
         if arguments.protocol == "modulus" and len(arguments.analyse) > 1:
             parser.error(
-                "analysing multiple modulus rates requires --target-strain-rate"
+                "analysing multiple modulus rates requires --target-property-rate"
             )
         return _analyse(arguments)
 
@@ -1611,10 +1623,13 @@ def _analyse(arguments: argparse.Namespace) -> int:
     """Report whatever a finished run directory holds, and write it out.
 
     Dispatches on what the directory recorded rather than on a flag. A run
-    that quenched gets a glass transition, a run that was deformed gets its
-    elastic constants, a run that did both gets both, and a run that did
-    neither is an error - which is the same "find the stages by what they
-    recorded" rule the readers underneath follow.
+    that quenched gets a glass transition, one that was heated a melting
+    interval, a tensile ladder its own measurement, any other deformation its
+    elastic constants, a relaxation its decay, and any stage that left
+    coordinates a structure report. A run gets every report that applies, and
+    a run with none is an error - which is the same "find the stages by what
+    they recorded" rule the readers underneath follow. Only a glass transition
+    reads the further directories.
     """
     directories = [Path(name) for name in arguments.analyse]
     first = directories[0]

@@ -87,7 +87,11 @@ def analyse_convergence(
 
     State traces provide density, temperature and potential energy; a saved
     trajectory and known/inferred backbone add radius of gyration and squared
-    end-to-end distance. Relaxation logs are analysed as decays separately.
+    end-to-end distance, and any saved coordinates get the structural windows
+    of :func:`~openmmpolymer.structural_convergence.structural_window_convergence`.
+    Relaxation logs are analysed as decays separately: the run's ensemble
+    average from :func:`~openmmpolymer.viscoelastic.analyse_relaxation` when
+    *stage* is None, and that stage's curve alone otherwise.
     Missing data and snapshots stay explicit in report notes.
 
     Raises:
@@ -258,7 +262,12 @@ def write_convergence_report(
 
 
 def _figures(report: ConvergenceReport) -> Iterator[tuple[str, Figure]]:
-    """Figures for the available stationary, relaxation and structural diagnostics."""
+    """Figures for the available stationary, relaxation and structural diagnostics.
+
+    An observable's stem is its name made safe for a filename, numbered on
+    past any stem already taken - the relaxation and structural ones
+    included - so no figure overwrites another.
+    """
     used = {"convergence_relaxation", "convergence_structural"}
     for name, result in report.results.items():
         safe = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "observable"

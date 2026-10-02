@@ -419,7 +419,7 @@ def test_hydrogen_mass_and_the_switch_reach_create_system(
 def test_naming_residue_templates_can_be_turned_off(
     tmp_path: Path, dimer_forcefield: Any
 ) -> None:
-    """It is a shortcut past the graph search, not a requirement."""
+    """Naming them narrows OpenMM's template search; it is not a requirement."""
     system = build_system(
         _dimer_box(tmp_path),
         dimer_forcefield,
@@ -538,7 +538,7 @@ def test_an_anisotropic_barostat_takes_a_pressure_per_axis() -> None:
 
 
 def test_an_axis_can_be_frozen_while_the_others_move() -> None:
-    """The uniaxial-strain ensemble, in one flag."""
+    """Uniaxial stress under strain control, in one flag."""
     barostat = make_barostat(
         "anisotropic", 300.0, 1.0, 25, 7, scale_axes=(True, True, False)
     )

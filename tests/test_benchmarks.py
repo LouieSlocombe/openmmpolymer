@@ -1,4 +1,4 @@
-"""Reference-benchmark acceptance rules and an opt-in real polymer smoke run."""
+"""Reference-benchmark acceptance rules and a real polymer smoke run."""
 
 from __future__ import annotations
 

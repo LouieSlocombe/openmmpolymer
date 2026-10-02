@@ -1,7 +1,7 @@
 """Melting scans preserve a crystal and distinguish a jump from a Tg corner.
 
 The transition estimator is exercised against independent planted curves.
-One tiny CPU run checks the saved measurement, resume and input provenance;
+Two tiny CPU runs check the saved measurement, resume and input provenance;
 argon is a plumbing fixture, not a polymer melting-temperature benchmark.
 """
 

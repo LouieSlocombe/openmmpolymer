@@ -27,7 +27,7 @@ PE4 = ChainSpec(
 
 
 def test_the_files_property_puts_the_new_xml_last() -> None:
-    """OpenMM reads them in order and the polymer template has to win."""
+    """The base files first, the polymer's on top: the order forcefill checks."""
     forcefield = PolymerForceField("poly.xml", DEFAULT_BASE_FORCEFIELD, "POL", "gaff")
     assert forcefield.files == (*DEFAULT_BASE_FORCEFIELD, "poly.xml")
 

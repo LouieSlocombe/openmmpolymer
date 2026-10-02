@@ -546,11 +546,18 @@ def _finite(value: float) -> float | None:
 def _observations(
     directory: Path, name: str, spec: dict[str, Any] | None, strain_limit: float
 ) -> list[RateObservation]:
+    """One observation per loading path in *directory*, a replica's chunks as one.
+
+    A path that cannot be fitted is kept as a missing value, its reason in
+    the notes, rather than dropped from the series.
+    """
     stages = _read_stages(directory)
     key = _PATH_KEYS[name]
     if name == "poisson_ratio":
         groups = group_by_stem(deform_stages(directory))
     else:
+        # A preparation's compression ladder records pressures as well; only
+        # the bulk pass measures a modulus.
         groups = [
             (stage,)
             for stage, entry in stages.items()
@@ -589,8 +596,9 @@ def _observations(
             )
         if not np.all(np.isfinite(path)) or path.size < 2:
             raise AnalysisError("Every loading path needs at least two finite points.")
-        # Deformation and shear start at zero. Pressure starts at the first
-        # recorded pressure: its arrival from preparation is not a measured leg.
+        # Extension, shear and applied stress start at zero. Pressure starts at
+        # the first recorded pressure: its arrival from preparation is not a
+        # measured leg.
         origin = path[0] if name == "bulk_modulus" else 0.0
         distance = float(np.abs(np.diff(np.r_[origin, path])).sum())
         rate = distance / float(duration.sum()) * 1000.0
@@ -773,7 +781,8 @@ def _check_youngs_scan(
     """A partial rate series cannot become a complete analysis by accident.
 
     Looser than the other properties' check, which these scans predate: a
-    requested temperature is compared only where one was recorded.
+    requested temperature is compared only where one was recorded, and the
+    lateral pressure and reference cell are not compared at all.
     """
     request = record.get("request", {})
     if "spec" not in request:
@@ -870,8 +879,8 @@ def _youngs_observations(
 
     The pooled fit is the one a single modulus scan reports. Its own error
     sees only how straight the pooled points lie, so the replicas' sample
-    spread is its floor, and a rate is unresolved if any replica is, or if
-    they spread by more than
+    spread is its floor, and a rate is unresolved if its pooled fit or any
+    replica is, or if the replicas spread by more than
     :data:`~openmmpolymer.mechanical.MAX_REPLICA_SPREAD` of the pooled value.
     """
     curves: list[tuple[str, StressStrain]] = []

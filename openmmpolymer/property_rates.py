@@ -131,8 +131,9 @@ def analyse_property_rates(
 ) -> RateReport:
     """Read a rate series in its property's units, preserving event censoring.
 
-    ``strain_limit`` is the window elastic moduli and ratios are fitted over;
-    the other properties carry their own criteria in their saved scans.
+    ``strain_limit`` is the window Young's moduli and Poisson's ratios are
+    fitted over; shear and bulk moduli use none, and the other properties
+    carry their own criteria in their saved scans.
     """
     family = _family(property_name)
     return family.analyse(
@@ -185,8 +186,10 @@ def run_property_rate_scan(
 ) -> RateReport:
     """Run independent rate branches from shared preparation, then compare models.
 
-    Tm retains its requirement for prepared crystalline coordinates and
-    ``crystalline=True``. Remaining keywords go to the property's workflow.
+    As in :func:`validate_property_rate_scan`, ``n_replicas`` configures
+    thermal scans only. Tm retains its requirement for prepared crystalline
+    coordinates and ``crystalline=True``. Remaining keywords go to the
+    property's workflow.
     """
     family = _family(property_name, spec)
     return family.run(

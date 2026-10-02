@@ -1,8 +1,8 @@
-"""Tests for the shared argument validators.
+"""Tests for the shared argument validators and the seed helpers.
 
-Everything numeric that crosses into this package goes through one of these,
-so that a negative temperature or a typo'd unit fails at the call site rather
-than a hundred picoseconds into a run.
+Numbers crossing into this package go through these validators, so that a
+negative temperature or a typo'd unit fails at the call site rather than a
+hundred picoseconds into a run.
 """
 
 from __future__ import annotations
@@ -27,10 +27,16 @@ def test_a_bare_number_is_taken_to_be_in_the_expected_unit() -> None:
 
 
 def test_a_quantity_is_converted_rather_than_refused() -> None:
-    """Callers coming from openmmnqe reach for one, and should not be stopped."""
+    """Given the unit to work in, a quantity is converted into it."""
     assert require_positive(
         2.0 * unit.picosecond, unit.femtosecond, name="timestep_fs"
     ) == pytest.approx(2000.0)
+
+
+def test_without_a_unit_only_a_plain_number_is_taken() -> None:
+    """How every caller in the package validates, so the message asks for one."""
+    with pytest.raises(TypeError, match="Pass a plain number"):
+        require_positive(300.0 * unit.kelvin, None, name="temperature_k")
 
 
 def test_something_that_is_not_a_number_says_what_was_wanted() -> None:

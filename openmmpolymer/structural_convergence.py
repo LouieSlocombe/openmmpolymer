@@ -125,7 +125,8 @@ class StructuralWindowConvergence:
     Args:
         stage: The stage measured.
         windows: One interval per prefix fraction, each starting at frame 0.
-        blocks: Three disjoint intervals spanning the final half.
+        blocks: Three disjoint intervals spanning the final half, or fewer
+            when it holds fewer than three frames.
         parameters: The stability of each parameter, by name.
         relative_tolerance: The most the compared values may spread.
         min_frames: Fewest frames a compared interval may rest on.
@@ -500,11 +501,13 @@ def structural_window_convergence(
     """Refit trajectory prefixes using fixed bins, lags policy and sampling.
 
     Pair/S(q) strides are chosen once from the entire trajectory. Their
-    default caps match ordinary structural reports (50/8 frames), which may
-    be too sparse to resolve convergence. Set caps to ``None`` to use every
-    ``stride``-th frame. The same RDF radius is legal for every observed box.
-    S(q) peak comparisons use a common bin mask with adequate wavevectors per
-    frame in every prefix and block. Missing modes stay missing.
+    default caps match ordinary structural reports (50/8 frames), which
+    against the default *min_frames* are too sparse ever to resolve: no S(q)
+    window, and no g(r) tail block, can reach it. Set caps to ``None`` to use
+    every ``stride``-th frame. The same RDF radius is legal for every
+    observed box. S(q) peak comparisons use a common bin mask with adequate
+    wavevectors per frame in every prefix and block. Missing modes stay
+    missing.
 
     Stationary parameters also need agreement among three disjoint blocks
     spanning the final half of the trajectory. Dynamical parameters require
@@ -514,8 +517,11 @@ def structural_window_convergence(
 
     Raises:
         ValueError: An option is out of range.
-        AnalysisError: The ensemble has no frames, no usable frame interval,
-            or a box the radius does not fit.
+        TypeError: A count, stride or frame cap is not an integer.
+        AnalysisError: *backbone* does not fit the chains, or the ensemble has
+            no frames, no usable frame interval, nonfinite coordinates, a box
+            edge that is not finite and positive, or a box the radius does not
+            fit.
     """
     fractions = require_fractions(window_fractions)
     relative_tolerance = require_positive(

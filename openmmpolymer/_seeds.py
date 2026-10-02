@@ -1,9 +1,9 @@
 """Deriving reproducible random seeds for the several streams a run needs.
 
-A run has one master seed. The thermostat, the initial velocities, the barostat,
-packmol and every chain conformer each need their own, and they must not
-collide. Deriving them from labels keeps a run reproducible while letting stages
-be added without renumbering anything.
+A run has one master seed. The thermostat, the initial velocities, the barostat
+and every chain conformer each need their own, and they must not collide.
+Deriving them from labels keeps a run reproducible while letting stages be
+added without renumbering anything.
 
 The one trap this module exists to avoid: OpenMM reads a seed of ``0`` as "pick
 a random one", on both integrators and barostats. A derived seed of zero would

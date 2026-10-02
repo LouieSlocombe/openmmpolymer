@@ -75,7 +75,7 @@ def test_a_one_row_csv_still_reads_back_as_arrays(tmp_path: Path) -> None:
 
 
 def test_a_missing_csv_is_named_rather_than_crashing(tmp_path: Path) -> None:
-    """A stage that died before its first report leaves no CSV at all."""
+    """A run directory moved without its CSVs points at files that are not there."""
     with pytest.raises(AnalysisError, match="No state-data CSV"):
         read_state_data(tmp_path / "nothing.csv")
 
@@ -90,7 +90,10 @@ def test_the_human_readable_log_is_refused_as_a_substitute(tmp_path: Path) -> No
 
 
 def test_a_header_with_no_rows_says_the_stage_wrote_nothing(tmp_path: Path) -> None:
-    """The reporter writes its header immediately and its first row later."""
+    """OpenMM writes the header before it checks the first report's energy.
+
+    So a stage that blew up at its first report leaves a header and no rows.
+    """
     path = tmp_path / "02_nvt.csv"
     path.write_text(state_data_csv([]))
     with pytest.raises(AnalysisError, match="no rows"):
@@ -208,8 +211,9 @@ def test_a_quench_curve_comes_back_ordered_by_temperature(tmp_path: Path) -> Non
 
 
 def test_the_cooling_rate_is_recovered_from_the_stage_csv(tmp_path: Path) -> None:
-    """Neither StageResult nor SystemSpec records a duration, so the CSV's last
-    time is the only thing that knows how long each temperature was held."""
+    """Without recorded segment durations, as in a manifest older than them,
+    the CSV's last time is the only thing that knows how long each
+    temperature was held."""
     temperature, density = two_line_curve()
     write_quench(tmp_path, temperature[::-1], density[::-1])
     curve = quench_curve(tmp_path)
@@ -229,7 +233,7 @@ def test_without_a_csv_the_cooling_rate_is_none_rather_than_guessed(
 
 
 def test_a_stage_that_was_not_a_quench_is_refused(tmp_path: Path) -> None:
-    """Only a quench records a density per temperature."""
+    """A stage that recorded no density per temperature was not a quench."""
     (tmp_path / "manifest.json").write_text(
         json.dumps(
             {
@@ -781,7 +785,7 @@ def test_a_transition_that_rises_as_cooling_slows_is_not_resolved() -> None:
 
 
 def test_a_fit_over_transitions_that_did_not_resolve_does_not_resolve() -> None:
-    """Fitting a line through three corners found in noise finds a fourth."""
+    """A line through even one corner found in noise is no better than it."""
     fits = [
         transition_at(r, 340.0 + 20.0 * math.log10(r), resolved=r != 10.0)
         for r in (1.0, 10.0, 100.0)

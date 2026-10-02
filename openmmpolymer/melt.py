@@ -1,9 +1,9 @@
 """Building a melt from a monomer in one call, and rebuilding it safely.
 
 :func:`build_melt` runs the four layers in turn - chain, charges, force field,
-packing - and returns the :class:`~openmmpolymer.simulate.RunContext` a
-protocol takes. What it adds to calling them yourself is what a second call
-into the same directory needs.
+packing - builds the System, and returns the chain with the
+:class:`~openmmpolymer.simulate.RunContext` a protocol takes. What it adds to
+calling them yourself is what a second call into the same directory needs.
 
 The build goes into ``<directory>/build`` together with a record of what it
 produced. A rerun cannot simply reuse those files - new dependency versions can
@@ -76,8 +76,8 @@ def build_melt(
             in it or in its ``equilibration`` subdirectory, where the rate
             scans keep their shared preparation.
         target_density_g_cm3: The density the cell will be compressed to. It
-            has to fit the cutoff there too, which is checked before anything
-            expensive starts.
+            has to fit the cutoff there too, which is checked as soon as the
+            chain is built, before charges, parameterisation and packing.
         n_conformers: Distinct conformations to build, repeated to fill the
             cell. None for one per chain, which is right and the slowest to
             pack; more than one per chain is never built.
@@ -86,7 +86,7 @@ def build_melt(
         smirnoff_forcefield: SMIRNOFF release, for the smirnoff backend.
         pack_density_g_cm3: The density packmol fills the cell to.
         packmol_timeout_s: Seconds packmol is allowed, or None for no limit.
-        platform: OpenMM platform, or None for the fastest available.
+        platform: OpenMM platform, or None for the fastest that works.
         cache_dir: The force-field cache, ``<directory>/cache`` by default.
             Share one to parameterise a chain once for several runs.
         progress: Called with one line of news as each layer finishes.
@@ -97,8 +97,8 @@ def build_melt(
 
     Raises:
         ProtocolError: A recorded asset changed or is missing, the directory
-            holds a build with no record, or the rebuild matches neither the
-            record nor a run already started. Nothing is overwritten.
+            holds a build with no record, or the build does not match the
+            record or a run already started there. Nothing is overwritten.
     """
     require_integer(n_chains, name="n_chains")
     root = Path(directory)
@@ -220,7 +220,11 @@ def _prepare(
     platform: str | None,
     progress: Callable[[str], object],
 ) -> tuple[ChainResult, RunContext]:
-    """Run the four layers into *build_dir*, the cheap cell-size check first."""
+    """Run the four layers into *build_dir*.
+
+    The cheap cell-size check runs as soon as the chain's molar mass is known,
+    before the charges, the force field and the packing.
+    """
     chain = build_chain(spec, "chain", n_conformers=n_conformers, output_dir=build_dir)
     progress(
         f"chain: {chain.n_atoms} atoms, {chain.molar_mass_g_mol:.1f} g/mol, "

@@ -57,8 +57,10 @@ def test_a_cubic_lattice_gives_its_exact_coordination_numbers(
 
 
 def test_the_shells_sit_where_the_lattice_puts_them() -> None:
-    """Which is the check that the minimum image convention is being applied:
-    without it the shells past the cell's half-width go missing."""
+    """At 0.6, 0.6 sqrt 2 and 0.6 sqrt 3 nm, which pins the distances and the
+    bins. That the minimum image convention is applied is the coordination
+    numbers' check: without it these shells are still found, but the sites
+    next to a cell face lose their neighbours across it."""
     measured = radial_distribution(
         lattice_ensemble(), n_bins=240, heavy_atoms_only=False
     )
@@ -121,8 +123,9 @@ def test_the_default_radius_survives_the_kernels_float32_box() -> None:
 
 
 def test_a_radius_past_half_the_cell_is_refused() -> None:
-    """Past it the convention counts one neighbour as two, and the distance
-    kernel applies it anyway without complaining."""
+    """Past it the convention no longer counts every neighbour in a shell, and
+    on a cell this small the distance kernel applies it anyway without
+    complaining."""
     with pytest.raises(AnalysisError, match="more than half the smallest"):
         radial_distribution(lattice_ensemble(), r_max_nm=2.0, heavy_atoms_only=False)
 

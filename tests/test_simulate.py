@@ -107,6 +107,8 @@ def test_prepare_run_measures_the_cell_mass(argon_run: Any) -> None:
 def test_final_pdb_uses_the_live_cell_without_changing_the_packed_topology(
     argon_run: Any, tmp_path: Path
 ) -> None:
+    """The closing PDB and state carry the stage's cell; the packed topology
+    every stage shares keeps the packed one."""
     simulation = _probe(argon_run)
     vectors = np.diag([3.0, 3.2, 3.4])
     simulation.context.setPeriodicBoxVectors(*(vectors * unit.nanometer))
@@ -651,6 +653,7 @@ def test_explicit_temperature_ladders_follow_the_stage_direction(
     temperatures: list[float],
     direction: str,
 ) -> None:
+    """A quench's explicit ladder must descend, and a heating scan's ascend."""
     with pytest.raises(ValueError, match=f"has to {direction}"):
         runner(argon_run, temperatures_k=temperatures)
 

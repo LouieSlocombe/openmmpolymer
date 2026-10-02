@@ -7,7 +7,7 @@ one of them is meant to be read back: ``<stem>.csv`` is all numbers, and
 ``numpy.genfromtxt`` derives from OpenMM's commented header are pinned in one
 place here rather than spelled out at each call site.
 
-The rest of the module answers the question the README declines to answer for
+The rest of the module answers the question the user guide declines to answer for
 you. Equilibration is reported, not claimed: :func:`equilibration` says where a
 series stopped drifting faster than its own noise and how many genuinely
 independent samples sit after that point, which is evidence about one
@@ -120,9 +120,10 @@ MAX_EXTRAPOLATION_DECADES = 2.0
 #: means anything.
 _FORM_PARAMETERS = {"log_linear": 2, "vft": 3}
 
-#: Bracket for the VFT inner search, as natural-log gaps above the fastest
-#: measured rate. Wide enough that the optimum sitting on an end means the fit
-#: has degenerated rather than that the bracket was too narrow.
+#: Bracket for the VFT inner search, over the log of ``ln(R0 / R)`` at the
+#: fastest measured rate R: that gap is searched from 1e-3 to 1e3. Wide enough
+#: that the optimum sitting on an end means the fit has degenerated rather than
+#: that the bracket was too narrow.
 _VFT_GAP_BRACKET = (math.log(1.0e-3), math.log(1.0e3))
 
 
@@ -221,16 +222,20 @@ class QuenchCurve:
     """The specific-volume curve a quench leaves behind.
 
     Args:
-        stage: Which stage produced it.
+        stage: Which stage produced it, or the stages pooled into it, joined
+            with ``", "``.
         temperature_k: The temperature held at each step, ascending.
         density_g_cm3: The mean density measured at each step.
         specific_volume_cm3_g: One over the density, which is what a glass
             transition is read off.
-        hold_ps: How long each temperature was held, or None when the stage's
-            CSV was not available to work it out from.
+        hold_ps: How long each temperature was held - the median of the
+            segment durations the stages recorded or, for a single stage that
+            recorded none, its CSV's last time over its segment count. None
+            when neither is available.
         cooling_rate_k_per_ns: The rate implied by the step and the hold, or
-            None for the same reason. Some ten orders of magnitude faster than
-            any experiment, which is why it is reported.
+            None when the hold is unknown or the ladder never stepped. Some
+            ten orders of magnitude faster than any experiment, which is why
+            it is reported.
     """
 
     stage: str
@@ -279,7 +284,7 @@ class GlassTransition:
             noise rather than a transition - which is what fitting two lines
             to a straight line always returns. Even when True this is not a
             measured Tg: the shape is informative, the temperature is not
-            comparable with a dilatometry experiment cooled a billion times
+            comparable with a dilatometry experiment cooled ten billion times
             slower.
     """
 
@@ -596,7 +601,8 @@ def quench_stages(run_dir: str | Path) -> tuple[str, ...]:
         The stage names, in the order the manifest records them.
 
     Raises:
-        AnalysisError: There is no manifest, or nothing in it held a ladder.
+        AnalysisError: There is no manifest, or nothing in it stepped down a
+            ladder of temperatures.
     """
     return stages_holding(
         run_dir,
@@ -758,12 +764,12 @@ def cooling_rate_extrapolation(
     is not small. On a melt with T0 = 300 K, B = 400 K and R0 = 1e4 K/ns,
     measured at 2, 5 and 10 K/ns:
 
-    =============  ==================
-    form           Tg at 10 K/min
-    =============  ==================
-    ``log_linear``  189 K
+    ==============  ==================
+    form            Tg at 10 K/min
+    ==============  ==================
+    ``log_linear``  190 K
     ``vft``         313 K
-    =============  ==================
+    ==============  ==================
 
     A quench overestimates an experimental transition by 20 to 50 K, which
     puts the honest answer near 313 K. So ``log_linear`` is the default
@@ -1016,9 +1022,10 @@ def _hold_of(
 def _hold_ps(csv_path: Any, n_segments: int) -> float | None:
     """How long each temperature was held, from the stage's CSV.
 
-    A :class:`~openmmpolymer.simulate.StageResult` records how many steps ran
-    but not the timestep, and ``SystemSpec`` records neither duration, so the
-    CSV's last time is the only thing that knows.
+    The fallback for a manifest written before segment durations were
+    recorded. Its :class:`~openmmpolymer.simulate.StageResult` records how
+    many steps ran but not the timestep, and ``SystemSpec`` records neither,
+    so the CSV's last time is the only thing that knows.
     """
     if not csv_path or n_segments <= 0:
         return None

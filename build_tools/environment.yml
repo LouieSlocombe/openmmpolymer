@@ -26,8 +26,8 @@ dependencies:
   - ambertools
   - openff-toolkit>=0.16
   - openmmforcefields>=0.16
-  # The graph-neural-network charges: without them, anything longer than a
-  # DP 15 chain needs AM1-BCC, and sqm is the wall.
+  # The default, graph-neural-network charges. Without them AM1-BCC is the
+  # only quality option, and sqm is the wall for anything past about DP 15.
   - openff-nagl
   - openff-nagl-models
   # Lowercase on conda-forge. 2.10 is the first release built for Python 3.14.

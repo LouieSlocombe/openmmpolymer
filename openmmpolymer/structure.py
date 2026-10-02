@@ -9,10 +9,10 @@ A trajectory adds whether they moved: the centre-of-mass displacement and the
 end-to-end relaxation.
 
 Each measurement stands on its own. A cell of one molecule has no
-intermolecular pairs, a snapshot has no displacement, a run with no recorded
-backbone has no chain dimensions, and in each case the report says so in a note
-and carries on with what it can measure, rather than failing the whole report
-over the part it cannot.
+intermolecular pairs, a snapshot has no displacement, a run whose backbone
+cannot be found has no chain dimensions, and in each case the report says so
+in a note and carries on with what it can measure, rather than failing the
+whole report over the part it cannot.
 
 The backbone is the awkward one. It comes from the attachment points the caps
 consumed when the chain was built, and a run records it in its manifest only
@@ -396,14 +396,14 @@ def _recorded_backbone(
 # --------------------------------------------------------------------------
 
 
-def _recorded_chains(manifest: RunManifest | None) -> ChainDimensions | None:
+def _recorded_chains(manifest: RunManifest) -> ChainDimensions | None:
     """The dimensions the run recorded at its end, if they are all there.
 
     Read key by key rather than ``ChainDimensions(**chains)``, so a manifest
     that records more than the dataclass holds - a backbone, say - still
     reads.
     """
-    if manifest is None or not isinstance(manifest.chains, dict):
+    if not isinstance(manifest.chains, dict):
         return None
     chains = manifest.chains
     try:
@@ -437,8 +437,8 @@ def analyse_structure(
 
     Reads and returns; writes nothing of its own. Opening a trajectory does
     leave MDAnalysis' offset and lock files beside it, so this touches the
-    run directory even though it is an analysis, and cannot be pointed at a
-    read-only archive.
+    run directory even though it is an analysis; in a read-only archive
+    MDAnalysis warns instead and works the offsets out in memory.
 
     The stage is the last one with a trajectory, or failing that the last
     one's closing structure. Each measurement that cannot be made becomes a
@@ -460,7 +460,8 @@ def analyse_structure(
         stride: Measure every *stride*-th frame. The pair distribution and the
             structure factor are further capped at
             :data:`MAX_DISTRIBUTION_FRAMES` and
-            :data:`MAX_STRUCTURE_FACTOR_FRAMES` frames.
+            :data:`MAX_STRUCTURE_FACTOR_FRAMES` frames, and the end-to-end
+            relaxation reads every frame whatever this is.
         heavy_atoms_only: Drop hydrogens from the pair distribution and the
             structure factor.
         q_max_per_nm: Highest wavevector for the structure factor.
@@ -473,7 +474,8 @@ def analyse_structure(
     Raises:
         AnalysisError: There is no manifest, nothing in it left coordinates,
             or the stage asked for did not.
-        ValueError: *stride* is not a positive integer.
+        TypeError: *stride* is not an integer.
+        ValueError: *stride* is not positive.
     """
     require_integer(stride, name="stride")
     directory = Path(run_dir)
@@ -482,11 +484,7 @@ def analyse_structure(
     ensemble = open_stage(files)
     notes: list[str] = []
     if expected_characteristic_ratio is None:
-        recorded = (
-            manifest.chains
-            if manifest is not None and isinstance(manifest.chains, dict)
-            else {}
-        )
+        recorded = manifest.chains if isinstance(manifest.chains, dict) else {}
         expected_characteristic_ratio = recorded.get(
             "expected_characteristic_ratio", 7.0
         )

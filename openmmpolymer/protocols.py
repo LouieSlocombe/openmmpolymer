@@ -8,11 +8,10 @@ and starts the next one from the last state written.
 
 The manifest is also where the run says what it actually did, as opposed to
 what it was asked to do: the temperature each stage ran at, the density it
-settled to, the timestep that was used after derating, and the chain dimensions
-at the end. That last one is the honest part. packmol places chains that do not
-interpenetrate, the Rouse time of a melt is tens of nanoseconds, and no
-protocol here runs for that long, so the measurement is reported and the
-interpretation is left to whoever reads it.
+settled to, and the chain dimensions at the end. That last one is the honest
+part. packmol places chains that do not interpenetrate, the Rouse time of a
+melt is tens of nanoseconds, and no protocol here runs for that long, so the
+measurement is reported and the interpretation is left to whoever reads it.
 """
 
 from __future__ import annotations
@@ -117,7 +116,7 @@ class Stage:
 
     @property
     def duration_ps(self) -> float:
-        """How much dynamics this stage asks for, from the options it was given."""
+        """How much dynamics this stage asks for, its runner's defaults included."""
         options = _stage_options(self)
         if self.kind in {"heat", "quench"}:
             build = _heat_segments if self.kind == "heat" else _quench_segments
@@ -207,7 +206,9 @@ def _stage_options(stage: Stage) -> dict[str, Any]:
 
     Read off the runner's signature rather than repeated here, so the numbers
     a cost estimate is built from cannot drift away from the numbers the run
-    actually uses.
+    actually uses. These filled-in options are also what each stage's
+    provenance records and a resume compares, so renaming or re-defaulting a
+    runner's keyword makes every run already on disk refuse to resume.
     """
     parameters = inspect.signature(STAGE_RUNNERS[stage.kind]).parameters
     forwarded = (
@@ -223,6 +224,8 @@ def _stage_options(stage: Stage) -> dict[str, Any]:
         if parameter.default is not inspect.Parameter.empty
     }
     options = {**defaults, **stage.options}
+    # Two runners set a forwarded keyword themselves: record the value that
+    # actually runs, not run_segments' default.
     if stage.kind == "heat":
         options["measure_enthalpy"] = True
     if stage.kind == "production":
@@ -258,12 +261,12 @@ def standard_melt_equilibration(
         compress_ps_each: Time at each rung of the pressure ladder.
         npt_ps: Time spent settling at constant pressure.
         anneal_cycles: How many melt-and-set cycles.
-        anneal_window_ps: Time at each step of an annealing ramp.
-        anneal_hold_ps: Time at the top and bottom of each cycle.
         anneal_t_low_k: The bottom of each annealing cycle, when it should not
             be *target_temperature_k*. A run that settles at the temperature
             it will start cooling from needs the two separated, or the anneal
             has nothing to cycle between.
+        anneal_window_ps: Time at each step of an annealing ramp.
+        anneal_hold_ps: Time at the top and bottom of each cycle.
         compress_pressures_bar: The pressure ladder, when
             :data:`~openmmpolymer.simulate.DEFAULT_COMPRESSION_BAR` is wrong
             for this cell. A kilobar squeezes a sparse cell past twice the
@@ -465,7 +468,7 @@ def chain_dimensions(
     expected_characteristic_ratio: float,
     masses: npt.NDArray[np.float64] | None = None,
 ) -> ChainDimensions:
-    """Measure the chain dimensions in a packed cell.
+    """Measure the chain dimensions in one snapshot of a cell.
 
     Every molecule is a copy of the same chain, so one backbone path shifted by
     the chain's atom count covers all of them.

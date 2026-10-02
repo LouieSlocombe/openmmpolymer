@@ -1,11 +1,11 @@
 """Tests for the two-pass glass-transition scan and what it reports.
 
 Everything that decides something - which waypoint to carry on from, how wide
-the window is, when to refuse - is tested against manifests written by hand,
-because those decisions are arithmetic over recorded numbers and running
-dynamics to reach them would only hide what is being checked. The plumbing
-that has to survive a real Context is tested once, on an argon cell, which
-runs the whole thing in a couple of seconds.
+the window is, when to refuse - is tested against numbers and manifests
+written by hand, because those decisions are arithmetic over recorded numbers
+and running dynamics to reach them would only hide what is being checked. The
+plumbing that has to survive a real Context is tested on argon cells, which
+run the whole thing in a couple of seconds.
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ QUICK = TgSpec(
 
 
 def test_the_fine_window_is_centred_on_the_coarse_transition() -> None:
-    """Sixty kelvin either side, which is the coarse fit's own uncertainty."""
+    """Sixty kelvin either side: room for the coarse fit's own uncertainty."""
     assert fine_window(420.0, TgSpec()) == (480.0, 360.0)
 
 
@@ -80,15 +80,19 @@ def test_a_window_running_off_the_top_of_the_ladder_is_clamped() -> None:
     assert bottom == pytest.approx(560.0)
 
 
-def test_a_window_running_off_the_bottom_is_clamped_too() -> None:
+def test_a_window_running_off_the_bottom_is_clamped_too(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """And the clamp is said out loud, not applied quietly."""
-    top, bottom = fine_window(170.0, TgSpec())
+    with caplog.at_level(logging.WARNING, logger="openmmpolymer.tg"):
+        top, bottom = fine_window(170.0, TgSpec())
     assert top == pytest.approx(230.0)
     assert bottom == pytest.approx(150.0)
+    assert "clamped" in caplog.text
 
 
 def test_a_window_that_clamps_to_nothing_is_refused() -> None:
-    """The transition sits outside the range that was actually scanned."""
+    """The transition sits outside the range the coarse ladder covers."""
     with pytest.raises(TgError, match="empty"):
         fine_window(900.0, TgSpec(melt_temperature_k=650.0, t_floor_k=600.0))
 
@@ -103,9 +107,14 @@ def test_the_fine_pass_carries_on_from_the_lowest_waypoint_above_the_window() ->
     assert pick_waypoint(candidates, 480.0) == (500.0, "just above")
 
 
-def test_with_nothing_above_the_window_the_hottest_waypoint_is_taken() -> None:
+def test_with_nothing_above_the_window_the_hottest_waypoint_is_taken(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Better than dropping in from the melt, and it says so."""
-    assert pick_waypoint([(300.0, "a"), (280.0, "b")], 480.0) == (300.0, "a")
+    with caplog.at_level(logging.WARNING, logger="openmmpolymer.tg"):
+        chosen = pick_waypoint([(300.0, "a"), (280.0, "b")], 480.0)
+    assert chosen == (300.0, "a")
+    assert "No waypoint sits at or above" in caplog.text
 
 
 def test_no_waypoints_at_all_is_not_a_choice() -> None:
@@ -149,7 +158,7 @@ def test_the_chunks_visit_every_temperature_once_and_in_order() -> None:
 
 
 def test_no_chunk_is_left_holding_a_single_temperature() -> None:
-    """A stage with no temperature step is one nothing can classify."""
+    """A stage with no temperature step is not recognised as a quench at all."""
     spec = TgSpec(stage_ps=2.0, fine_hold_ps=0.4)
     schedule = fine_schedule(140.0, 100.0, spec)
     stages = tg_fine_scan(schedule, spec, timestep_fs=1.0).stages
@@ -642,8 +651,9 @@ def test_nothing_is_written_until_the_report_is(tmp_path: Path) -> None:
 def test_the_report_writes_one_record_and_a_figure_per_pass(
     tmp_path: Path,
 ) -> None:
-    """Two quench figures and a rate figure, beside the machine-readable one.
+    """A quench figure for each of the two passes, beside the record.
 
+    One pass at each step leaves no rate to fit, so there is no rate figure.
     And the manifest - the resume ledger of a three-day run - is left alone.
     """
     directory = two_pass_directory(tmp_path)

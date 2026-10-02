@@ -44,7 +44,9 @@ from .relaxation import (
 )
 from .trajectory import AnalysisError
 
-#: Prefix lengths compared, as fractions of the observed time.
+#: Prefix lengths compared, as fractions of the observation: of the time since
+#: the first sample for a trace, of the time since the step for a relaxation,
+#: and of the recorded frames for a trajectory.
 DEFAULT_WINDOW_FRACTIONS = (0.25, 0.5, 0.75, 1.0)
 
 #: How far the compared windows may disagree, relative to their scale, and
@@ -59,7 +61,8 @@ DEFAULT_MIN_SAMPLES = 20
 #: modulus is quoted in.
 PA_S_PER_MPA_PS = 1.0e-6
 
-#: What every window analysis says of a single frame.
+#: What the structural windows, and the report on a saved run, say of a single
+#: frame. A stationary trace refuses one in its own words.
 SNAPSHOT_REFUSAL = "A single snapshot cannot establish observation-window convergence."
 
 #: What every window analysis says when its last three prefixes end on fewer
@@ -87,7 +90,8 @@ class WindowEstimate:
         duration_ps: Time from the first sample to the prefix's last.
         n_samples: Samples kept after the discard.
         n_effective: How many of them are independent, from the statistical
-            inefficiency. Zero for a constant window, which samples nothing.
+            inefficiency. Zero for a window of fewer than three samples, and
+            for a constant one, which samples nothing.
         mean: Their mean.
         standard_error: Its standard error over the independent samples, or
             NaN when there are too few or they are constant.
@@ -157,7 +161,9 @@ class ParameterConvergence:
         property_name: The fitted parameter.
         value_unit: Its unit.
         values: Its value in each window, NaN where the fit gave none.
-        relative_change: Spread of the last three values over their scale.
+        relative_change: Spread of the last three values over the magnitude
+            of the last - or, for the equilibrium modulus, which can rightly
+            be zero, over the curve's first binned modulus.
         resolved: Whether the last three windows were valid and agree.
         notes: The standing caveat, then every refusal.
     """
@@ -181,7 +187,7 @@ class RelaxationWindowEstimate:
         prony: The Prony series fitted to it.
         tail_decayed: Whether the prefix saw its decay reach a plateau the
             Prony series describes.
-        notes: Why the Prony fit could not be trusted, if it could not.
+        notes: Why the Prony residual could not be trusted, if it could not.
     """
 
     fraction: float

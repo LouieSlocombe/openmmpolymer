@@ -5,13 +5,14 @@ can be checked against it, and measures from the cell that equilibration
 left - most of them by branching every replica and pass from it. The pieces of
 that which are not specific to one measurement live here.
 
-So do the conventions. A workflow runs every protocol under its own name, so
-an interrupted run's manifest still says which workflow it belongs to. Its
-stage names are numbered, so a run directory sorts into run order, and free of
-dots, because a name becomes a file stem and ``Path.with_suffix`` would read a
-dot as an extension. And what it derives goes in its own ``*_workflow.json``
-beside the manifest rather than in it: the manifest is the record of what ran,
-and a derived field in it would be stale after the next resume.
+So do the conventions. A workflow that keeps one manifest runs every protocol
+in it under its own name, so an interrupted run's manifest still says which
+workflow it belongs to. Its stage names are numbered, so a run directory sorts
+into run order, and free of dots, because a name becomes a file stem and
+``Path.with_suffix`` would read a dot as an extension. And what it derives
+goes in its own ``*_workflow.json`` beside the manifest rather than in it: the
+manifest is the record of what ran, and a derived field in it would be stale
+after the next resume.
 """
 
 from __future__ import annotations
@@ -134,7 +135,7 @@ def sample_spread(values: Sequence[float]) -> float | None:
 def validate_hold_times(
     values: Sequence[float], *, name: str = "hold_times_ps"
 ) -> tuple[float, ...]:
-    """Require three distinct positive holds, preserving their requested order."""
+    """Require at least three distinct positive holds, in their requested order."""
     holds = tuple(require_positive(value, None, name=name) for value in values)
     if len(holds) < 3 or any(
         math.isclose(first, second, rel_tol=1e-8)
@@ -237,7 +238,9 @@ def deformation_stages(
 
     The caller supplies its existing stage stem and suffix width: names seed
     the random streams and identify resumable output. Only the first chunk
-    draws velocities; every chunk measures strain from the same reference.
+    draws velocities. Given *reference_box_nm*, every chunk measures strain
+    from that one cell; without it each takes the cell it starts in, which is
+    right only for the first.
     """
     stages: list[Stage] = []
     for index, steps in enumerate(
@@ -354,6 +357,19 @@ def remaining_ps(stages: Iterable[Stage], manifest: RunManifest | None) -> float
     """How much of *stages* the manifest does not already record as done."""
     done = set() if manifest is None else set(manifest.stages)
     return sum(stage.duration_ps for stage in stages if stage.name not in done)
+
+
+def chain_options(
+    chain_backbone: Sequence[int] | None,
+    atoms_per_chain: int | None,
+    expected_characteristic_ratio: float,
+) -> dict[str, Any]:
+    """The chain-measurement keywords a scan passes to every protocol it runs."""
+    return {
+        "chain_backbone": chain_backbone,
+        "atoms_per_chain": atoms_per_chain,
+        "expected_characteristic_ratio": expected_characteristic_ratio,
+    }
 
 
 def equilibrate(
@@ -512,10 +528,10 @@ def write_report_files(
     record opens with the version that wrote it and the versions that produced
     the run, so a surprising number can be placed. Its *fields* are spelled
     out by each workflow rather than taken from ``asdict``, which drops
-    properties, renders arrays as strings and would tie what is on disk to how
-    the dataclasses happen to be laid out. An undefined diagnostic is written
-    as null, as every report writes it. Each ``(stem, figure)`` pair is saved
-    as ``<stem>.<figure_format>``, in the order *figures* yields them.
+    properties and would tie what is on disk to how the dataclasses happen to
+    be laid out. An undefined diagnostic is written as null, as every report
+    writes it. Each ``(stem, figure)`` pair is saved as
+    ``<stem>.<figure_format>``, in the order *figures* yields them.
     """
     from . import __version__
 
@@ -533,19 +549,6 @@ def write_report_files(
 # --------------------------------------------------------------------------
 # Rate scans: one equilibration, every rate and replica branched from it
 # --------------------------------------------------------------------------
-
-
-def chain_options(
-    chain_backbone: Sequence[int] | None,
-    atoms_per_chain: int | None,
-    expected_characteristic_ratio: float,
-) -> dict[str, Any]:
-    """The chain-measurement keywords a scan passes to every protocol it runs."""
-    return {
-        "chain_backbone": chain_backbone,
-        "atoms_per_chain": atoms_per_chain,
-        "expected_characteristic_ratio": expected_characteristic_ratio,
-    }
 
 
 def resumable_record(

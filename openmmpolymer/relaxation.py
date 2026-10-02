@@ -7,9 +7,10 @@ for the same reason.
 
 :mod:`openmmpolymer.elasticity` measures how hard a cell pushes back. This
 measures how long it keeps pushing. A single affine step strain is applied, the
-box is locked, and the stress decays: ``E(t)`` for a tensile step, ``G(t)`` for
-a shear one. It is the function a Prony series and a stretched exponential are
-fitted to, and the thing a viscoelastic material model is actually made of.
+box is locked, and the stress decays: ``G(t)``, whether the step was tensile or
+shear, with ``E(t)`` derived from it. It is the function a Prony series and a
+stretched exponential are fitted to, and the thing a viscoelastic material
+model is actually made of.
 
 What is measured is the *shear* relaxation modulus, whichever step was
 applied, and that is not a convention. For an isotropic solid under an imposed
@@ -33,9 +34,11 @@ could not do.
 
 The decay has a floor. The pre-strain window measures what the cell was already
 carrying, and its scatter is the level below which a relaxed cell and a
-relaxing one are the same measurement. Every curve carries that floor and every
-fit refuses to rest on points underneath it, because a stretched exponential
-fitted to noise is an extremely convincing description of nothing.
+relaxing one are the same measurement. Every curve carries that floor. Every
+fit stops where the signal does - at the last bin standing
+:data:`SIGNAL_TO_NOISE_FLOOR` of its own standard errors clear of zero -
+because a stretched exponential fitted to noise is an extremely convincing
+description of nothing.
 
 What makes the early part of the curve mean anything is replicas, not
 sampling. The first bins hold a reading or two, so a single run resolves the
@@ -98,8 +101,8 @@ PRONY_PER_DECADE = 1
 #: the whole window recovered 567 and one reaching a third of it 404.
 PRONY_SLOWEST_FRACTION = 1.0 / 3.0
 
-#: How many standard errors a point must stand above zero to be inside the
-#: fitting window. Not a nicety: the logarithm a stretched exponential is
+#: How many standard errors a bin must stand above zero for the fitting window
+#: to reach it. Not a nicety: the logarithm a stretched exponential is
 #: fitted through biases low by about half the squared relative error, which
 #: is five per cent at a signal-to-noise of three and thirteen at two.
 SIGNAL_TO_NOISE_FLOOR = 3.0
@@ -230,8 +233,8 @@ class RelaxationCurve:
 
         The one place a Poisson ratio enters, and it is the *material's*, not
         the one the box was scaled by. Pass a measured one where there is one -
-        :func:`~openmmpolymer.elasticity.poisson_ratio` fits it from an
-        extension - rather than letting the default stand in for it.
+        the ``ratio`` :func:`~openmmpolymer.elasticity.poisson_ratio` fits from
+        an extension - rather than letting the default stand in for it.
 
         Args:
             poisson: The material's Poisson ratio. None takes the one the
@@ -240,6 +243,10 @@ class RelaxationCurve:
 
         Returns:
             Young's relaxation modulus at each time.
+
+        Raises:
+            AnalysisError: There is no ratio to use: none was passed, and a
+                shear step imposed none.
         """
         ratio = self.poisson if poisson is None else float(poisson)
         if not math.isfinite(ratio):
@@ -542,7 +549,7 @@ def mean_curve(curves: Sequence[RelaxationCurve]) -> RelaxationCurve:
         raise AnalysisError(
             "These replicas share no bin, so they were not run on one grid "
             "and cannot be averaged. Check that they were given the same "
-            "total duration and bins_per_decade."
+            "sample_every_ps, total duration and bins_per_decade."
         )
 
     def stack(
@@ -610,7 +617,10 @@ def _signal_window(
     The test runs from the end because the earliest bins are noisy for the
     opposite reason - one reading each - and the usable stretch is in the
     middle. How far above its error a bin must stand is
-    :data:`SIGNAL_TO_NOISE_FLOOR`, and why.
+    :data:`SIGNAL_TO_NOISE_FLOOR`, and why; a bin with no error to judge it
+    by, a single reading, passes when it is positive. Inside the window a bin
+    that came out non-positive is still left out, because a stretched
+    exponential is fitted through its logarithm.
     """
     scale = np.where(np.isfinite(error_mpa), error_mpa, 0.0)
     usable = modulus_mpa > floor * scale
@@ -695,8 +705,8 @@ def fit_kww(
     Args:
         curve: What :func:`relaxation_curve` or :func:`mean_curve` returned.
         min_points: Fewest bins the fit may rest on.
-        signal_to_noise: How far a bin must stand above its own error to be
-            inside the window.
+        signal_to_noise: How many of its own standard errors a bin must
+            stand above zero for the window to reach it.
 
     Returns:
         The fit, whose ``resolved`` says whether to believe it.
@@ -792,9 +802,9 @@ def nnls(
 
     Deterministic and terminating. Each outer round moves one index into the
     free set and no set repeats, so it stops on its own; the iteration caps
-    are against floating point, not the reason it ends. Fed pure noise it
-    returns zeros, which is the right shape for a caller that has to be able
-    to say it found nothing.
+    are against floating point, not the reason it ends. Fed a target that no
+    non-negative weight improves on it returns zeros, which is the right shape
+    for a caller that has to be able to say it found nothing.
 
     Args:
         design: The ``(rows, columns)`` matrix.
@@ -899,8 +909,8 @@ def fit_prony(
         curve: What :func:`relaxation_curve` or :func:`mean_curve` returned.
         min_points: Fewest bins the fit may rest on.
         per_decade: Relaxation times per decade in the grid.
-        signal_to_noise: How far a bin must stand above its own error to be
-            inside the window.
+        signal_to_noise: How many of its own standard errors a bin must
+            stand above zero for the window to reach it.
 
     Returns:
         The spectrum, whose ``resolved`` says whether to believe it.

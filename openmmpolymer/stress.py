@@ -95,6 +95,9 @@ def pressure_bar(simulation: Any) -> float:
     Returns:
         The pressure in bar. Instantaneously very noisy - see the module
         docstring.
+
+    Raises:
+        StressError: There is no barostat, so there is nothing to ask.
     """
     kind, barostat = _require_barostat(simulation)
     if kind == "flexible":
@@ -160,6 +163,10 @@ def stress_tensor_bar(simulation: Any) -> npt.NDArray[np.float64]:
 
     Returns:
         A symmetric ``(3, 3)`` array in bar, NaN where nothing was measured.
+
+    Raises:
+        StressError: There is no barostat, or it is the isotropic one - see
+            :func:`pressure_tensor_bar`.
     """
     return -pressure_tensor_bar(simulation)
 
@@ -170,7 +177,9 @@ def tensile_stress_bar(stress: npt.NDArray[np.float64], axis: int = 2) -> float:
     ``sigma_zz - (sigma_xx + sigma_yy) / 2``. The lateral axes are held at the
     target pressure by a barostat, but only on average and only as fast as the
     cell relaxes, so subtracting what they actually did removes a drift the
-    driven axis would otherwise be credited with.
+    driven axis would otherwise be credited with. In a box held fixed, as the
+    relaxation stage holds it, the same subtraction removes the isotropic
+    background, leaving the deviatoric part :func:`deviatoric_strain` describes.
 
     Args:
         stress: A stress tensor, from :func:`stress_tensor_bar`.
