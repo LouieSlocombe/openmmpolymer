@@ -24,6 +24,7 @@ from openmmpolymer.mdsystem import (
     check_box,
     check_target_density,
     check_timestep,
+    ensemble_controls,
     find_barostat,
     make_barostat,
     max_timestep_fs,
@@ -605,3 +606,31 @@ def test_a_barostat_may_be_built_at_zero_frequency() -> None:
     """A probe attached only so that its pressure readout can be called."""
     barostat = make_barostat("flexible", 300.0, 1.0, 0, 7)
     assert barostat.getFrequency() == 0
+
+
+def test_ensemble_controls_lists_every_control_in_force_order() -> None:
+    """Disabled and membrane barostats count alongside the thermostat."""
+    system = mm.System()
+    assert ensemble_controls(system) == []
+    system.addForce(mm.NonbondedForce())
+    system.addForce(mm.CMMotionRemover())
+    assert ensemble_controls(system) == []
+    for kind in ("isotropic", "anisotropic", "flexible"):
+        system.addForce(make_barostat(kind, 300.0, 1.0, 0, 7))
+    system.addForce(mm.AndersenThermostat(300.0, 1.0))
+    system.addForce(
+        mm.MonteCarloMembraneBarostat(
+            1.0,
+            0.0,
+            300.0,
+            mm.MonteCarloMembraneBarostat.XYIsotropic,
+            mm.MonteCarloMembraneBarostat.ZFree,
+        )
+    )
+    assert ensemble_controls(system) == [
+        "MonteCarloBarostat",
+        "MonteCarloAnisotropicBarostat",
+        "MonteCarloFlexibleBarostat",
+        "AndersenThermostat",
+        "MonteCarloMembraneBarostat",
+    ]

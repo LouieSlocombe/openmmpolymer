@@ -16,10 +16,13 @@ from openmmpolymer.chain import (
     ChainSpec,
     _atom_names,
     _characteristic_ratio,
+    _mean_bond_length_nm,
+    _radius_of_gyration_nm,
     _trans_fraction,
     assemble_chain,
     build_chain,
 )
+from openmmpolymer.protocols import _chain_dimension_sums
 
 PE = "[*]CC[*]"
 PS = "[*]CC([*])c1ccccc1"
@@ -200,6 +203,75 @@ def test_the_seed_decides_the_conformers(pe12: ChainResult, tmp_path: Path) -> N
     )
     assert again.radius_of_gyration_nm == pe12.radius_of_gyration_nm[:2]
     assert other.radius_of_gyration_nm != again.radius_of_gyration_nm
+
+
+@pytest.mark.parametrize(
+    ("seed", "radii", "extents", "ratio"),
+    [
+        (
+            5,
+            (0.5787275880836984, 0.7165536334243441),
+            (2.011338353852507, 2.53652057500043),
+            7.186237870164912,
+        ),
+        (
+            6,
+            (0.8130763029789595, 0.7995003794693913),
+            (2.7388088441624765, 2.8050869338411406),
+            11.185481234792949,
+        ),
+    ],
+)
+def test_chain_result_floats_keep_the_recorded_build_inputs(
+    tmp_path: Path,
+    seed: int,
+    radii: tuple[float, ...],
+    extents: tuple[float, ...],
+    ratio: float,
+) -> None:
+    """Even one ulp changes the exact floats compared by build/inputs.json.
+
+    These independent golden values were recorded before consolidation, with
+    the CPU environment's RDKit, for two grown conformers of each seed.
+    """
+    result = build_chain(
+        ChainSpec(
+            monomer_smiles=PE, degree_of_polymerization=12, residue_name="PE", seed=seed
+        ),
+        "golden",
+        n_conformers=2,
+        output_dir=tmp_path,
+    )
+    assert result.molar_mass_g_mol == 338.664
+    assert result.radius_of_gyration_nm == radii
+    assert result.max_extent_nm == extents
+    assert result.characteristic_ratio == ratio
+
+
+def test_chain_and_protocol_dimension_kernels_agree(pe12: ChainResult) -> None:
+    """The two unit conventions agree, without rerouting recorded build floats."""
+    molecule = _conformer(pe12.sdf_paths[0])
+    masses = np.array(
+        [molecule.GetAtomWithIdx(index).GetMass() for index in range(pe12.n_atoms)],
+        dtype=np.float64,
+    )
+    rng = np.random.default_rng(40)
+    conformers = [np.asarray(molecule.GetConformer().GetPositions(), dtype=np.float64)]
+    conformers.extend(rng.normal(size=(pe12.n_atoms, 3)) for _ in range(200))
+    for positions_angstrom in conformers:
+        sums = _chain_dimension_sums(
+            positions_angstrom / 10.0,
+            pe12.backbone,
+            pe12.n_atoms,
+            1,
+            masses=masses,
+        )
+        assert sums.sum_radius_of_gyration_nm == pytest.approx(
+            _radius_of_gyration_nm(molecule, positions_angstrom), rel=0.0, abs=1e-12
+        )
+        assert sums.sum_bond_length_nm == pytest.approx(
+            _mean_bond_length_nm(positions_angstrom, pe12.backbone), rel=0.0, abs=1e-12
+        )
 
 
 def test_the_backbone_runs_bonded_from_head_to_tail(pe12: ChainResult) -> None:

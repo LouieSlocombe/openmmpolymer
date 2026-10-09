@@ -6,8 +6,10 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import openmm as mm
 import pytest
+from openmm import unit
 from openmm.app.internal.xtc_utils import get_xtc_nframes
 
 from openmmpolymer.reporters import (
@@ -20,6 +22,7 @@ from openmmpolymer.reporters import (
     steps_for,
 )
 from openmmpolymer.simulate import run_nvt
+from openmmpolymer.timeseries import CSV_FIELDS, read_state_data
 
 from .helpers import bare_simulation
 
@@ -211,6 +214,33 @@ def test_the_csv_columns_are_the_documented_ones(argon_run: Any) -> None:
     header = Path(paths.csv).read_text().splitlines()[0]
     assert len(header.split(",")) == len(CSV_COLUMNS)
     assert "Progress" not in header
+    table = np.genfromtxt(paths.csv, delimiter=",", names=True)
+    assert table.dtype.names == tuple(CSV_FIELDS.values())
+    data = read_state_data(paths.csv, stage="stage")
+    assert data.stage == "stage"
+    assert data.path == paths.csv
+    for field, column in CSV_FIELDS.items():
+        np.testing.assert_array_equal(getattr(data, field), table[column])
+    np.testing.assert_array_equal(data.step, [10, 20])
+    state = simulation.context.getState(getEnergy=True)
+    assert data.time_ps[-1] == pytest.approx(
+        state.getTime().value_in_unit(unit.picosecond)
+    )
+    assert data.potential_energy_kj_mol[-1] == pytest.approx(
+        state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+    )
+    assert data.kinetic_energy_kj_mol[-1] == pytest.approx(
+        state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
+    )
+    np.testing.assert_allclose(
+        data.total_energy_kj_mol,
+        data.potential_energy_kj_mol + data.kinetic_energy_kj_mol,
+    )
+    assert data.volume_nm3[-1] == pytest.approx(
+        state.getPeriodicBoxVolume().value_in_unit(unit.nanometer**3)
+    )
+    assert np.all(data.temperature_k > 0.0)
+    assert np.all(data.density_g_cm3 > 0.0)
 
 
 def test_a_requested_frame_interval_is_what_the_trajectory_gets(

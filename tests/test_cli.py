@@ -67,6 +67,12 @@ RECORDED_REQUEST_SHA256 = {
     "yield": "012ff7978ea93edc33b04a21caffd630ca654b2d45a5786e0e9ad0a6e071f44a",
 }
 
+# The action schema also pins parsing and user-visible help, which need not
+# affect the shortest command lines above to change the CLI contract.
+RECORDED_PARSER_SHA256 = (
+    "37b929f66932aa135a27f88ce8a92fc9c97d30e4ab68655b74d260766120325b"
+)
+
 #: What the build request leaves out: where things go, which device runs
 #: them, how much is said, and whether - or under what budget - dynamics
 #: start. None of them changes the physical system.
@@ -293,6 +299,33 @@ def test_every_setting_a_build_request_records_is_pinned() -> None:
     ):
         recorded[protocol] = _sha256(vars(parser.parse_args(_argv(protocol))))
     assert recorded == RECORDED_REQUEST_SHA256
+
+
+def test_the_whole_parser_action_schema_is_pinned() -> None:
+    """Defaults alone cannot detect a changed converter, choice, arity or help."""
+    recorded = []
+    for action in build_parser()._actions:
+        action_type = action.type
+        converter = None
+        if action_type is not None:
+            assert hasattr(action_type, "__qualname__")
+            converter = f"{action_type.__module__}.{action_type.__qualname__}"
+        recorded.append(
+            {
+                "action": type(action).__name__,
+                "option_strings": action.option_strings,
+                "dest": action.dest,
+                "default": action.default,
+                "const": action.const,
+                "type": converter,
+                "choices": action.choices,
+                "nargs": action.nargs,
+                "help": action.help,
+                "required": action.required,
+                "metavar": action.metavar,
+            }
+        )
+    assert _sha256(recorded) == RECORDED_PARSER_SHA256
 
 
 def test_the_build_request_is_every_setting_but_where_and_how_it_runs(

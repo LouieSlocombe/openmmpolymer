@@ -9,16 +9,56 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 from openmm import unit
 
 from openmmpolymer._seeds import derive_seed, seed_random_stream
 from openmmpolymer._validation import (
+    require_axis,
     require_choice,
     require_finite,
     require_integer,
+    require_plane,
     require_positive,
 )
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_each_cartesian_axis_is_accepted(axis: int) -> None:
+    assert require_axis(axis) == axis
+
+
+@pytest.mark.parametrize("axis", [-1, 3, True, False, 1.0, "1", None, np.int64(1)])
+def test_an_axis_is_a_plain_cartesian_integer(axis: object) -> None:
+    with pytest.raises(ValueError, match=r"loading_axis=.*must be 0, 1 or 2"):
+        require_axis(axis, name="loading_axis")
+
+
+@pytest.mark.parametrize("plane", [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)])
+def test_a_plane_preserves_driven_and_gradient_order(plane: tuple[int, int]) -> None:
+    assert require_plane(list(plane)) == plane
+
+
+@pytest.mark.parametrize(
+    "plane",
+    [
+        (),
+        (0,),
+        (0, 1, 2),
+        (1, 1),
+        (-1, 2),
+        (0, 3),
+        (True, 2),
+        (0, False),
+        (0, 1.0),
+        ("0", 1),
+        (0, np.int64(1)),
+    ],
+)
+def test_a_plane_requires_two_distinct_plain_axes(plane: tuple[int, ...]) -> None:
+    with pytest.raises(ValueError, match=r"shear_plane=.*two different axes"):
+        require_plane(plane, name="shear_plane")
 
 
 def test_a_bare_number_is_taken_to_be_in_the_expected_unit() -> None:
