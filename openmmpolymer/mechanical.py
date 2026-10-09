@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ._files import ReportFiles
+from ._files import ReportFiles, figure_stem
 from ._fitting import MAX_REPLICA_SPREAD as MAX_REPLICA_SPREAD
 from ._fitting import NEGLIGIBLE, PS_PER_NS
 from ._validation import require_axis, require_integer
@@ -581,13 +581,14 @@ def _log_result(report: ModulusReport, schedule: ModulusSchedule) -> None:
                 "" if fit.resolved else " (not resolved)",
             )
     if report.consistency is not None:
+        check = report.consistency
+        gaps = ", ".join(f"{name} {100.0 * gap:.0f}%" for name, gap in check.gaps)
         log.info(
-            "  E and nu imply K = %.0f, G = %.0f MPa; gaps %.0f%% and %.0f%%%s.",
-            report.consistency.bulk_implied_mpa,
-            report.consistency.shear_implied_mpa,
-            100.0 * report.consistency.bulk_gap,
-            100.0 * report.consistency.shear_gap,
-            "" if report.consistency.consistent else " - not consistent",
+            "  E and nu imply K = %.0f, G = %.0f MPa; %s%s.",
+            check.bulk_implied_mpa,
+            check.shear_implied_mpa,
+            f"gaps {gaps}" if gaps else "nothing measured to check them against",
+            "" if check.consistent or not gaps else " - not consistent",
         )
     if math.isfinite(report.method_gap):
         log.info(
@@ -883,7 +884,7 @@ def write_mechanical_report(
 def _figures(report: ModulusReport) -> Iterator[tuple[str, Figure]]:
     """Each replica's stress-strain curve, the constant-stress one, the moduli."""
     for curve, fit in zip(report.curves, report.replicas, strict=False):
-        stem = curve.stage.replace(", ", "_").replace(" ", "_")
+        stem = figure_stem(curve.stage, fallback="stage")
         yield (
             f"stress_strain_{stem}",
             plot_stress_strain(curve, fit=fit, poisson=report.poisson),

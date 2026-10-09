@@ -83,7 +83,7 @@ from .relaxation import (
     relaxation_curve,
 )
 from .simulate import RELAX_MODES, RunContext, relax_bin_edges_ps, safe_timestep_fs
-from .trajectory import AnalysisError
+from .trajectory import AnalysisError, load_manifest
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
@@ -703,6 +703,7 @@ def analyse_relaxation(
     run_dir: str | Path,
     *,
     min_points: int = MIN_RELAXATION_POINTS,
+    manifest: RunManifest | None = None,
 ) -> RelaxationReport:
     """Read everything a finished run has to say about its stress relaxation.
 
@@ -730,12 +731,14 @@ def analyse_relaxation(
         AnalysisError: There is no manifest, or nothing in it was a relaxation.
     """
     directory = Path(run_dir)
+    if manifest is None:
+        manifest = load_manifest(directory)
     notes: list[str] = []
     curves: list[RelaxationCurve] = []
 
-    for group in group_by_stem(relax_stages(directory)):
+    for group in group_by_stem(relax_stages(directory, manifest=manifest)):
         try:
-            curves.append(relaxation_curve(directory, group))
+            curves.append(relaxation_curve(directory, group, manifest=manifest))
         except AnalysisError as error:
             notes.append(f"Skipped {', '.join(group)}: {error}")
 

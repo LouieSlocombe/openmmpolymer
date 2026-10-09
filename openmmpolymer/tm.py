@@ -15,10 +15,10 @@ reads a prepared cell with its System, and :func:`run_tm_scan` heats it.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -36,10 +36,12 @@ from ._workflow import (
     run_fingerprint,
     spec_request,
     with_timestep,
+    write_report_files,
 )
 from .forcefield import PolymerForceField
 from .mdsystem import PackedBox, SystemSpec, require_no_ensemble_controls
 from .packing import read_pdb
+from .plots import plot_melting
 from .protocols import (
     Protocol,
     RunManifest,
@@ -50,7 +52,10 @@ from .protocols import (
 )
 from .reporters import TrajectoryOptions
 from .simulate import RunContext, heating_temperatures, prepare_run, safe_timestep_fs
-from .trajectory import AnalysisError
+from .trajectory import AnalysisError, load_manifest, stages_holding
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 PROTOCOL_NAME = "tm_heating"
 WORKFLOW_NAME = "tm_workflow.json"
@@ -314,42 +319,45 @@ def melting_scan(spec: TmSpec = DEFAULT_SPEC) -> Protocol:
     return protocol
 
 
-def heating_stages(run_dir: str | Path) -> tuple[str, ...]:
+def _is_heating(samples: dict[str, Any]) -> bool:
+    """Keep malformed enthalpy candidates visible to the curve reader."""
+    if "segment_enthalpy_kj_mol" not in samples:
+        return False
+    try:
+        temperatures = np.asarray(samples["segment_temperature_k"], dtype=float)
+        return not (
+            temperatures.ndim == 1
+            and len(temperatures) > 1
+            and np.all(np.diff(temperatures) < 0)
+        )
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def heating_stages(
+    run_dir: str | Path, *, manifest: RunManifest | None = None
+) -> tuple[str, ...]:
     """Find stages carrying heating enthalpy samples, including one-point chunks."""
-    manifest = RunManifest.load(run_dir)
-    if manifest is None:
-        raise AnalysisError(f"No manifest in {run_dir}.")
-    names = []
-    for name, record in manifest.stages.items():
-        samples = record.get("samples", {})
-        if "segment_enthalpy_kj_mol" not in samples:
-            continue
-        try:
-            temperatures = np.asarray(samples["segment_temperature_k"], dtype=float)
-            if (
-                temperatures.ndim == 1
-                and len(temperatures) > 1
-                and np.all(np.diff(temperatures) < 0)
-            ):
-                continue
-        except (KeyError, TypeError, ValueError):
-            # Keep malformed candidates visible so heating_curve names the
-            # offending stage instead of silently shortening the history.
-            pass
-        names.append(name)
-    return tuple(names)
+    return stages_holding(
+        run_dir,
+        _is_heating,
+        "heating enthalpy samples",
+        manifest=manifest,
+        allow_empty=True,
+    )
 
 
 def heating_curve(
     run_dir: str | Path,
     stages: str | Sequence[str] | None = None,
+    *,
+    manifest: RunManifest | None = None,
 ) -> HeatingCurve:
     """Read a recorded ascending history without modifying its manifest."""
-    manifest = RunManifest.load(run_dir)
     if manifest is None:
-        raise AnalysisError(f"No manifest in {run_dir}.")
+        manifest = load_manifest(run_dir)
     names = (
-        heating_stages(run_dir)
+        heating_stages(run_dir, manifest=manifest)
         if stages is None
         else ((stages,) if isinstance(stages, str) else tuple(stages))
     )
@@ -796,20 +804,10 @@ def write_melting_report(
     """Write ``tm.json`` and a paired volume/enthalpy plot, outside the manifest.
 
     Into ``<run_dir>/analysis``, or into *output_dir*. The plot is
-    ``melting.<figure_format>``, which must be png, pdf or svg.
+    ``melting.<figure_format>``. Its format must be a plain filename extension
+    accepted by matplotlib when figures are requested.
     """
-    from . import __version__
-
-    directory = (
-        Path(output_dir)
-        if output_dir is not None
-        else Path(report.run_dir) / "analysis"
-    )
-    if figure_format not in ("png", "pdf", "svg"):
-        raise ValueError("figure_format must be png, pdf or svg.")
-    directory.mkdir(parents=True, exist_ok=True)
-    record = {
-        "openmmpolymer": __version__,
+    fields = {
         "method": "apparent melting from NPT heating",
         **asdict(report),
         "temperature_k": report.temperature_k,
@@ -817,29 +815,16 @@ def write_melting_report(
         "heating_rate_k_per_ns": report.curve.heating_rate_k_per_ns,
         "enthalpy_units": "kJ/mol of simulation cells",
     }
-    path = directory / "tm.json"
-    write_json(path, record)
-    paths: list[str] = []
-    if figures:
-        from matplotlib.figure import Figure
+    return write_report_files(
+        report.run_dir,
+        output_dir,
+        "tm.json",
+        fields,
+        _figures(report) if figures else (),
+        figure_format,
+    )
 
-        figure = Figure(figsize=(7, 7), layout="constrained")
-        axes = figure.subplots(2, 1, sharex=True)
-        curve = report.curve
-        axes[0].plot(curve.temperature_k, curve.specific_volume_cm3_g, "o-")
-        axes[1].plot(curve.temperature_k, curve.enthalpy_kj_mol, "o-")
-        axes[0].set_ylabel("Specific volume (cm³/g)")
-        axes[1].set_ylabel("Enthalpy (kJ/mol of cells)")
-        axes[1].set_xlabel("Temperature (K)")
-        for axis in axes:
-            if report.transition.bracket_k is not None:
-                axis.axvspan(*report.transition.bracket_k, alpha=0.2, color="tab:red")
-        rate = curve.heating_rate_k_per_ns
-        label = "irregular heating schedule" if rate is None else f"{rate:g} K/ns"
-        figure.suptitle(
-            f"Apparent melting scan - {label}, {curve.pressure_bar[0]:g} bar"
-        )
-        figure_path = directory / f"melting.{figure_format}"
-        figure.savefig(figure_path)
-        paths.append(str(figure_path))
-    return ReportFiles(str(path), tuple(paths))
+
+def _figures(report: MeltingReport) -> Iterator[tuple[str, Figure]]:
+    """Defer plotting until the JSON has been written."""
+    yield "melting", plot_melting(report)

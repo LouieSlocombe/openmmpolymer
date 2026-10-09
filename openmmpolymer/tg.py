@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ._files import ReportFiles, write_json
+from ._files import ReportFiles, figure_stem, write_json
 from ._fitting import PS_PER_NS
 from ._validation import require_integer, require_positive
 from ._workflow import (
@@ -77,7 +77,7 @@ from .timeseries import (
     quench_stages,
     read_state_data,
 )
-from .trajectory import AnalysisError
+from .trajectory import AnalysisError, load_manifest
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
@@ -1154,10 +1154,13 @@ def analyse_tg(
     stages: list[str] = []
     curves: list[QuenchCurve] = []
     for index, candidate in enumerate([directory, *map(Path, extra_run_dirs)]):
-        for group in _group_passes(candidate, quench_stages(candidate)):
+        manifest = load_manifest(candidate)
+        for group in _group_passes(
+            candidate, quench_stages(candidate, manifest=manifest), manifest=manifest
+        ):
             joined = ", ".join(group)
             stages.append(joined if index == 0 else f"{candidate}:{joined}")
-            curves.append(quench_curve(candidate, group))
+            curves.append(quench_curve(candidate, group, manifest=manifest))
 
     # Paired as they are fitted, and a curve too short to fit drops out of
     # both lists together. Zipping them back up afterwards would pair the
@@ -1245,7 +1248,9 @@ def analyse_tg(
     )
 
 
-def _group_passes(run_dir: str | Path, names: Sequence[str]) -> list[tuple[str, ...]]:
+def _group_passes(
+    run_dir: str | Path, names: Sequence[str], *, manifest: RunManifest | None = None
+) -> list[tuple[str, ...]]:
     """Group the stages that walked one ladder between them.
 
     The pieces a ladder was split into for resume are one cooling history and
@@ -1253,10 +1258,12 @@ def _group_passes(run_dir: str | Path, names: Sequence[str]) -> list[tuple[str, 
     when they stepped the same way and held for the same time, which is a
     property of what they recorded rather than of what they were named.
     """
+    if manifest is None:
+        manifest = load_manifest(run_dir)
     grouped: dict[tuple[float, float], list[str]] = {}
     order: list[tuple[float, float]] = []
     for name in names:
-        curve = quench_curve(run_dir, name)
+        curve = quench_curve(run_dir, name, manifest=manifest)
         key = (
             round(curve.temperature_step_k, 6),
             round(-1.0 if curve.hold_ps is None else curve.hold_ps, 6),
@@ -1390,7 +1397,7 @@ def write_tg_report(
 def _figures(report: TgReport) -> Iterator[tuple[str, Figure]]:
     """A figure per quench and per rate fit, and the melt's volume series."""
     for curve, transition in zip(report.curves, report.transitions, strict=False):
-        stem = curve.stage.replace(", ", "_").replace(" ", "_")
+        stem = figure_stem(curve.stage, fallback="stage")
         yield f"quench_{stem}", plot_quench_curve(curve, transition=transition)
     for fit in (report.log_linear, report.vft):
         if fit is not None:

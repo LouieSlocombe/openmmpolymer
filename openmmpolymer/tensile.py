@@ -37,14 +37,14 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ._files import ReportFiles, json_value, write_json
+from ._files import ReportFiles, write_json
 from ._fitting import PS_PER_NS
 from ._validation import require_axis, require_integer, require_positive
 from ._workflow import (
@@ -58,6 +58,7 @@ from ._workflow import (
     sample_spread,
     scan_listing,
     settled_state,
+    write_report_files,
 )
 from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .elasticity import StressStrain, stress_strain
@@ -80,6 +81,9 @@ from .strength import (
     yield_strength,
 )
 from .trajectory import AnalysisError
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 log = logging.getLogger(__name__)
 
@@ -852,7 +856,7 @@ def _recorded_spec(
 
 
 def _read_replica(
-    directory: Path, stages: dict[str, dict[str, Any]], names: Sequence[str]
+    directory: Path, manifest: RunManifest, names: Sequence[str]
 ) -> StressStrain:
     """Check that the chunks continue one ladder, then read them as one curve.
 
@@ -863,7 +867,7 @@ def _read_replica(
     axis: int | None = None
     last_strain = -1.0
     for name in names:
-        samples = stages[name]["samples"]
+        samples = manifest.stages[name]["samples"]
         reference = np.asarray(samples["reference_box_nm"], dtype=np.float64)
         recorded_axis = samples["deform_axis"]
         if (
@@ -904,14 +908,18 @@ def _read_replica(
             ):
                 raise ValueError(f"{name} has nonpositive {key} samples.")
         last_strain = float(strain[-1])
-    return stress_strain(directory, names)
+    return stress_strain(directory, names, manifest=manifest)
 
 
 def _analyse[R: BreakingReport | ElongationReport | YieldReport](
-    measurement: TensileMeasurement[R], run_dir: str | Path
+    measurement: TensileMeasurement[R],
+    run_dir: str | Path,
+    *,
+    manifest: RunManifest | None = None,
 ) -> R:
     directory = Path(run_dir)
-    manifest = RunManifest.load(directory)
+    if manifest is None:
+        manifest = RunManifest.load(directory)
     chunks = _replica_chunks(measurement, manifest, directory)
     assert manifest is not None  # the replicas above were found in it
     record = _read_record(measurement, directory)
@@ -923,7 +931,7 @@ def _analyse[R: BreakingReport | ElongationReport | YieldReport](
     fits: list[Any] = []
     for replica, names in chunks.items():
         try:
-            curve = _read_replica(directory, manifest.stages, names)
+            curve = _read_replica(directory, manifest, names)
             fit = measurement.fit(curve, **criterion)
         except (KeyError, TypeError, ValueError, IndexError) as error:
             raise AnalysisError(
@@ -968,19 +976,25 @@ def _analyse[R: BreakingReport | ElongationReport | YieldReport](
     )
 
 
-def analyse_breaking(run_dir: str | Path) -> BreakingReport:
+def analyse_breaking(
+    run_dir: str | Path, *, manifest: RunManifest | None = None
+) -> BreakingReport:
     """Read a breaking scan's apparent tensile strength under its saved criterion."""
-    return _analyse(BREAKING, run_dir)
+    return _analyse(BREAKING, run_dir, manifest=manifest)
 
 
-def analyse_elongation(run_dir: str | Path) -> ElongationReport:
+def analyse_elongation(
+    run_dir: str | Path, *, manifest: RunManifest | None = None
+) -> ElongationReport:
     """Read an elongation scan's apparent elongation at break, as a percentage."""
-    return _analyse(ELONGATION, run_dir)
+    return _analyse(ELONGATION, run_dir, manifest=manifest)
 
 
-def analyse_yield(run_dir: str | Path) -> YieldReport:
+def analyse_yield(
+    run_dir: str | Path, *, manifest: RunManifest | None = None
+) -> YieldReport:
     """Read a yield scan's offset proof stress under its saved offset and fit window."""
-    return _analyse(YIELD, run_dir)
+    return _analyse(YIELD, run_dir, manifest=manifest)
 
 
 def _write_report[R: BreakingReport | ElongationReport | YieldReport](
@@ -991,22 +1005,24 @@ def _write_report[R: BreakingReport | ElongationReport | YieldReport](
     figures: bool,
     figure_format: str,
 ) -> ReportFiles:
-    directory = (
-        Path(report.run_dir) / "analysis" if output_dir is None else Path(output_dir)
+    return write_report_files(
+        report.run_dir,
+        output_dir,
+        f"{measurement.name}.json",
+        asdict(report),
+        _figures(measurement, report) if figures else (),
+        figure_format,
     )
-    directory.mkdir(parents=True, exist_ok=True)
-    path = write_json(
-        directory / f"{measurement.name}.json", json_value(asdict(report))
-    )
-    written: list[str] = []
-    if figures:
-        for index, curve, fit in zip(
-            report.replica_indices, report.curves, report.replicas, strict=True
-        ):
-            figure_path = directory / f"{measurement.name}_r{index}.{figure_format}"
-            measurement.plot(curve, fit).savefig(figure_path, bbox_inches="tight")
-            written.append(str(figure_path))
-    return ReportFiles(json=path, figures=tuple(written))
+
+
+def _figures[R: BreakingReport | ElongationReport | YieldReport](
+    measurement: TensileMeasurement[R], report: R
+) -> Iterator[tuple[str, Figure]]:
+    """Defer each replica's plot until the JSON has been written."""
+    for index, curve, fit in zip(
+        report.replica_indices, report.curves, report.replicas, strict=True
+    ):
+        yield f"{measurement.name}_r{index}", measurement.plot(curve, fit)
 
 
 def write_breaking_report(

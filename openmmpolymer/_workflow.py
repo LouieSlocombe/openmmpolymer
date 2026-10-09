@@ -30,7 +30,13 @@ from typing import TYPE_CHECKING, Any, Self
 import numpy as np
 import numpy.typing as npt
 
-from ._files import ReportFiles, file_sha256, write_json, write_report
+from ._files import (
+    ReportFiles,
+    analysis_directory,
+    file_sha256,
+    write_json,
+    write_report,
+)
 from ._fitting import PS_PER_NS
 from ._validation import require_positive
 from .protocols import (
@@ -534,16 +540,15 @@ def write_report_files(
 
     Or into *output_dir*, for a run directory that should not be touched. The
     record opens with the version that wrote it and the versions that produced
-    the run, so a surprising number can be placed. Its *fields* are spelled
-    out by each workflow rather than taken from ``asdict``, which drops
-    properties and would tie what is on disk to how the dataclasses happen to
-    be laid out. An undefined diagnostic is written as null, as every report
-    writes it. Each ``(stem, figure)`` pair is saved as
+    the run, so a surprising number can be placed. Each workflow owns its
+    *fields* and computed properties; nested plain records can use ``asdict``
+    when their fields are the recorded schema. An undefined diagnostic is
+    written as null, as every report writes it. Each ``(stem, figure)`` pair is saved as
     ``<stem>.<figure_format>``, in the order *figures* yields them.
     """
     from . import __version__
 
-    directory = Path(run_dir) / "analysis" if output_dir is None else Path(output_dir)
+    directory = analysis_directory(run_dir, output_dir)
     manifest = RunManifest.load(run_dir)
     record = {
         "openmmpolymer": __version__,

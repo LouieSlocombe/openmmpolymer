@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ._files import ReportFiles, write_report
+from ._files import ReportFiles, analysis_directory, figure_stem, write_report
 from .plots import plot_rate_dependence
 from .rate_dependence import RateReport
 
@@ -34,12 +33,10 @@ def write_rate_report(
     """
     if output_dir is None and not report.run_dirs:
         raise ValueError("output_dir is required when the report has no run_dirs.")
-    directory = (
-        Path(report.run_dirs[0]) / "analysis"
-        if output_dir is None
-        else Path(output_dir)
+    directory = analysis_directory(
+        report.run_dirs[0] if report.run_dirs else "", output_dir
     )
-    name = re.sub(r"[^A-Za-z0-9_-]+", "_", report.property.name).strip("_")
+    name = figure_stem(report.property.name)
     if not name:
         raise ValueError("The property name must contain a filename-safe character.")
     record = asdict(report)

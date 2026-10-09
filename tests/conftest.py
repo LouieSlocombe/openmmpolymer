@@ -244,3 +244,18 @@ def no_build(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
 
     monkeypatch.setattr(melt, "build_chain", build)
     return asked
+
+
+@pytest.fixture
+def manifest_reads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Count manifest file reads, including readers that parse raw JSON directly."""
+    reads: list[Path] = []
+    original = Path.read_text
+
+    def read(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path.name == "manifest.json":
+            reads.append(path.resolve())
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    return reads

@@ -126,6 +126,16 @@ class PersistenceLength:
     contour_length_nm: float
     decayed: bool
 
+    @property
+    def regime(self) -> str:
+        """Whether a persistence length was measured, extrapolated or unavailable."""
+        fitted = self.persistence_length_nm
+        if fitted == math.inf:
+            return "rod_like"
+        if not math.isfinite(fitted) or fitted <= 0.0:
+            return "unfitted"
+        return "measured" if self.decayed else "extrapolated"
+
 
 @dataclass(frozen=True)
 class EndToEndRelaxation:

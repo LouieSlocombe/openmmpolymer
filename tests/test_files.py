@@ -13,11 +13,36 @@ import pytest
 from matplotlib.figure import Figure
 
 from openmmpolymer._files import (
+    analysis_directory,
+    figure_stem,
     json_value,
     write_atomically,
     write_json,
     write_report,
 )
+
+
+def test_analysis_directory_defaults_to_run_without_creating_files(
+    tmp_path: Path,
+) -> None:
+    assert analysis_directory(tmp_path, None) == tmp_path / "analysis"
+    assert analysis_directory(tmp_path, "elsewhere") == Path("elsewhere")
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("06_coarse_00, 06_coarse_01", "06_coarse_00_06_coarse_01"),
+        ("../../outside/a\\b", "outside_a_b"),
+        ("E / rate", "E_rate"),
+        ("_known-stage_", "known-stage"),
+        ("../", ""),
+    ],
+)
+def test_figure_stem_is_one_safe_filename_component(name: str, expected: str) -> None:
+    assert figure_stem(name) == expected
+    assert figure_stem(name, fallback="observable") == (expected or "observable")
 
 
 def test_json_value_converts_nested_numpy_and_nonfinite_values() -> None:

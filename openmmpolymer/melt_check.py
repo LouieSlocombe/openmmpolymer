@@ -21,10 +21,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ._workflow import optional
 from .conformation import MeanSquaredDisplacement, centre_of_mass_msd
 from .protocols import RunManifest
 from .timeseries import Equilibration, equilibration, read_state_data
-from .trajectory import AnalysisError, open_run
+from .trajectory import load_manifest, open_stage, stage_files
 
 log = logging.getLogger(__name__)
 
@@ -100,14 +101,12 @@ def melt_equilibration(
         AnalysisError: There is no manifest to read.
     """
     directory = Path(run_dir)
-    manifest = RunManifest.load(directory)
-    if manifest is None:
-        raise AnalysisError(f"No manifest in {directory}.")
+    manifest = load_manifest(directory)
 
     unchecked: list[str] = []
     volume = _volume_settling(stage, manifest, unchecked)
     displacement = _chain_displacement(
-        directory, stage, max_lag_fraction, stride, unchecked
+        directory, stage, max_lag_fraction, stride, unchecked, manifest
     )
     radius = radius_of_gyration_nm
     if radius is None:
@@ -145,12 +144,18 @@ def _volume_settling(
             "there is no volume series."
         )
         return None
-    try:
-        series = read_state_data(csv, stage=stage)
-        return equilibration(series.time_ps, series.volume_nm3)
-    except AnalysisError as error:
-        unchecked.append(f"box volume: {error}")
-        return None
+    series = optional(
+        lambda: read_state_data(csv, stage=stage), unchecked, "box volume"
+    )
+    return (
+        None
+        if series is None
+        else optional(
+            lambda: equilibration(series.time_ps, series.volume_nm3),
+            unchecked,
+            "box volume",
+        )
+    )
 
 
 def _chain_displacement(
@@ -159,12 +164,15 @@ def _chain_displacement(
     max_lag_fraction: float,
     stride: int,
     unchecked: list[str],
+    manifest: RunManifest,
 ) -> MeanSquaredDisplacement | None:
     """How far the chains went, or None with a reason why it is not known."""
-    try:
-        ensemble = open_run(directory, stage)
-    except AnalysisError as error:
-        unchecked.append(f"chain displacement: {error}")
+    ensemble = optional(
+        lambda: open_stage(stage_files(directory, stage, manifest=manifest)),
+        unchecked,
+        "chain displacement",
+    )
+    if ensemble is None:
         return None
     if ensemble.is_snapshot:
         unchecked.append(
@@ -174,13 +182,13 @@ def _chain_displacement(
             "npt_trajectory_ps, and the command line takes --check-melt."
         )
         return None
-    try:
-        return centre_of_mass_msd(
+    return optional(
+        lambda: centre_of_mass_msd(
             ensemble, max_lag_fraction=max_lag_fraction, stride=stride
-        )
-    except AnalysisError as error:
-        unchecked.append(f"chain displacement: {error}")
-        return None
+        ),
+        unchecked,
+        "chain displacement",
+    )
 
 
 def _recorded_float(record: dict[str, Any] | None, key: str) -> float | None:

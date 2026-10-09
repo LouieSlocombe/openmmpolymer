@@ -374,7 +374,7 @@ def run_thermal_rate_scan(
     )
 
 
-def _check_completed(directory: Path, entry: dict[str, Any]) -> None:
+def _check_completed(directory: Path, entry: dict[str, Any]) -> RunManifest:
     manifest = RunManifest.load(directory)
     if manifest is None:
         raise AnalysisError(f"Missing thermal rate manifest in {directory}.")
@@ -417,16 +417,23 @@ def _check_completed(directory: Path, entry: dict[str, Any]) -> None:
                     f"{directory}/{stage['name']} has a changed pressure."
                 )
 
+    return manifest
+
 
 def _directories(
     run_dirs: Sequence[str | Path], property_name: str
-) -> list[tuple[Path, dict[str, Any] | None, dict[str, Any] | None]]:
-    result: list[tuple[Path, dict[str, Any] | None, dict[str, Any] | None]] = []
+) -> list[tuple[Path, dict[str, Any] | None, dict[str, Any] | None, RunManifest]]:
+    result: list[
+        tuple[Path, dict[str, Any] | None, dict[str, Any] | None, RunManifest]
+    ] = []
     for value in run_dirs:
         directory = Path(value).resolve()
         workflow = directory / WORKFLOW_NAME
         if not workflow.is_file():
-            result.append((directory, None, None))
+            manifest = RunManifest.load(directory)
+            if manifest is None:
+                raise AnalysisError(f"No thermal manifest in {directory}.")
+            result.append((directory, None, None, manifest))
             continue
         record = json.loads(workflow.read_text())
         if record.get("request", {}).get("property_name") != property_name:
@@ -441,10 +448,10 @@ def _directories(
             candidate = (directory / entry["directory"]).resolve()
             if not candidate.is_relative_to(directory):
                 raise AnalysisError(f"{workflow} has a directory outside its scan.")
-            _check_completed(candidate, entry)
-            result.append((candidate, record, entry))
+            manifest = _check_completed(candidate, entry)
+            result.append((candidate, record, entry, manifest))
     require_distinct(
-        [directory for directory, _, _ in result], what="thermal histories"
+        [directory for directory, _, _, _ in result], what="thermal histories"
     )
     return result
 
@@ -513,18 +520,21 @@ def analyse_thermal_rates(
             "Heating transitions can depend on superheating, finite size and crystal morphology. "
             "Density and enthalpy do not prove loss of crystalline order; inspect saved structures or trajectories."
         )
-    for directory, record, entry in directories:
-        manifest = RunManifest.load(directory)
-        if manifest is None:
-            raise AnalysisError(f"No thermal manifest in {directory}.")
+    for directory, record, entry, manifest in directories:
         metadata = _metadata(directory, record, manifest)
         if property_name == "glass_transition":
             groups = (
                 [tuple(entry["stages"])]
                 if entry is not None
-                else _group_passes(directory, quench_stages(directory))
+                else _group_passes(
+                    directory,
+                    quench_stages(directory, manifest=manifest),
+                    manifest=manifest,
+                )
             )
-            curves = [quench_curve(directory, group) for group in groups]
+            curves = [
+                quench_curve(directory, group, manifest=manifest) for group in groups
+            ]
             finest = min(curve.temperature_step_k for curve in curves)
             for curve in curves:
                 if not math.isclose(curve.temperature_step_k, finest, rel_tol=1e-8):
@@ -569,7 +579,7 @@ def analyse_thermal_rates(
                 )
         else:
             heating = heating_curve(
-                directory, None if entry is None else entry["stages"]
+                directory, None if entry is None else entry["stages"], manifest=manifest
             )
             rate = heating.heating_rate_k_per_ns
             if rate is None:
@@ -638,6 +648,6 @@ def analyse_thermal_rates(
         property=property_,
         target_rate=target_rate,
         max_extrapolation_decades=max_extrapolation_decades,
-        run_dirs=[str(directory) for directory, _, _ in directories],
+        run_dirs=[str(directory) for directory, _, _, _ in directories],
     )
     return replace(report, notes=tuple(notes) + report.notes)

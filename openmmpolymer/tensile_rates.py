@@ -81,7 +81,7 @@ TENSILE_RATE_PROPERTIES = {
 #: For each property, the tensile measurement whose scans record it, how a
 #: finished run of that measurement is read, and which replica fit field
 #: holds the property.
-_EVENTS: dict[str, tuple[TensileMeasurement[Any], Callable[[Path], Any], str]] = {
+_EVENTS: dict[str, tuple[TensileMeasurement[Any], Callable[..., Any], str]] = {
     "yield_strength": (YIELD, analyse_yield, "strength_mpa"),
     "yield_strain": (YIELD, analyse_yield, "yield_strain"),
     "breaking_strength": (BREAKING, analyse_breaking, "strength_mpa"),
@@ -91,7 +91,7 @@ _EVENTS: dict[str, tuple[TensileMeasurement[Any], Callable[[Path], Any], str]] =
 
 def _event(
     property_name: str,
-) -> tuple[TensileMeasurement[Any], Callable[[Path], Any], str]:
+) -> tuple[TensileMeasurement[Any], Callable[..., Any], str]:
     try:
         return _EVENTS[property_name]
     except KeyError:
@@ -342,7 +342,9 @@ def analyse_tensile_rates(
     observations: list[RateObservation] = []
     directories = _directories(run_dirs, property_name, measurement)
     for directory in directories:
-        report = analyse(directory)
+        manifest = RunManifest.load(directory)
+        assert manifest is not None
+        report = analyse(directory, manifest=manifest)
         workflow = directory / measurement.workflow_name
         request = (
             json.loads(workflow.read_text()).get("request", {})
@@ -351,7 +353,7 @@ def analyse_tensile_rates(
         )
         settings = request.get("spec", {})
         if settings:
-            _validate_recorded_ladder(directory, measurement.spec(**settings))
+            _validate_recorded_ladder(directory, measurement.spec(**settings), manifest)
         conditions = {
             key: value
             for key, value in settings.items()
@@ -372,8 +374,6 @@ def analyse_tensile_rates(
             conditions["preparation"] = request["equilibration"]
         if request.get("preparation_state_sha256") is not None:
             conditions["preparation_state_sha256"] = request["preparation_state_sha256"]
-        manifest = RunManifest.load(directory)
-        assert manifest is not None
         if request.get("system") or manifest.system:
             conditions["system"] = request.get("system", manifest.system)
         if manifest.box is not None:
@@ -435,10 +435,10 @@ def analyse_tensile_rates(
     )
 
 
-def _validate_recorded_ladder(directory: Path, spec: TensileSpec) -> None:
+def _validate_recorded_ladder(
+    directory: Path, spec: TensileSpec, manifest: RunManifest
+) -> None:
     """Check physical samples against the saved request, not just point counts."""
-    manifest = RunManifest.load(directory)
-    assert manifest is not None
     for replica in range(spec.n_replicas):
         for stage in tensile_protocol(spec, replica=replica).stages:
             if stage.name not in manifest.stages:

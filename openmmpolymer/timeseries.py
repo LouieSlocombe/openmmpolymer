@@ -57,6 +57,7 @@ from ._fitting import (
     statistical_inefficiency,
 )
 from ._validation import require_choice, require_integer, require_positive
+from .protocols import RunManifest
 from .trajectory import (
     AnalysisError,
     load_manifest,
@@ -583,7 +584,9 @@ def _is_quench(samples: dict[str, Any]) -> bool:
     return all(cooler < hotter for hotter, cooler in itertools.pairwise(temperatures))
 
 
-def quench_stages(run_dir: str | Path) -> tuple[str, ...]:
+def quench_stages(
+    run_dir: str | Path, *, manifest: RunManifest | None = None
+) -> tuple[str, ...]:
     """Name every stage in a run that cooled the cell down a ladder.
 
     A run that quenched twice - a coarse scan to locate the transition and a
@@ -606,11 +609,15 @@ def quench_stages(run_dir: str | Path) -> tuple[str, ...]:
         run_dir,
         _is_quench,
         "that it stepped down a ladder of temperatures, so nothing there was a quench",
+        manifest=manifest,
     )
 
 
 def quench_curve(
-    run_dir: str | Path, stage: str | Sequence[str] = "06_quench"
+    run_dir: str | Path,
+    stage: str | Sequence[str] = "06_quench",
+    *,
+    manifest: RunManifest | None = None,
 ) -> QuenchCurve:
     """Read back the specific-volume curve a quench recorded.
 
@@ -633,7 +640,8 @@ def quench_curve(
             one recorded no per-temperature densities.
     """
     directory = Path(run_dir)
-    manifest = load_manifest(directory)
+    if manifest is None:
+        manifest = load_manifest(directory)
     names = stage_names(stage)
 
     temperatures: list[float] = []

@@ -68,7 +68,7 @@ from .mechanical import (
     equilibration_protocol,
     extra_stages,
 )
-from .protocols import Protocol, Stage, run_protocol
+from .protocols import Protocol, RunManifest, Stage, run_protocol
 from .rate_dependence import (
     _TEMPERATURE_TOLERANCE_K,
     RateObservation,
@@ -407,24 +407,28 @@ def run_elastic_rate_scan(
     )
 
 
-def _read_stages(directory: Path) -> dict[str, Any]:
+def _read_rate_manifest(directory: Path) -> dict[str, Any]:
     path = directory / "manifest.json"
     if not path.is_file():
         raise AnalysisError(f"No completed rate manifest in {directory}.")
-    return dict(json.loads(path.read_text()).get("stages", {}))
+    record: dict[str, Any] = json.loads(path.read_text())
+    return record
 
 
 def _check_recorded_scan(
     directory: Path, record: dict[str, Any], property_name: str
-) -> None:
+) -> dict[Path, dict[str, Any]]:
     request = record["request"]
     spec = ModulusSpec(**request["spec"])
     holds = request.get("hold_times_ps", request.get("relax_ps", []))
     names = record.get("run_dirs", [])
     if len(holds) != len(names):
         raise AnalysisError("Recorded hold and rate directory counts differ.")
+    manifests: dict[Path, dict[str, Any]] = {}
     for i, (name, hold) in enumerate(zip(names, holds, strict=True)):
-        stages = _read_stages(directory / name)
+        path = (directory / name).resolve()
+        manifests[path] = _read_rate_manifest(path)
+        stages = manifests[path].get("stages", {})
         rate_spec = _rate_spec(spec, property_name, hold)
         for replica in range(spec.n_replicas):
             protocol = _protocol(
@@ -480,6 +484,8 @@ def _check_recorded_scan(
                             "Recorded reference box differs from the workflow."
                         )
 
+    return manifests
+
 
 def _recorded_spec(record: dict[str, Any]) -> dict[str, Any] | None:
     """Carry preparation provenance alongside the measurement's settings."""
@@ -503,10 +509,11 @@ def _recorded_spec(record: dict[str, Any]) -> dict[str, Any] | None:
 
 def _expand(
     run_dirs: Sequence[str | Path], property_name: str
-) -> list[tuple[Path, dict[str, Any] | None]]:
-    result: list[tuple[Path, dict[str, Any] | None]] = []
+) -> list[tuple[Path, dict[str, Any] | None, dict[str, Any]]]:
+    result: list[tuple[Path, dict[str, Any] | None, dict[str, Any]]] = []
     for value in run_dirs:
         directory = Path(value).resolve()
+        manifests: dict[Path, dict[str, Any]] = {}
         workflow = directory / WORKFLOW_NAME
         if not workflow.is_file() and property_name == "poisson_ratio":
             workflow = directory / YOUNGS_WORKFLOW_NAME
@@ -519,7 +526,7 @@ def _expand(
             if not isinstance(names, list) or not names:
                 raise AnalysisError(f"{workflow} records no rate run directories.")
             if "spec" in request:
-                _check_recorded_scan(directory, record, property_name)
+                manifests = _check_recorded_scan(directory, record, property_name)
             candidates = [(directory / name, _recorded_spec(record)) for name in names]
         else:
             # A measurement child remains independently analysable with its
@@ -536,29 +543,41 @@ def _expand(
                         != property_name
                     ):
                         raise AnalysisError(f"{directory} measures another property.")
-                    _check_recorded_scan(directory.parent, record, property_name)
+                    manifests = _check_recorded_scan(
+                        directory.parent, record, property_name
+                    )
                     spec_data = _recorded_spec(record)
             candidates = [(directory, spec_data)]
         for candidate, spec_data in candidates:
             candidate = candidate.resolve()
-            _read_stages(candidate)
-            result.append((candidate, spec_data))
-    require_distinct([path for path, _ in result], what="elastic measurements")
+            raw = (
+                manifests[candidate]
+                if candidate in manifests
+                else _read_rate_manifest(candidate)
+            )
+            result.append((candidate, spec_data, raw))
+    require_distinct([path for path, _, _ in result], what="elastic measurements")
     return result
 
 
 def _observations(
-    directory: Path, name: str, spec: dict[str, Any] | None, strain_limit: float
+    directory: Path,
+    name: str,
+    spec: dict[str, Any] | None,
+    strain_limit: float,
+    raw_manifest: dict[str, Any],
 ) -> list[RateObservation]:
     """One observation per loading path in *directory*, a replica's chunks as one.
 
     A path that cannot be fitted is kept as a missing value, its reason in
     the notes, rather than dropped from the series.
     """
-    stages = _read_stages(directory)
+    stages = raw_manifest.get("stages", {})
     key = _PATH_KEYS[name]
     if name == "poisson_ratio":
-        groups = group_by_stem(deform_stages(directory))
+        groups = group_by_stem(
+            deform_stages(directory, manifest=RunManifest(**raw_manifest))
+        )
     else:
         # A preparation's compression ladder records pressures as well; only
         # the bulk pass measures a modulus.
@@ -674,20 +693,22 @@ def _observations(
                 )
             axis = int(axes[0])
         try:
+            manifest = RunManifest(**raw_manifest)
             if name == "poisson_ratio":
                 fit = poisson_ratio(
-                    stress_strain(directory, group), strain_limit=strain_limit
+                    stress_strain(directory, group, manifest=manifest),
+                    strain_limit=strain_limit,
                 )
                 value, error, resolved = fit.ratio, fit.standard_error, fit.resolved
             elif name == "shear_modulus":
-                shear = shear_modulus(directory, group)
+                shear = shear_modulus(directory, group, manifest=manifest)
                 value, error, resolved = (
                     shear.modulus_mpa,
                     shear.standard_error_mpa,
                     shear.resolved,
                 )
             elif name == "bulk_modulus":
-                bulk = bulk_modulus(directory, group)
+                bulk = bulk_modulus(directory, group, manifest=manifest)
                 value, error, resolved = (
                     bulk.modulus_mpa,
                     bulk.standard_error_mpa,
@@ -699,7 +720,7 @@ def _observations(
                 )
             else:
                 load = youngs_modulus(
-                    load_curve(directory, group),
+                    load_curve(directory, group, manifest=manifest),
                     strain_limit=strain_limit,
                     min_points=2,
                 )
@@ -756,31 +777,35 @@ def _observations(
 # --------------------------------------------------------------------------
 
 
-def _youngs_directories(run_dirs: Sequence[str | Path]) -> list[Path]:
+def _youngs_directories(
+    run_dirs: Sequence[str | Path],
+) -> list[tuple[Path, dict[str, Any]]]:
     """Each scan root's recorded rate directories, or the directory itself."""
-    directories: list[Path] = []
+    directories: list[tuple[Path, dict[str, Any]]] = []
     for value in run_dirs:
         directory = Path(value).resolve()
         workflow = directory / YOUNGS_WORKFLOW_NAME
         if not workflow.is_file():
-            _read_stages(directory)
-            directories.append(directory)
+            directories.append((directory, _read_rate_manifest(directory)))
             continue
         record = json.loads(workflow.read_text())
         names = record.get("run_dirs")
         if not isinstance(names, list) or not names:
             raise AnalysisError(f"{workflow} records no rate run directories.")
         rate_dirs = [(directory / str(name)).resolve() for name in names]
-        for rate_dir in rate_dirs:
-            _read_stages(rate_dir)
-        _check_youngs_scan(workflow, record, rate_dirs)
-        directories.extend(rate_dirs)
-    require_distinct(directories, what="strain-rate measurements")
+        loaded = [(rate_dir, _read_rate_manifest(rate_dir)) for rate_dir in rate_dirs]
+        _check_youngs_scan(workflow, record, loaded)
+        directories.extend(loaded)
+    require_distinct(
+        [directory for directory, _ in directories], what="strain-rate measurements"
+    )
     return directories
 
 
 def _check_youngs_scan(
-    workflow: Path, record: dict[str, Any], directories: Sequence[Path]
+    workflow: Path,
+    record: dict[str, Any],
+    directories: Sequence[tuple[Path, dict[str, Any]]],
 ) -> None:
     """A partial rate series cannot become a complete analysis by accident.
 
@@ -797,10 +822,10 @@ def _check_youngs_scan(
         raise AnalysisError(
             f"{workflow} has inconsistent rate directory and hold counts."
         )
-    for rate_index, (directory, hold) in enumerate(
+    for rate_index, ((directory, raw_manifest), hold) in enumerate(
         zip(directories, holds, strict=True)
     ):
-        entries = _read_stages(directory)
+        entries = raw_manifest.get("stages", {})
         rate_spec = replace(spec, relax_ps=float(hold))
         for replica in range(spec.n_replicas):
             protocol = deform_protocol(
@@ -877,7 +902,7 @@ def _check_comparable(curves: Sequence[StressStrain]) -> None:
 
 
 def _youngs_observations(
-    directories: Sequence[Path], strain_limit: float
+    directories: Sequence[tuple[Path, dict[str, Any]]], strain_limit: float
 ) -> list[RateObservation]:
     """One observation per distinct rate, fitted through all its replicas' points.
 
@@ -888,9 +913,10 @@ def _youngs_observations(
     :data:`~openmmpolymer.mechanical.MAX_REPLICA_SPREAD` of the pooled value.
     """
     curves: list[tuple[str, StressStrain]] = []
-    for directory in directories:
+    for directory, raw_manifest in directories:
+        manifest = RunManifest(**raw_manifest)
         try:
-            groups = group_by_stem(deform_stages(directory))
+            groups = group_by_stem(deform_stages(directory, manifest=manifest))
         except AnalysisError:
             groups = []
         if not groups:
@@ -898,7 +924,7 @@ def _youngs_observations(
                 f"{directory} has no strain-controlled extension to fit."
             )
         for group in groups:
-            curve = stress_strain(directory, group)
+            curve = stress_strain(directory, group, manifest=manifest)
             curves.append((f"{directory}: {curve.stage}", curve))
     _check_comparable([curve for _, curve in curves])
     by_rate = group_nearby_rates(
@@ -962,15 +988,18 @@ def analyse_elastic_rates(
     validate_rate_request(target_rate, max_extrapolation_decades)
     require_positive(strain_limit, None, name="strain_limit")
     if property_name == "youngs_modulus":
-        directories = _youngs_directories(run_dirs)
-        observations = _youngs_observations(directories, strain_limit)
+        loaded = _youngs_directories(run_dirs)
+        directories = [directory for directory, _ in loaded]
+        observations = _youngs_observations(loaded, strain_limit)
     else:
         expanded = _expand(run_dirs, property_name)
-        directories = [directory for directory, _ in expanded]
+        directories = [directory for directory, _, _ in expanded]
         observations = [
             item
-            for directory, spec in expanded
-            for item in _observations(directory, property_name, spec, strain_limit)
+            for directory, spec, raw_manifest in expanded
+            for item in _observations(
+                directory, property_name, spec, strain_limit, raw_manifest
+            )
         ]
     return analyse_rate_observations(
         observations,

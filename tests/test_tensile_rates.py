@@ -386,3 +386,14 @@ def test_tensile_shared_state_is_checked_before_any_resume_write(
         run_tensile_rate_scan(argon_run, tmp_path, **options)
     assert len(calls) == count
     assert workflow.read_text() == before
+
+
+def test_tensile_rate_validation_and_analysis_share_each_manifest(
+    tmp_path: Path, manifest_reads: list[Path]
+) -> None:
+    directories = write_tensile_rate_series(tmp_path, "yield_strength")
+    manifest_reads.clear()
+    analyse_tensile_rates(directories, property_name="yield_strength", target_rate=0.1)
+    assert sorted(manifest_reads) == sorted(
+        directory / "manifest.json" for directory in directories
+    )

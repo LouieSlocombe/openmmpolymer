@@ -498,3 +498,19 @@ def test_real_tiny_heating_series_records_three_rates_and_resumes(
     resumed = run_thermal_rate_scan(argon_run, tmp_path, **options)
     assert len(resumed.observations) == 3
     assert [json.loads(path.read_text())["stages"] for path in manifests] == before
+
+
+@pytest.mark.parametrize("property_name", ["glass_transition", "melting_temperature"])
+def test_thermal_stage_selection_and_curves_share_each_manifest(
+    tmp_path: Path, manifest_reads: list[Path], property_name: str
+) -> None:
+    directories = (
+        _tg_series(tmp_path)
+        if property_name == "glass_transition"
+        else _tm_series(tmp_path, [planted_curve()] * 3)
+    )
+    manifest_reads.clear()
+    analyse_thermal_rates(directories, property_name=property_name, target_rate=0.1)
+    assert sorted(manifest_reads) == sorted(
+        directory / "manifest.json" for directory in directories
+    )

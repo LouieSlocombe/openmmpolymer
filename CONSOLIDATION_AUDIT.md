@@ -96,10 +96,10 @@ Reuse: `write_report_files`, `trajectory.load_manifest/stage_files/open_stage`, 
 Callers changed: `tm.write_melting_report` (plus a new `plots.plot_melting`), `tensile._write_report`, `convergence_report`, `rate_reports`, `melt_check`, `tm.heating_*`, `structural_convergence._measure`, the rate modules' manifest reads.
 Removed: two bypass writers, five spellings of the `analysis` directory default, three of the four manifest parses in `analyse_convergence`.
 
-- [ ] F4 report writers (needs D8)
-- [ ] F10 manifest helpers and `optional`
-- [ ] F14 renderer verdicts (needs D3)
-- [ ] F15 `asdict` records (needs D4)
+- [x] F4 report writers (needs D8)
+- [x] F10 manifest helpers and `optional`
+- [x] F14 renderer verdicts (needs D3)
+- [x] F15 `asdict` records (needs D4)
 
 ### Stage 3: scan scaffolding (highest value, highest risk, about -150 lines)
 
@@ -422,6 +422,13 @@ remain above so the changes and decisions can be reviewed against the audit.
 
 - D2: preserve each existing request shape, including the differing treatment of
   budgets and chain options. No workflow-record migration is part of this work.
+- D3: use shared interpretation properties for persistence regimes and finite
+  elastic-consistency gaps. Keep runtime analysis-file generation unchanged;
+  making scans automatically write reports is a separate product choice.
+- D4: nested structure records use `asdict`, guarded by ordered schemas and a
+  baseline full-JSON digest. Top-level report layouts remain explicit.
+- D8: use the common filename-extension validation for all report writers.
+  Tm gains dependency versions; tensile reports gain package/dependency headers.
 - D5/D7: public API removals, checkpoint artifact removal, and stricter legacy
   Young's-ladder verification wait until the final review. Existing user data and
   external API use cannot be established from this checkout.
@@ -461,6 +468,20 @@ remain above so the changes and decisions can be reviewed against the audit.
   same checks. Shared scalar and tensile-criterion validation keeps intentional
   zero baseline/ramp/time-offset values and finite zero/negative pressures.
   Gate: 2,255 passed, eight expected failures; ruff, formatting and mypy clean.
+
+- Stage 2: report writers share output-directory/format validation and safe
+  figure stems. Six tensile format-validation expected failures are now passing.
+  Tm gains dependency versions, tensile gains package/dependency headers; all
+  measured report fields remain unchanged. Melting uses the common tight bounding
+  box when saving its existing paired plot. Nested structure records preserve
+  their ordered schema and full normalized JSON digest under `asdict`.
+  Manifest snapshots flow through reader calls without global caching, preserving
+  permissive legacy elastic reads and malformed heating candidates. Persistence
+  regimes and finite consistency gaps now drive console/figure/log verdicts;
+  unavailable fit errors display as unknown. Runtime report-file generation is
+  unchanged (D3 option B); adding automatic analysis reports remains deferred.
+  F18 report directories, safe figure stems and plotting-helper bypasses are done.
+  Gate: 2,302 passed, two expected Tg failures; ruff, formatting and mypy clean.
 
 ## Appendix A. Builder and request digest harness (Stage 0)
 

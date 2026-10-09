@@ -31,6 +31,16 @@ class ReportFiles:
     figures: tuple[str, ...]
 
 
+def analysis_directory(run_dir: str | Path, output_dir: str | Path | None) -> Path:
+    """The caller's output directory, or the run's analysis directory."""
+    return Path(run_dir) / "analysis" if output_dir is None else Path(output_dir)
+
+
+def figure_stem(name: str, *, fallback: str = "") -> str:
+    """A filename component with separators and punctuation replaced by underscores."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or fallback
+
+
 def write_report(
     directory: str | Path,
     name: str,

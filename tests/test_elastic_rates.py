@@ -1046,3 +1046,15 @@ def test_real_youngs_scan_retains_replicas_common_reference_and_resume(
     _youngs_scan(argon_run, tmp_path, **options)
     after = [json.loads(path.read_text())["stages"] for path in manifests]
     assert after == before
+
+
+@pytest.mark.parametrize("property_name", PROPERTIES)
+def test_each_elastic_rate_manifest_is_read_once(
+    tmp_path: Path, manifest_reads: list[Path], property_name: str
+) -> None:
+    directories = _series(tmp_path, property_name)
+    manifest_reads.clear()
+    analyse_elastic_rates(directories, property_name=property_name, target_rate=0.001)
+    assert sorted(manifest_reads) == sorted(
+        directory / "manifest.json" for directory in directories
+    )

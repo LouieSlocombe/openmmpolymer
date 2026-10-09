@@ -47,6 +47,7 @@ the stage start, not the run start.
 from __future__ import annotations
 
 import logging
+import math
 import warnings
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -278,8 +279,52 @@ def stage_names(stage: str | Sequence[str]) -> tuple[str, ...]:
     return names
 
 
+def sample_ladder(key: str) -> Callable[[dict[str, Any]], bool]:
+    """Whether a stage's samples hold a ladder of *key*."""
+
+    def holds(samples: dict[str, Any]) -> bool:
+        values = samples.get(key)
+        return isinstance(values, list) and len(values) >= 1
+
+    return holds
+
+
+def gather_samples(
+    run_dir: str | Path,
+    names: Sequence[str],
+    *,
+    manifest: RunManifest | None = None,
+) -> tuple[dict[str, list[float]], float]:
+    """Concatenate the samples of several stages, in the order given.
+
+    A strain ladder split across stages for resume is one curve; reading each
+    chunk as its own would give several short ones and fit a modulus to each.
+    An optional already loaded manifest keeps a multi-part analysis on one
+    snapshot of its recorded data.
+    """
+    directory = Path(run_dir)
+    if manifest is None:
+        manifest = load_manifest(directory)
+    merged: dict[str, list[float]] = {}
+    temperatures: list[float] = []
+    for name in names:
+        recorded = stage_record(manifest, name, directory)
+        samples = recorded.get("samples") or {}
+        for key, values in samples.items():
+            merged.setdefault(key, []).extend(float(value) for value in values)
+        mean = recorded.get("mean_temperature_k")
+        if mean is not None:
+            temperatures.append(float(mean))
+    return merged, float(np.mean(temperatures)) if temperatures else math.nan
+
+
 def stages_holding(
-    run_dir: str | Path, holds: Callable[[dict[str, Any]], bool], what: str
+    run_dir: str | Path,
+    holds: Callable[[dict[str, Any]], bool],
+    what: str,
+    *,
+    manifest: RunManifest | None = None,
+    allow_empty: bool = False,
 ) -> tuple[str, ...]:
     """Name every stage whose recorded samples *holds* accepts, in manifest order.
 
@@ -291,17 +336,19 @@ def stages_holding(
         run_dir: A directory a run wrote to.
         holds: Whether one stage's samples are the kind being looked for.
         what: What that kind is, for the refusal.
+        manifest: Reuse this snapshot instead of reading the manifest again.
+        allow_empty: Return an empty tuple instead of refusing an empty selection.
 
     Raises:
         AnalysisError: There is no manifest, or no stage in it qualifies.
     """
-    stages = load_manifest(run_dir).stages
+    stages = (load_manifest(run_dir) if manifest is None else manifest).stages
     found = tuple(
         name
         for name, recorded in stages.items()
         if holds(recorded.get("samples") or {})
     )
-    if not found:
+    if not found and not allow_empty:
         raise AnalysisError(
             f"No stage in {Path(run_dir)} recorded {what}. It records: "
             f"{', '.join(stages) or 'nothing'}."

@@ -11,7 +11,7 @@ censored; extending a fit beyond the recorded trajectory cannot resolve them.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import pairwise
 from typing import Any
@@ -20,6 +20,7 @@ import numpy as np
 
 from ._fitting import finite_or_none
 from ._validation import require_in_range, require_integer, require_positive
+from ._workflow import optional
 from .conformation import (
     centre_of_mass_msd,
     chain_conformation,
@@ -37,7 +38,6 @@ from .convergence import (
 )
 from .correlations import (
     MIN_WAVEVECTORS_PER_BIN,
-    RadialDistribution,
     StructureFactor,
     _pair_limit,
     peak_bins,
@@ -224,26 +224,21 @@ def _measure(
     curves: dict[str, dict[str, tuple[float, ...]]] = {}
     notes: list[str] = []
 
-    def attempt(label: str, call: Callable[[], Any]) -> Any:
-        try:
-            return call()
-        except AnalysisError as error:
-            notes.append(f"{label}: {error}")
-            return None
-
     if backbone is not None:
-        conformation = attempt(
-            "chain dimensions",
+        conformation = optional(
             lambda: chain_conformation(ensemble, backbone, stride=stride),
+            notes,
+            "chain dimensions",
         )
         if conformation is not None:
             for name in ("characteristic_ratio", "ratio_of_squares"):
                 value = finite_or_none(getattr(conformation.mean, name))
                 values[name], valid[name] = value, value is not None and value > 0
                 counts[name] = conformation.n_frames
-        persistence = attempt(
-            "persistence length",
+        persistence = optional(
             lambda: persistence_length(ensemble, backbone, stride=stride),
+            notes,
+            "persistence length",
         )
         if persistence is not None:
             name = "persistence_length_nm"
@@ -263,11 +258,12 @@ def _measure(
                     "Backbone correlation did not decay within the chain; "
                     "persistence length remains censored."
                 )
-        relaxation = attempt(
-            "end-to-end relaxation",
+        relaxation = optional(
             lambda: end_to_end_relaxation(
                 ensemble, backbone, max_lag_fraction=max_lag_fraction
             ),
+            notes,
+            "end-to-end relaxation",
         )
         if relaxation is not None:
             name = "end_to_end_relaxation_time_ps"
@@ -291,11 +287,12 @@ def _measure(
             "No backbone supplied; chain dimensions, persistence and orientational "
             "relaxation are unavailable."
         )
-    displacement = attempt(
-        "COM diffusion",
+    displacement = optional(
         lambda: centre_of_mass_msd(
             ensemble, stride=stride, max_lag_fraction=max_lag_fraction
         ),
+        notes,
+        "COM diffusion",
     )
     if displacement is not None:
         name = "diffusion_coefficient_cm2_s"
@@ -314,8 +311,7 @@ def _measure(
                 f"COM MSD slope {displacement.log_slope:.3g} does not establish "
                 "diffusion; coefficient remains censored."
             )
-    distribution: RadialDistribution | None = attempt(
-        "RDF",
+    distribution = optional(
         lambda: radial_distribution(
             ensemble,
             r_max_nm=r_max_nm,
@@ -323,6 +319,8 @@ def _measure(
             heavy_atoms_only=heavy_atoms_only,
             stride=pair_stride,
         ),
+        notes,
+        "RDF",
     )
     if distribution is not None:
         curves["radial_distribution"] = _curve(
@@ -340,8 +338,7 @@ def _measure(
                 finite is not None and finite > 0 and distribution.n_pairs > 0,
             )
             counts[name] = distribution.n_frames
-    factor: StructureFactor | None = attempt(
-        "structure factor",
+    factor = optional(
         lambda: structure_factor(
             ensemble,
             q_max_per_nm=q_max_per_nm,
@@ -349,6 +346,8 @@ def _measure(
             heavy_atoms_only=heavy_atoms_only,
             stride=factor_stride,
         ),
+        notes,
+        "structure factor",
     )
     if factor is not None:
         curves["structure_factor"] = _curve(
