@@ -16,6 +16,8 @@ import pytest
 from openmmpolymer import __main__ as cli
 from openmmpolymer.tensile import BreakingSpec, ElongationSpec, YieldSpec
 
+from .helpers import forbidden
+
 SPECS = {"breaking": BreakingSpec, "elongation": ElongationSpec, "yield": YieldSpec}
 
 
@@ -155,8 +157,9 @@ def test_analyse_detects_a_tensile_scan_and_writes_its_report(
         written.append((result, output_dir, figures, figure_format))
         return SimpleNamespace(json=f"reports/{name}.json", figures=())
 
-    def unexpected_mechanics(*args: Any, **kwargs: Any) -> Any:
-        pytest.fail("a finite tensile ladder was dispatched to the modulus report")
+    unexpected_mechanics = forbidden(
+        "a finite tensile ladder was dispatched to the modulus report"
+    )
 
     for kind in (*SPECS, "quench", "heating", "load", "shear", "relax"):
         monkeypatch.setattr(cli, f"{kind}_stages", lambda path: ())

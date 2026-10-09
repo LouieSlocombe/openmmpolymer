@@ -9,7 +9,6 @@ JSON, with figures that retain every refusal and unknown error.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -17,8 +16,9 @@ from typing import TYPE_CHECKING
 
 import numpy.typing as npt
 
-from ._files import ReportFiles, write_report
+from ._files import ReportFiles, analysis_directory, figure_stem, write_report
 from ._validation import require_integer
+from ._workflow import optional
 from .conformation import chain_conformation
 from .convergence import (
     DEFAULT_MIN_SAMPLES,
@@ -43,7 +43,7 @@ from .structural_convergence import (
 )
 from .structure import resolve_backbone, select_stage
 from .timeseries import read_state_data
-from .trajectory import AnalysisError, load_manifest, open_run, stage_files
+from .trajectory import AnalysisError, load_manifest, open_stage, stage_files
 from .viscoelastic import analyse_relaxation
 
 if TYPE_CHECKING:
@@ -104,19 +104,20 @@ def analyse_convergence(
     )
     require_integer(stride, name="stride")
     directory = Path(run_dir)
+    manifest = load_manifest(directory)
     try:
-        files, _ = select_stage(directory, stage)
+        files, _ = select_stage(directory, stage, manifest=manifest)
     except AnalysisError:
         # CSV-only and relaxation-only runs can be useful without coordinates.
-        files = stage_files(directory, stage)
+        files = stage_files(directory, stage, manifest=manifest)
     notes: list[str] = []
     results: dict[str, WindowConvergence] = {}
 
     def measure(
         times: npt.ArrayLike, values: npt.ArrayLike, name: str, unit: str
     ) -> None:
-        try:
-            results[name] = time_window_convergence(
+        result = optional(
+            lambda: time_window_convergence(
                 times,
                 values,
                 property_name=name,
@@ -125,16 +126,21 @@ def analyse_convergence(
                 relative_tolerance=relative_tolerance,
                 min_effective_samples=min_effective_samples,
                 discard_fraction=discard_fraction,
-            )
-        except AnalysisError as exc:
-            notes.append(f"{name} unavailable: {exc}")
+            ),
+            notes,
+            f"{name} unavailable",
+        )
+        if result is not None:
+            results[name] = result
 
-    if files.csv:
-        try:
-            state = read_state_data(files.csv, stage=files.stage)
-        except AnalysisError as exc:
-            notes.append(f"State-data convergence unavailable: {exc}")
-        else:
+    csv = files.csv
+    if csv:
+        state = optional(
+            lambda: read_state_data(csv, stage=files.stage),
+            notes,
+            "State-data convergence unavailable",
+        )
+        if state is not None:
             for name, unit in (
                 ("density_g_cm3", "g/cm^3"),
                 ("temperature_k", "K"),
@@ -143,11 +149,11 @@ def analyse_convergence(
                 measure(state.time_ps, getattr(state, name), name, unit)
     else:
         notes.append("No state-data CSV is available for the selected stage.")
-    structural = None
-    try:
-        ensemble = open_run(directory, files.stage)
+
+    def read_structure() -> StructuralWindowConvergence:
+        ensemble = open_stage(files)
         path, _, _ = resolve_backbone(
-            directory, load_manifest(directory), ensemble, backbone, True, notes
+            directory, manifest, ensemble, backbone, True, notes
         )
         if ensemble.is_snapshot:
             notes.append(SNAPSHOT_REFUSAL)
@@ -165,20 +171,20 @@ def analyse_convergence(
                 "mean_squared_end_to_end_nm2",
                 "nm^2",
             )
-        structural = structural_window_convergence(
+        return structural_window_convergence(
             ensemble,
             backbone=path,
             window_fractions=fractions,
             relative_tolerance=relative_tolerance,
             stride=stride,
         )
-    except AnalysisError as exc:
-        notes.append(f"Structural convergence unavailable: {exc}")
-    relaxation = None
-    try:
+
+    structural = optional(read_structure, notes, "Structural convergence unavailable")
+
+    def read_relaxation() -> RelaxationWindowConvergence:
         source_refusals: list[str] = []
         if stage is None:
-            source = analyse_relaxation(directory)
+            source = analyse_relaxation(directory, manifest=manifest)
             notes.extend(source.notes)
             if source.mean is None:
                 raise AnalysisError("No independent relaxation ensemble could be read.")
@@ -192,7 +198,7 @@ def analyse_convergence(
                     "At least one recorded relaxation replica could not be analysed."
                 )
         else:
-            curve = relaxation_curve(directory, stage=stage)
+            curve = relaxation_curve(directory, stage=stage, manifest=manifest)
         relaxation = relaxation_window_convergence(
             curve, window_fractions=fractions, relative_tolerance=relative_tolerance
         )
@@ -208,8 +214,9 @@ def analyse_convergence(
                 resolved=False,
                 notes=(*relaxation.notes, *source_refusals),
             )
-    except AnalysisError as exc:
-        notes.append(f"Relaxation convergence unavailable: {exc}")
+        return relaxation
+
+    relaxation = optional(read_relaxation, notes, "Relaxation convergence unavailable")
     return ConvergenceReport(
         run_dir=str(directory),
         stage=files.stage,
@@ -241,9 +248,7 @@ def write_convergence_report(
     Raises:
         ValueError: *figure_format* is not a plain filename extension.
     """
-    directory = (
-        Path(report.run_dir) / "analysis" if output_dir is None else Path(output_dir)
-    )
+    directory = analysis_directory(report.run_dir, output_dir)
     record = asdict(report)
     record["interpretation"] = (
         "Window stability is conditional on recorded observables and sampled times. "
@@ -270,7 +275,7 @@ def _figures(report: ConvergenceReport) -> Iterator[tuple[str, Figure]]:
     """
     used = {"convergence_relaxation", "convergence_structural"}
     for name, result in report.results.items():
-        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "observable"
+        safe = figure_stem(name, fallback="observable")
         stem = f"convergence_{safe}"
         candidate = stem
         suffix = 2

@@ -70,9 +70,17 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 
-from ._fitting import NEGLIGIBLE, separable_fit
-from .elasticity import MPA_PER_BAR, _gather, _ladder, _require_stress_estimator
-from .trajectory import AnalysisError, stage_names, stages_holding
+from ._fitting import NEGLIGIBLE, separable_fit, standard_error_from_moments
+from .elasticity import MPA_PER_BAR, _require_stress_estimator
+from .protocols import RunManifest
+from .trajectory import (
+    AnalysisError,
+    gather_samples,
+    load_manifest,
+    sample_ladder,
+    stage_names,
+    stages_holding,
+)
 
 log = logging.getLogger(__name__)
 
@@ -370,7 +378,9 @@ class PronyFit:
 # --------------------------------------------------------------------------
 
 
-def relax_stages(run_dir: str | Path) -> tuple[str, ...]:
+def relax_stages(
+    run_dir: str | Path, *, manifest: RunManifest | None = None
+) -> tuple[str, ...]:
     """Name every stage in a run that applied a step strain and held it.
 
     Found by what each stage recorded rather than by its name, as
@@ -385,13 +395,18 @@ def relax_stages(run_dir: str | Path) -> tuple[str, ...]:
     Raises:
         AnalysisError: There is no manifest, or nothing in it was a relaxation.
     """
-    return stages_holding(run_dir, _ladder("segment_bin"), "a binned stress relaxation")
+    return stages_holding(
+        run_dir,
+        sample_ladder("segment_bin"),
+        "a binned stress relaxation",
+        manifest=manifest,
+    )
 
 
 def _merge_bins(samples: dict[str, list[float]]) -> dict[str, npt.NDArray[np.float64]]:
     """Add several chunks' bins together, bin for bin.
 
-    :func:`~openmmpolymer.elasticity._gather` concatenates, which is right for
+    :func:`~openmmpolymer.trajectory.gather_samples` concatenates, which is right for
     a strain ladder and would be silently wrong here: two chunks of one
     relaxation would give a curve with every shared bin in it twice, and
     nothing downstream would notice. Grouping the concatenation by bin index
@@ -417,29 +432,11 @@ def _merge_bins(samples: dict[str, list[float]]) -> dict[str, npt.NDArray[np.flo
     }
 
 
-def _standard_error(
-    mean: npt.NDArray[np.float64],
-    mean_sq: npt.NDArray[np.float64],
-    count: npt.NDArray[np.float64],
-) -> npt.NDArray[np.float64]:
-    """The standard error of each bin's mean, or NaN for a bin of one.
-
-    Clamped at zero before the square root: the variance is a difference of
-    two large similar numbers and can come out a hair negative.
-
-    It is also an underestimate, and knowingly so. It assumes the readings in
-    a bin are independent, and stress readings a tenth of a picosecond apart
-    in a melt are not. The error bar worth believing is the one across
-    replicas, which :func:`mean_curve` computes.
-    """
-    variance = np.maximum(mean_sq - mean * mean, 0.0)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        error = np.sqrt(variance / count)
-    return np.where(count > 1.0, error, np.nan)
-
-
 def relaxation_curve(
-    run_dir: str | Path, stage: str | Sequence[str] | None = None
+    run_dir: str | Path,
+    stage: str | Sequence[str] | None = None,
+    *,
+    manifest: RunManifest | None = None,
 ) -> RelaxationCurve:
     """Read the relaxation modulus one step-strain pass left behind.
 
@@ -455,8 +452,14 @@ def relaxation_curve(
         AnalysisError: There is nothing there to read, or what is there did
             not record a relaxation.
     """
-    names = relax_stages(run_dir) if stage is None else stage_names(stage)
-    samples, temperature = _gather(run_dir, names)
+    if manifest is None:
+        manifest = load_manifest(run_dir)
+    names = (
+        relax_stages(run_dir, manifest=manifest)
+        if stage is None
+        else stage_names(stage)
+    )
+    samples, temperature = gather_samples(run_dir, names, manifest=manifest)
     if "relax_plane" in samples:
         _require_stress_estimator(samples, names)
     if "segment_bin" not in samples:
@@ -485,7 +488,7 @@ def relaxation_curve(
     order = np.argsort(merged["time_ps"])
     scale = MPA_PER_BAR / measure
     baseline = _first(samples, "baseline_stress_bar", 0.0)
-    zero_level_error = _standard_error(
+    zero_level_error = standard_error_from_moments(
         np.asarray([baseline]),
         np.asarray([_first(samples, "baseline_stress_sq_bar2", 0.0)]),
         np.asarray([_first(samples, "baseline_samples", 0.0)]),
@@ -499,7 +502,7 @@ def relaxation_curve(
         bin_index=merged["bin"][order].astype(np.int64),
         time_ps=merged["time_ps"][order],
         modulus_mpa=(merged["mean"][order] - baseline) * scale,
-        standard_error_mpa=_standard_error(
+        standard_error_mpa=standard_error_from_moments(
             merged["mean"][order], merged["mean_sq"][order], merged["n"][order]
         )
         * abs(scale),

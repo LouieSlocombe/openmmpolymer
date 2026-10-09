@@ -176,10 +176,6 @@ def radial_distribution(
         ensemble, stride=stride, heavy_atoms_only=heavy_atoms_only
     )
     per_chain = positions.shape[2]
-    if per_chain == 0:
-        raise AnalysisError(
-            "Dropping hydrogens left no atoms. Pass heavy_atoms_only=False."
-        )
     limit = _pair_limit(boxes, r_max_nm)
 
     edges = np.linspace(0.0, limit, n_bins + 1)
@@ -264,10 +260,6 @@ def structure_factor(
         ensemble, stride=stride, heavy_atoms_only=heavy_atoms_only
     )
     per_chain = positions.shape[2]
-    if per_chain == 0:
-        raise AnalysisError(
-            "Dropping hydrogens left no atoms. Pass heavy_atoms_only=False."
-        )
     n_atoms = positions.shape[1] * per_chain
 
     edges = np.linspace(0.0, q_max_per_nm, n_bins + 1)

@@ -494,4 +494,27 @@ def test_empty_report_keeps_request_and_unavailable_models() -> None:
     assert report.log_linear is None and report.power_law is None
     assert report.target_rate == 0.01
     assert report.run_dirs == ("run-a",)
-    assert any("three or more distinct" in note for note in report.notes)
+    assert report.notes == (
+        "Model disagreement is sensitivity to model choice, not a confidence interval.",
+        "log_linear unavailable: Measure the property at three or more distinct rates.",
+        "power_law unavailable: Measure the property at three or more distinct rates.",
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "decades", "resolved"),
+    [
+        (0.99 / 100.0, 2.0000000000000004, False),
+        (99.0 * 100.0, 1.9999999999999998, True),
+    ],
+)
+def test_property_rate_boundary_retains_log_difference_arithmetic(
+    target: float, decades: float, resolved: bool
+) -> None:
+    result = rate_extrapolation(
+        measured([(0.99, 900.0), (9.9, 1000.0), (99.0, 1100.0)]),
+        property=PROPERTY,
+        target_rate=target,
+    )
+    assert result.extrapolation_decades == decades
+    assert result.resolved is resolved

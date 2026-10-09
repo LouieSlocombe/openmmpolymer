@@ -149,9 +149,14 @@ def _modulus_lines(report: Any) -> list[str]:
         )
     for label, fit in (("K", report.bulk), ("G", report.shear)):
         if fit is not None:
+            error = (
+                f"{fit.standard_error_mpa:.2g}"
+                if math.isfinite(fit.standard_error_mpa)
+                else "unknown"
+            )
             lines.append(
                 f"{label} = {fit.modulus_mpa:.0f} +/- "
-                f"{fit.standard_error_mpa:.2g} MPa (fit SE){_unresolved(fit.resolved)}"
+                f"{error} MPa (fit SE){_unresolved(fit.resolved)}"
             )
     if report.load_modulus is not None:
         lines.append(
@@ -169,11 +174,7 @@ def _consistency_line(check: Any) -> str:
         f"E and nu imply K = {check.bulk_implied_mpa:.0f}, "
         f"G = {check.shear_implied_mpa:.0f} MPa"
     )
-    gaps = ", ".join(
-        f"{name} {100.0 * gap:.0f}%"
-        for name, gap in (("K", check.bulk_gap), ("G", check.shear_gap))
-        if math.isfinite(gap)
-    )
+    gaps = ", ".join(f"{name} {100.0 * gap:.0f}%" for name, gap in check.gaps)
     if not gaps:
         return f"{implied} - nothing measured to check them against"
     return (
@@ -412,16 +413,21 @@ def _structure_lines(report: Any) -> Iterator[str]:
 
 def _persistence_line(persistence: Any) -> str:
     """One line for a persistence length, with the extrapolation caveat."""
-    if not math.isfinite(persistence.persistence_length_nm):
+    if persistence.regime == "rod_like":
         return (
             "persistence length: no decay along the chain "
             f"({persistence.contour_length_nm:.2f} nm contour), rod-like"
+        )
+    if persistence.regime == "unfitted":
+        return (
+            "persistence length: no persistence length could be fitted over a "
+            f"{persistence.contour_length_nm:.2f} nm contour"
         )
     line = (
         f"persistence length: {persistence.persistence_length_nm:.3f} nm over "
         f"{persistence.n_bonds} bonds ({persistence.contour_length_nm:.2f} nm "
         "contour)"
     )
-    if not persistence.decayed:
+    if persistence.regime == "extrapolated":
         line += " - never decayed to 1/e within the chain, so this is an extrapolation"
     return line

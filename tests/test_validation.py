@@ -9,16 +9,58 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 from openmm import unit
 
 from openmmpolymer._seeds import derive_seed, seed_random_stream
 from openmmpolymer._validation import (
+    require_axis,
     require_choice,
     require_finite,
+    require_in_range,
     require_integer,
+    require_nonnegative,
+    require_plane,
     require_positive,
 )
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_each_cartesian_axis_is_accepted(axis: int) -> None:
+    assert require_axis(axis) == axis
+
+
+@pytest.mark.parametrize("axis", [-1, 3, True, False, 1.0, "1", None, np.int64(1)])
+def test_an_axis_is_a_plain_cartesian_integer(axis: object) -> None:
+    with pytest.raises(ValueError, match=r"loading_axis=.*must be 0, 1 or 2"):
+        require_axis(axis, name="loading_axis")
+
+
+@pytest.mark.parametrize("plane", [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)])
+def test_a_plane_preserves_driven_and_gradient_order(plane: tuple[int, int]) -> None:
+    assert require_plane(list(plane)) == plane
+
+
+@pytest.mark.parametrize(
+    "plane",
+    [
+        (),
+        (0,),
+        (0, 1, 2),
+        (1, 1),
+        (-1, 2),
+        (0, 3),
+        (True, 2),
+        (0, False),
+        (0, 1.0),
+        ("0", 1),
+        (0, np.int64(1)),
+    ],
+)
+def test_a_plane_requires_two_distinct_plain_axes(plane: tuple[int, ...]) -> None:
+    with pytest.raises(ValueError, match=r"shear_plane=.*two different axes"):
+        require_plane(plane, name="shear_plane")
 
 
 def test_a_bare_number_is_taken_to_be_in_the_expected_unit() -> None:
@@ -72,6 +114,70 @@ def test_a_non_positive_value_is_refused_where_one_is_needed(value: float) -> No
         require_positive(value, unit.kelvin, name="temperature_k")
 
 
+@pytest.mark.parametrize("value", [0.0, 0.5])
+def test_nonnegative_allows_zero(value: float) -> None:
+    assert require_nonnegative(value, None, name="baseline_ps") == value
+
+
+@pytest.mark.parametrize("value", [-1.0, math.nan, math.inf, -math.inf])
+def test_nonnegative_rejects_negative_and_nonfinite_values(value: float) -> None:
+    with pytest.raises(
+        ValueError, match=r"baseline_ps=.*nonnegative.*finite and zero or more"
+    ):
+        require_nonnegative(value, None, name="baseline_ps")
+
+
+@pytest.mark.parametrize("include_minimum", [False, True])
+@pytest.mark.parametrize("include_maximum", [False, True])
+def test_range_endpoints_can_be_open_or_closed(
+    include_minimum: bool, include_maximum: bool
+) -> None:
+    options = {
+        "include_minimum": include_minimum,
+        "include_maximum": include_maximum,
+    }
+    for value, accepted in (
+        (-0.1, False),
+        (0.0, include_minimum),
+        (0.5, True),
+        (1.0, include_maximum),
+        (1.1, False),
+    ):
+        if accepted:
+            assert (
+                require_in_range(
+                    value, None, name="fraction", minimum=0.0, maximum=1.0, **options
+                )
+                == value
+            )
+        else:
+            with pytest.raises(ValueError, match=r"fraction=.*must be in"):
+                require_in_range(
+                    value, None, name="fraction", minimum=0.0, maximum=1.0, **options
+                )
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_an_unbounded_range_still_requires_finite_values(value: float) -> None:
+    with pytest.raises(ValueError, match=r"count=.*finite"):
+        require_in_range(value, None, name="count", minimum=1.0)
+
+
+def test_ranges_and_nonnegative_values_follow_the_shared_unit_rules() -> None:
+    assert (
+        require_nonnegative(0.5 * unit.picosecond, unit.femtosecond, name="time")
+        == 500.0
+    )
+    assert (
+        require_in_range(
+            0.5 * unit.picosecond, unit.femtosecond, name="time", maximum=1000.0
+        )
+        == 500.0
+    )
+    assert require_in_range(2.0, None, name="count", minimum=1.0) == 2.0
+    assert require_in_range(-2.0, None, name="offset", maximum=-1.0) == -2.0
+
+
 def test_an_integer_is_required_where_one_is_meant() -> None:
     """A float count of chains would silently truncate somewhere."""
     assert require_integer(5, name="n_chains") == 5
@@ -97,6 +203,22 @@ def test_a_typo_in_a_choice_lists_the_options() -> None:
     assert require_choice("gaff", ("gaff", "smirnoff"), name="backend") == "gaff"
     with pytest.raises(ValueError, match="gaff, smirnoff"):
         require_choice("gaf", ("gaff", "smirnoff"), name="backend")
+
+
+def test_custom_choice_message_is_only_built_for_a_refusal() -> None:
+    messages: list[str] = []
+
+    def message() -> str:
+        messages.append("called")
+        return "Unknown recorded property."
+
+    assert (
+        require_choice("known", ("known",), name="property", message=message) == "known"
+    )
+    assert messages == []
+    with pytest.raises(ValueError, match=r"^Unknown recorded property\.$"):
+        require_choice("unknown", ("known",), name="property", message=message)
+    assert messages == ["called"]
 
 
 def test_derived_seeds_are_stable_and_distinct() -> None:

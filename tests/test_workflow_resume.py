@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from openmmpolymer import _workflow, mechanical, viscoelastic
+from openmmpolymer import _workflow, mechanical, tensile, viscoelastic
 from openmmpolymer._files import file_sha256
 from openmmpolymer._workflow import record_scan_request, resumable_record
 from openmmpolymer.protocols import (
@@ -22,20 +22,49 @@ from openmmpolymer.protocols import (
 )
 from openmmpolymer.simulate import RunContext
 
-from .helpers import QUICK_EQUILIBRATION
+from .helpers import QUICK_EQUILIBRATION, snapshot_files
 
 
 @dataclass(frozen=True)
 class Scan:
     run: Callable[..., Any]
-    spec: mechanical.ModulusSpec | viscoelastic.RelaxationSpec
+    spec: mechanical.ModulusSpec | viscoelastic.RelaxationSpec | tensile.TensileSpec
     record_name: str
     measurement_stem: str
     error: type[Exception]
 
 
-@pytest.fixture(params=("mechanical", "relaxation"))
+@pytest.fixture(params=("mechanical", "relaxation", "breaking", "elongation", "yield"))
 def scan(request: pytest.FixtureRequest) -> Scan:
+    if request.param in ("breaking", "elongation", "yield"):
+        name = request.param
+        measurements: dict[
+            str, tuple[tensile.TensileMeasurement[Any], Callable[..., Any]]
+        ] = {
+            "breaking": (tensile.BREAKING, tensile.run_breaking_scan),
+            "elongation": (tensile.ELONGATION, tensile.run_elongation_scan),
+            "yield": (tensile.YIELD, tensile.run_yield_scan),
+        }
+        measurement, run_scan = measurements[name]
+        options: dict[str, Any] = (
+            {"max_strain": 0.024, "stage_ps": 0.2, "fit_max_strain": 0.0125}
+            if name == "yield"
+            else {"max_strain": 0.012, "stage_ps": 0.1}
+        )
+        return Scan(
+            run_scan,
+            measurement.spec(
+                temperature_k=120.0,
+                relax_ps=0.05,
+                n_replicas=2,
+                samples_per_step=2,
+                strain_increment=0.002,
+                **options,
+            ),
+            measurement.workflow_name,
+            f"06_{name}",
+            measurement.error,
+        )
     if request.param == "mechanical":
         return Scan(
             mechanical.run_modulus_scan,
@@ -80,13 +109,28 @@ class Interrupted(RuntimeError):
     """Stop at a known point in a scan without losing its saved artifacts."""
 
 
-def _files(directory: Path) -> dict[Path, tuple[bytes, int]]:
-    """Refused requests must not rewrite even an otherwise identical file."""
-    return {
-        path.relative_to(directory): (path.read_bytes(), path.stat().st_mtime_ns)
-        for path in directory.rglob("*")
-        if path.is_file()
-    }
+@pytest.mark.parametrize("stage_name", ["missing", ""])
+def test_rate_missing_state_refusal_keeps_short_circuiting(
+    tmp_path: Path, argon_run: Any, stage_name: str
+) -> None:
+    workflow = tmp_path / "rate_workflow.json"
+    workflow.write_text(json.dumps({"request": {}}))
+    preparation = tmp_path / "equilibration"
+    preparation.mkdir()
+    (preparation / "manifest.json").write_text(
+        json.dumps(
+            {
+                "stages": {
+                    stage_name: {"final_state": str(tmp_path / "missing.xml")},
+                    "malformed": {"final_state": None},
+                }
+            }
+        )
+    )
+    before = snapshot_files(tmp_path, mtimes=True)
+    with pytest.raises(ValueError, match="completed stages with missing states"):
+        resumable_record(argon_run, workflow, {}, [], resume=True, error=ValueError)
+    assert snapshot_files(tmp_path, mtimes=True) == before
 
 
 @pytest.mark.parametrize(
@@ -141,7 +185,7 @@ def test_forced_rerun_ignores_records_that_cannot_be_resumed(
     manifest.save(branch)
     if damage != "orphan":
         workflow.write_text(json.dumps(record))
-    before = _files(tmp_path)
+    before = snapshot_files(tmp_path, mtimes=True)
 
     with pytest.raises(error, match=message):
         resumable_record(
@@ -153,7 +197,7 @@ def test_forced_rerun_ignores_records_that_cannot_be_resumed(
         )
         == {}
     )
-    assert _files(tmp_path) == before
+    assert snapshot_files(tmp_path, mtimes=True) == before
 
 
 @pytest.mark.parametrize("resume", [False, True])
@@ -242,7 +286,7 @@ def test_interrupted_request_refuses_changed_inputs_without_writing(
     monkeypatch.setattr(_workflow, "run_protocol", interrupt)
     with pytest.raises(Interrupted):
         scan.run(argon_run, "run", spec=scan.spec, **QUICK_EQUILIBRATION)
-    before = _files(Path("run"))
+    before = snapshot_files(Path("run"), mtimes=True)
 
     run, spec = argon_run, scan.spec
     options = dict(QUICK_EQUILIBRATION)
@@ -263,10 +307,18 @@ def test_interrupted_request_refuses_changed_inputs_without_writing(
     else:
         options["expected_characteristic_ratio"] = 8.0
 
+    if change == "chains" and isinstance(scan.spec, tensile.TensileSpec):
+        # These options have never been part of a tensile workflow request.
+        with pytest.raises(Interrupted):
+            scan.run(run, "run", spec=spec, **options)
+        assert calls == 2
+        saved = json.loads((Path("run") / scan.record_name).read_text())
+        assert "expected_characteristic_ratio" not in saved["request"]
+        return
     with pytest.raises(scan.error, match="different settings"):
         scan.run(run, "run", spec=spec, **options)
     assert calls == 1
-    assert _files(Path("run")) == before
+    assert snapshot_files(Path("run"), mtimes=True) == before
 
 
 @pytest.mark.parametrize(
@@ -316,12 +368,17 @@ def test_unverifiable_runs_require_an_explicit_fresh_start(
         seed=argon_run.seed,
         stages={"unverified_measurement": {"samples": {}}},
     ).save(directory)
-    before = _files(directory)
+    before = snapshot_files(directory, mtimes=True)
 
+    if isinstance(scan.spec, tensile.TensileSpec):
+        if existing == "orphan-manifest":
+            message = "workflow record"
+        elif existing == "missing-request":
+            message = "different settings"
     with pytest.raises(scan.error, match=message):
         scan.run(argon_run, directory, spec=scan.spec, **QUICK_EQUILIBRATION)
     assert len(protocols) == 1
-    assert _files(directory) == before
+    assert snapshot_files(directory, mtimes=True) == before
 
     with pytest.raises(Interrupted):
         scan.run(
@@ -369,11 +426,11 @@ def test_interrupted_replicas_resume_consistently_and_force_rerun_replaces_them(
         scan.run(argon_scan_run, "run", spec=scan.spec, **QUICK_EQUILIBRATION)
 
     directory = Path("run")
-    before = _files(directory)
+    before = snapshot_files(directory, mtimes=True)
     one_replica = replace(scan.spec, n_replicas=1)
     with pytest.raises(scan.error, match="different settings"):
         scan.run(argon_scan_run, directory, spec=one_replica, **QUICK_EQUILIBRATION)
-    assert _files(directory) == before
+    assert snapshot_files(directory, mtimes=True) == before
 
     manifest_before = (directory / "manifest.json").read_bytes()
     resumed = scan.run(argon_scan_run, directory, spec=scan.spec, **QUICK_EQUILIBRATION)
@@ -406,7 +463,12 @@ def test_interrupted_replicas_resume_consistently_and_force_rerun_replaces_them(
     )
     assert len(replaced.curves) == 1
     saved = json.loads((directory / scan.record_name).read_text())
-    assert saved["n_replicas"] == saved["request"]["spec"]["n_replicas"] == 1
+    replica_count = (
+        len(saved["replica_stages"])
+        if isinstance(scan.spec, tensile.TensileSpec)
+        else saved["n_replicas"]
+    )
+    assert replica_count == saved["request"]["spec"]["n_replicas"] == 1
     manifest = json.loads((directory / "manifest.json").read_text())
     assert not any(
         name.startswith(f"{scan.measurement_stem}_r1_") for name in manifest["stages"]

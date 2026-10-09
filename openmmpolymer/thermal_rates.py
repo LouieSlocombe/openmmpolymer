@@ -18,9 +18,12 @@ from typing import Any
 import numpy as np
 
 from ._files import file_sha256, write_json
-from ._validation import require_integer
+from ._fitting import MAX_EXTRAPOLATION_DECADES, PS_PER_NS
+from ._validation import require_choice, require_integer
 from ._workflow import (
     chain_options,
+    enforce_budget,
+    rate_request,
     record_scan_request,
     require_distinct,
     resumable_record,
@@ -29,8 +32,10 @@ from ._workflow import (
     settled_state,
     start_fingerprint,
     validate_hold_times,
+    with_timestep,
 )
-from .mdsystem import ensemble_controls
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
+from .mdsystem import require_no_ensemble_controls
 from .protocols import Protocol, RunManifest, Stage, run_protocol
 from .rate_dependence import (
     RateObservation,
@@ -41,7 +46,14 @@ from .rate_dependence import (
 )
 from .reporters import TrajectoryOptions
 from .simulate import RunContext, safe_timestep_fs
-from .tg import TgSpec, _group_passes, coarse_schedule, tg_coarse_scan
+from .tg import (
+    TgSchedule,
+    TgSpec,
+    _chunks,
+    _group_passes,
+    coarse_schedule,
+    tg_coarse_scan,
+)
 from .timeseries import glass_transition, quench_curve, quench_stages
 from .tm import TmSpec, heating_curve, melting_scan, melting_temperature
 from .trajectory import AnalysisError
@@ -88,32 +100,32 @@ class ThermalRatePlan:
         return (
             self.equilibration.total_duration_ps
             + self.n_replicas * sum(item.total_duration_ps for item in self.protocols)
-        ) / 1000.0
+        ) / PS_PER_NS
 
 
 def _property(property_name: str) -> RateProperty:
-    try:
-        return THERMAL_RATE_PROPERTIES[property_name]
-    except KeyError as error:
-        raise ValueError(
-            f"Unknown thermal property {property_name!r}; choose "
-            f"{', '.join(THERMAL_RATE_PROPERTIES)}."
-        ) from error
+    require_choice(
+        property_name,
+        tuple(THERMAL_RATE_PROPERTIES),
+        name="property_name",
+        message=lambda: (
+            f"Unknown thermal property {property_name!r}; choose {', '.join(THERMAL_RATE_PROPERTIES)}."
+        ),
+    )
+    return THERMAL_RATE_PROPERTIES[property_name]
 
 
 def _thermal_protocol(
     temperatures: tuple[float, ...], hold: float, spec: TgSpec | TmSpec
 ) -> Protocol:
-    chunks = [
-        temperatures[chunk.start : chunk.stop]
-        for chunk in resume_chunks(len(temperatures), hold, spec.stage_ps)
-    ]
-    # As in a Tg scan, a trailing one-temperature quench chunk has no step of
-    # its own to be grouped by, so it joins the one before; a heating chunk
-    # is found by the enthalpy it records and stays as it is.
-    if isinstance(spec, TgSpec) and len(chunks) > 1 and len(chunks[-1]) == 1:
-        tail = chunks.pop()
-        chunks[-1] += tail
+    chunks = (
+        _chunks(TgSchedule(temperatures, hold, spec.coarse_step_k), spec.stage_ps)
+        if isinstance(spec, TgSpec)
+        else [
+            temperatures[chunk.start : chunk.stop]
+            for chunk in resume_chunks(len(temperatures), hold, spec.stage_ps)
+        ]
+    )
     stages = []
     for index, chunk in enumerate(chunks):
         options: dict[str, Any] = {
@@ -147,7 +159,7 @@ def validate_thermal_rate_scan(
     property_name: str,
     target_rate: float,
     n_replicas: int = 3,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
     **equilibration: Any,
 ) -> ThermalRatePlan:
     """Validate three or more rates and the full budget without filesystem writes.
@@ -183,7 +195,10 @@ def validate_thermal_rate_scan(
             raise ValueError("Tm preparation is specified by TmSpec.equilibration_ps.")
         temperatures = spec.temperatures_k
         preparation = melting_scan(replace(spec, max_total_ns=None))
-        preparation = replace(preparation, stages=preparation.stages[:2])
+        preparation = replace(
+            preparation,
+            stages=tuple(stage for stage in preparation.stages if stage.kind != "heat"),
+        )
     plan = ThermalRatePlan(
         property_name,
         preparation,
@@ -192,11 +207,15 @@ def validate_thermal_rate_scan(
         holds,
         n_replicas,
     )
-    if spec.max_total_ns is not None and plan.total_ns > spec.max_total_ns:
-        raise ThermalRateError(
+    enforce_budget(
+        plan.total_ns,
+        spec.max_total_ns,
+        error=ThermalRateError,
+        message=lambda: (
             f"Thermal rate scan requires {plan.total_ns:.3g} ns across all rates and "
             f"replicas, over the {spec.max_total_ns:.3g} ns budget."
-        )
+        ),
+    )
     return plan
 
 
@@ -204,13 +223,9 @@ def _check_system(run: RunContext) -> None:
     """Refuse a System that would fight the stages' own thermostat and barostat."""
     import openmm as mm
 
-    controls = ensemble_controls(mm.XmlSerializer.deserialize(run.system_xml))
-    if controls:
-        raise ThermalRateError(
-            "The supplied System must contain no barostat or Andersen thermostat; "
-            "the thermal stages provide their own temperature and pressure "
-            f"control. It carries {', '.join(controls)}."
-        )
+    require_no_ensemble_controls(
+        mm.XmlSerializer.deserialize(run.system_xml), ThermalRateError, stages="thermal"
+    )
 
 
 def _replica_protocol(
@@ -219,12 +234,8 @@ def _replica_protocol(
     return replace(
         protocol,
         stages=tuple(
-            replace(
-                stage,
-                name=f"r{rate:02d}_rep{replica:02d}_{stage.name}",
-                options={**stage.options, "timestep_fs": timestep},
-            )
-            for stage in protocol.stages
+            replace(stage, name=f"r{rate:02d}_rep{replica:02d}_{stage.name}")
+            for stage in with_timestep(protocol.stages, timestep)
         ),
     )
 
@@ -238,13 +249,13 @@ def run_thermal_rate_scan(
     target_rate: float,
     spec: TgSpec | TmSpec | None = None,
     n_replicas: int = 3,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
     state_in: str | Path | None = None,
     crystalline: bool = False,
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> RateReport:
     """Prepare once and branch every rate/replica from the same saved state.
@@ -293,26 +304,22 @@ def run_thermal_rate_scan(
     chains = chain_options(
         chain_backbone, atoms_per_chain, expected_characteristic_ratio
     )
-    request = json.loads(
-        json.dumps(
-            {
-                "property_name": property_name,
-                "spec": asdict(spec),
-                "hold_times_ps": plan.hold_times_ps,
-                "n_replicas": n_replicas,
-                "equilibration": asdict(plan.equilibration),
-                "target_rate": target_rate,
-                "max_extrapolation_decades": max_extrapolation_decades,
-                **run_fingerprint(run, spec_key="system_spec"),
-                "state_sha256": None if state_in is None else file_sha256(state_in),
-                "crystalline_supplied": crystalline
-                if property_name == "melting_temperature"
-                else None,
-                **chains,
-            },
-            allow_nan=False,
-            default=str,
-        )
+    request = rate_request(
+        {
+            "property_name": property_name,
+            "spec": asdict(spec),
+            "hold_times_ps": plan.hold_times_ps,
+            "n_replicas": n_replicas,
+            "equilibration": asdict(plan.equilibration),
+            "target_rate": target_rate,
+            "max_extrapolation_decades": max_extrapolation_decades,
+            **run_fingerprint(run, spec_key="system_spec"),
+            "state_sha256": None if state_in is None else file_sha256(state_in),
+            "crystalline_supplied": crystalline
+            if property_name == "melting_temperature"
+            else None,
+            **chains,
+        }
     )
     directory = Path(output_dir).resolve()
     workflow = directory / WORKFLOW_NAME
@@ -371,7 +378,7 @@ def run_thermal_rate_scan(
     )
 
 
-def _check_completed(directory: Path, entry: dict[str, Any]) -> None:
+def _check_completed(directory: Path, entry: dict[str, Any]) -> RunManifest:
     manifest = RunManifest.load(directory)
     if manifest is None:
         raise AnalysisError(f"Missing thermal rate manifest in {directory}.")
@@ -414,16 +421,23 @@ def _check_completed(directory: Path, entry: dict[str, Any]) -> None:
                     f"{directory}/{stage['name']} has a changed pressure."
                 )
 
+    return manifest
+
 
 def _directories(
     run_dirs: Sequence[str | Path], property_name: str
-) -> list[tuple[Path, dict[str, Any] | None, dict[str, Any] | None]]:
-    result: list[tuple[Path, dict[str, Any] | None, dict[str, Any] | None]] = []
+) -> list[tuple[Path, dict[str, Any] | None, dict[str, Any] | None, RunManifest]]:
+    result: list[
+        tuple[Path, dict[str, Any] | None, dict[str, Any] | None, RunManifest]
+    ] = []
     for value in run_dirs:
         directory = Path(value).resolve()
         workflow = directory / WORKFLOW_NAME
         if not workflow.is_file():
-            result.append((directory, None, None))
+            manifest = RunManifest.load(directory)
+            if manifest is None:
+                raise AnalysisError(f"No thermal manifest in {directory}.")
+            result.append((directory, None, None, manifest))
             continue
         record = json.loads(workflow.read_text())
         if record.get("request", {}).get("property_name") != property_name:
@@ -438,10 +452,10 @@ def _directories(
             candidate = (directory / entry["directory"]).resolve()
             if not candidate.is_relative_to(directory):
                 raise AnalysisError(f"{workflow} has a directory outside its scan.")
-            _check_completed(candidate, entry)
-            result.append((candidate, record, entry))
+            manifest = _check_completed(candidate, entry)
+            result.append((candidate, record, entry, manifest))
     require_distinct(
-        [directory for directory, _, _ in result], what="thermal histories"
+        [directory for directory, _, _, _ in result], what="thermal histories"
     )
     return result
 
@@ -482,7 +496,7 @@ def analyse_thermal_rates(
     *,
     property_name: str,
     target_rate: float,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
 ) -> RateReport:
     """Fit comparable saved thermal histories without rerunning dynamics.
 
@@ -510,18 +524,21 @@ def analyse_thermal_rates(
             "Heating transitions can depend on superheating, finite size and crystal morphology. "
             "Density and enthalpy do not prove loss of crystalline order; inspect saved structures or trajectories."
         )
-    for directory, record, entry in directories:
-        manifest = RunManifest.load(directory)
-        if manifest is None:
-            raise AnalysisError(f"No thermal manifest in {directory}.")
+    for directory, record, entry, manifest in directories:
         metadata = _metadata(directory, record, manifest)
         if property_name == "glass_transition":
             groups = (
                 [tuple(entry["stages"])]
                 if entry is not None
-                else _group_passes(directory, quench_stages(directory))
+                else _group_passes(
+                    directory,
+                    quench_stages(directory, manifest=manifest),
+                    manifest=manifest,
+                )
             )
-            curves = [quench_curve(directory, group) for group in groups]
+            curves = [
+                quench_curve(directory, group, manifest=manifest) for group in groups
+            ]
             finest = min(curve.temperature_step_k for curve in curves)
             for curve in curves:
                 if not math.isclose(curve.temperature_step_k, finest, rel_tol=1e-8):
@@ -566,7 +583,7 @@ def analyse_thermal_rates(
                 )
         else:
             heating = heating_curve(
-                directory, None if entry is None else entry["stages"]
+                directory, None if entry is None else entry["stages"], manifest=manifest
             )
             rate = heating.heating_rate_k_per_ns
             if rate is None:
@@ -635,6 +652,6 @@ def analyse_thermal_rates(
         property=property_,
         target_rate=target_rate,
         max_extrapolation_decades=max_extrapolation_decades,
-        run_dirs=[str(directory) for directory, _, _ in directories],
+        run_dirs=[str(directory) for directory, _, _, _ in directories],
     )
     return replace(report, notes=tuple(notes) + report.notes)

@@ -23,6 +23,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from openmmpolymer._fitting import standard_error_from_moments
 from openmmpolymer.elasticity import MPA_PER_BAR
 from openmmpolymer.relaxation import (
     KWW_BETA_BRACKET,
@@ -30,7 +31,6 @@ from openmmpolymer.relaxation import (
     _merge_bins,
     _prony_design,
     _signal_window,
-    _standard_error,
     fit_kww,
     fit_prony,
     mean_curve,
@@ -135,7 +135,7 @@ def test_a_bin_straddling_a_chunk_boundary_merges_exactly() -> None:
         np.concatenate([early_t, late_t]).mean(), abs=1e-12
     )
     # And the error that falls out of them is the one the whole sample gives.
-    error = _standard_error(merged["mean"], merged["mean_sq"], merged["n"])
+    error = standard_error_from_moments(merged["mean"], merged["mean_sq"], merged["n"])
     assert error[0] == pytest.approx(whole.std(ddof=0) / np.sqrt(whole.size))
     # An unweighted average of the two means would have given 18.0, not 19.5.
     assert merged["mean"][0] != pytest.approx(

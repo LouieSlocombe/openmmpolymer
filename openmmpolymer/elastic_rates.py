@@ -25,21 +25,33 @@ from typing import Any
 import numpy as np
 
 from ._files import write_json
-from ._validation import require_positive
+from ._fitting import (
+    MAX_EXTRAPOLATION_DECADES,
+    MAX_REPLICA_SPREAD,
+    PS_PER_NS,
+    finite_or_none,
+    group_nearby_rates,
+)
+from ._validation import require_choice, require_positive
 from ._workflow import (
     chain_options,
+    enforce_budget,
     equilibrate,
     group_by_stem,
+    rate_request,
     record_scan_request,
     require_distinct,
     resumable_record,
+    run_branches,
     run_fingerprint,
     sample_spread,
     start_fingerprint,
     strain_ladder,
     validate_hold_times,
 )
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .elasticity import (
+    DEFAULT_STRAIN_LIMIT,
     StressStrain,
     bulk_modulus,
     deform_stages,
@@ -52,7 +64,6 @@ from .elasticity import (
 from .mechanical import (
     BULK_STEM,
     DEFAULT_SPEC,
-    MAX_REPLICA_SPREAD,
     MechanicalError,
     ModulusSpec,
     _pool,
@@ -60,7 +71,7 @@ from .mechanical import (
     equilibration_protocol,
     extra_stages,
 )
-from .protocols import Protocol, Stage, run_protocol
+from .protocols import Protocol, RunManifest, Stage
 from .rate_dependence import (
     _TEMPERATURE_TOLERANCE_K,
     RateObservation,
@@ -101,26 +112,32 @@ ELASTIC_RATE_PROPERTIES = {
         trend="increasing",
     ),
 }
-_PATH_KEYS = {
-    "poisson_ratio": "segment_strain",
-    "shear_modulus": "segment_shear_strain",
-    "bulk_modulus": "segment_pressure_bar",
-    "load_modulus": "segment_applied_stress_bar",
+
+
+@dataclass(frozen=True)
+class _ElasticPath:
+    """The builder settings and recorded samples for one loading path."""
+
+    kind: str
+    hold_field: str
+    sample_key: str
+    path_option: str | None = None
+
+
+_PATHS = {
+    "youngs_modulus": _ElasticPath("deform", "relax_ps", "segment_strain"),
+    "poisson_ratio": _ElasticPath("deform", "relax_ps", "segment_strain"),
+    "shear_modulus": _ElasticPath(
+        "shear", "shear_ps_each", "segment_shear_strain", "strains"
+    ),
+    "bulk_modulus": _ElasticPath(
+        "compress", "bulk_ps_each", "segment_pressure_bar", "pressures_bar"
+    ),
+    "load_modulus": _ElasticPath(
+        "load", "load_ps_each", "segment_applied_stress_bar", "stresses_bar"
+    ),
 }
-_KIND = {
-    "youngs_modulus": "deform",
-    "poisson_ratio": "deform",
-    "shear_modulus": "shear",
-    "bulk_modulus": "compress",
-    "load_modulus": "load",
-}
-_HOLD = {
-    "youngs_modulus": "relax_ps",
-    "poisson_ratio": "relax_ps",
-    "shear_modulus": "shear_ps_each",
-    "bulk_modulus": "bulk_ps_each",
-    "load_modulus": "load_ps_each",
-}
+_PATHS_BY_KIND = {path.kind: path for path in _PATHS.values()}
 
 
 @dataclass(frozen=True)
@@ -138,20 +155,23 @@ class ElasticRatePlan:
         return (
             self.equilibration.total_duration_ps
             + sum(p.total_duration_ps for group in self.protocols for p in group)
-        ) / 1000.0
+        ) / PS_PER_NS
 
 
 def _property(name: str) -> RateProperty:
-    try:
-        return ELASTIC_RATE_PROPERTIES[name]
-    except KeyError:
-        raise ValueError(
+    require_choice(
+        name,
+        tuple(ELASTIC_RATE_PROPERTIES),
+        name="property_name",
+        message=lambda: (
             f"Unknown elastic property {name!r}; choose {', '.join(ELASTIC_RATE_PROPERTIES)}."
-        ) from None
+        ),
+    )
+    return ELASTIC_RATE_PROPERTIES[name]
 
 
 def _rate_spec(spec: ModulusSpec, name: str, hold: float) -> ModulusSpec:
-    options: dict[str, Any] = {_HOLD[name]: hold}
+    options: dict[str, Any] = {_PATHS[name].hold_field: hold}
     return replace(spec, **options)
 
 
@@ -163,7 +183,7 @@ def _protocol(
     timestep_fs: float = 2.0,
     reference_box_nm: Sequence[float] | None = None,
 ) -> Protocol:
-    if _KIND[name] == "deform":
+    if _PATHS[name].kind == "deform":
         return deform_protocol(
             spec,
             timestep_fs=timestep_fs,
@@ -171,7 +191,9 @@ def _protocol(
             reference_box_nm=reference_box_nm,
         )
     selected = [
-        s for s in extra_stages(spec, timestep_fs=timestep_fs) if s.kind == _KIND[name]
+        s
+        for s in extra_stages(spec, timestep_fs=timestep_fs)
+        if s.kind == _PATHS[name].kind
     ]
     if not selected:
         raise ValueError(f"{name} needs its loading ladder enabled in ModulusSpec.")
@@ -198,12 +220,13 @@ def _expected_path(stage: Stage) -> tuple[str, list[float], float]:
             options["strain_start"], options["strain_increment"], options["n_steps"]
         )
         return "segment_strain", path.tolist(), float(options["relax_ps"])
-    name, key = {
-        "shear": ("strains", "segment_shear_strain"),
-        "compress": ("pressures_bar", "segment_pressure_bar"),
-        "load": ("stresses_bar", "segment_applied_stress_bar"),
-    }[stage.kind]
-    return key, [float(v) for v in options[name]], float(options["duration_ps_each"])
+    definition = _PATHS_BY_KIND[stage.kind]
+    assert definition.path_option is not None  # deform's ladder returned above
+    return (
+        definition.sample_key,
+        [float(value) for value in options[definition.path_option]],
+        float(options["duration_ps_each"]),
+    )
 
 
 def validate_elastic_rate_scan(
@@ -212,7 +235,7 @@ def validate_elastic_rate_scan(
     *,
     property_name: str,
     target_rate: float,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
     **equilibration: Any,
 ) -> ElasticRatePlan:
     """Validate a selected property and price all rates before any output exists."""
@@ -250,11 +273,15 @@ def validate_elastic_rate_scan(
     plan = ElasticRatePlan(
         equilibration_protocol(spec, **equilibration), groups, holds, property_name
     )
-    if spec.max_total_ns is not None and plan.total_ns > spec.max_total_ns:
-        raise MechanicalError(
+    enforce_budget(
+        plan.total_ns,
+        spec.max_total_ns,
+        error=MechanicalError,
+        message=lambda: (
             f"The elastic rate scan is {plan.total_ns:.3g} ns across every rate and replica, "
             f"over the {spec.max_total_ns:.3g} ns budget."
-        )
+        ),
+    )
     return plan
 
 
@@ -291,10 +318,7 @@ def _request(
             **run_fingerprint(run),
         }
     )
-    request: dict[str, Any] = json.loads(
-        json.dumps(fields, allow_nan=False, default=str)
-    )
-    return request
+    return rate_request(fields)
 
 
 def run_elastic_rate_scan(
@@ -305,11 +329,11 @@ def run_elastic_rate_scan(
     hold_times_ps: Sequence[float],
     target_rate: float,
     spec: ModulusSpec = DEFAULT_SPEC,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> RateReport:
     """Vary only the holds; start each replica from one common relaxed cell.
@@ -372,24 +396,23 @@ def run_elastic_rate_scan(
     write_json(workflow, record)
     for i, (name, hold) in enumerate(zip(names, plan.hold_times_ps, strict=True)):
         rate_spec = _rate_spec(spec, property_name, hold)
-        for replica in range(spec.n_replicas):
-            protocol = _protocol(
-                rate_spec,
-                property_name,
-                i * spec.n_replicas + replica,
-                timestep_fs=timestep,
-                reference_box_nm=origin,
-            )
-            run_protocol(
-                protocol,
-                run,
-                directory / name,
-                state_in=start,
-                # The first replica creates each rate's fresh manifest;
-                # later replicas keep the ones completed before them.
-                resume=resume or replica > 0,
-                **chains,
-            )
+        run_branches(
+            (
+                _protocol(
+                    rate_spec,
+                    property_name,
+                    i * spec.n_replicas + replica,
+                    timestep_fs=timestep,
+                    reference_box_nm=origin,
+                )
+                for replica in range(spec.n_replicas)
+            ),
+            run,
+            directory / name,
+            start,
+            resume_first=resume,
+            **chains,
+        )
     return analyse_elastic_rates(
         [directory],
         property_name=property_name,
@@ -399,24 +422,28 @@ def run_elastic_rate_scan(
     )
 
 
-def _read_stages(directory: Path) -> dict[str, Any]:
+def _read_rate_manifest(directory: Path) -> dict[str, Any]:
     path = directory / "manifest.json"
     if not path.is_file():
         raise AnalysisError(f"No completed rate manifest in {directory}.")
-    return dict(json.loads(path.read_text()).get("stages", {}))
+    record: dict[str, Any] = json.loads(path.read_text())
+    return record
 
 
 def _check_recorded_scan(
     directory: Path, record: dict[str, Any], property_name: str
-) -> None:
+) -> dict[Path, dict[str, Any]]:
     request = record["request"]
     spec = ModulusSpec(**request["spec"])
     holds = request.get("hold_times_ps", request.get("relax_ps", []))
     names = record.get("run_dirs", [])
     if len(holds) != len(names):
         raise AnalysisError("Recorded hold and rate directory counts differ.")
+    manifests: dict[Path, dict[str, Any]] = {}
     for i, (name, hold) in enumerate(zip(names, holds, strict=True)):
-        stages = _read_stages(directory / name)
+        path = (directory / name).resolve()
+        manifests[path] = _read_rate_manifest(path)
+        stages = manifests[path].get("stages", {})
         rate_spec = _rate_spec(spec, property_name, hold)
         for replica in range(spec.n_replicas):
             protocol = _protocol(
@@ -472,6 +499,8 @@ def _check_recorded_scan(
                             "Recorded reference box differs from the workflow."
                         )
 
+    return manifests
+
 
 def _recorded_spec(record: dict[str, Any]) -> dict[str, Any] | None:
     """Carry preparation provenance alongside the measurement's settings."""
@@ -495,10 +524,11 @@ def _recorded_spec(record: dict[str, Any]) -> dict[str, Any] | None:
 
 def _expand(
     run_dirs: Sequence[str | Path], property_name: str
-) -> list[tuple[Path, dict[str, Any] | None]]:
-    result: list[tuple[Path, dict[str, Any] | None]] = []
+) -> list[tuple[Path, dict[str, Any] | None, dict[str, Any]]]:
+    result: list[tuple[Path, dict[str, Any] | None, dict[str, Any]]] = []
     for value in run_dirs:
         directory = Path(value).resolve()
+        manifests: dict[Path, dict[str, Any]] = {}
         workflow = directory / WORKFLOW_NAME
         if not workflow.is_file() and property_name == "poisson_ratio":
             workflow = directory / YOUNGS_WORKFLOW_NAME
@@ -511,7 +541,7 @@ def _expand(
             if not isinstance(names, list) or not names:
                 raise AnalysisError(f"{workflow} records no rate run directories.")
             if "spec" in request:
-                _check_recorded_scan(directory, record, property_name)
+                manifests = _check_recorded_scan(directory, record, property_name)
             candidates = [(directory / name, _recorded_spec(record)) for name in names]
         else:
             # A measurement child remains independently analysable with its
@@ -528,33 +558,41 @@ def _expand(
                         != property_name
                     ):
                         raise AnalysisError(f"{directory} measures another property.")
-                    _check_recorded_scan(directory.parent, record, property_name)
+                    manifests = _check_recorded_scan(
+                        directory.parent, record, property_name
+                    )
                     spec_data = _recorded_spec(record)
             candidates = [(directory, spec_data)]
         for candidate, spec_data in candidates:
             candidate = candidate.resolve()
-            _read_stages(candidate)
-            result.append((candidate, spec_data))
-    require_distinct([path for path, _ in result], what="elastic measurements")
+            raw = (
+                manifests[candidate]
+                if candidate in manifests
+                else _read_rate_manifest(candidate)
+            )
+            result.append((candidate, spec_data, raw))
+    require_distinct([path for path, _, _ in result], what="elastic measurements")
     return result
 
 
-def _finite(value: float) -> float | None:
-    return float(value) if math.isfinite(value) else None
-
-
 def _observations(
-    directory: Path, name: str, spec: dict[str, Any] | None, strain_limit: float
+    directory: Path,
+    name: str,
+    spec: dict[str, Any] | None,
+    strain_limit: float,
+    raw_manifest: dict[str, Any],
 ) -> list[RateObservation]:
     """One observation per loading path in *directory*, a replica's chunks as one.
 
     A path that cannot be fitted is kept as a missing value, its reason in
     the notes, rather than dropped from the series.
     """
-    stages = _read_stages(directory)
-    key = _PATH_KEYS[name]
+    stages = raw_manifest.get("stages", {})
+    key = _PATHS[name].sample_key
     if name == "poisson_ratio":
-        groups = group_by_stem(deform_stages(directory))
+        groups = group_by_stem(
+            deform_stages(directory, manifest=RunManifest(**raw_manifest))
+        )
     else:
         # A preparation's compression ladder records pressures as well; only
         # the bulk pass measures a modulus.
@@ -601,7 +639,7 @@ def _observations(
         # measured leg.
         origin = path[0] if name == "bulk_modulus" else 0.0
         distance = float(np.abs(np.diff(np.r_[origin, path])).sum())
-        rate = distance / float(duration.sum()) * 1000.0
+        rate = distance / float(duration.sum()) * PS_PER_NS
         if not math.isfinite(rate) or rate <= 0:
             raise AnalysisError(
                 "Every loading path must record a positive nominal rate."
@@ -670,20 +708,22 @@ def _observations(
                 )
             axis = int(axes[0])
         try:
+            manifest = RunManifest(**raw_manifest)
             if name == "poisson_ratio":
                 fit = poisson_ratio(
-                    stress_strain(directory, group), strain_limit=strain_limit
+                    stress_strain(directory, group, manifest=manifest),
+                    strain_limit=strain_limit,
                 )
                 value, error, resolved = fit.ratio, fit.standard_error, fit.resolved
             elif name == "shear_modulus":
-                shear = shear_modulus(directory, group)
+                shear = shear_modulus(directory, group, manifest=manifest)
                 value, error, resolved = (
                     shear.modulus_mpa,
                     shear.standard_error_mpa,
                     shear.resolved,
                 )
             elif name == "bulk_modulus":
-                bulk = bulk_modulus(directory, group)
+                bulk = bulk_modulus(directory, group, manifest=manifest)
                 value, error, resolved = (
                     bulk.modulus_mpa,
                     bulk.standard_error_mpa,
@@ -695,7 +735,7 @@ def _observations(
                 )
             else:
                 load = youngs_modulus(
-                    load_curve(directory, group),
+                    load_curve(directory, group, manifest=manifest),
                     strain_limit=strain_limit,
                     min_points=2,
                 )
@@ -729,8 +769,8 @@ def _observations(
         observations.append(
             RateObservation(
                 rate=rate,
-                value=_finite(value),
-                standard_error=None if error is None else _finite(error),
+                value=finite_or_none(value),
+                standard_error=finite_or_none(error),
                 resolved=bool(
                     resolved
                     and temperature is not None
@@ -752,31 +792,35 @@ def _observations(
 # --------------------------------------------------------------------------
 
 
-def _youngs_directories(run_dirs: Sequence[str | Path]) -> list[Path]:
+def _youngs_directories(
+    run_dirs: Sequence[str | Path],
+) -> list[tuple[Path, dict[str, Any]]]:
     """Each scan root's recorded rate directories, or the directory itself."""
-    directories: list[Path] = []
+    directories: list[tuple[Path, dict[str, Any]]] = []
     for value in run_dirs:
         directory = Path(value).resolve()
         workflow = directory / YOUNGS_WORKFLOW_NAME
         if not workflow.is_file():
-            _read_stages(directory)
-            directories.append(directory)
+            directories.append((directory, _read_rate_manifest(directory)))
             continue
         record = json.loads(workflow.read_text())
         names = record.get("run_dirs")
         if not isinstance(names, list) or not names:
             raise AnalysisError(f"{workflow} records no rate run directories.")
         rate_dirs = [(directory / str(name)).resolve() for name in names]
-        for rate_dir in rate_dirs:
-            _read_stages(rate_dir)
-        _check_youngs_scan(workflow, record, rate_dirs)
-        directories.extend(rate_dirs)
-    require_distinct(directories, what="strain-rate measurements")
+        loaded = [(rate_dir, _read_rate_manifest(rate_dir)) for rate_dir in rate_dirs]
+        _check_youngs_scan(workflow, record, loaded)
+        directories.extend(loaded)
+    require_distinct(
+        [directory for directory, _ in directories], what="strain-rate measurements"
+    )
     return directories
 
 
 def _check_youngs_scan(
-    workflow: Path, record: dict[str, Any], directories: Sequence[Path]
+    workflow: Path,
+    record: dict[str, Any],
+    directories: Sequence[tuple[Path, dict[str, Any]]],
 ) -> None:
     """A partial rate series cannot become a complete analysis by accident.
 
@@ -793,10 +837,10 @@ def _check_youngs_scan(
         raise AnalysisError(
             f"{workflow} has inconsistent rate directory and hold counts."
         )
-    for rate_index, (directory, hold) in enumerate(
+    for rate_index, ((directory, raw_manifest), hold) in enumerate(
         zip(directories, holds, strict=True)
     ):
-        entries = _read_stages(directory)
+        entries = raw_manifest.get("stages", {})
         rate_spec = replace(spec, relax_ps=float(hold))
         for replica in range(spec.n_replicas):
             protocol = deform_protocol(
@@ -873,7 +917,7 @@ def _check_comparable(curves: Sequence[StressStrain]) -> None:
 
 
 def _youngs_observations(
-    directories: Sequence[Path], strain_limit: float
+    directories: Sequence[tuple[Path, dict[str, Any]]], strain_limit: float
 ) -> list[RateObservation]:
     """One observation per distinct rate, fitted through all its replicas' points.
 
@@ -884,9 +928,10 @@ def _youngs_observations(
     :data:`~openmmpolymer.mechanical.MAX_REPLICA_SPREAD` of the pooled value.
     """
     curves: list[tuple[str, StressStrain]] = []
-    for directory in directories:
+    for directory, raw_manifest in directories:
+        manifest = RunManifest(**raw_manifest)
         try:
-            groups = group_by_stem(deform_stages(directory))
+            groups = group_by_stem(deform_stages(directory, manifest=manifest))
         except AnalysisError:
             groups = []
         if not groups:
@@ -894,19 +939,12 @@ def _youngs_observations(
                 f"{directory} has no strain-controlled extension to fit."
             )
         for group in groups:
-            curve = stress_strain(directory, group)
+            curve = stress_strain(directory, group, manifest=manifest)
             curves.append((f"{directory}: {curve.stage}", curve))
     _check_comparable([curve for _, curve in curves])
-    by_rate: list[list[tuple[str, StressStrain]]] = []
-    for item in sorted(curves, key=lambda item: float(item[1].strain_rate_per_ns or 0)):
-        if by_rate and math.isclose(
-            float(item[1].strain_rate_per_ns or 0),
-            float(by_rate[-1][0][1].strain_rate_per_ns or 0),
-            rel_tol=1.0e-8,
-        ):
-            by_rate[-1].append(item)
-        else:
-            by_rate.append([item])
+    by_rate = group_nearby_rates(
+        curves, rate=lambda item: float(item[1].strain_rate_per_ns or 0)
+    )
     observations: list[RateObservation] = []
     for members in by_rate:
         replicas = [curve for _, curve in members]
@@ -950,8 +988,8 @@ def analyse_elastic_rates(
     *,
     property_name: str,
     target_rate: float,
-    strain_limit: float = 0.015,
-    max_extrapolation_decades: float = 2.0,
+    strain_limit: float = DEFAULT_STRAIN_LIMIT,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
 ) -> RateReport:
     """Fit logarithmic and power-law responses to matching saved loading paths.
 
@@ -965,15 +1003,18 @@ def analyse_elastic_rates(
     validate_rate_request(target_rate, max_extrapolation_decades)
     require_positive(strain_limit, None, name="strain_limit")
     if property_name == "youngs_modulus":
-        directories = _youngs_directories(run_dirs)
-        observations = _youngs_observations(directories, strain_limit)
+        loaded = _youngs_directories(run_dirs)
+        directories = [directory for directory, _ in loaded]
+        observations = _youngs_observations(loaded, strain_limit)
     else:
         expanded = _expand(run_dirs, property_name)
-        directories = [directory for directory, _ in expanded]
+        directories = [directory for directory, _, _ in expanded]
         observations = [
             item
-            for directory, spec in expanded
-            for item in _observations(directory, property_name, spec, strain_limit)
+            for directory, spec, raw_manifest in expanded
+            for item in _observations(
+                directory, property_name, spec, strain_limit, raw_manifest
+            )
         ]
     return analyse_rate_observations(
         observations,

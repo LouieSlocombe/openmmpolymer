@@ -32,33 +32,35 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 
-from ._fitting import NEGLIGIBLE, fit_line, slope_error
+from ._fitting import MAX_RELATIVE_STANDARD_ERROR as MAX_RELATIVE_STANDARD_ERROR
+from ._fitting import NEGLIGIBLE, PS_PER_NS, fit_line, slope_error
+from ._validation import require_positive
+from .protocols import RunManifest
 from .stress import STRESS_ESTIMATOR_VERSION
 from .trajectory import (
     AnalysisError,
+    gather_samples,
     load_manifest,
+    sample_ladder,
     stage_names,
-    stage_record,
     stages_holding,
 )
 
 log = logging.getLogger(__name__)
 
+#: Largest engineering strain included by the default linear elastic fit.
+DEFAULT_STRAIN_LIMIT = 0.015
+
 #: 1 bar in MPa. Stress is recorded in bar, to match the pressures every other
 #: stage is set in, and reported in MPa, which is what a modulus is quoted in.
 MPA_PER_BAR = 0.1
-
-#: Largest relative standard error a fitted modulus may carry and still call
-#: itself resolved.
-MAX_RELATIVE_STANDARD_ERROR = 0.25
 
 #: How far the two halves of a fitting window may disagree about the slope,
 #: relative to the whole-window slope, before the fit is reporting a curve
@@ -317,23 +319,24 @@ class ElasticConsistency:
     shear_gap: float
     consistent: bool
 
+    @property
+    def gaps(self) -> tuple[tuple[str, float], ...]:
+        """The finite measured-versus-implied gaps, in bulk/shear order."""
+        return tuple(
+            (name, gap)
+            for name, gap in (("K", self.bulk_gap), ("G", self.shear_gap))
+            if math.isfinite(gap)
+        )
+
 
 # --------------------------------------------------------------------------
 # Reading a run directory
 # --------------------------------------------------------------------------
 
 
-def _ladder(key: str) -> Callable[[dict[str, Any]], bool]:
-    """Whether a stage's samples hold a ladder of *key*."""
-
-    def holds(samples: dict[str, Any]) -> bool:
-        values = samples.get(key)
-        return isinstance(values, list) and len(values) >= 1
-
-    return holds
-
-
-def deform_stages(run_dir: str | Path) -> tuple[str, ...]:
+def deform_stages(
+    run_dir: str | Path, *, manifest: RunManifest | None = None
+) -> tuple[str, ...]:
     """Name every stage in a run that stretched the cell along an axis.
 
     Found by what each stage recorded rather than by its name, as
@@ -349,32 +352,49 @@ def deform_stages(run_dir: str | Path) -> tuple[str, ...]:
         AnalysisError: There is no manifest, or nothing in it was a
             deformation.
     """
-    return stages_holding(run_dir, _ladder("segment_strain"), "a ladder of strains")
+    return stages_holding(
+        run_dir,
+        sample_ladder("segment_strain"),
+        "a ladder of strains",
+        manifest=manifest,
+    )
 
 
-def load_stages(run_dir: str | Path) -> tuple[str, ...]:
+def load_stages(
+    run_dir: str | Path, *, manifest: RunManifest | None = None
+) -> tuple[str, ...]:
     """Name every stage that pulled at a known stress.
 
     Raises:
         AnalysisError: There is no manifest, or nothing in it was a load.
     """
     return stages_holding(
-        run_dir, _ladder("segment_applied_stress_bar"), "a ladder of applied stresses"
+        run_dir,
+        sample_ladder("segment_applied_stress_bar"),
+        "a ladder of applied stresses",
+        manifest=manifest,
     )
 
 
-def shear_stages(run_dir: str | Path) -> tuple[str, ...]:
+def shear_stages(
+    run_dir: str | Path, *, manifest: RunManifest | None = None
+) -> tuple[str, ...]:
     """Name every stage that sheared the cell.
 
     Raises:
         AnalysisError: There is no manifest, or nothing in it was a shear.
     """
     return stages_holding(
-        run_dir, _ladder("segment_shear_strain"), "a ladder of shear strains"
+        run_dir,
+        sample_ladder("segment_shear_strain"),
+        "a ladder of shear strains",
+        manifest=manifest,
     )
 
 
-def bulk_stages(run_dir: str | Path) -> tuple[str, ...]:
+def bulk_stages(
+    run_dir: str | Path, *, manifest: RunManifest | None = None
+) -> tuple[str, ...]:
     """Name every stage that stepped through a ladder of pressures.
 
     Found by its ``segment_pressure_bar``, which a heating scan records too,
@@ -384,31 +404,11 @@ def bulk_stages(run_dir: str | Path) -> tuple[str, ...]:
         AnalysisError: There is no manifest, or nothing in it was a ladder.
     """
     return stages_holding(
-        run_dir, _ladder("segment_pressure_bar"), "a ladder of pressures"
+        run_dir,
+        sample_ladder("segment_pressure_bar"),
+        "a ladder of pressures",
+        manifest=manifest,
     )
-
-
-def _gather(
-    run_dir: str | Path, names: Sequence[str]
-) -> tuple[dict[str, list[float]], float]:
-    """Concatenate the samples of several stages, in the order given.
-
-    A strain ladder split across stages for resume is one curve; reading each
-    chunk as its own would give several short ones and fit a modulus to each.
-    """
-    directory = Path(run_dir)
-    manifest = load_manifest(directory)
-    merged: dict[str, list[float]] = {}
-    temperatures: list[float] = []
-    for name in names:
-        recorded = stage_record(manifest, name, directory)
-        samples = recorded.get("samples") or {}
-        for key, values in samples.items():
-            merged.setdefault(key, []).extend(float(value) for value in values)
-        mean = recorded.get("mean_temperature_k")
-        if mean is not None:
-            temperatures.append(float(mean))
-    return merged, float(np.mean(temperatures)) if temperatures else math.nan
 
 
 def _require_stress_estimator(
@@ -437,11 +437,14 @@ def _strain_rate_per_ns(
     """
     if not durations or len(durations) != len(strains) or min(durations) <= 0.0:
         return None
-    return abs(float(strains[-1])) / float(sum(durations)) * 1000.0
+    return abs(float(strains[-1])) / float(sum(durations)) * PS_PER_NS
 
 
 def stress_strain(
-    run_dir: str | Path, stage: str | Sequence[str] | None = None
+    run_dir: str | Path,
+    stage: str | Sequence[str] | None = None,
+    *,
+    manifest: RunManifest | None = None,
 ) -> StressStrain:
     """Read the stress-strain curve a deformation stage left behind.
 
@@ -458,8 +461,14 @@ def stress_strain(
         AnalysisError: There is nothing there to read, or what is there is
             not a deformation.
     """
-    names = deform_stages(run_dir) if stage is None else stage_names(stage)
-    samples, temperature = _gather(run_dir, names)
+    if manifest is None:
+        manifest = load_manifest(run_dir)
+    names = (
+        deform_stages(run_dir, manifest=manifest)
+        if stage is None
+        else stage_names(stage)
+    )
+    samples, temperature = gather_samples(run_dir, names, manifest=manifest)
     if "segment_strain" not in samples:
         raise AnalysisError(
             f"{', '.join(names)} recorded no strains, so nothing there was a "
@@ -512,7 +521,10 @@ def stress_strain(
 
 
 def load_curve(
-    run_dir: str | Path, stage: str | Sequence[str] | None = None
+    run_dir: str | Path,
+    stage: str | Sequence[str] | None = None,
+    *,
+    manifest: RunManifest | None = None,
 ) -> StressStrain:
     """Read the curve a constant-stress load stage left behind.
 
@@ -531,8 +543,12 @@ def load_curve(
     Raises:
         AnalysisError: There is nothing there to read.
     """
-    names = load_stages(run_dir) if stage is None else stage_names(stage)
-    samples, temperature = _gather(run_dir, names)
+    if manifest is None:
+        manifest = load_manifest(run_dir)
+    names = (
+        load_stages(run_dir, manifest=manifest) if stage is None else stage_names(stage)
+    )
+    samples, temperature = gather_samples(run_dir, names, manifest=manifest)
     axis = int(samples.get("load_axis", [2.0])[0])
     lateral = [index for index in range(3) if index != axis]
     applied = np.asarray(samples["segment_applied_stress_bar"], dtype=np.float64)
@@ -596,15 +612,14 @@ def _window(
     Raises:
         ValueError: The window is not a strain.
     """
-    if strain_limit <= 0.0:
-        raise ValueError(f"strain_limit={strain_limit} must be above zero.")
+    require_positive(strain_limit, None, name="strain_limit")
     return np.asarray(np.abs(strain) <= strain_limit + NEGLIGIBLE, dtype=np.bool_)
 
 
 def youngs_modulus(
     curve: StressStrain,
     *,
-    strain_limit: float = 0.015,
+    strain_limit: float = DEFAULT_STRAIN_LIMIT,
     min_points: int = 5,
 ) -> ElasticModulus:
     """Fit Young's modulus to the linear part of a stress-strain curve.
@@ -667,7 +682,7 @@ def youngs_modulus(
 def poisson_ratio(
     curve: StressStrain,
     *,
-    strain_limit: float = 0.015,
+    strain_limit: float = DEFAULT_STRAIN_LIMIT,
     min_points: int = 5,
 ) -> PoissonRatio:
     """Fit Poisson's ratio to the transverse response of a curve.
@@ -721,6 +736,7 @@ def bulk_modulus(
     stage: str | Sequence[str] | None = None,
     *,
     min_points: int = 4,
+    manifest: RunManifest | None = None,
 ) -> BulkModulus:
     """Fit the bulk modulus to a pressure ladder.
 
@@ -752,8 +768,12 @@ def bulk_modulus(
         AnalysisError: There is nothing there to read, or the pressures and
             densities do not pair up as finite numbers.
     """
-    names = bulk_stages(run_dir) if stage is None else stage_names(stage)
-    samples, temperature = _gather(run_dir, names)
+    if manifest is None:
+        manifest = load_manifest(run_dir)
+    names = (
+        bulk_stages(run_dir, manifest=manifest) if stage is None else stage_names(stage)
+    )
+    samples, temperature = gather_samples(run_dir, names, manifest=manifest)
     pressure = np.asarray(samples.get("segment_pressure_bar", []), dtype=np.float64)
     density = np.asarray(samples.get("segment_density_g_cm3", []), dtype=np.float64)
     if (
@@ -850,6 +870,7 @@ def shear_modulus(
     stage: str | Sequence[str] | None = None,
     *,
     min_points: int = 3,
+    manifest: RunManifest | None = None,
 ) -> ShearModulus:
     """Fit the shear modulus to a ladder of shear strains.
 
@@ -867,8 +888,14 @@ def shear_modulus(
         AnalysisError: There is nothing there to read, or the stress was
             recorded with an obsolete or unidentified estimator.
     """
-    names = shear_stages(run_dir) if stage is None else stage_names(stage)
-    samples, temperature = _gather(run_dir, names)
+    if manifest is None:
+        manifest = load_manifest(run_dir)
+    names = (
+        shear_stages(run_dir, manifest=manifest)
+        if stage is None
+        else stage_names(stage)
+    )
+    samples, temperature = gather_samples(run_dir, names, manifest=manifest)
     _require_stress_estimator(samples, names)
     strain = np.asarray(samples["segment_shear_strain"], dtype=np.float64)
     stress = (

@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from .rate_dependence import RateExtrapolation
     from .strength import BreakingStrength, ElongationAtBreak, YieldStrength
     from .structural_convergence import StructuralWindowConvergence
+    from .tm import MeltingReport
 
 #: Figure size in inches. Wide enough for a four-panel column to stay legible
 #: at a report's width.
@@ -83,6 +84,30 @@ _ALTERNATIVE_COLOUR = "#6c3483"
 # --------------------------------------------------------------------------
 # Thermal: the state data and the quench
 # --------------------------------------------------------------------------
+
+
+def plot_melting(report: MeltingReport) -> Figure:
+    """Show a heating scan's volume and enthalpy with its transition bracket.
+
+    Returns a figure without writing files or selecting a pyplot backend.
+    """
+    from matplotlib.figure import Figure
+
+    figure = Figure(figsize=(7, 7), layout="constrained")
+    axes = figure.subplots(2, 1, sharex=True)
+    curve = report.curve
+    axes[0].plot(curve.temperature_k, curve.specific_volume_cm3_g, "o-")
+    axes[1].plot(curve.temperature_k, curve.enthalpy_kj_mol, "o-")
+    axes[0].set_ylabel("Specific volume (cm³/g)")
+    axes[1].set_ylabel("Enthalpy (kJ/mol of cells)")
+    axes[1].set_xlabel("Temperature (K)")
+    for axis in axes:
+        if report.transition.bracket_k is not None:
+            axis.axvspan(*report.transition.bracket_k, alpha=0.2, color="tab:red")
+    rate = curve.heating_rate_k_per_ns
+    label = "irregular heating schedule" if rate is None else f"{rate:g} K/ns"
+    figure.suptitle(f"Apparent melting scan - {label}, {curve.pressure_bar[0]:g} bar")
+    return figure
 
 
 def plot_state_data(data: StateData, *, settled: Equilibration | None = None) -> Figure:
@@ -481,11 +506,11 @@ def _persistence_title(length: PersistenceLength) -> str:
     """A title that says whether the length was measured or extrapolated."""
     contour = f"{length.contour_length_nm:.2f} nm contour"
     fitted = length.persistence_length_nm
-    if math.isinf(fitted):
+    if length.regime == "rod_like":
         return f"no decay along a {contour} ({length.n_bonds} bonds): rod-like"
-    if not fitted > 0.0:
+    if length.regime == "unfitted":
         return f"no persistence length could be fitted over a {contour}"
-    if not length.decayed:
+    if length.regime == "extrapolated":
         return (
             f"l_p = {fitted:.2f} nm, extrapolated: not decayed to 1/e within "
             f"the {contour}"
@@ -655,9 +680,8 @@ def plot_moduli(report: ModulusReport) -> Figure:
     axis.set_xticklabels(labels)
     axis.set_ylabel("Modulus (MPa)")
     _title(axis, _moduli_title(report))
-    handles, names = axis.get_legend_handles_labels()
-    if handles:
-        axis.legend(handles, names, fontsize=7, frameon=False)
+    if axis.get_legend_handles_labels()[0]:
+        _legend(axis)
     return figure
 
 
@@ -923,11 +947,7 @@ def _moduli_title(report: ModulusReport) -> str:
     check = report.consistency
     if check is None:
         return "Elastic constants"
-    gaps = [
-        f"{name} {100.0 * gap:.0f}%"
-        for name, gap in (("K", check.bulk_gap), ("G", check.shear_gap))
-        if np.isfinite(gap)
-    ]
+    gaps = [f"{name} {100.0 * gap:.0f}%" for name, gap in check.gaps]
     if not gaps:
         return "Elastic constants - nothing to check them against"
     verdict = "consistent" if check.consistent else "not consistent"
@@ -1384,20 +1404,28 @@ def plot_window_convergence(result: WindowConvergence) -> Figure:
         finite = np.isfinite(y)
         known = finite & np.isfinite(error)
         if np.any(known):
-            axis.errorbar(
+            _error_bars(
+                axis,
                 x[known],
                 y[known],
-                yerr=error[known],
+                error[known],
                 marker="o",
-                linestyle="none",
+                elinewidth=None,
                 capsize=3,
-                color=_DATA_COLOUR,
                 label="mean (1 SE)",
             )
         unknown = finite & ~known
         if np.any(unknown):
-            axis.plot(
-                x[unknown], y[unknown], "x", color=_GUIDE_COLOUR, label="SE unavailable"
+            _measured(
+                axis,
+                x[unknown],
+                y[unknown],
+                marker="x",
+                markersize=None,
+                linewidth=None,
+                linestyle="none",
+                color=_GUIDE_COLOUR,
+                label="SE unavailable",
             )
         _title(axis, label)
         axis.set_ylabel(f"{result.property_name} ({result.value_unit})")
@@ -1431,7 +1459,14 @@ def plot_relaxation_convergence(result: RelaxationWindowConvergence) -> Figure:
     durations = np.asarray([item.duration_ps for item in result.windows])
     for axis, metric in zip(axes, result.metrics.values(), strict=True):
         finite = np.isfinite(metric.values)
-        axis.plot(durations[finite], metric.values[finite], "o-", color=_DATA_COLOUR)
+        _measured(
+            axis,
+            durations[finite],
+            metric.values[finite],
+            marker="o",
+            markersize=None,
+            linewidth=None,
+        )
         if np.any(finite):
             scale = float(np.max(np.abs(metric.values[finite])))
             if scale > 0.0 and float(np.ptp(metric.values[finite])) < 1e-8 * scale:
@@ -1475,25 +1510,31 @@ def plot_structural_convergence(result: StructuralWindowConvergence) -> Figure:
         values = np.asarray(metric.values, dtype=np.float64)
         finite = np.isfinite(values)
         valid = finite & np.asarray(metric.valid, dtype=bool)
-        axis.plot(
+        _guide(
+            axis,
             durations[finite],
             values[finite],
-            "--",
-            color=_REFERENCE_COLOUR,
             linewidth=0.7,
         )
-        axis.plot(
+        _measured(
+            axis,
             durations[valid],
             values[valid],
-            "o",
-            color=_DATA_COLOUR,
+            marker="o",
+            markersize=None,
+            linewidth=None,
+            linestyle="none",
             label="valid window",
         )
         if np.any(finite & ~valid):
-            axis.plot(
+            _measured(
+                axis,
                 durations[finite & ~valid],
                 values[finite & ~valid],
-                "x",
+                marker="x",
+                markersize=None,
+                linewidth=None,
+                linestyle="none",
                 color=_GUIDE_COLOUR,
                 label="unresolved window",
             )

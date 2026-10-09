@@ -12,6 +12,8 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from ._fitting import MAX_EXTRAPOLATION_DECADES
+from ._validation import require_choice
 from .elastic_rates import (
     ELASTIC_RATE_PROPERTIES,
     ElasticRatePlan,
@@ -19,6 +21,7 @@ from .elastic_rates import (
     run_elastic_rate_scan,
     validate_elastic_rate_scan,
 )
+from .elasticity import DEFAULT_STRAIN_LIMIT
 from .mechanical import ModulusSpec
 from .rate_dependence import RateReport
 from .simulate import RunContext
@@ -28,6 +31,7 @@ from .tensile_rates import (
     TensileRatePlan,
     analyse_tensile_rates,
     run_tensile_rate_scan,
+    tensile_rate_spec_type,
     validate_tensile_rate_scan,
 )
 from .tg import TgSpec
@@ -85,10 +89,7 @@ _FAMILIES = {
 }
 _SPECS: dict[str, type[RateScanSpec]] = {
     **dict.fromkeys(ELASTIC_RATE_PROPERTIES, ModulusSpec),
-    "yield_strength": YieldSpec,
-    "yield_strain": YieldSpec,
-    "breaking_strength": BreakingSpec,
-    "elongation_at_break": ElongationSpec,
+    **{name: tensile_rate_spec_type(name) for name in TENSILE_RATE_PROPERTIES},
     "glass_transition": TgSpec,
     "melting_temperature": TmSpec,
 }
@@ -101,12 +102,15 @@ def default_rate_spec(property_name: str) -> RateScanSpec:
 
 def _spec_type(property_name: str) -> type[RateScanSpec]:
     """Look up settings without constructing and validating a default instance."""
-    try:
-        return _SPECS[property_name]
-    except KeyError:
-        raise ValueError(
+    require_choice(
+        property_name,
+        tuple(_SPECS),
+        name="property_name",
+        message=lambda: (
             f"Unknown rate property {property_name!r}; choose {tuple(RATE_PROPERTIES)}."
-        ) from None
+        ),
+    )
+    return _SPECS[property_name]
 
 
 def _family(property_name: str, spec: RateScanSpec | None = None) -> _Family:
@@ -126,8 +130,8 @@ def analyse_property_rates(
     *,
     property_name: str,
     target_rate: float,
-    strain_limit: float = 0.015,
-    max_extrapolation_decades: float = 2.0,
+    strain_limit: float = DEFAULT_STRAIN_LIMIT,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
 ) -> RateReport:
     """Read a rate series in its property's units, preserving event censoring.
 
@@ -152,7 +156,7 @@ def validate_property_rate_scan(
     property_name: str,
     target_rate: float,
     n_replicas: int = 3,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
     **equilibration: Any,
 ) -> RatePlan:
     """Price every rate and replica, using the appropriate preparation protocol.
@@ -181,7 +185,7 @@ def run_property_rate_scan(
     target_rate: float,
     spec: RateScanSpec | None = None,
     n_replicas: int = 3,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
     **options: Any,
 ) -> RateReport:
     """Run independent rate branches from shared preparation, then compare models.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 from collections.abc import Sequence
@@ -102,6 +103,54 @@ def quick_run(tmp_path_factory: pytest.TempPathFactory) -> RunSummary:
     return run_protocol(
         QUICK, argon_context(64, 2.4), tmp_path_factory.mktemp("quick") / "run"
     )
+
+
+@pytest.mark.parametrize(
+    ("kind", "options"),
+    [
+        ("heat", {}),
+        ("heat", {"measure_enthalpy": False}),
+        (
+            "heat",
+            {
+                "barostat": "isotropic",
+                "samples_per_segment": 12,
+                "trajectory": TrajectoryOptions("dcd", 0.5),
+            },
+        ),
+        ("production", {}),
+        ("production", {"pressure_bar": None}),
+        ("production", {"pressure_bar": 0.0}),
+        (
+            "production",
+            {
+                "pressure_bar": 2.5,
+                "samples_per_segment": 12,
+                "trajectory": "none",
+                "new_velocities": True,
+            },
+        ),
+    ],
+)
+def test_forwarded_runner_options_match_recorded_provenance(
+    monkeypatch: pytest.MonkeyPatch, kind: str, options: dict[str, Any]
+) -> None:
+    """Heating forces enthalpy and production selects its barostat at execution."""
+    signature = inspect.signature(simulate.run_segments)
+
+    def capture(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        return bound.arguments
+
+    monkeypatch.setattr(simulate, "run_segments", capture)
+    recorded = _stage_options(Stage("recorded", kind, options))
+    observed = getattr(simulate, f"run_{kind}")(None, "custom/prefix", **options)
+    assert observed["barostat"] == recorded["barostat"]
+    assert observed["measure_enthalpy"] == recorded["measure_enthalpy"]
+    for name in signature.parameters:
+        if name in recorded and name != "output_prefix":
+            assert observed[name] == recorded[name], name
 
 
 def test_the_defaults_every_manifest_records_are_pinned() -> None:
@@ -675,6 +724,48 @@ def test_duration_counts_the_segments_handed_to_execution(
         ],
         ("compress", {"pressures_bar": []}, "no segments"),
         ("anneal", {"n_cycles": 0}, "no segments"),
+        *[
+            (kind, {option: value}, "duration_ps")
+            for kind, option in (
+                ("pushoff", "duration_ps"),
+                ("nvt", "duration_ps"),
+                ("npt", "duration_ps"),
+                ("production", "duration_ps"),
+                ("compress", "duration_ps_each"),
+                ("quench", "hold_ps"),
+                ("anneal", "window_ps"),
+                ("anneal", "hold_ps"),
+                ("load", "duration_ps_each"),
+                ("shear", "duration_ps_each"),
+                ("relax", "duration_ps"),
+            )
+            for value in (-1.0, 0.0, math.nan, math.inf)
+        ],
+        *[
+            (kind, {"pressure_bar": value}, "pressure_bar")
+            for kind in ("quench", "heat", "anneal", "npt", "production")
+            for value in (math.nan, math.inf)
+        ],
+        ("compress", {"pressures_bar": [1.0, math.nan]}, "pressure_bar"),
+        *[
+            (kind, {"temperature_k": value}, "temperature_k")
+            for kind in ("nvt", "npt", "production", "pushoff")
+            for value in (0.0, -1.0, math.nan, math.inf)
+        ],
+        *[
+            (kind, {option: [0.01, value]}, option)
+            for kind, option in (("load", "stresses_bar"), ("shear", "strains"))
+            for value in (math.nan, math.inf)
+        ],
+        *[
+            ("relax", {option: value}, option)
+            for option in ("baseline_ps", "ramp_ps", "time_offset_ps")
+            for value in (-1.0, math.nan, math.inf)
+        ],
+        *[
+            ("deform", {"relax_ps": value}, "relax_ps")
+            for value in (0.0, -1.0, math.nan, math.inf)
+        ],
     ],
 )
 def test_invalid_schedules_fail_identically_in_budgets_and_execution(
@@ -767,6 +858,12 @@ def test_a_quench_can_start_somewhere_other_than_the_melt_temperature() -> None:
 @pytest.mark.parametrize(
     ("kind", "options", "duration"),
     [
+        ("nvt", {"duration_ps": 0.7}, 0.7),
+        ("npt", {"duration_ps": 0.7, "pressure_bar": -10.0}, 0.7),
+        ("production", {"duration_ps": 0.7, "pressure_bar": None}, 0.7),
+        ("pushoff", {"duration_ps": 0.7}, 0.7),
+        ("relax", {"duration_ps": 0.7, "baseline_ps": 0.0, "ramp_ps": 0.0}, 0.7),
+        ("relax", {"duration_ps": 0.7, "strain_applied": True}, 0.7),
         ("deform", {"n_steps": 25, "relax_ps": 50.0}, 1250.0),
         (
             "load",

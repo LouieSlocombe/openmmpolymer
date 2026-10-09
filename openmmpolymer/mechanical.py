@@ -41,25 +41,29 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ._files import ReportFiles
+from ._files import ReportFiles, figure_stem
+from ._fitting import MAX_REPLICA_SPREAD as MAX_REPLICA_SPREAD
+from ._fitting import NEGLIGIBLE, PS_PER_NS
 from ._validation import require_axis, require_integer
 from ._workflow import (
     StrainSchedule,
     chain_options,
     deformation_stages,
+    enforce_budget,
     equilibration_at,
     group_by_stem,
     optional,
     remaining_ps,
     require_positive_fields,
-    run_branched_scan,
+    run_measurement_scan,
     sample_spread,
     scan_listing,
-    scan_request,
     with_reference_box,
     write_report_files,
 )
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .elasticity import (
+    DEFAULT_STRAIN_LIMIT,
     BulkModulus,
     ElasticConsistency,
     ElasticModulus,
@@ -77,7 +81,7 @@ from .elasticity import (
 )
 from .plots import plot_moduli, plot_stress_strain
 from .protocols import Protocol, RunManifest, Stage
-from .simulate import RunContext, safe_timestep_fs
+from .simulate import RunContext
 from .trajectory import AnalysisError
 
 if TYPE_CHECKING:
@@ -91,13 +95,6 @@ LOAD_STEM = "07_load"
 BULK_STEM = "08_bulk"
 SHEAR_STEM = "09_shear"
 WORKFLOW_NAME = "mechanical_workflow.json"
-
-#: How far the replicas may disagree - their sample standard deviation,
-#: relative to the pooled modulus - before that modulus stops claiming to be
-#: resolved. Generous, because three replicas of a forty-chain cell is a small
-#: sample of a noisy quantity - and still worth having, because the
-#: alternative is quoting one run's number with no spread at all.
-MAX_REPLICA_SPREAD = 0.3
 
 
 class MechanicalError(RuntimeError):
@@ -154,7 +151,7 @@ class ModulusSpec:
     strain_increment: float = 0.002
     max_strain: float = 0.05
     relax_ps: float = 50.0
-    elastic_strain_limit: float = 0.015
+    elastic_strain_limit: float = DEFAULT_STRAIN_LIMIT
     n_replicas: int = 3
     samples_per_step: int = 250
     stage_ps: float = 10_000.0
@@ -468,23 +465,27 @@ def _report_cost(
         "Mechanical scan: %.1f ns equilibration, %.1f ns of extension (%d "
         "replicas of %d steps to %.1f%% strain at %.3g /ns), %.1f ns of "
         "load, bulk and shear - %.1f ns in total, %.1f ns of it still to run.",
-        settle.total_duration_ps / 1000.0,
-        schedule.total_ps * spec.n_replicas / 1000.0,
+        settle.total_duration_ps / PS_PER_NS,
+        schedule.total_ps * spec.n_replicas / PS_PER_NS,
         spec.n_replicas,
         schedule.n_steps,
         100.0 * schedule.max_strain,
         schedule.strain_rate_per_ns,
         sum(stage.duration_ps for stage in extra_stages(spec, timestep_fs=2.0))
-        / 1000.0,
-        total_ps / 1000.0,
-        remaining_ps(listing.stages, manifest) / 1000.0,
+        / PS_PER_NS,
+        total_ps / PS_PER_NS,
+        remaining_ps(listing.stages, manifest) / PS_PER_NS,
     )
-    if spec.max_total_ns is not None and total_ps / 1000.0 > spec.max_total_ns:
-        raise MechanicalError(
-            f"The scan is {total_ps / 1000.0:.1f} ns, over the "
+    enforce_budget(
+        total_ps / PS_PER_NS,
+        spec.max_total_ns,
+        error=MechanicalError,
+        message=lambda: (
+            f"The scan is {total_ps / PS_PER_NS:.1f} ns, over the "
             f"{spec.max_total_ns:.1f} ns budget. Shorten relax_ps, drop a "
             "replica, skip a pass, or raise max_total_ns."
-        )
+        ),
+    )
 
 
 def run_modulus_scan(
@@ -495,7 +496,7 @@ def run_modulus_scan(
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> ModulusReport:
     """Equilibrate a cell, measure its elastic constants, and report them.
@@ -529,28 +530,23 @@ def run_modulus_scan(
     settle = equilibration_protocol(spec, **equilibration)
     _report_cost(spec, settle, RunManifest.load(directory) if resume else None)
 
-    timestep_fs = safe_timestep_fs(spec.temperature_k, run.spec)
-    chains = chain_options(
-        chain_backbone, atoms_per_chain, expected_characteristic_ratio
-    )
-    run_branched_scan(
+    return run_measurement_scan(
         run,
         directory / WORKFLOW_NAME,
-        scan_request(run, spec, settle, **chains),
+        spec,
         settle,
-        lambda origin: _branches(
+        lambda timestep_fs, origin: _branches(
             spec, timestep_fs=timestep_fs, reference_box_nm=origin
         ),
+        lambda directory: analyse_mechanics(
+            directory, strain_limit=spec.elastic_strain_limit
+        ),
+        lambda report: _log_result(report, deform_schedule(spec)),
         resume=resume,
         error=MechanicalError,
         verb="deform",
-        metadata={"timestep_fs": timestep_fs, "n_replicas": spec.n_replicas},
-        **chains,
+        **chain_options(chain_backbone, atoms_per_chain, expected_characteristic_ratio),
     )
-
-    report = analyse_mechanics(directory, strain_limit=spec.elastic_strain_limit)
-    _log_result(report, deform_schedule(spec))
-    return report
 
 
 def _log_result(report: ModulusReport, schedule: ModulusSchedule) -> None:
@@ -584,13 +580,14 @@ def _log_result(report: ModulusReport, schedule: ModulusSchedule) -> None:
                 "" if fit.resolved else " (not resolved)",
             )
     if report.consistency is not None:
+        check = report.consistency
+        gaps = ", ".join(f"{name} {100.0 * gap:.0f}%" for name, gap in check.gaps)
         log.info(
-            "  E and nu imply K = %.0f, G = %.0f MPa; gaps %.0f%% and %.0f%%%s.",
-            report.consistency.bulk_implied_mpa,
-            report.consistency.shear_implied_mpa,
-            100.0 * report.consistency.bulk_gap,
-            100.0 * report.consistency.shear_gap,
-            "" if report.consistency.consistent else " - not consistent",
+            "  E and nu imply K = %.0f, G = %.0f MPa; %s%s.",
+            check.bulk_implied_mpa,
+            check.shear_implied_mpa,
+            f"gaps {gaps}" if gaps else "nothing measured to check them against",
+            "" if check.consistent or not gaps else " - not consistent",
         )
     if math.isfinite(report.method_gap):
         log.info(
@@ -607,7 +604,7 @@ def _log_result(report: ModulusReport, schedule: ModulusSchedule) -> None:
 def analyse_mechanics(
     run_dir: str | Path,
     *,
-    strain_limit: float = 0.015,
+    strain_limit: float = DEFAULT_STRAIN_LIMIT,
     min_points: int = 5,
 ) -> ModulusReport:
     """Read everything a finished run has to say about its mechanics.
@@ -636,17 +633,18 @@ def analyse_mechanics(
     """
     directory = Path(run_dir)
     notes: list[str] = []
+    manifest = RunManifest.load(directory)
     curves: list[StressStrain] = []
     replicas: list[ElasticModulus] = []
 
-    try:
-        groups = group_by_stem(deform_stages(directory))
-    except AnalysisError as error:
-        groups = []
-        notes.append(f"No extension to fit: {error}")
+    groups = optional(
+        lambda: group_by_stem(deform_stages(directory, manifest=manifest)),
+        notes,
+        "No extension to fit",
+    )
 
-    for group in groups:
-        curve = stress_strain(directory, group)
+    for group in groups or []:
+        curve = stress_strain(directory, group, manifest=manifest)
         curves.append(curve)
         replicas.append(
             youngs_modulus(curve, strain_limit=strain_limit, min_points=min_points)
@@ -670,11 +668,10 @@ def analyse_mechanics(
     # records exactly what the equilibration's compression ladder records -
     # and that one climbs to a kilobar at the melt temperature, which fitted
     # as a bulk modulus is a confident number about nothing.
-    manifest = RunManifest.load(directory)
     stage_names = list(manifest.stages) if manifest is not None else []
     if BULK_STEM in stage_names:
         bulk = optional(
-            lambda: bulk_modulus(directory, BULK_STEM),
+            lambda: bulk_modulus(directory, BULK_STEM, manifest=manifest),
             notes,
             "No bulk-modulus pass to fit",
         )
@@ -685,8 +682,16 @@ def analyse_mechanics(
             "compression ladder run as part of equilibration is not one - it "
             "is far outside linear response and at the wrong temperature."
         )
-    shear = optional(lambda: shear_modulus(directory), notes, "No shear ladder to fit")
-    load = optional(lambda: load_curve(directory), notes, "No constant-stress pass")
+    shear = optional(
+        lambda: shear_modulus(directory, manifest=manifest),
+        notes,
+        "No shear ladder to fit",
+    )
+    load = optional(
+        lambda: load_curve(directory, manifest=manifest),
+        notes,
+        "No constant-stress pass",
+    )
     load_fit = (
         youngs_modulus(load, strain_limit=strain_limit, min_points=2)
         if load is not None
@@ -702,7 +707,7 @@ def analyse_mechanics(
     if (
         youngs is not None
         and load_fit is not None
-        and abs(youngs.modulus_mpa) > 1.0e-12
+        and abs(youngs.modulus_mpa) > NEGLIGIBLE
     ):
         gap = abs(load_fit.modulus_mpa - youngs.modulus_mpa) / abs(youngs.modulus_mpa)
 
@@ -886,7 +891,7 @@ def write_mechanical_report(
 def _figures(report: ModulusReport) -> Iterator[tuple[str, Figure]]:
     """Each replica's stress-strain curve, the constant-stress one, the moduli."""
     for curve, fit in zip(report.curves, report.replicas, strict=False):
-        stem = curve.stage.replace(", ", "_").replace(" ", "_")
+        stem = figure_stem(curve.stage, fallback="stage")
         yield (
             f"stress_strain_{stem}",
             plot_stress_strain(curve, fit=fit, poisson=report.poisson),

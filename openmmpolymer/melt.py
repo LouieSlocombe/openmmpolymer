@@ -30,8 +30,12 @@ from tempfile import TemporaryDirectory
 from ._files import file_sha256, write_json
 from ._validation import require_integer
 from .chain import ChainResult, ChainSpec, build_chain
-from .charges import assign_charges
-from .forcefield import DEFAULT_SMIRNOFF_FORCEFIELD, build_polymer_forcefield
+from .charges import DEFAULT_CHARGE_METHOD, assign_charges
+from .forcefield import (
+    DEFAULT_BACKEND,
+    DEFAULT_SMIRNOFF_FORCEFIELD,
+    build_polymer_forcefield,
+)
 from .mdsystem import SystemSpec, assemble_box, check_target_density, prepare_box
 from .packing import (
     DEFAULT_PACKING_DENSITY,
@@ -41,7 +45,7 @@ from .packing import (
     distribute_conformers,
     pack_box,
 )
-from .protocols import ProtocolError, _run_identity, validate_run_inputs
+from .protocols import ProtocolError, _canonical, _run_identity, validate_run_inputs
 from .simulate import RunContext, prepare_run
 
 log = logging.getLogger(__name__)
@@ -57,8 +61,8 @@ def build_melt(
     *,
     target_density_g_cm3: float,
     n_conformers: int | None = None,
-    charge_method: str = "nagl",
-    backend: str = "smirnoff",
+    charge_method: str = DEFAULT_CHARGE_METHOD,
+    backend: str = DEFAULT_BACKEND,
     smirnoff_forcefield: str = DEFAULT_SMIRNOFF_FORCEFIELD,
     pack_density_g_cm3: float = DEFAULT_PACKING_DENSITY,
     packmol_timeout_s: float | None = PACKMOL_TIMEOUT_S,
@@ -145,19 +149,16 @@ def build_melt(
             platform=platform,
             progress=progress,
         )
-        # Through JSON, so the tuples in the chain compare with the record's lists.
-        inputs = json.loads(
-            json.dumps(
-                {
-                    "run": _run_identity(run),
-                    "chain": {
-                        key: value
-                        for key, value in asdict(chain).items()
-                        if key not in {"sdf_paths", "pdb_paths"}
-                    },
+        # Canonical lists compare with the chain tuples saved in the JSON record.
+        inputs = _canonical(
+            {
+                "run": _run_identity(run),
+                "chain": {
+                    key: value
+                    for key, value in asdict(chain).items()
+                    if key not in {"sdf_paths", "pdb_paths"}
                 },
-                allow_nan=False,
-            )
+            }
         )
         if not fresh and (record is None or record["inputs"] != inputs):
             raise ProtocolError(

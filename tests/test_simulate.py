@@ -62,7 +62,7 @@ from openmmpolymer.simulate import (
 )
 from openmmpolymer.stress import STRESS_ESTIMATOR_VERSION, StressError, affine_scale
 
-from .helpers import argon_context, bare_simulation, rigid_rotor_system
+from .helpers import argon_context, bare_simulation, forbidden, rigid_rotor_system
 
 
 @pytest.fixture(scope="module")
@@ -102,6 +102,76 @@ def _probe(
 def test_prepare_run_measures_the_cell_mass(argon_run: Any) -> None:
     """64 argon atoms, and the density arithmetic depends on it."""
     assert argon_run.total_mass_g_mol == pytest.approx(64 * 39.948, rel=1e-3)
+
+
+@pytest.mark.parametrize("field", ["temperature_k", "duration_ps"])
+@pytest.mark.parametrize("value", [-1.0, 0.0, float("nan"), float("inf")])
+def test_segments_require_positive_finite_temperatures_and_durations(
+    field: str, value: float
+) -> None:
+    options: dict[str, Any] = {"temperature_k": 120.0, "duration_ps": 0.1, field: value}
+    with pytest.raises(ValueError, match=field):
+        Segment(**options)
+
+
+@pytest.mark.parametrize("pressure", [-100.0, 0.0, 1.0])
+def test_segment_pressure_may_be_finite_tension_or_zero(pressure: float) -> None:
+    assert Segment(120.0, 0.1, pressure).pressure_bar == pressure
+
+
+@pytest.mark.parametrize(
+    ("runner", "option"),
+    [
+        ("run_pushoff", "duration_ps"),
+        ("run_nvt", "duration_ps"),
+        ("run_npt", "duration_ps"),
+        ("run_production", "duration_ps"),
+        ("run_compress", "duration_ps_each"),
+        ("run_quench", "hold_ps"),
+        ("run_anneal", "window_ps"),
+        ("run_anneal", "hold_ps"),
+    ],
+)
+@pytest.mark.parametrize("value", [-1.0, 0.0, float("nan"), float("inf")])
+def test_invalid_hold_duration_is_refused_before_accessing_run_or_writing(
+    tmp_path: Path, runner: str, option: str, value: float
+) -> None:
+    with pytest.raises(ValueError, match="duration_ps"):
+        getattr(simulate, runner)(
+            None, output_prefix=tmp_path / "invalid", **{option: value}
+        )
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "runner", ["run_npt", "run_production", "run_quench", "run_anneal", "run_compress"]
+)
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_nonfinite_pressure_is_refused_before_accessing_run_or_writing(
+    tmp_path: Path, runner: str, value: float
+) -> None:
+    options = (
+        {"pressures_bar": (1.0, value)}
+        if runner == "run_compress"
+        else {"pressure_bar": value}
+    )
+    with pytest.raises(ValueError, match="pressure_bar"):
+        getattr(simulate, runner)(None, output_prefix=tmp_path / "invalid", **options)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("runner", "option"), [("run_load", "stresses_bar"), ("run_shear", "strains")]
+)
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_the_whole_load_or_shear_ladder_is_finite_before_any_dynamics(
+    tmp_path: Path, runner: str, option: str, value: float
+) -> None:
+    with pytest.raises(ValueError, match=option):
+        getattr(simulate, runner)(
+            None, output_prefix=tmp_path / "invalid", **{option: (0.01, value)}
+        )
+    assert not list(tmp_path.iterdir())
 
 
 def test_final_pdb_uses_the_live_cell_without_changing_the_packed_topology(
@@ -504,8 +574,9 @@ def test_density_and_temperature_helpers_agree_with_openmm(
 
     state = simulation.context.getState(getEnergy=True)
 
-    def unexpected_fetch(**kwargs: Any) -> Any:
-        pytest.fail("An existing state must not trigger another state fetch.")
+    unexpected_fetch = forbidden(
+        "An existing state must not trigger another state fetch."
+    )
 
     monkeypatch.setattr(simulation.context, "getState", unexpected_fetch)
     assert _density_g_cm3(
@@ -978,6 +1049,49 @@ def test_a_strain_leaves_every_constraint_satisfied() -> None:
     along = np.einsum("ij,ij->i", velocities[1::2] - velocities[0::2], bonds)
     assert np.linalg.norm(bonds, axis=1) == pytest.approx(0.109, rel=1e-6)
     assert along == pytest.approx(0.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_shared_tensile_increment_preserves_the_recorded_affine_transform(
+    axis: int,
+) -> None:
+    """Consolidating strain application must not perturb a resumed trajectory."""
+    before = bare_simulation(*rigid_rotor_system(30, 3.0))
+    after = bare_simulation(*rigid_rotor_system(30, 3.0))
+    vectors = np.array([[3.0, 0.0, 0.0], [0.4, 3.0, 0.0], [0.2, 0.3, 3.0]])
+    velocities = np.random.default_rng(3).normal(0.0, 0.5, (60, 3))
+    for simulation in (before, after):
+        simulation.context.setPeriodicBoxVectors(*(vectors * unit.nanometer))
+        simulation.context.setVelocities(velocities * unit.nanometer / unit.picosecond)
+
+    # The original deformation arithmetic is an independent compatibility
+    # oracle: the other two vectors used to be retained without multiplying.
+    increment = 0.013
+    factors = [1.0, 1.0, 1.0]
+    factors[axis] = 1.0 + increment
+    previous = before.context.getState().getPeriodicBoxVectors()
+    _apply_positions(
+        before,
+        affine_scale(_positions_nm(before), factors),
+        [
+            vector * factors[axis] if index == axis else vector
+            for index, vector in enumerate(previous)
+        ],
+    )
+    simulate._strain_increment(
+        after, mode="tensile", axis=axis, plane=(0, 1), increment=increment, poisson=0.0
+    )
+    expected = before.context.getState(getPositions=True, getVelocities=True)
+    actual = after.context.getState(getPositions=True, getVelocities=True)
+    for getter, units in (
+        ("getPositions", unit.nanometer),
+        ("getVelocities", unit.nanometer / unit.picosecond),
+        ("getPeriodicBoxVectors", unit.nanometer),
+    ):
+        np.testing.assert_array_equal(
+            getattr(actual, getter)(asNumpy=True).value_in_unit(units),
+            getattr(expected, getter)(asNumpy=True).value_in_unit(units),
+        )
 
 
 def test_a_shear_past_the_reduced_form_is_refused_before_the_ladder_runs(

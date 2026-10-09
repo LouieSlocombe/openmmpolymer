@@ -26,12 +26,17 @@ from itertools import pairwise
 import numpy as np
 import numpy.typing as npt
 
-from ._fitting import ROUNDING, standard_error, statistical_inefficiency
-from ._validation import require_positive
+from ._fitting import (
+    ROUNDING,
+    relative_span,
+    rms,
+    standard_error,
+    statistical_inefficiency,
+)
+from ._validation import require_in_range, require_positive
 from .rate_dependence import (
     MAX_RATE_RESIDUAL_TO_ERROR,
     MAX_RELATIVE_RATE_RESIDUAL,
-    _rms,
 )
 from .relaxation import (
     SIGNAL_TO_NOISE_FLOOR,
@@ -257,10 +262,17 @@ def require_window_options(
     """
     fractions = require_fractions(window_fractions)
     require_positive(relative_tolerance, None, name="relative_tolerance")
-    if not math.isfinite(min_effective_samples) or min_effective_samples < 1.0:
-        raise ValueError("min_effective_samples must be finite and at least one.")
-    if not math.isfinite(discard_fraction) or not 0.0 <= discard_fraction < 1.0:
-        raise ValueError("discard_fraction must be finite and in [0, 1).")
+    require_in_range(
+        min_effective_samples, None, name="min_effective_samples", minimum=1.0
+    )
+    require_in_range(
+        discard_fraction,
+        None,
+        name="discard_fraction",
+        minimum=0.0,
+        maximum=1.0,
+        include_maximum=False,
+    )
     return fractions
 
 
@@ -319,15 +331,6 @@ def _sample_estimate(data: npt.NDArray[np.float64]) -> tuple[float, float, float
         return mean, math.nan, 0.0
     effective = data.size / statistical_inefficiency(data)
     return mean, standard_error(data, effective), effective
-
-
-def _relative_span(values: npt.NDArray[np.float64], scale: float) -> float:
-    """How far *values* spread, over *scale*; infinite when that means nothing."""
-    if not values.size or np.any(~np.isfinite(values)):
-        return math.inf
-    if scale == 0.0:
-        return 0.0 if np.all(values == 0.0) else math.inf
-    return float(np.ptp(values / scale))
 
 
 def time_window_convergence(
@@ -400,10 +403,10 @@ def time_window_convergence(
     block_means = np.asarray([item[0] for item in estimates])
     block_errors = np.asarray([item[1] for item in estimates])
     block_effective = np.asarray([item[2] for item in estimates])
-    relative_change = _relative_span(
+    relative_change = relative_span(
         np.asarray([item.mean for item in windows[-3:]]), scale
     )
-    block_spread = _relative_span(block_means, scale)
+    block_spread = relative_span(block_means, scale)
     refusals: list[str] = []
     if data.size < 3:
         refusals.append(
@@ -541,7 +544,7 @@ def relaxation_window_convergence(
         window_notes: list[str] = []
         if fitted_values.size and math.isfinite(prony.residual_mpa):
             response_scale = float(np.mean(np.abs(fitted_values)))
-            reported_error = _rms(fitted_errors)
+            reported_error = rms(fitted_errors)
             rounding = ROUNDING * float(np.max(np.abs(fitted_values)))
             residual_ok = bool(
                 prony.residual_mpa <= MAX_RELATIVE_RATE_RESIDUAL * response_scale
@@ -612,7 +615,7 @@ def relaxation_window_convergence(
             if name == "equilibrium_modulus_mpa"
             else abs(float(final[-1]))
         )
-        change = _relative_span(final, scale)
+        change = relative_span(final, scale)
         refusals: list[str] = []
         if not distinct:
             refusals.append(ENDPOINTS_REFUSAL)

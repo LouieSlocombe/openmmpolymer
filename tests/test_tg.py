@@ -41,6 +41,8 @@ from openmmpolymer.trajectory import AnalysisError
 from .helpers import (
     QUICK_EQUILIBRATION,
     argon_context,
+    forbidden,
+    quench_entry,
     two_line_curve,
     write_quench,
     write_quenches,
@@ -197,10 +199,10 @@ def test_an_invalid_explicit_window_stops_before_files_or_dynamics(
     argon_run: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def unexpected_dynamics(*args: Any, **kwargs: Any) -> Any:
-        pytest.fail("an invalid explicit window started dynamics")
-
-    monkeypatch.setattr("openmmpolymer.tg.run_protocol", unexpected_dynamics)
+    monkeypatch.setattr(
+        "openmmpolymer.tg.run_protocol",
+        forbidden("an invalid explicit window started dynamics"),
+    )
     with pytest.raises(error, match=message):
         scan(argon_run, "run", spec=QUICK, tg_approx_k=approximate)
     assert not Path("run").exists()
@@ -420,21 +422,15 @@ def two_pass_directory(directory: Path) -> Path:
     return write_quenches(
         directory,
         {
-            "06_coarse_quench_00": {
-                "temperature_k": list(coarse_t[::-1]),
-                "density_g_cm3": list(coarse_d[::-1]),
-                "segment_duration_ps": [1000.0] * 11,
-            },
-            "08_fine_quench_00": {
-                "temperature_k": list(fine_t[::-1][:11]),
-                "density_g_cm3": list(fine_d[::-1][:11]),
-                "segment_duration_ps": [4000.0] * 11,
-            },
-            "08_fine_quench_01": {
-                "temperature_k": list(fine_t[::-1][11:]),
-                "density_g_cm3": list(fine_d[::-1][11:]),
-                "segment_duration_ps": [4000.0] * 10,
-            },
+            "06_coarse_quench_00": quench_entry(
+                coarse_t[::-1], coarse_d[::-1], segment_duration_ps=[1000.0] * 11
+            ),
+            "08_fine_quench_00": quench_entry(
+                fine_t[::-1][:11], fine_d[::-1][:11], segment_duration_ps=[4000.0] * 11
+            ),
+            "08_fine_quench_01": quench_entry(
+                fine_t[::-1][11:], fine_d[::-1][11:], segment_duration_ps=[4000.0] * 10
+            ),
         },
     )
 
@@ -472,16 +468,12 @@ def test_passes_are_found_by_shape_rather_than_by_the_names_they_were_given(
     write_quenches(
         tmp_path,
         {
-            "screen": {
-                "temperature_k": list(coarse_t[::-1]),
-                "density_g_cm3": list(coarse_d[::-1]),
-                "segment_duration_ps": [1000.0] * 11,
-            },
-            "resolve": {
-                "temperature_k": list(fine_t[::-1]),
-                "density_g_cm3": list(fine_d[::-1]),
-                "segment_duration_ps": [4000.0] * 21,
-            },
+            "screen": quench_entry(
+                coarse_t[::-1], coarse_d[::-1], segment_duration_ps=[1000.0] * 11
+            ),
+            "resolve": quench_entry(
+                fine_t[::-1], fine_d[::-1], segment_duration_ps=[4000.0] * 21
+            ),
         },
     )
     report = analyse_tg(tmp_path, melt_stage=None)
@@ -558,19 +550,15 @@ def test_only_the_finest_scans_are_weighed_against_each_other(
     """
     coarse_t, coarse_d = two_line_curve(transition_k=340.0, n_points=11)
     stages: dict[str, Any] = {
-        "06_coarse": {
-            "temperature_k": list(coarse_t[::-1]),
-            "density_g_cm3": list(coarse_d[::-1]),
-            "segment_duration_ps": [1000.0] * 11,
-        }
+        "06_coarse": quench_entry(
+            coarse_t[::-1], coarse_d[::-1], segment_duration_ps=[1000.0] * 11
+        )
     }
     for transition_k, hold_ps in ((340.0, 4000.0), (360.0, 8000.0)):
         temperature, density = two_line_curve(transition_k=transition_k)
-        stages[f"08_fine_{hold_ps:.0f}"] = {
-            "temperature_k": list(temperature[::-1]),
-            "density_g_cm3": list(density[::-1]),
-            "segment_duration_ps": [hold_ps] * 21,
-        }
+        stages[f"08_fine_{hold_ps:.0f}"] = quench_entry(
+            temperature[::-1], density[::-1], segment_duration_ps=[hold_ps] * 21
+        )
     write_quenches(tmp_path, stages)
 
     report = analyse_tg(tmp_path, melt_stage=None)
@@ -578,7 +566,10 @@ def test_only_the_finest_scans_are_weighed_against_each_other(
     assert report.log_linear is not None
     assert report.log_linear.n_rates == 2
     assert report.vft is None
-    assert any("vft" in note for note in report.notes)
+    assert (
+        "vft rate fit: A 'vft' fit has 3 parameters and there are 2 rates, "
+        "so it is not determined. Measure at least 3 rates, or use form='log_linear'."
+    ) in report.notes
 
 
 def test_one_quench_alone_has_no_rate_dependence_to_fit(tmp_path: Path) -> None:
@@ -607,21 +598,15 @@ def test_a_curve_too_short_to_fit_drops_out_without_shifting_the_others(
     write_quenches(
         tmp_path,
         {
-            "06_coarse": {
-                "temperature_k": list(long_t[::-1]),
-                "density_g_cm3": list(long_d[::-1]),
-                "segment_duration_ps": [1000.0] * 21,
-            },
-            "07_stub": {
-                "temperature_k": list(short_t[::-1]),
-                "density_g_cm3": list(short_d[::-1]),
-                "segment_duration_ps": [1000.0] * 4,
-            },
-            "08_fine": {
-                "temperature_k": list(fine_t[::-1]),
-                "density_g_cm3": list(fine_d[::-1]),
-                "segment_duration_ps": [4000.0] * 41,
-            },
+            "06_coarse": quench_entry(
+                long_t[::-1], long_d[::-1], segment_duration_ps=[1000.0] * 21
+            ),
+            "07_stub": quench_entry(
+                short_t[::-1], short_d[::-1], segment_duration_ps=[1000.0] * 4
+            ),
+            "08_fine": quench_entry(
+                fine_t[::-1], fine_d[::-1], segment_duration_ps=[4000.0] * 41
+            ),
         },
     )
     report = analyse_tg(tmp_path, melt_stage=None)
@@ -630,7 +615,10 @@ def test_a_curve_too_short_to_fit_drops_out_without_shifting_the_others(
     assert len(report.curves) == len(report.transitions) == 2
     assert report.curves[1].temperature_step_k == pytest.approx(10.0)
     assert report.fine is report.transitions[1]
-    assert any("07_stub" in note for note in report.notes)
+    assert (
+        "07_stub: 4 temperatures cannot give two branches of 4 points. "
+        "Quench in smaller steps, or lower min_points_per_branch."
+    ) in report.notes
 
 
 # --------------------------------------------------------------------------
@@ -689,16 +677,10 @@ def test_the_equilibration_figure_is_drawn_when_the_melt_was_checked(
     write_quenches(
         tmp_path,
         {
-            "05_npt": {
-                "temperature_k": [650.0],
-                "density_g_cm3": [0.85],
-                "total_ps": 2000.0,
-            },
-            "06_quench": {
-                "temperature_k": list(temperature[::-1]),
-                "density_g_cm3": list(density[::-1]),
-                "segment_duration_ps": [1000.0] * 21,
-            },
+            "05_npt": quench_entry([650.0], [0.85], total_ps=2000.0),
+            "06_quench": quench_entry(
+                temperature[::-1], density[::-1], segment_duration_ps=[1000.0] * 21
+            ),
         },
     )
     report = analyse_tg(tmp_path, melt_stage="05_npt")
@@ -710,3 +692,31 @@ def test_the_equilibration_figure_is_drawn_when_the_melt_was_checked(
 
     files = write_tg_report(report)
     assert any(Path(path).name.startswith("equilibration") for path in files.figures)
+
+
+@pytest.mark.parametrize(
+    ("decimal_steps", "rates", "expected"),
+    [
+        (False, None, 100110.0),
+        (False, (10.0, 5.0, 2.0), 125110.0),
+        (False, (0.3, 1.7, 9.0), 529194.9673202615),
+        (True, None, 44565.5),
+        (True, (10.0, 5.0, 2.0), 132070.0),
+        (True, (0.3, 1.7, 9.0), 580442.6797385621),
+    ],
+)
+def test_scan_duration_keeps_the_original_cli_price(
+    decimal_steps: bool, rates: tuple[float, ...] | None, expected: float
+) -> None:
+    from openmmpolymer.tg import tg_scan_duration_ps
+
+    spec = TgSpec()
+    if decimal_steps:
+        spec = replace(
+            spec,
+            coarse_step_k=33.3,
+            window_k=63.0,
+            fine_step_k=7.3,
+            fine_hold_ps=1234.5,
+        )
+    assert tg_scan_duration_ps(spec, rates_k_per_ns=rates) == expected

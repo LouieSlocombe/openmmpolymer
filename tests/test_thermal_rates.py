@@ -25,7 +25,7 @@ from openmmpolymer.thermal_rates import (
 from openmmpolymer.tm import HeatingCurve, TmSpec
 from openmmpolymer.trajectory import AnalysisError
 
-from .helpers import planted_curve, write_heating, write_quench
+from .helpers import ensemble_controls, planted_curve, write_heating, write_quench
 
 HOLDS = (100.0, 1000.0, 10000.0)
 
@@ -348,24 +348,10 @@ def test_a_system_that_controls_its_own_state_is_refused_before_writing(
     """The stages bring their own thermostat and barostat; a second would fight them."""
     import openmm as mm
 
-    forces = {
-        "isotropic": lambda: mm.MonteCarloBarostat(1.0, 300.0),
-        "anisotropic": lambda: mm.MonteCarloAnisotropicBarostat(
-            mm.Vec3(1.0, 1.0, 1.0), 300.0
-        ),
-        "flexible": lambda: mm.MonteCarloFlexibleBarostat(1.0, 300.0),
-        "membrane": lambda: mm.MonteCarloMembraneBarostat(
-            1.0,
-            0.0,
-            300.0,
-            mm.MonteCarloMembraneBarostat.XYIsotropic,
-            mm.MonteCarloMembraneBarostat.ZFree,
-        ),
-        "andersen": lambda: mm.AndersenThermostat(300.0, 1.0),
-    }
     system = mm.XmlSerializer.deserialize(argon_run.system_xml)
     for control in controls:
-        system.addForce(forces[control]())
+        for force in ensemble_controls(control):
+            system.addForce(force)
     argon_run.system_xml = mm.XmlSerializer.serialize(system)
     with pytest.raises(ThermalRateError, match="barostat or Andersen thermostat"):
         run_thermal_rate_scan(
@@ -498,3 +484,19 @@ def test_real_tiny_heating_series_records_three_rates_and_resumes(
     resumed = run_thermal_rate_scan(argon_run, tmp_path, **options)
     assert len(resumed.observations) == 3
     assert [json.loads(path.read_text())["stages"] for path in manifests] == before
+
+
+@pytest.mark.parametrize("property_name", ["glass_transition", "melting_temperature"])
+def test_thermal_stage_selection_and_curves_share_each_manifest(
+    tmp_path: Path, manifest_reads: list[Path], property_name: str
+) -> None:
+    directories = (
+        _tg_series(tmp_path)
+        if property_name == "glass_transition"
+        else _tm_series(tmp_path, [planted_curve()] * 3)
+    )
+    manifest_reads.clear()
+    analyse_thermal_rates(directories, property_name=property_name, target_rate=0.1)
+    assert sorted(manifest_reads) == sorted(
+        directory / "manifest.json" for directory in directories
+    )

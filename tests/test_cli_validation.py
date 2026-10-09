@@ -9,6 +9,8 @@ import pytest
 
 from openmmpolymer import __main__ as cli
 
+from .helpers import forbidden
+
 CRYSTAL = "--protocol tm --crystal-pdb crystal.pdb --system-xml system.xml"
 YOUNGS_RATE = "--modulus-relax-times 10,50,100 --target-strain-rate 0.01"
 
@@ -159,11 +161,35 @@ def test_invalid_request_has_no_side_effects(
     no_build: list[Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def unexpected_read(*args: Any, **kwargs: Any) -> Any:
-        pytest.fail("an invalid request read the crystal")
+    unexpected_read = forbidden("an invalid request read the crystal")
 
     monkeypatch.setattr(cli, "load_crystal", unexpected_read)
     with pytest.raises(SystemExit, match="2"):
         cli.main([*mode.split(), *flags.split(), "-o", "output"])
     assert not no_build
     assert not Path("output").exists()
+
+
+@pytest.mark.parametrize("mode", ["analysis", "scan"])
+def test_report_refusals_are_cli_errors_without_a_traceback(
+    mode: str,
+    staged_melt: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Both entry paths report a refused output option like other CLI errors."""
+
+    def refused(*args: Any, **kwargs: Any) -> Any:
+        raise ValueError("figure_format must be a filename extension")
+
+    if mode == "analysis":
+        monkeypatch.setattr(cli, "_analyse", refused)
+        argv = ["--analyse", "saved"]
+    else:
+        monkeypatch.setattr(cli, "run_breaking_scan", refused)
+        argv = ["[*]CC[*]", "--protocol", "breaking"]
+    with pytest.raises(SystemExit, match="2"):
+        cli.main([*argv, "--figure-format", "not-a-format"])
+    error = capsys.readouterr().err
+    assert "error: figure_format" in error
+    assert "Traceback" not in error

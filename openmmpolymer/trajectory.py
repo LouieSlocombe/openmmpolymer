@@ -47,6 +47,7 @@ the stage start, not the run start.
 from __future__ import annotations
 
 import logging
+import math
 import warnings
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -58,8 +59,9 @@ import numpy.typing as npt
 from openmm import unit
 
 from ._validation import require_integer
-from .packing import read_pdb
+from .packing import ANGSTROM_PER_NM, read_pdb
 from .protocols import RunManifest
+from .reporters import topology_path, trajectory_path
 
 log = logging.getLogger(__name__)
 
@@ -67,10 +69,6 @@ log = logging.getLogger(__name__)
 #: for. ``pdb`` is deliberately absent: it carries no frame times, so nothing
 #: here could put a lag on an axis. See this module's docstring.
 READABLE_FORMATS = ("xtc", "dcd")
-
-#: Ångström per nanometre. MDAnalysis reports both coordinates and box lengths
-#: in Ångström; this module is the only place in the package that sees them.
-_ANGSTROM_PER_NM = 10.0
 
 #: Biggest position array a load will build without being asked twice, in
 #: gibibytes. A long run of a large cell will not fit in memory, and saying so
@@ -147,6 +145,8 @@ class Ensemble:
         topology_path: Where the topology was read from.
         trajectory_path: Where the coordinates were read from, or None when
             they came from the topology file itself.
+        first_frame: Offset into the underlying trajectory. Slices are relative
+            to this view; yielded indices and times remain absolute.
     """
 
     stage: str
@@ -160,6 +160,7 @@ class Ensemble:
     interval_ps: float
     topology_path: str
     trajectory_path: str | None
+    first_frame: int = 0
 
     @property
     def is_snapshot(self) -> bool:
@@ -191,15 +192,17 @@ class Ensemble:
         """
         require_integer(stride, name="stride")
         start, last, stride = slice(start, stop, stride).indices(self.n_frames)
+        start += self.first_frame
+        last += self.first_frame
         for index, step in enumerate(self.universe.trajectory[start:last:stride]):
             frame_index = start + index * stride
             yield Frame(
                 index=frame_index,
                 time_ps=self._time_ps(frame_index),
                 positions_nm=np.asarray(self.universe.atoms.positions, dtype=np.float64)
-                / _ANGSTROM_PER_NM,
+                / ANGSTROM_PER_NM,
                 box_nm=np.asarray(step.dimensions[:3], dtype=np.float64)
-                / _ANGSTROM_PER_NM,
+                / ANGSTROM_PER_NM,
             )
 
     def per_chain(
@@ -277,8 +280,52 @@ def stage_names(stage: str | Sequence[str]) -> tuple[str, ...]:
     return names
 
 
+def sample_ladder(key: str) -> Callable[[dict[str, Any]], bool]:
+    """Whether a stage's samples hold a ladder of *key*."""
+
+    def holds(samples: dict[str, Any]) -> bool:
+        values = samples.get(key)
+        return isinstance(values, list) and len(values) >= 1
+
+    return holds
+
+
+def gather_samples(
+    run_dir: str | Path,
+    names: Sequence[str],
+    *,
+    manifest: RunManifest | None = None,
+) -> tuple[dict[str, list[float]], float]:
+    """Concatenate the samples of several stages, in the order given.
+
+    A strain ladder split across stages for resume is one curve; reading each
+    chunk as its own would give several short ones and fit a modulus to each.
+    An optional already loaded manifest keeps a multi-part analysis on one
+    snapshot of its recorded data.
+    """
+    directory = Path(run_dir)
+    if manifest is None:
+        manifest = load_manifest(directory)
+    merged: dict[str, list[float]] = {}
+    temperatures: list[float] = []
+    for name in names:
+        recorded = stage_record(manifest, name, directory)
+        samples = recorded.get("samples") or {}
+        for key, values in samples.items():
+            merged.setdefault(key, []).extend(float(value) for value in values)
+        mean = recorded.get("mean_temperature_k")
+        if mean is not None:
+            temperatures.append(float(mean))
+    return merged, float(np.mean(temperatures)) if temperatures else math.nan
+
+
 def stages_holding(
-    run_dir: str | Path, holds: Callable[[dict[str, Any]], bool], what: str
+    run_dir: str | Path,
+    holds: Callable[[dict[str, Any]], bool],
+    what: str,
+    *,
+    manifest: RunManifest | None = None,
+    allow_empty: bool = False,
 ) -> tuple[str, ...]:
     """Name every stage whose recorded samples *holds* accepts, in manifest order.
 
@@ -290,17 +337,19 @@ def stages_holding(
         run_dir: A directory a run wrote to.
         holds: Whether one stage's samples are the kind being looked for.
         what: What that kind is, for the refusal.
+        manifest: Reuse this snapshot instead of reading the manifest again.
+        allow_empty: Return an empty tuple instead of refusing an empty selection.
 
     Raises:
         AnalysisError: There is no manifest, or no stage in it qualifies.
     """
-    stages = load_manifest(run_dir).stages
+    stages = (load_manifest(run_dir) if manifest is None else manifest).stages
     found = tuple(
         name
         for name, recorded in stages.items()
         if holds(recorded.get("samples") or {})
     )
-    if not found:
+    if not found and not allow_empty:
         raise AnalysisError(
             f"No stage in {Path(run_dir)} recorded {what}. It records: "
             f"{', '.join(stages) or 'nothing'}."
@@ -442,9 +491,9 @@ def _coordinate_paths(prefix: Path) -> tuple[str | None, str | None]:
     stage start; with no trajectory, the end-of-stage ``<stem>.pdb`` is both.
     """
     for extension in READABLE_FORMATS:
-        candidate = prefix.with_suffix(f".{extension}")
+        candidate = trajectory_path(prefix, extension)
         if candidate.is_file():
-            topology = prefix.with_name(f"{prefix.name}_topology.pdb")
+            topology = topology_path(prefix)
             if topology.is_file():
                 return str(candidate), str(topology)
             snapshot = prefix.with_suffix(".pdb")
@@ -461,7 +510,7 @@ def _coordinate_paths(prefix: Path) -> tuple[str | None, str | None]:
                 f"no topology of its own, so {topology.name} is needed to read "
                 "it."
             )
-    written_as_pdb = prefix.with_name(f"{prefix.name}_trajectory.pdb")
+    written_as_pdb = trajectory_path(prefix, "pdb")
     if written_as_pdb.is_file():
         log.info(
             "%s holds this stage's frames, but a PDB trajectory records no "
@@ -704,6 +753,10 @@ def chain_positions(
     Returns:
         ``(n_frames, n_chains, atoms, 3)`` positions in nanometres, and the
         matching ``(n_frames,)`` times in picoseconds.
+
+    Raises:
+        AnalysisError: Filtering leaves no atoms, or the selected positions
+            exceed the memory budget.
     """
     positions, times, _ = _load_chain_frames(
         ensemble, stride=stride, heavy_atoms_only=heavy_atoms_only
@@ -728,6 +781,10 @@ def _load_chain_frames(
     require_integer(stride, name="stride")
     keep = ~ensemble.is_hydrogen if heavy_atoms_only else None
     n_atoms = ensemble.atoms_per_chain if keep is None else int(np.count_nonzero(keep))
+    if n_atoms == 0:
+        raise AnalysisError(
+            "Dropping hydrogens left no atoms. Pass heavy_atoms_only=False."
+        )
     n_frames = len(range(0, ensemble.n_frames, stride))
     _check_size(ensemble.n_chains * n_atoms, n_frames)
     positions = np.empty((n_frames, ensemble.n_chains, n_atoms, 3), dtype=np.float64)

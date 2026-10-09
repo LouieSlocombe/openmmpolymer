@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
 
+from openmmpolymer.structural_convergence import _block
 from openmmpolymer.trajectory import (
     AnalysisError,
     _load_chain_frames,
@@ -23,22 +23,7 @@ from openmmpolymer.trajectory import (
     stages_holding,
 )
 
-from .helpers import synthetic_ensemble
-
-
-def write_manifest(directory: Path, stages: dict[str, Any], **extra: Any) -> Path:
-    """Write a manifest holding *stages*, as ``run_protocol`` would."""
-    payload = {
-        "protocol": "test",
-        "seed": 1,
-        "versions": {},
-        "system": {},
-        "stages": stages,
-        "chains": None,
-        **extra,
-    }
-    (directory / "manifest.json").write_text(json.dumps(payload))
-    return directory
+from .helpers import synthetic_ensemble, write_manifest
 
 
 def test_a_directory_without_a_manifest_is_not_a_run_directory(tmp_path: Path) -> None:
@@ -167,6 +152,20 @@ def test_both_readable_trajectory_formats_are_found(
     assert found.trajectory.endswith(extension)
 
 
+@pytest.mark.parametrize("stem", ["02_nvt", "02_nvt.old"])
+def test_trajectory_selection_keeps_binary_priority_and_topology_suffix(
+    tmp_path: Path, stem: str
+) -> None:
+    """XTC wins over DCD; the topology name retains the complete file stem."""
+    (tmp_path / "02_nvt.xtc").write_bytes(b"")
+    (tmp_path / "02_nvt.dcd").write_bytes(b"")
+    (tmp_path / f"{stem}_topology.pdb").write_text("")
+    write_manifest(tmp_path, {stem: {}})
+    found = stage_files(tmp_path, stem)
+    assert found.trajectory == str(tmp_path / "02_nvt.xtc")
+    assert found.topology == str(tmp_path / f"{stem}_topology.pdb")
+
+
 def test_a_pdb_is_never_taken_for_a_trajectory(tmp_path: Path) -> None:
     """<stem>.pdb is a stage's closing snapshot, never its trajectory: a
     pdb-format trajectory is written to <stem>_trajectory.pdb instead."""
@@ -285,12 +284,17 @@ def test_every_frame_reports_its_own_box(dimer_run_directory: Path) -> None:
     ("start", "stop", "stride"),
     [(-3, None, 1), (-20, -1, 2), (2, -1, 3), (20, None, 1)],
 )
+@pytest.mark.parametrize("block", [False, True])
 def test_frame_slices_keep_absolute_indices_and_times(
-    dimer_run_directory: Path, start: int, stop: int | None, stride: int
+    dimer_run_directory: Path, start: int, stop: int | None, stride: int, block: bool
 ) -> None:
     """Negative bounds select from the end without changing frame metadata."""
     ensemble = open_run(dimer_run_directory, "02_nvt")
-    expected = list(ensemble.frames())[start:stop:stride]
+    frames = list(ensemble.frames())
+    if block:
+        ensemble = _block(ensemble, 3, 9)
+        frames = frames[3:9]
+    expected = frames[start:stop:stride]
     actual = list(ensemble.frames(start=start, stop=stop, stride=stride))
     assert [frame.index for frame in actual] == [frame.index for frame in expected]
     assert [frame.time_ps for frame in actual] == [frame.time_ps for frame in expected]

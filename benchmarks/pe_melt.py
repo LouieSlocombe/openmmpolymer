@@ -8,7 +8,6 @@ the scientific comparison. Reference tolerances are fixed before running.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 from dataclasses import asdict
@@ -26,14 +25,14 @@ from openmmpolymer import (
     build_melt,
     end_to_end_relaxation,
     equilibration,
-    open_run,
     read_state_data,
     run_protocol,
     standard_melt_equilibration,
 )
-from openmmpolymer._files import json_value, write_json
+from openmmpolymer._files import file_sha256, json_value, write_json
 from openmmpolymer.packing import PACKMOL_TIMEOUT_S
-from openmmpolymer.protocols import RunManifest, record_build_request
+from openmmpolymer.protocols import record_build_request
+from openmmpolymer.trajectory import open_stage, stage_files
 
 REFERENCE_PATH = Path(__file__).with_name("polyethylene.json")
 
@@ -247,11 +246,11 @@ def run_benchmark(
             atoms_per_chain=chain.n_atoms,
             expected_characteristic_ratio=case["characteristic_ratio"],
         )
-        manifest = RunManifest.load(directory)
-        assert manifest is not None
-        series = read_state_data(manifest.stages["06_measure"]["csv"])
+        files = stage_files(directory, "06_measure")
+        assert files.csv is not None
+        series = read_state_data(files.csv)
         density_check = equilibration(series.time_ps, series.density_g_cm3)
-        ensemble = open_run(directory, "06_measure")
+        ensemble = open_stage(files)
         try:
             chains = end_to_end_relaxation(ensemble, chain.backbone)
         finally:
@@ -287,7 +286,7 @@ def run_benchmark(
         "packing_density_g_cm3": packing_density,
         "temperature_k": temperature_k,
         "pressure_bar": case["pressure_bar"],
-        "case_sha256": hashlib.sha256(REFERENCE_PATH.read_bytes()).hexdigest(),
+        "case_sha256": file_sha256(REFERENCE_PATH),
         "charge_method": charge_method,
         "smirnoff_forcefield": case["smirnoff_forcefield"],
         "protocol": asdict(protocol),

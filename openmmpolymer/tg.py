@@ -36,14 +36,17 @@ import logging
 import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ._files import ReportFiles, write_json
+from ._files import ReportFiles, figure_stem, write_json
+from ._fitting import PS_PER_NS
 from ._validation import require_integer, require_positive
 from ._workflow import (
     chain_options,
-    check_request,
+    check_scan_resume,
+    enforce_budget,
     optional,
     remaining_ps,
     require_positive_fields,
@@ -51,6 +54,7 @@ from ._workflow import (
     spec_request,
     write_report_files,
 )
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .melt_check import MeltEquilibration, melt_equilibration
 from .plots import plot_cooling_rate, plot_quench_curve, plot_state_data
 from .protocols import (
@@ -60,7 +64,6 @@ from .protocols import (
     Stage,
     run_protocol,
     standard_melt_equilibration,
-    validate_run_inputs,
 )
 from .reporters import TrajectoryOptions
 from .simulate import RunContext, quench_temperatures, safe_timestep_fs
@@ -75,7 +78,7 @@ from .timeseries import (
     quench_stages,
     read_state_data,
 )
-from .trajectory import AnalysisError
+from .trajectory import AnalysisError, load_manifest
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
@@ -205,7 +208,7 @@ class TgSchedule:
     @property
     def cooling_rate_k_per_ns(self) -> float:
         """The rate the ladder amounts to, in kelvin per nanosecond."""
-        return self.step_k / self.hold_ps * 1000.0
+        return self.step_k / self.hold_ps * PS_PER_NS
 
 
 @dataclass(frozen=True)
@@ -557,6 +560,38 @@ def nominal_fine_schedule(spec: TgSpec, *, hold_ps: float | None = None) -> TgSc
     )
 
 
+def _total_scan_ps(coarse: Protocol, fine_ladders: Sequence[TgSchedule]) -> float:
+    """Price the coarse preparation and each complete fine ladder."""
+    return coarse.total_duration_ps + sum(ladder.total_ps for ladder in fine_ladders)
+
+
+def tg_scan_duration_ps(
+    spec: TgSpec = DEFAULT_SPEC,
+    *,
+    rates_k_per_ns: Sequence[float] | None = None,
+) -> float:
+    """Estimate coarse and fine dynamics before the fine window is located.
+
+    Each supplied rate sets its own fine hold; without rates the spec's fine
+    hold is used once. Uses the default coarse preparation; the ladder
+    arithmetic matches the runner.
+    """
+    holds = (
+        [spec.fine_hold_ps]
+        if rates_k_per_ns is None
+        else [
+            spec.fine_step_k
+            / require_positive(rate, None, name="rates_k_per_ns")
+            * PS_PER_NS
+            for rate in rates_k_per_ns
+        ]
+    )
+    return _total_scan_ps(
+        tg_coarse_scan(spec),
+        [nominal_fine_schedule(spec, hold_ps=hold) for hold in holds],
+    )
+
+
 def _report_cost(
     coarse: Protocol,
     coarse_ladder: TgSchedule,
@@ -576,28 +611,32 @@ def _report_cost(
         TgError: The total is over ``max_total_ns``.
     """
     fine_ps = sum(ladder.total_ps for ladder in fine_ladders)
-    total_ps = coarse.total_duration_ps + fine_ps
+    total_ps = _total_scan_ps(coarse, fine_ladders)
     log.info(
         "Tg scan: %.1f ns equilibration, %.1f ns coarse (%d points at %.1f "
         "K/ns), %.1f ns fine over %d pass(es) at %s K/ns, %d points each - "
         "%.1f ns in total, %.1f ns of it still to run.",
-        (coarse.total_duration_ps - coarse_ladder.total_ps) / 1000.0,
-        coarse_ladder.total_ps / 1000.0,
+        (coarse.total_duration_ps - coarse_ladder.total_ps) / PS_PER_NS,
+        coarse_ladder.total_ps / PS_PER_NS,
         coarse_ladder.n_temperatures,
         coarse_ladder.cooling_rate_k_per_ns,
-        fine_ps / 1000.0,
+        fine_ps / PS_PER_NS,
         len(fine_ladders),
         ", ".join(f"{ladder.cooling_rate_k_per_ns:.2f}" for ladder in fine_ladders),
         fine_ladders[0].n_temperatures if fine_ladders else 0,
-        total_ps / 1000.0,
-        (remaining_ps(coarse.stages, manifest) + fine_ps) / 1000.0,
+        total_ps / PS_PER_NS,
+        (remaining_ps(coarse.stages, manifest) + fine_ps) / PS_PER_NS,
     )
-    if spec.max_total_ns is not None and total_ps / 1000.0 > spec.max_total_ns:
-        raise TgError(
-            f"This scan is {total_ps / 1000.0:.1f} ns against a max_total_ns "
+    enforce_budget(
+        total_ps / PS_PER_NS,
+        spec.max_total_ns,
+        error=TgError,
+        message=lambda: (
+            f"This scan is {total_ps / PS_PER_NS:.1f} ns against a max_total_ns "
             f"of {spec.max_total_ns:.1f}. Shorten the holds, widen the steps, "
             "or raise the limit - but decide before it starts, not after."
-        )
+        ),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -667,9 +706,9 @@ def _approach(
 
     path = directory / WORKFLOW_NAME
     request = spec_request(spec, tg_approx_k=tg_approx_k)
-    record = check_request(path, request, error=TgError) if resume else {}
-    if resume:
-        validate_run_inputs(run, directory)
+    record = check_scan_resume(
+        run, path, request, coarse.name, resume=resume, error=TgError
+    )
     record["request"] = request
     directory.mkdir(parents=True, exist_ok=True)
     write_json(path, record, strict=False)
@@ -894,7 +933,7 @@ def _run_fine(
         schedule.temperatures_k[0],
         schedule.temperatures_k[-1],
         schedule.cooling_rate_k_per_ns,
-        schedule.total_ps / 1000.0,
+        schedule.total_ps / PS_PER_NS,
         approach.restart,
         approach.start_temperature_k,
     )
@@ -925,7 +964,7 @@ def run_tg_scan(
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> TgResult:
     """Equilibrate, screen coarsely for the transition, then resolve it.
@@ -1023,7 +1062,7 @@ def cooling_rate_series(
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> tuple[GlassTransition, ...]:
     """Walk the fine window several times, each at a different cooling rate.
@@ -1099,7 +1138,7 @@ def _fine_holds(rates_k_per_ns: Sequence[float], spec: TgSpec) -> tuple[float, .
         rate_k_per_ns = require_positive(rate, None, name="rates_k_per_ns")
         holds.append(
             require_positive(
-                spec.fine_step_k / rate_k_per_ns * 1000.0, None, name="hold_ps"
+                spec.fine_step_k / rate_k_per_ns * PS_PER_NS, None, name="hold_ps"
             )
         )
     return tuple(holds)
@@ -1152,27 +1191,28 @@ def analyse_tg(
     stages: list[str] = []
     curves: list[QuenchCurve] = []
     for index, candidate in enumerate([directory, *map(Path, extra_run_dirs)]):
-        for group in _group_passes(candidate, quench_stages(candidate)):
+        manifest = load_manifest(candidate)
+        for group in _group_passes(
+            candidate, quench_stages(candidate, manifest=manifest), manifest=manifest
+        ):
             joined = ", ".join(group)
             stages.append(joined if index == 0 else f"{candidate}:{joined}")
-            curves.append(quench_curve(candidate, group))
+            curves.append(quench_curve(candidate, group, manifest=manifest))
 
     # Paired as they are fitted, and a curve too short to fit drops out of
     # both lists together. Zipping them back up afterwards would pair the
     # wrong curve with the wrong fit the moment one in the middle failed.
     pairs: list[tuple[QuenchCurve, GlassTransition]] = []
     for curve in curves:
-        try:
-            pairs.append(
-                (
-                    curve,
-                    glass_transition(
-                        curve, min_points_per_branch=min_points_per_branch
-                    ),
-                )
-            )
-        except AnalysisError as error:
-            notes.append(f"{curve.stage}: {error}")
+        transition = optional(
+            partial(
+                glass_transition, curve, min_points_per_branch=min_points_per_branch
+            ),
+            notes,
+            curve.stage,
+        )
+        if transition is not None:
+            pairs.append((curve, transition))
     if not pairs:
         raise AnalysisError(
             f"No quench in {directory} gave a curve long enough to fit. "
@@ -1243,7 +1283,9 @@ def analyse_tg(
     )
 
 
-def _group_passes(run_dir: str | Path, names: Sequence[str]) -> list[tuple[str, ...]]:
+def _group_passes(
+    run_dir: str | Path, names: Sequence[str], *, manifest: RunManifest | None = None
+) -> list[tuple[str, ...]]:
     """Group the stages that walked one ladder between them.
 
     The pieces a ladder was split into for resume are one cooling history and
@@ -1251,10 +1293,12 @@ def _group_passes(run_dir: str | Path, names: Sequence[str]) -> list[tuple[str, 
     when they stepped the same way and held for the same time, which is a
     property of what they recorded rather than of what they were named.
     """
+    if manifest is None:
+        manifest = load_manifest(run_dir)
     grouped: dict[tuple[float, float], list[str]] = {}
     order: list[tuple[float, float]] = []
     for name in names:
-        curve = quench_curve(run_dir, name)
+        curve = quench_curve(run_dir, name, manifest=manifest)
         key = (
             round(curve.temperature_step_k, 6),
             round(-1.0 if curve.hold_ps is None else curve.hold_ps, 6),
@@ -1282,15 +1326,18 @@ def _rate_fits(
         return None, None
     fits: list[CoolingRateExtrapolation | None] = []
     for form in ("log_linear", "vft"):
-        try:
-            fits.append(
-                cooling_rate_extrapolation(
-                    family, target_rate_k_per_ns=target_rate_k_per_ns, form=form
-                )
+        fits.append(
+            optional(
+                partial(
+                    cooling_rate_extrapolation,
+                    family,
+                    target_rate_k_per_ns=target_rate_k_per_ns,
+                    form=form,
+                ),
+                notes,
+                f"{form} rate fit",
             )
-        except AnalysisError as error:
-            fits.append(None)
-            notes.append(f"{form} rate fit: {error}")
+        )
     return fits[0], fits[1]
 
 
@@ -1388,7 +1435,7 @@ def write_tg_report(
 def _figures(report: TgReport) -> Iterator[tuple[str, Figure]]:
     """A figure per quench and per rate fit, and the melt's volume series."""
     for curve, transition in zip(report.curves, report.transitions, strict=False):
-        stem = curve.stage.replace(", ", "_").replace(" ", "_")
+        stem = figure_stem(curve.stage, fallback="stage")
         yield f"quench_{stem}", plot_quench_curve(curve, transition=transition)
     for fit in (report.log_linear, report.vft):
         if fit is not None:

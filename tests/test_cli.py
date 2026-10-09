@@ -20,6 +20,8 @@ import pytest
 
 from openmmpolymer import __main__ as cli
 from openmmpolymer.__main__ import PROTOCOLS, build_parser, main
+from openmmpolymer.conformation import PersistenceLength
+from openmmpolymer.elasticity import ElasticConsistency
 from openmmpolymer.mechanical import ModulusSpec, mechanical_scan
 from openmmpolymer.protocols import (
     Protocol,
@@ -66,6 +68,12 @@ RECORDED_REQUEST_SHA256 = {
     "tm": "f66ed12a1460e2f2e5546b1bdf5075004755b20b86baa02b9cdc3b29910fc23e",
     "yield": "012ff7978ea93edc33b04a21caffd630ca654b2d45a5786e0e9ad0a6e071f44a",
 }
+
+# The action schema also pins parsing and user-visible help, which need not
+# affect the shortest command lines above to change the CLI contract.
+RECORDED_PARSER_SHA256 = (
+    "37b929f66932aa135a27f88ce8a92fc9c97d30e4ab68655b74d260766120325b"
+)
 
 #: What the build request leaves out: where things go, which device runs
 #: them, how much is said, and whether - or under what budget - dynamics
@@ -293,6 +301,33 @@ def test_every_setting_a_build_request_records_is_pinned() -> None:
     ):
         recorded[protocol] = _sha256(vars(parser.parse_args(_argv(protocol))))
     assert recorded == RECORDED_REQUEST_SHA256
+
+
+def test_the_whole_parser_action_schema_is_pinned() -> None:
+    """Defaults alone cannot detect a changed converter, choice, arity or help."""
+    recorded = []
+    for action in build_parser()._actions:
+        action_type = action.type
+        converter = None
+        if action_type is not None:
+            assert hasattr(action_type, "__qualname__")
+            converter = f"{action_type.__module__}.{action_type.__qualname__}"
+        recorded.append(
+            {
+                "action": type(action).__name__,
+                "option_strings": action.option_strings,
+                "dest": action.dest,
+                "default": action.default,
+                "const": action.const,
+                "type": converter,
+                "choices": action.choices,
+                "nargs": action.nargs,
+                "help": action.help,
+                "required": action.required,
+                "metavar": action.metavar,
+            }
+        )
+    assert _sha256(recorded) == RECORDED_PARSER_SHA256
 
 
 def test_the_build_request_is_every_setting_but_where_and_how_it_runs(
@@ -937,7 +972,9 @@ PRINTED: dict[str, tuple[Any, list[str]]] = {
             bulk=_fake(modulus_mpa=3301.0, standard_error_mpa=120.0, resolved=True),
             shear=_fake(modulus_mpa=741.0, standard_error_mpa=15.3, resolved=False),
             load_modulus=_fake(modulus_mpa=1950.2),
-            consistency=_fake(
+            consistency=ElasticConsistency(
+                bulk_measured_mpa=3301.0,
+                shear_measured_mpa=741.0,
                 bulk_implied_mpa=2220.0,
                 shear_implied_mpa=744.8,
                 bulk_gap=0.33,
@@ -1028,7 +1065,10 @@ PRINTED: dict[str, tuple[Any, list[str]]] = {
                 ),
                 settled=_fake(equilibrated=False),
             ),
-            persistence=_fake(
+            persistence=PersistenceLength(
+                separation=np.array([1.0]),
+                correlation=np.array([1.0]),
+                bond_length_nm=0.125,
                 persistence_length_nm=0.45,
                 n_bonds=20,
                 contour_length_nm=2.5,
@@ -1180,3 +1220,69 @@ def test_structure_analysis_preserves_saved_ratio_and_accepts_explicit_override(
     assert record["conformation"]["mean"]["expected_characteristic_ratio"] == (
         5.5 if override is None else float(override)
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "decayed", "regime", "phrase"),
+    [
+        (float("inf"), False, "rod_like", "rod-like"),
+        (float("nan"), False, "unfitted", "no persistence length could be fitted"),
+        (-float("inf"), False, "unfitted", "no persistence length could be fitted"),
+        (0.0, False, "unfitted", "no persistence length could be fitted"),
+        (-1.0, False, "unfitted", "no persistence length could be fitted"),
+        (0.45, False, "extrapolated", "extrapolat"),
+        (0.45, True, "measured", "0.45"),
+    ],
+)
+def test_persistence_verdict_agrees_between_console_and_figure(
+    value: float, decayed: bool, regime: str, phrase: str
+) -> None:
+    from openmmpolymer._cli_reports import _persistence_line
+    from openmmpolymer.plots import _persistence_title
+
+    persistence = PersistenceLength(
+        separation=np.array([1.0]),
+        correlation=np.array([1.0]),
+        bond_length_nm=0.125,
+        persistence_length_nm=value,
+        n_bonds=20,
+        contour_length_nm=2.5,
+        decayed=decayed,
+    )
+    assert persistence.regime == regime
+    assert phrase in _persistence_line(persistence)
+    assert phrase in _persistence_title(persistence)
+
+
+@pytest.mark.parametrize("error", [float("inf"), float("nan")])
+def test_unavailable_modulus_fit_error_is_reported_as_unknown(error: float) -> None:
+    from openmmpolymer._cli_reports import _modulus_lines
+
+    report = _fake(**vars(PRINTED["_modulus_lines"][0]))
+    report.bulk = _fake(**(vars(report.bulk) | {"standard_error_mpa": error}))
+    text = "\n".join(_modulus_lines(report))
+    assert "K = 3301 +/- unknown MPa (fit SE)" in text
+
+
+def test_finite_consistency_gaps_are_shared_by_console_figure_and_log(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+    from dataclasses import replace
+
+    from openmmpolymer._cli_reports import _consistency_line
+    from openmmpolymer.mechanical import _log_result, analyse_mechanics, deform_schedule
+    from openmmpolymer.plots import _moduli_title
+
+    write_deformation(tmp_path)
+    report = analyse_mechanics(tmp_path)
+    check = ElasticConsistency(2000.0, 700.0, None, None, float("nan"), 0.1, False)
+    assert check.gaps == (("G", 0.1),)
+    report = replace(report, consistency=check)
+    with caplog.at_level(logging.INFO, logger="openmmpolymer.mechanical"):
+        _log_result(report, deform_schedule(ModulusSpec()))
+    assert "gaps G 10%" in caplog.text
+    assert "nan%" not in caplog.text
+    assert "G 10%" in _consistency_line(check)
+    assert "G 10%" in _moduli_title(report)
+    assert replace(check, shear_gap=float("inf")).gaps == ()

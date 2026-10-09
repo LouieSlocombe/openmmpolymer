@@ -39,33 +39,38 @@ import logging
 import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from ._files import ReportFiles
-from ._fitting import NEGLIGIBLE
+from ._fitting import MAX_REPLICA_SPREAD as MAX_REPLICA_SPREAD
+from ._fitting import NEGLIGIBLE, PS_PER_NS
 from ._validation import (
     require_axis,
     require_choice,
     require_integer,
+    require_nonnegative,
     require_plane,
     require_positive,
 )
 from ._workflow import (
     chain_options,
+    enforce_budget,
     equilibration_at,
     group_by_stem,
+    optional,
     remaining_ps,
     require_positive_fields,
-    run_branched_scan,
+    run_measurement_scan,
     sample_spread,
     scan_listing,
-    scan_request,
     with_reference_box,
     write_report_files,
 )
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .plots import plot_relaxation, plot_relaxation_spectrum
 from .protocols import Protocol, RunManifest, Stage
 from .relaxation import (
@@ -79,8 +84,8 @@ from .relaxation import (
     relax_stages,
     relaxation_curve,
 )
-from .simulate import RELAX_MODES, RunContext, relax_bin_edges_ps, safe_timestep_fs
-from .trajectory import AnalysisError
+from .simulate import RELAX_MODES, RunContext, relax_bin_edges_ps
+from .trajectory import AnalysisError, load_manifest
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
@@ -91,10 +96,6 @@ PROTOCOL_NAME = "viscoelastic"
 RELAX_STEM = "06_relax"
 LINEARITY_STEM = "07_linearity"
 WORKFLOW_NAME = "viscoelastic_workflow.json"
-
-#: How far the replicas may disagree about the initial modulus, relative to
-#: their mean, before the report stops claiming to be resolved.
-MAX_REPLICA_SPREAD = 0.3
 
 #: How large the pre-strain deviatoric stress may be, as a fraction of the
 #: initial response, before the cell was carrying too much to measure from.
@@ -208,8 +209,7 @@ class RelaxationSpec:
         require_choice(self.mode, RELAX_MODES, name="mode")
         require_axis(self.axis)
         require_plane(self.plane)
-        if self.ramp_ps < 0.0:
-            raise ValueError(f"ramp_ps={self.ramp_ps} cannot be negative.")
+        require_nonnegative(self.ramp_ps, None, name="ramp_ps")
         if self.sample_every_ps >= self.relax_ps:
             raise ValueError(
                 f"sample_every_ps={self.sample_every_ps} is not below "
@@ -523,24 +523,28 @@ def _report_cost(
         "Relaxation scan: %.1f ns equilibration, %.1f ns of relaxation (%d "
         "replicas of %.1f ns at %+.3f strain%s, %d chunks each, %d bins over "
         "%.1f decades) - %.1f ns in total, %.1f ns of it still to run.",
-        settle.total_duration_ps / 1000.0,
-        relax_ps / 1000.0,
+        settle.total_duration_ps / PS_PER_NS,
+        relax_ps / PS_PER_NS,
         spec.n_replicas,
-        relax_ps / (spec.n_replicas * passes) / 1000.0,
+        relax_ps / (spec.n_replicas * passes) / PS_PER_NS,
         spec.step_strain,
         "" if passes == 1 else f" and {passes - 1} more for linearity",
         schedule.n_chunks,
         schedule.n_bins,
         schedule.decades,
-        total_ps / 1000.0,
-        remaining_ps(listing.stages, manifest) / 1000.0,
+        total_ps / PS_PER_NS,
+        remaining_ps(listing.stages, manifest) / PS_PER_NS,
     )
-    if spec.max_total_ns is not None and total_ps / 1000.0 > spec.max_total_ns:
-        raise ViscoelasticError(
-            f"The scan is {total_ps / 1000.0:.1f} ns, over the "
+    enforce_budget(
+        total_ps / PS_PER_NS,
+        spec.max_total_ns,
+        error=ViscoelasticError,
+        message=lambda: (
+            f"The scan is {total_ps / PS_PER_NS:.1f} ns, over the "
             f"{spec.max_total_ns:.1f} ns budget. Shorten relax_ps, drop a "
             "replica, skip the linearity pass, or raise max_total_ns."
-        )
+        ),
+    )
 
 
 def run_relaxation_scan(
@@ -551,7 +555,7 @@ def run_relaxation_scan(
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> RelaxationReport:
     """Equilibrate a cell, strain it once, and watch the stress decay.
@@ -588,28 +592,21 @@ def run_relaxation_scan(
     settle = equilibration_protocol(spec, **equilibration)
     _report_cost(spec, settle, RunManifest.load(directory) if resume else None)
 
-    timestep_fs = safe_timestep_fs(spec.temperature_k, run.spec)
-    chains = chain_options(
-        chain_backbone, atoms_per_chain, expected_characteristic_ratio
-    )
-    run_branched_scan(
+    return run_measurement_scan(
         run,
         directory / WORKFLOW_NAME,
-        scan_request(run, spec, settle, **chains),
+        spec,
         settle,
-        lambda origin: _branches(
+        lambda timestep_fs, origin: _branches(
             spec, timestep_fs=timestep_fs, reference_box_nm=origin
         ),
+        analyse_relaxation,
+        _log_result,
         resume=resume,
         error=ViscoelasticError,
         verb="strain",
-        metadata={"timestep_fs": timestep_fs, "n_replicas": spec.n_replicas},
-        **chains,
+        **chain_options(chain_backbone, atoms_per_chain, expected_characteristic_ratio),
     )
-
-    report = analyse_relaxation(directory)
-    _log_result(report)
-    return report
 
 
 def _log_result(report: RelaxationReport) -> None:
@@ -705,6 +702,7 @@ def analyse_relaxation(
     run_dir: str | Path,
     *,
     min_points: int = MIN_RELAXATION_POINTS,
+    manifest: RunManifest | None = None,
 ) -> RelaxationReport:
     """Read everything a finished run has to say about its stress relaxation.
 
@@ -732,14 +730,19 @@ def analyse_relaxation(
         AnalysisError: There is no manifest, or nothing in it was a relaxation.
     """
     directory = Path(run_dir)
+    if manifest is None:
+        manifest = load_manifest(directory)
     notes: list[str] = []
     curves: list[RelaxationCurve] = []
 
-    for group in group_by_stem(relax_stages(directory)):
-        try:
-            curves.append(relaxation_curve(directory, group))
-        except AnalysisError as error:
-            notes.append(f"Skipped {', '.join(group)}: {error}")
+    for group in group_by_stem(relax_stages(directory, manifest=manifest)):
+        curve = optional(
+            partial(relaxation_curve, directory, group, manifest=manifest),
+            notes,
+            f"Skipped {', '.join(group)}",
+        )
+        if curve is not None:
+            curves.append(curve)
 
     if not curves:
         raise AnalysisError(

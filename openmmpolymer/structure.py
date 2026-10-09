@@ -29,13 +29,14 @@ from __future__ import annotations
 import logging
 from collections import deque
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ._files import ReportFiles
 from ._validation import require_integer, require_positive
 from ._workflow import optional, write_report_files
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .conformation import (
     ConformationSeries,
     EndToEndRelaxation,
@@ -59,7 +60,6 @@ from .plots import (
     plot_persistence,
 )
 from .protocols import ChainDimensions, RunManifest
-from .timeseries import Equilibration
 from .trajectory import (
     AnalysisError,
     Ensemble,
@@ -348,11 +348,10 @@ def resolve_backbone(
             return found, "manifest", "manifest.json"
 
     if infer:
-        try:
-            inferred = infer_backbone(ensemble)
-        except AnalysisError as error:
-            notes.append(f"No backbone could be inferred: {error}")
-        else:
+        inferred = optional(
+            lambda: infer_backbone(ensemble), notes, "No backbone could be inferred"
+        )
+        if inferred is not None:
             n_heavy = int((~ensemble.is_hydrogen).sum())
             notes.append(
                 "Backbone inferred from the bond graph as the longest shortest "
@@ -383,10 +382,12 @@ def _recorded_backbone(
             "so it was not used."
         )
         return None
-    try:
-        path = backbone_indices(value, n_atoms)  # type: ignore[arg-type]
-    except AnalysisError as error:
-        notes.append(f"The backbone recorded in {source} was not used: {error}")
+    path = optional(
+        lambda: backbone_indices(value, n_atoms),  # type: ignore[arg-type]
+        notes,
+        f"The backbone recorded in {source} was not used",
+    )
+    if path is None:
         return None
     return tuple(int(index) for index in path)
 
@@ -486,7 +487,7 @@ def analyse_structure(
     if expected_characteristic_ratio is None:
         recorded = manifest.chains if isinstance(manifest.chains, dict) else {}
         expected_characteristic_ratio = recorded.get(
-            "expected_characteristic_ratio", 7.0
+            "expected_characteristic_ratio", DEFAULT_CHARACTERISTIC_RATIO
         )
     expected_characteristic_ratio = require_positive(
         expected_characteristic_ratio, None, name="expected_characteristic_ratio"
@@ -598,117 +599,6 @@ def analyse_structure(
 # --------------------------------------------------------------------------
 
 
-def _distribution_record(distribution: RadialDistribution) -> dict[str, Any]:
-    """A pair distribution as plain JSON types."""
-    return {
-        "r_nm": distribution.r_nm.tolist(),
-        "g_r": distribution.g_r.tolist(),
-        "coordination_number": distribution.coordination_number.tolist(),
-        "first_peak_nm": distribution.first_peak_nm,
-        "first_peak_height": distribution.first_peak_height,
-        "number_density_nm3": distribution.number_density_nm3,
-        "r_max_nm": distribution.r_max_nm,
-        "n_frames": distribution.n_frames,
-        "n_pairs": distribution.n_pairs,
-        "heavy_atoms_only": distribution.heavy_atoms_only,
-    }
-
-
-def _structure_factor_record(structure: StructureFactor) -> dict[str, Any]:
-    """A structure factor as plain JSON types."""
-    return {
-        "q_per_nm": structure.q_per_nm.tolist(),
-        "s_q": structure.s_q.tolist(),
-        "n_vectors": structure.n_vectors.tolist(),
-        "first_peak_per_nm": structure.first_peak_per_nm,
-        "q_min_per_nm": structure.q_min_per_nm,
-        "n_frames": structure.n_frames,
-        "heavy_atoms_only": structure.heavy_atoms_only,
-    }
-
-
-def _chain_dimensions_record(dimensions: ChainDimensions) -> dict[str, Any]:
-    """Chain dimensions as plain JSON types."""
-    return {
-        "mean_squared_end_to_end_nm2": dimensions.mean_squared_end_to_end_nm2,
-        "mean_radius_of_gyration_nm": dimensions.mean_radius_of_gyration_nm,
-        "ratio_of_squares": dimensions.ratio_of_squares,
-        "characteristic_ratio": dimensions.characteristic_ratio,
-        "expected_characteristic_ratio": dimensions.expected_characteristic_ratio,
-        "consistent": dimensions.consistent,
-    }
-
-
-def _equilibration_record(settled: Equilibration) -> dict[str, Any]:
-    """Where a series settled, as plain JSON types."""
-    return {
-        "start_index": settled.start_index,
-        "start_ps": settled.start_ps,
-        "n_samples": settled.n_samples,
-        "n_independent_samples": settled.n_independent_samples,
-        "correlation_time_ps": settled.correlation_time_ps,
-        "relative_standard_error": settled.relative_standard_error,
-        "relative_drift": settled.relative_drift,
-        "equilibrated": settled.equilibrated,
-    }
-
-
-def _conformation_record(series: ConformationSeries) -> dict[str, Any]:
-    """A conformation series as plain JSON types."""
-    return {
-        "stage": series.stage,
-        "time_ps": series.time_ps.tolist(),
-        "mean_squared_end_to_end_nm2": series.mean_squared_end_to_end_nm2.tolist(),
-        "mean_radius_of_gyration_nm": series.mean_radius_of_gyration_nm.tolist(),
-        "mean": _chain_dimensions_record(series.mean),
-        "settled": (
-            None if series.settled is None else _equilibration_record(series.settled)
-        ),
-        "n_chains": series.n_chains,
-        "n_frames": series.n_frames,
-    }
-
-
-def _persistence_record(length: PersistenceLength) -> dict[str, Any]:
-    """A persistence length as plain JSON types."""
-    return {
-        "separation": length.separation.tolist(),
-        "correlation": length.correlation.tolist(),
-        "bond_length_nm": length.bond_length_nm,
-        "persistence_length_nm": length.persistence_length_nm,
-        "n_bonds": length.n_bonds,
-        "contour_length_nm": length.contour_length_nm,
-        "decayed": length.decayed,
-    }
-
-
-def _displacement_record(msd: MeanSquaredDisplacement) -> dict[str, Any]:
-    """A mean-squared displacement as plain JSON types."""
-    return {
-        "lag_ps": msd.lag_ps.tolist(),
-        "msd_nm2": msd.msd_nm2.tolist(),
-        "log_slope": msd.log_slope,
-        "diffusion_coefficient_cm2_s": msd.diffusion_coefficient_cm2_s,
-        "box_drift_fraction": msd.box_drift_fraction,
-        "n_chains": msd.n_chains,
-        "n_origins": msd.n_origins,
-        "diffusive": msd.diffusive,
-    }
-
-
-def _relaxation_record(relaxation: EndToEndRelaxation) -> dict[str, Any]:
-    """An end-to-end relaxation as plain JSON types."""
-    return {
-        "lag_ps": relaxation.lag_ps.tolist(),
-        "correlation": relaxation.correlation.tolist(),
-        "relaxation_time_ps": relaxation.relaxation_time_ps,
-        "trajectory_ps": relaxation.trajectory_ps,
-        "n_chains": relaxation.n_chains,
-        "n_origins": relaxation.n_origins,
-        "decorrelated": relaxation.decorrelated,
-    }
-
-
 def write_structure_report(
     report: StructureReport,
     output_dir: str | Path | None = None,
@@ -733,37 +623,25 @@ def write_structure_report(
         "backbone_source": report.backbone_source,
         "backbone_file": report.backbone_file,
         "radial_distribution": (
-            None
-            if report.distribution is None
-            else _distribution_record(report.distribution)
+            None if report.distribution is None else asdict(report.distribution)
         ),
         "structure_factor": (
-            None
-            if report.structure is None
-            else _structure_factor_record(report.structure)
+            None if report.structure is None else asdict(report.structure)
         ),
         "conformation": (
-            None
-            if report.conformation is None
-            else _conformation_record(report.conformation)
+            None if report.conformation is None else asdict(report.conformation)
         ),
         "persistence": (
-            None
-            if report.persistence is None
-            else _persistence_record(report.persistence)
+            None if report.persistence is None else asdict(report.persistence)
         ),
         "displacement": (
-            None
-            if report.displacement is None
-            else _displacement_record(report.displacement)
+            None if report.displacement is None else asdict(report.displacement)
         ),
         "relaxation": (
-            None if report.relaxation is None else _relaxation_record(report.relaxation)
+            None if report.relaxation is None else asdict(report.relaxation)
         ),
         "recorded_chains": (
-            None
-            if report.recorded_chains is None
-            else _chain_dimensions_record(report.recorded_chains)
+            None if report.recorded_chains is None else asdict(report.recorded_chains)
         ),
         "notes": list(report.notes),
     }

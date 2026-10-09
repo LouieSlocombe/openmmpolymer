@@ -36,6 +36,9 @@ from ._validation import require_choice
 
 log = logging.getLogger(__name__)
 
+#: Charge model used when a caller does not select one.
+DEFAULT_CHARGE_METHOD = "nagl"
+
 #: Accepted charge methods.
 CHARGE_METHODS = ("nagl", "am1bcc", "gasteiger", "none")
 
@@ -129,7 +132,7 @@ def _version_key(name: str) -> tuple[int, ...]:
 
 def assign_charges(
     sdf_path: str | Path,
-    method: str = "nagl",
+    method: str = DEFAULT_CHARGE_METHOD,
     *,
     output_sdf: str | Path | None = None,
 ) -> ChargeResult:

@@ -37,39 +37,54 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ._files import ReportFiles, json_value, write_json
-from ._validation import require_axis, require_finite, require_integer, require_positive
+from ._files import ReportFiles
+from ._fitting import PS_PER_NS
+from ._validation import require_axis, require_integer, require_positive
 from ._workflow import (
     StrainSchedule,
     chain_options,
     deformation_stages,
-    equilibrated_box_nm,
+    enforce_budget,
     equilibration_at,
+    missing_state_names,
+    require_positive_fields,
+    run_branched_scan,
     run_fingerprint,
     sample_spread,
     scan_listing,
-    settled_state,
+    write_report_files,
 )
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .elasticity import StressStrain, stress_strain
 from .plots import plot_breaking_strength, plot_elongation_at_break, plot_yield_strength
-from .protocols import Protocol, RunManifest, run_protocol, validate_run_inputs
+from .protocols import Protocol, RunManifest
 from .simulate import RunContext, safe_timestep_fs
 from .strength import (
+    DEFAULT_CONFIRMATION_STEPS,
+    DEFAULT_FAILURE_FRACTION,
+    DEFAULT_FIT_MAX_STRAIN,
+    DEFAULT_FIT_MIN_STRAIN,
+    DEFAULT_OFFSET_STRAIN,
     BreakingStrength,
     ElongationAtBreak,
     YieldStrength,
     breaking_strength,
     elongation_at_break,
+    require_breaking_criterion,
+    require_yield_criterion,
     yield_strength,
 )
 from .trajectory import AnalysisError
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 log = logging.getLogger(__name__)
 
@@ -127,15 +142,18 @@ class TensileSpec:
 
     def __post_init__(self) -> None:
         """Reject unusable settings before any dynamics or output."""
-        for name in (
-            "temperature_k",
-            "pressure_bar",
-            "strain_increment",
-            "max_strain",
-            "relax_ps",
-            "stage_ps",
-        ):
-            require_positive(getattr(self, name), None, name=name)
+        require_positive_fields(
+            self,
+            (
+                "temperature_k",
+                "pressure_bar",
+                "strain_increment",
+                "max_strain",
+                "relax_ps",
+                "stage_ps",
+            ),
+            optional=("trajectory_ps", "max_total_ns"),
+        )
         require_axis(self.axis)
         require_integer(self.n_replicas, name="n_replicas")
         require_integer(self.samples_per_step, minimum=2, name="samples_per_step")
@@ -143,10 +161,6 @@ class TensileSpec:
             raise ValueError("strain_increment must be below max_strain.")
         if self.stage_ps < self.relax_ps:
             raise ValueError("stage_ps must hold at least one relax_ps increment.")
-        for name in ("trajectory_ps", "max_total_ns"):
-            value = getattr(self, name)
-            if value is not None:
-                require_positive(value, None, name=name)
 
 
 @dataclass(frozen=True)
@@ -159,16 +173,13 @@ class BreakingSpec(TensileSpec):
     strengthening stays unresolved.
     """
 
-    failure_fraction: float = 0.5
-    confirmation_steps: int = 3
+    failure_fraction: float = DEFAULT_FAILURE_FRACTION
+    confirmation_steps: int = DEFAULT_CONFIRMATION_STEPS
 
     def __post_init__(self) -> None:
         """Reject an unusable criterion as well as an unusable ladder."""
         super().__post_init__()
-        require_positive(self.failure_fraction, None, name="failure_fraction")
-        if self.failure_fraction >= 1.0:
-            raise ValueError("failure_fraction must be strictly between zero and one.")
-        require_integer(self.confirmation_steps, minimum=2, name="confirmation_steps")
+        require_breaking_criterion(self.failure_fraction, self.confirmation_steps)
 
 
 @dataclass(frozen=True)
@@ -193,20 +204,16 @@ class YieldSpec(TensileSpec):
 
     strain_increment: float = 0.002
     max_strain: float = 0.3
-    offset_strain: float = 0.002
-    fit_min_strain: float = 0.0
-    fit_max_strain: float = 0.02
+    offset_strain: float = DEFAULT_OFFSET_STRAIN
+    fit_min_strain: float = DEFAULT_FIT_MIN_STRAIN
+    fit_max_strain: float = DEFAULT_FIT_MAX_STRAIN
 
     def __post_init__(self) -> None:
         """Reject an unusable criterion as well as an unusable ladder."""
         super().__post_init__()
-        require_positive(self.offset_strain, None, name="offset_strain")
-        require_positive(self.fit_max_strain, None, name="fit_max_strain")
-        require_finite(self.fit_min_strain, None, name="fit_min_strain")
-        if not 0.0 <= self.fit_min_strain < self.fit_max_strain:
-            raise ValueError(
-                "fit_min_strain must be nonnegative and below fit_max_strain."
-            )
+        require_yield_criterion(
+            self.offset_strain, self.fit_min_strain, self.fit_max_strain
+        )
         if self.fit_max_strain >= self.max_strain:
             raise ValueError("fit_max_strain must be below max_strain.")
         if self.offset_strain >= self.max_strain:
@@ -524,7 +531,6 @@ def _check_resume(
     directory: Path,
     previous: dict[str, Any],
     manifest: RunManifest | None,
-    request: dict[str, Any],
     settle: Protocol,
     ladders: Sequence[Protocol],
 ) -> None:
@@ -535,11 +541,7 @@ def _check_resume(
     finished and no completed state missing: new predecessors would otherwise
     feed old descendants.
     """
-    if manifest is not None and manifest.protocol != measurement.name:
-        raise measurement.error(
-            f"{directory} contains a different protocol; use a fresh directory."
-        )
-    if previous and previous.get("request") != request:
+    if previous and previous.get("request") is None:
         raise measurement.error(
             f"Cannot resume {measurement.name} scan with different settings. Restore "
             "the original request, use a fresh directory, or rerun with resume=False."
@@ -572,17 +574,37 @@ def _check_resume(
             "Cannot resume: tensile stages exist before equilibration is complete. "
             "Restore missing stages or rerun with resume=False."
         )
-    missing = [
-        name
-        for name, stage in manifest.stages.items()
-        if not Path(stage.get("final_state", "")).is_file()
-    ]
+    missing = list(missing_state_names(manifest.stages))
     if missing:
         raise measurement.error(
             "Cannot resume: completed stages have missing state files "
             f"({', '.join(missing)}). Restore them or rerun with resume=False so "
             "old descendants are not mixed with new dynamics."
         )
+
+
+def workflow_record(
+    request: dict[str, Any],
+    spec: TensileSpec,
+    ladders: Sequence[Protocol],
+    timestep_fs: float,
+    *,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The tensile record shared by standalone and rate scans.
+
+    Optional state fields retain their caller's insertion order and omitted
+    fields remain absent, preserving the existing workflow JSON layouts.
+    """
+    return {
+        "request": request,
+        "replica_stages": [
+            [stage.name for stage in ladder.stages] for ladder in ladders
+        ],
+        "steps_per_replica": tensile_schedule(spec).n_steps,
+        "timestep_fs": timestep_fs,
+        **({} if state is None else state),
+    }
 
 
 def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
@@ -613,15 +635,21 @@ def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
     )
     total_ns = (
         settle.total_duration_ps + sum(ladder.total_duration_ps for ladder in ladders)
-    ) / 1000.0
-    if spec.max_total_ns is not None and total_ns > spec.max_total_ns:
-        raise measurement.error(
+    ) / PS_PER_NS
+    enforce_budget(
+        total_ns,
+        spec.max_total_ns,
+        error=measurement.error,
+        message=lambda: (
             f"The {measurement.name} scan costs {total_ns:.3g} ns, above "
             f"max_total_ns={spec.max_total_ns:g}; shorten the ladder or raise the "
             "budget."
-        )
+        ),
+    )
     settings = asdict(spec)
     settings.pop("max_total_ns")
+    # Preserve the standalone tensile request's refusal of unsupported JSON
+    # scalars; other spec requests historically stringify those values.
     request = json.loads(
         json.dumps(
             {
@@ -631,23 +659,7 @@ def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
             }
         )
     )
-    previous = _read_record(measurement, directory) if resume else {}
-    manifest = RunManifest.load(directory) if resume else None
-    _check_resume(measurement, directory, previous, manifest, request, settle, ladders)
     schedule = tensile_schedule(spec)
-    record = {
-        "request": request,
-        "replica_stages": [
-            [stage.name for stage in ladder.stages] for ladder in ladders
-        ],
-        "steps_per_replica": schedule.n_steps,
-        "timestep_fs": timestep,
-    }
-    if resume:
-        validate_run_inputs(run, directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    workflow = directory / measurement.workflow_name
-    write_json(workflow, record)
     log.info(
         "%s scan: %d replicas, %.3g ns total, %.3g average strain/ns.",
         measurement.name.capitalize(),
@@ -658,28 +670,37 @@ def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
     chains = chain_options(
         chain_backbone, atoms_per_chain, expected_characteristic_ratio
     )
-    start_state = settled_state(
-        run_protocol(settle, run, directory, resume=resume, **chains),
-        directory,
-        error=measurement.error,
-        verb="stretch",
-    )
-    origin = equilibrated_box_nm(start_state)
-    record.update({"reference_box_nm": origin, "start_state": start_state})
-    write_json(workflow, record)
-    for replica in range(spec.n_replicas):
-        run_protocol(
+    run_branched_scan(
+        run,
+        directory / measurement.workflow_name,
+        request,
+        settle,
+        lambda origin: (
             tensile_protocol(
                 spec, timestep_fs=timestep, replica=replica, reference_box_nm=origin
-            ),
-            run,
-            directory,
-            # The equilibration alone resets a manifest for an explicit rerun.
-            # The replicas preserve it and each other.
-            resume=True,
-            state_in=start_state,
-            **chains,
-        )
+            )
+            for replica in range(spec.n_replicas)
+        ),
+        resume=resume,
+        error=measurement.error,
+        verb="stretch",
+        metadata={},
+        read_record=lambda: _read_record(measurement, directory),
+        precheck=lambda previous, manifest: _check_resume(
+            measurement, directory, previous, manifest, settle, ladders
+        ),
+        record_builder=lambda start, origin: workflow_record(
+            request,
+            spec,
+            ladders,
+            timestep,
+            state=None
+            if start is None
+            else {"reference_box_nm": origin, "start_state": start},
+        ),
+        require_record_for_empty_manifest=False,
+        **chains,
+    )
     return _analyse(measurement, directory)
 
 
@@ -691,7 +712,7 @@ def run_breaking_scan(
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> BreakingReport:
     """Equilibrate, stretch every replica and read the apparent tensile strength.
@@ -720,7 +741,7 @@ def run_elongation_scan(
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> ElongationReport:
     """Equilibrate, stretch every replica and read the apparent elongation at break.
@@ -749,7 +770,7 @@ def run_yield_scan(
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> YieldReport:
     """Equilibrate, stretch every replica and read the apparent yield strength.
@@ -850,7 +871,7 @@ def _recorded_spec(
 
 
 def _read_replica(
-    directory: Path, stages: dict[str, dict[str, Any]], names: Sequence[str]
+    directory: Path, manifest: RunManifest, names: Sequence[str]
 ) -> StressStrain:
     """Check that the chunks continue one ladder, then read them as one curve.
 
@@ -861,7 +882,7 @@ def _read_replica(
     axis: int | None = None
     last_strain = -1.0
     for name in names:
-        samples = stages[name]["samples"]
+        samples = manifest.stages[name]["samples"]
         reference = np.asarray(samples["reference_box_nm"], dtype=np.float64)
         recorded_axis = samples["deform_axis"]
         if (
@@ -902,14 +923,18 @@ def _read_replica(
             ):
                 raise ValueError(f"{name} has nonpositive {key} samples.")
         last_strain = float(strain[-1])
-    return stress_strain(directory, names)
+    return stress_strain(directory, names, manifest=manifest)
 
 
 def _analyse[R: BreakingReport | ElongationReport | YieldReport](
-    measurement: TensileMeasurement[R], run_dir: str | Path
+    measurement: TensileMeasurement[R],
+    run_dir: str | Path,
+    *,
+    manifest: RunManifest | None = None,
 ) -> R:
     directory = Path(run_dir)
-    manifest = RunManifest.load(directory)
+    if manifest is None:
+        manifest = RunManifest.load(directory)
     chunks = _replica_chunks(measurement, manifest, directory)
     assert manifest is not None  # the replicas above were found in it
     record = _read_record(measurement, directory)
@@ -921,7 +946,7 @@ def _analyse[R: BreakingReport | ElongationReport | YieldReport](
     fits: list[Any] = []
     for replica, names in chunks.items():
         try:
-            curve = _read_replica(directory, manifest.stages, names)
+            curve = _read_replica(directory, manifest, names)
             fit = measurement.fit(curve, **criterion)
         except (KeyError, TypeError, ValueError, IndexError) as error:
             raise AnalysisError(
@@ -966,19 +991,25 @@ def _analyse[R: BreakingReport | ElongationReport | YieldReport](
     )
 
 
-def analyse_breaking(run_dir: str | Path) -> BreakingReport:
+def analyse_breaking(
+    run_dir: str | Path, *, manifest: RunManifest | None = None
+) -> BreakingReport:
     """Read a breaking scan's apparent tensile strength under its saved criterion."""
-    return _analyse(BREAKING, run_dir)
+    return _analyse(BREAKING, run_dir, manifest=manifest)
 
 
-def analyse_elongation(run_dir: str | Path) -> ElongationReport:
+def analyse_elongation(
+    run_dir: str | Path, *, manifest: RunManifest | None = None
+) -> ElongationReport:
     """Read an elongation scan's apparent elongation at break, as a percentage."""
-    return _analyse(ELONGATION, run_dir)
+    return _analyse(ELONGATION, run_dir, manifest=manifest)
 
 
-def analyse_yield(run_dir: str | Path) -> YieldReport:
+def analyse_yield(
+    run_dir: str | Path, *, manifest: RunManifest | None = None
+) -> YieldReport:
     """Read a yield scan's offset proof stress under its saved offset and fit window."""
-    return _analyse(YIELD, run_dir)
+    return _analyse(YIELD, run_dir, manifest=manifest)
 
 
 def _write_report[R: BreakingReport | ElongationReport | YieldReport](
@@ -989,22 +1020,24 @@ def _write_report[R: BreakingReport | ElongationReport | YieldReport](
     figures: bool,
     figure_format: str,
 ) -> ReportFiles:
-    directory = (
-        Path(report.run_dir) / "analysis" if output_dir is None else Path(output_dir)
+    return write_report_files(
+        report.run_dir,
+        output_dir,
+        f"{measurement.name}.json",
+        asdict(report),
+        _figures(measurement, report) if figures else (),
+        figure_format,
     )
-    directory.mkdir(parents=True, exist_ok=True)
-    path = write_json(
-        directory / f"{measurement.name}.json", json_value(asdict(report))
-    )
-    written: list[str] = []
-    if figures:
-        for index, curve, fit in zip(
-            report.replica_indices, report.curves, report.replicas, strict=True
-        ):
-            figure_path = directory / f"{measurement.name}_r{index}.{figure_format}"
-            measurement.plot(curve, fit).savefig(figure_path, bbox_inches="tight")
-            written.append(str(figure_path))
-    return ReportFiles(json=path, figures=tuple(written))
+
+
+def _figures[R: BreakingReport | ElongationReport | YieldReport](
+    measurement: TensileMeasurement[R], report: R
+) -> Iterator[tuple[str, Figure]]:
+    """Defer each replica's plot until the JSON has been written."""
+    for index, curve, fit in zip(
+        report.replica_indices, report.curves, report.replicas, strict=True
+    ):
+        yield f"{measurement.name}_r{index}", measurement.plot(curve, fit)
 
 
 def write_breaking_report(

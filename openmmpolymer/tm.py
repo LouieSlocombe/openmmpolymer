@@ -15,37 +15,49 @@ reads a prepared cell with its System, and :func:`run_tm_scan` heats it.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
 import openmm as mm
-from openmm import app, unit
+from openmm import unit
 
 from ._files import ReportFiles, file_sha256, write_json
-from ._validation import require_integer
+from ._fitting import PS_PER_NS
+from ._seeds import DEFAULT_SEED
+from ._state import box_vectors_nm, positions_nm, read_state
+from ._validation import require_choice, require_integer
 from ._workflow import (
+    check_scan_resume,
+    enforce_budget,
     require_positive_fields,
+    require_scan_protocol,
     resume_chunks,
     run_fingerprint,
     spec_request,
+    with_timestep,
+    write_report_files,
 )
 from .forcefield import PolymerForceField
-from .mdsystem import PackedBox, SystemSpec, ensemble_controls
+from .mdsystem import PackedBox, SystemSpec, require_no_ensemble_controls
+from .packing import read_pdb
+from .plots import plot_melting
 from .protocols import (
     Protocol,
     RunManifest,
     RunSummary,
     Stage,
     run_protocol,
-    validate_run_inputs,
 )
 from .reporters import TrajectoryOptions
 from .simulate import RunContext, heating_temperatures, prepare_run, safe_timestep_fs
-from .trajectory import AnalysisError
+from .trajectory import AnalysisError, load_manifest, stages_holding
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 PROTOCOL_NAME = "tm_heating"
 WORKFLOW_NAME = "tm_workflow.json"
@@ -110,8 +122,7 @@ class TmSpec:
         require_integer(
             self.min_points_per_branch, minimum=3, name="min_points_per_branch"
         )
-        if self.barostat not in ("isotropic", "anisotropic"):
-            raise ValueError("barostat must be 'isotropic' or 'anisotropic'.")
+        require_choice(self.barostat, ("isotropic", "anisotropic"), name="barostat")
         if self.stage_ps < self.hold_ps:
             raise ValueError("stage_ps must be at least hold_ps: a hold is not split.")
         if len(self.temperatures_k) < 2 * self.min_points_per_branch:
@@ -191,7 +202,7 @@ class HeatingCurve:
             return None
         if not np.allclose(steps[:-1], steps[0]) or steps[-1] > steps[0] * (1 + 1e-8):
             return None
-        return float(steps[0] / self.hold_ps[0] * 1000.0)
+        return float(steps[0] / self.hold_ps[0] * PS_PER_NS)
 
 
 @dataclass(frozen=True)
@@ -302,50 +313,57 @@ def melting_scan(spec: TmSpec = DEFAULT_SPEC) -> Protocol:
             )
         )
     protocol = Protocol(PROTOCOL_NAME, tuple(stages))
-    total_ns = protocol.total_duration_ps / 1000.0
-    if spec.max_total_ns is not None and total_ns > spec.max_total_ns:
-        raise TmError(
+    total_ns = protocol.total_duration_ps / PS_PER_NS
+    enforce_budget(
+        total_ns,
+        spec.max_total_ns,
+        error=TmError,
+        message=lambda: (
             f"Heating scan needs {total_ns:g} ns, above max_total_ns={spec.max_total_ns:g}."
-        )
+        ),
+    )
     return protocol
 
 
-def heating_stages(run_dir: str | Path) -> tuple[str, ...]:
+def _is_heating(samples: dict[str, Any]) -> bool:
+    """Keep malformed enthalpy candidates visible to the curve reader."""
+    if "segment_enthalpy_kj_mol" not in samples:
+        return False
+    try:
+        temperatures = np.asarray(samples["segment_temperature_k"], dtype=float)
+        return not (
+            temperatures.ndim == 1
+            and len(temperatures) > 1
+            and np.all(np.diff(temperatures) < 0)
+        )
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def heating_stages(
+    run_dir: str | Path, *, manifest: RunManifest | None = None
+) -> tuple[str, ...]:
     """Find stages carrying heating enthalpy samples, including one-point chunks."""
-    manifest = RunManifest.load(run_dir)
-    if manifest is None:
-        raise AnalysisError(f"No manifest in {run_dir}.")
-    names = []
-    for name, record in manifest.stages.items():
-        samples = record.get("samples", {})
-        if "segment_enthalpy_kj_mol" not in samples:
-            continue
-        try:
-            temperatures = np.asarray(samples["segment_temperature_k"], dtype=float)
-            if (
-                temperatures.ndim == 1
-                and len(temperatures) > 1
-                and np.all(np.diff(temperatures) < 0)
-            ):
-                continue
-        except (KeyError, TypeError, ValueError):
-            # Keep malformed candidates visible so heating_curve names the
-            # offending stage instead of silently shortening the history.
-            pass
-        names.append(name)
-    return tuple(names)
+    return stages_holding(
+        run_dir,
+        _is_heating,
+        "heating enthalpy samples",
+        manifest=manifest,
+        allow_empty=True,
+    )
 
 
 def heating_curve(
     run_dir: str | Path,
     stages: str | Sequence[str] | None = None,
+    *,
+    manifest: RunManifest | None = None,
 ) -> HeatingCurve:
     """Read a recorded ascending history without modifying its manifest."""
-    manifest = RunManifest.load(run_dir)
     if manifest is None:
-        raise AnalysisError(f"No manifest in {run_dir}.")
+        manifest = load_manifest(run_dir)
     names = (
-        heating_stages(run_dir)
+        heating_stages(run_dir, manifest=manifest)
         if stages is None
         else ((stages,) if isinstance(stages, str) else tuple(stages))
     )
@@ -395,6 +413,15 @@ class _Jump:
     multiple: bool
 
 
+def _sse(
+    design: npt.NDArray[np.float64], values: npt.NDArray[np.float64]
+) -> tuple[npt.NDArray[np.float64], float]:
+    """Least-squares coefficients and explicitly evaluated squared residuals."""
+    coef, _, _, _ = np.linalg.lstsq(design, values, rcond=None)
+    residual = values - design @ coef
+    return coef, float(residual @ residual)
+
+
 def _jump_fit(
     temperature: npt.NDArray[np.float64],
     values: npt.NDArray[np.float64],
@@ -420,9 +447,7 @@ def _jump_fit(
         dx = x - midpoint
         right = (np.arange(n) >= index).astype(float)
         design = np.column_stack((np.ones(n), dx, right, right * dx))
-        coef, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
-        residual = y - design @ coef
-        sse = float(residual @ residual)
+        coef, sse = _sse(design, y)
         variance = max(0.0, sse / (n - 4))
         error = float(np.sqrt(variance * np.linalg.inv(design.T @ design)[2, 2]))
         candidates.append((sse, index, float(coef[2]), error))
@@ -436,14 +461,11 @@ def _jump_fit(
     # A smooth cubic is also a four-parameter null: broad curved expansion
     # must not be reduced to a narrow temperature-grid melting bracket.
     cubic = np.column_stack((np.ones(n), x, x**2, x**3))
-    coef, _, _, _ = np.linalg.lstsq(cubic, y, rcond=None)
-    residual = y - cubic @ coef
-    null_sse = float(residual @ residual)
+    _, null_sse = _sse(cubic, y)
     for knot in knots:
         design = np.column_stack((np.ones(n), x, np.maximum(x - knot, 0)))
-        coef, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
-        residual = y - design @ coef
-        null_sse = min(null_sse, float(residual @ residual))
+        _, hinge_sse = _sse(design, y)
+        null_sse = min(null_sse, hinge_sse)
     floor = 1e-24 * n
     bic_gain = n * np.log(max(null_sse, floor) / max(sse, floor)) - np.log(n)
     supported = jump > max(3 * error, 1e-8) and bic_gain >= 10.0
@@ -466,9 +488,7 @@ def _jump_fit(
                         after_second * x,
                     )
                 )
-                coef, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
-                residual = y - design @ coef
-                two_sse = float(residual @ residual)
+                _, two_sse = _sse(design, y)
                 gain = n * np.log(max(sse, floor) / max(two_sse, floor)) - 3 * np.log(n)
                 if gain >= 10.0:
                     multiple = True
@@ -559,7 +579,7 @@ def load_crystal(
     *,
     state_in: str | Path | None = None,
     platform: str | None = None,
-    seed: int = 0xF0,
+    seed: int = DEFAULT_SEED,
 ) -> RunContext:
     """Read a prepared crystal and its System, ready for :func:`run_tm_scan`.
 
@@ -588,7 +608,7 @@ def load_crystal(
         ValueError: A file cannot be read, or does not describe such a cell.
     """
     try:
-        pdb = app.PDBFile(str(crystal_pdb))
+        pdb = read_pdb(crystal_pdb)
         system = mm.XmlSerializer.deserialize(Path(system_xml).read_text())
     except Exception as error:
         raise ValueError(
@@ -598,7 +618,7 @@ def load_crystal(
         raise ValueError("system_xml must contain a serialised OpenMM System")
     if system.getNumParticles() != pdb.topology.getNumAtoms():
         raise ValueError("Crystal PDB and System must contain the same number of atoms")
-    _refuse_ensemble_controls(system, ValueError)
+    require_no_ensemble_controls(system, ValueError, stages="heating")
     if not system.usesPeriodicBoundaryConditions():
         raise ValueError("The supplied System must use periodic boundary conditions")
     vectors = pdb.topology.getPeriodicBoxVectors()
@@ -613,17 +633,11 @@ def load_crystal(
     system.setDefaultPeriodicBoxVectors(*vectors)
     if state_in is not None:
         try:
-            state = mm.XmlSerializer.deserialize(Path(state_in).read_text())
+            state = read_state(state_in)
             if not isinstance(state, mm.State):
                 raise ValueError("state_in must contain a serialised OpenMM State")
-            saved_positions = np.asarray(
-                state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
-                dtype=float,
-            )
-            saved_vectors = np.asarray(
-                state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer),
-                dtype=float,
-            )
+            saved_positions = positions_nm(state)
+            saved_vectors = box_vectors_nm(state)
         except Exception as error:
             raise ValueError(
                 f"Could not read the crystalline starting State: {error}"
@@ -659,21 +673,6 @@ def load_crystal(
         seed=seed,
         system=system,
     )
-
-
-def _refuse_ensemble_controls(system: Any, error: type[Exception]) -> None:
-    """Refuse a System that brings its own barostat or Andersen thermostat.
-
-    The heating stages control temperature and pressure themselves, and
-    OpenMM applies every barostat a System carries, a second one included.
-    """
-    controls = ensemble_controls(system)
-    if controls:
-        raise error(
-            "The supplied System must contain no barostat or Andersen thermostat; "
-            "the heating stages provide their own temperature and pressure "
-            f"control. It carries {', '.join(controls)}."
-        )
 
 
 def _molecule_count(topology: Any) -> int:
@@ -741,22 +740,16 @@ def run_tm_scan(
             "A melting scan requires a supplied crystalline or semicrystalline "
             "cell. Pass crystalline=True only after preparing that structure."
         )
-    _refuse_ensemble_controls(mm.XmlSerializer.deserialize(run.system_xml), TmError)
+    require_no_ensemble_controls(
+        mm.XmlSerializer.deserialize(run.system_xml), TmError, stages="heating"
+    )
     protocol = melting_scan(spec)
-    total_ns = protocol.total_duration_ps / 1000.0
+    total_ns = protocol.total_duration_ps / PS_PER_NS
     # Pinned for every stage that integrates, at the hottest hold's safe step:
     # left alone, each chunk would derate to its own hottest temperature, and
     # one heating curve integrated several ways is a confound.
     timestep = safe_timestep_fs(spec.t_end_k, run.spec)
-    protocol = replace(
-        protocol,
-        stages=tuple(
-            stage
-            if stage.kind == "minimise"
-            else replace(stage, options={**stage.options, "timestep_fs": timestep})
-            for stage in protocol.stages
-        ),
-    )
+    protocol = replace(protocol, stages=with_timestep(protocol.stages, timestep))
     request = spec_request(
         spec,
         drop=("max_total_ns",),
@@ -765,23 +758,29 @@ def run_tm_scan(
     )
     directory = Path(run_dir)
     path = directory / WORKFLOW_NAME
-    manifest = RunManifest.load(directory)
-    if manifest is not None and manifest.protocol != PROTOCOL_NAME:
-        raise TmError(
-            f"{directory} already contains a different protocol; use a new run directory."
+    if not resume:
+        # A supplied crystal cannot overwrite a different workflow even on
+        # an explicit rerun, unlike the other scan entry points.
+        require_scan_protocol(
+            directory, RunManifest.load(directory), PROTOCOL_NAME, error=TmError
         )
-    if resume and manifest is not None and not path.is_file():
-        raise TmError(
-            "The melting workflow record is missing; use a new run directory."
-        )
-    if resume and path.is_file():
-        previous = json.loads(path.read_text())
-        if previous.get("request") != request:
+
+    def check_record(previous: dict[str, Any], manifest: RunManifest | None) -> None:
+        if path.is_file() and previous.get("request") is None:
             raise TmError(
                 "Melting settings or starting inputs changed; use a new run directory."
             )
-    if resume:
-        validate_run_inputs(run, directory)
+
+    check_scan_resume(
+        run,
+        path,
+        request,
+        PROTOCOL_NAME,
+        resume=resume,
+        error=TmError,
+        read_record=lambda: json.loads(path.read_text()) if path.is_file() else {},
+        precheck=check_record,
+    )
     directory.mkdir(parents=True, exist_ok=True)
     write_json(
         path,
@@ -817,20 +816,10 @@ def write_melting_report(
     """Write ``tm.json`` and a paired volume/enthalpy plot, outside the manifest.
 
     Into ``<run_dir>/analysis``, or into *output_dir*. The plot is
-    ``melting.<figure_format>``, which must be png, pdf or svg.
+    ``melting.<figure_format>``. Its format must be a plain filename extension
+    accepted by matplotlib when figures are requested.
     """
-    from . import __version__
-
-    directory = (
-        Path(output_dir)
-        if output_dir is not None
-        else Path(report.run_dir) / "analysis"
-    )
-    if figure_format not in ("png", "pdf", "svg"):
-        raise ValueError("figure_format must be png, pdf or svg.")
-    directory.mkdir(parents=True, exist_ok=True)
-    record = {
-        "openmmpolymer": __version__,
+    fields = {
         "method": "apparent melting from NPT heating",
         **asdict(report),
         "temperature_k": report.temperature_k,
@@ -838,29 +827,16 @@ def write_melting_report(
         "heating_rate_k_per_ns": report.curve.heating_rate_k_per_ns,
         "enthalpy_units": "kJ/mol of simulation cells",
     }
-    path = directory / "tm.json"
-    write_json(path, record)
-    paths: list[str] = []
-    if figures:
-        from matplotlib.figure import Figure
+    return write_report_files(
+        report.run_dir,
+        output_dir,
+        "tm.json",
+        fields,
+        _figures(report) if figures else (),
+        figure_format,
+    )
 
-        figure = Figure(figsize=(7, 7), layout="constrained")
-        axes = figure.subplots(2, 1, sharex=True)
-        curve = report.curve
-        axes[0].plot(curve.temperature_k, curve.specific_volume_cm3_g, "o-")
-        axes[1].plot(curve.temperature_k, curve.enthalpy_kj_mol, "o-")
-        axes[0].set_ylabel("Specific volume (cm³/g)")
-        axes[1].set_ylabel("Enthalpy (kJ/mol of cells)")
-        axes[1].set_xlabel("Temperature (K)")
-        for axis in axes:
-            if report.transition.bracket_k is not None:
-                axis.axvspan(*report.transition.bracket_k, alpha=0.2, color="tab:red")
-        rate = curve.heating_rate_k_per_ns
-        label = "irregular heating schedule" if rate is None else f"{rate:g} K/ns"
-        figure.suptitle(
-            f"Apparent melting scan - {label}, {curve.pressure_bar[0]:g} bar"
-        )
-        figure_path = directory / f"melting.{figure_format}"
-        figure.savefig(figure_path)
-        paths.append(str(figure_path))
-    return ReportFiles(str(path), tuple(paths))
+
+def _figures(report: MeltingReport) -> Iterator[tuple[str, Figure]]:
+    """Defer plotting until the JSON has been written."""
+    yield "melting", plot_melting(report)

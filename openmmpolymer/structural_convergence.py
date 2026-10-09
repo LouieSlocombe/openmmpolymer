@@ -11,14 +11,16 @@ censored; extending a fit beyond the recorded trajectory cannot resolve them.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, fields, replace
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from typing import Any
 
 import numpy as np
 
-from ._validation import require_integer, require_positive
+from ._fitting import finite_or_none
+from ._validation import require_in_range, require_integer, require_positive
+from ._workflow import optional
 from .conformation import (
     centre_of_mass_msd,
     chain_conformation,
@@ -36,7 +38,6 @@ from .convergence import (
 )
 from .correlations import (
     MIN_WAVEVECTORS_PER_BIN,
-    RadialDistribution,
     StructureFactor,
     _pair_limit,
     peak_bins,
@@ -47,7 +48,6 @@ from .structure import MAX_DISTRIBUTION_FRAMES, MAX_STRUCTURE_FACTOR_FRAMES
 from .trajectory import (
     AnalysisError,
     Ensemble,
-    Frame,
     backbone_indices,
     boxes_nm,
     capped_stride,
@@ -162,42 +162,13 @@ _PARAMETERS = {
 }
 
 
-@dataclass(frozen=True)
-class _BlockEnsemble(Ensemble):
-    """An offset view that shares the reader without copying its coordinates."""
-
-    first_frame: int = 0
-
-    def frames(
-        self, *, start: int = 0, stop: int | None = None, stride: int = 1
-    ) -> Iterator[Frame]:
-        """The block's frames, indexed and timed as in the whole trajectory."""
-        last = self.n_frames if stop is None else min(stop, self.n_frames)
-        whole = replace(self, n_frames=self.first_frame + self.n_frames, first_frame=0)
-        yield from Ensemble.frames(
-            whole,
-            start=self.first_frame + start,
-            stop=self.first_frame + last,
-            stride=stride,
-        )
-
-
 def _block(ensemble: Ensemble, start: int, stop: int) -> Ensemble:
     """Frames *start* to *stop* of *ensemble*, as an ensemble of their own."""
-    return _BlockEnsemble(
-        **{
-            field.name: getattr(ensemble, field.name)
-            for field in fields(Ensemble)
-            if field.name != "n_frames"
-        },
+    return replace(
+        ensemble,
         n_frames=stop - start,
-        first_frame=start,
+        first_frame=ensemble.first_frame + start,
     )
-
-
-def _finite(value: float | None) -> float | None:
-    """A measured value, or None when there is none worth comparing."""
-    return None if value is None or not math.isfinite(value) else float(value)
 
 
 def _curve(**columns: Any) -> dict[str, tuple[float, ...]]:
@@ -253,31 +224,26 @@ def _measure(
     curves: dict[str, dict[str, tuple[float, ...]]] = {}
     notes: list[str] = []
 
-    def attempt(label: str, call: Callable[[], Any]) -> Any:
-        try:
-            return call()
-        except AnalysisError as error:
-            notes.append(f"{label}: {error}")
-            return None
-
     if backbone is not None:
-        conformation = attempt(
-            "chain dimensions",
+        conformation = optional(
             lambda: chain_conformation(ensemble, backbone, stride=stride),
+            notes,
+            "chain dimensions",
         )
         if conformation is not None:
             for name in ("characteristic_ratio", "ratio_of_squares"):
-                value = _finite(getattr(conformation.mean, name))
+                value = finite_or_none(getattr(conformation.mean, name))
                 values[name], valid[name] = value, value is not None and value > 0
                 counts[name] = conformation.n_frames
-        persistence = attempt(
-            "persistence length",
+        persistence = optional(
             lambda: persistence_length(ensemble, backbone, stride=stride),
+            notes,
+            "persistence length",
         )
         if persistence is not None:
             name = "persistence_length_nm"
             value = (
-                _finite(persistence.persistence_length_nm)
+                finite_or_none(persistence.persistence_length_nm)
                 if persistence.decayed
                 else None
             )
@@ -292,16 +258,17 @@ def _measure(
                     "Backbone correlation did not decay within the chain; "
                     "persistence length remains censored."
                 )
-        relaxation = attempt(
-            "end-to-end relaxation",
+        relaxation = optional(
             lambda: end_to_end_relaxation(
                 ensemble, backbone, max_lag_fraction=max_lag_fraction
             ),
+            notes,
+            "end-to-end relaxation",
         )
         if relaxation is not None:
             name = "end_to_end_relaxation_time_ps"
             value = (
-                _finite(relaxation.relaxation_time_ps)
+                finite_or_none(relaxation.relaxation_time_ps)
                 if relaxation.decorrelated
                 else None
             )
@@ -320,16 +287,17 @@ def _measure(
             "No backbone supplied; chain dimensions, persistence and orientational "
             "relaxation are unavailable."
         )
-    displacement = attempt(
-        "COM diffusion",
+    displacement = optional(
         lambda: centre_of_mass_msd(
             ensemble, stride=stride, max_lag_fraction=max_lag_fraction
         ),
+        notes,
+        "COM diffusion",
     )
     if displacement is not None:
         name = "diffusion_coefficient_cm2_s"
         value = (
-            _finite(displacement.diffusion_coefficient_cm2_s)
+            finite_or_none(displacement.diffusion_coefficient_cm2_s)
             if displacement.diffusive
             else None
         )
@@ -343,8 +311,7 @@ def _measure(
                 f"COM MSD slope {displacement.log_slope:.3g} does not establish "
                 "diffusion; coefficient remains censored."
             )
-    distribution: RadialDistribution | None = attempt(
-        "RDF",
+    distribution = optional(
         lambda: radial_distribution(
             ensemble,
             r_max_nm=r_max_nm,
@@ -352,6 +319,8 @@ def _measure(
             heavy_atoms_only=heavy_atoms_only,
             stride=pair_stride,
         ),
+        notes,
+        "RDF",
     )
     if distribution is not None:
         curves["radial_distribution"] = _curve(
@@ -363,14 +332,13 @@ def _measure(
             ("rdf_first_peak_nm", distribution.first_peak_nm),
             ("rdf_first_peak_height", distribution.first_peak_height),
         ):
-            finite = _finite(value)
+            finite = finite_or_none(value)
             values[name], valid[name] = (
                 finite,
                 finite is not None and finite > 0 and distribution.n_pairs > 0,
             )
             counts[name] = distribution.n_frames
-    factor: StructureFactor | None = attempt(
-        "structure factor",
+    factor = optional(
         lambda: structure_factor(
             ensemble,
             q_max_per_nm=q_max_per_nm,
@@ -378,6 +346,8 @@ def _measure(
             heavy_atoms_only=heavy_atoms_only,
             stride=factor_stride,
         ),
+        notes,
+        "structure factor",
     )
     if factor is not None:
         curves["structure_factor"] = _curve(
@@ -406,6 +376,7 @@ def _relative_change(values: Sequence[float | None]) -> float | None:
         return None
     array = np.asarray(values, dtype=float)
     scale = max(abs(float(array[-1])), float(np.mean(np.abs(array))))
+    # Dividing before ptp can cross the tolerance boundary by one ulp.
     return float(np.ptp(array) / scale) if scale > 0 else 0.0
 
 
@@ -533,8 +504,14 @@ def structural_window_convergence(
     require_integer(q_bins, name="q_bins")
     require_integer(min_vectors_per_bin, name="min_vectors_per_bin")
     require_positive(q_max_per_nm, None, name="q_max_per_nm")
-    if not math.isfinite(max_lag_fraction) or not 0 < max_lag_fraction <= 0.5:
-        raise ValueError("max_lag_fraction must be in (0, 0.5].")
+    require_in_range(
+        max_lag_fraction,
+        None,
+        name="max_lag_fraction",
+        minimum=0.0,
+        maximum=0.5,
+        include_minimum=False,
+    )
     if ensemble.n_frames < 1:
         raise AnalysisError("The ensemble contains no frames.")
     if not ensemble.is_snapshot and (
@@ -613,7 +590,7 @@ def structural_window_convergence(
                 ("structure_factor_peak_per_nm", factor.q_per_nm[index]),
                 ("structure_factor_peak_height", factor.s_q[index]),
             ):
-                values[name] = _finite(float(value))
+                values[name] = finite_or_none(float(value))
                 valid[name] = values[name] is not None and float(value) > 0
             window = replace(window, values=values, valid=valid)
         else:

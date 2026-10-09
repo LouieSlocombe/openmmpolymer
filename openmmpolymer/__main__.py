@@ -26,7 +26,8 @@ import io
 import logging
 import math
 import sys
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from importlib.metadata import version
@@ -50,13 +51,15 @@ from ._cli_reports import (
     _yield_lines,
 )
 from ._files import ReportFiles
+from ._fitting import MAX_EXTRAPOLATION_DECADES, PS_PER_NS
+from ._seeds import DEFAULT_SEED
 from ._workflow import chain_options
 from .chain import ChainResult, ChainSpec
-from .charges import CHARGE_METHODS
+from .charges import CHARGE_METHODS, DEFAULT_CHARGE_METHOD
 from .convergence import DEFAULT_WINDOW_FRACTIONS
 from .convergence_report import analyse_convergence, write_convergence_report
-from .elasticity import deform_stages, load_stages, shear_stages
-from .forcefield import BACKENDS
+from .elasticity import DEFAULT_STRAIN_LIMIT, deform_stages, load_stages, shear_stages
+from .forcefield import BACKENDS, DEFAULT_BACKEND
 from .mechanical import (
     ModulusSpec,
     analyse_mechanics,
@@ -86,7 +89,20 @@ from .rate_reports import write_rate_report
 from .relaxation import relax_stages
 from .reporters import TrajectoryOptions
 from .simulate import RELAX_MODES, RunContext
-from .structure import analyse_structure, structure_stages, write_structure_report
+from .strength import (
+    DEFAULT_CONFIRMATION_STEPS,
+    DEFAULT_FAILURE_FRACTION,
+    DEFAULT_FIT_MAX_STRAIN,
+    DEFAULT_FIT_MIN_STRAIN,
+    DEFAULT_OFFSET_STRAIN,
+)
+from .structure import (
+    MAX_DISTRIBUTION_FRAMES,
+    MAX_STRUCTURE_FACTOR_FRAMES,
+    analyse_structure,
+    structure_stages,
+    write_structure_report,
+)
 from .tensile import (
     BreakingSpec,
     ElongationSpec,
@@ -111,15 +127,15 @@ from .tg import (
     analyse_tg,
     cooling_rate_series,
     fine_window,
-    nominal_fine_schedule,
     run_tg_scan,
-    tg_coarse_scan,
+    tg_scan_duration_ps,
     write_tg_report,
 )
 from .timeseries import (
     DSC_COOLING_RATE_K_PER_NS,
     EXTRAPOLATION_FORMS,
     cooling_rate_extrapolation,
+    minimum_cooling_rates,
     quench_stages,
 )
 from .tm import (
@@ -224,15 +240,13 @@ def _tg_ps(spec: TgSpec, arguments: argparse.Namespace) -> float:
     if arguments.tg_approx is not None:
         fine_window(arguments.tg_approx, spec)
     rates = arguments.cooling_rates
-    if rates is not None and arguments.rate_form == "vft" and len(rates) < 3:
+    if (
+        rates is not None
+        and arguments.rate_form == "vft"
+        and len(rates) < minimum_cooling_rates(arguments.rate_form)
+    ):
         raise ValueError("--rate-form vft requires at least three --cooling-rates.")
-    holds = (
-        [spec.fine_hold_ps]
-        if rates is None
-        else [spec.fine_step_k / rate * 1000.0 for rate in rates]
-    )
-    fine = sum(nominal_fine_schedule(spec, hold_ps=hold).total_ps for hold in holds)
-    return tg_coarse_scan(spec).total_duration_ps + fine
+    return tg_scan_duration_ps(spec, rates_k_per_ns=rates)
 
 
 class _Job(NamedTuple):
@@ -725,14 +739,14 @@ def build_parser() -> argparse.ArgumentParser:
     _flag(
         parser,
         "--charge-method",
-        "nagl",
+        DEFAULT_CHARGE_METHOD,
         "partial-charge method",
         choices=CHARGE_METHODS,
     )
     _flag(
         parser,
         "--backend",
-        "smirnoff",
+        DEFAULT_BACKEND,
         "forcefill parameterisation backend",
         choices=BACKENDS,
     )
@@ -842,7 +856,7 @@ def build_parser() -> argparse.ArgumentParser:
         "cell (default: one per chain, which is the right thing and the "
         "slowest to pack)",
     )
-    _flag(parser, "--seed", 0xF0, "master random seed")
+    _flag(parser, "--seed", DEFAULT_SEED, "master random seed")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -888,7 +902,7 @@ def build_parser() -> argparse.ArgumentParser:
     _flag(
         mechanics,
         "--elastic-strain-limit",
-        0.015,
+        DEFAULT_STRAIN_LIMIT,
         "strain the modulus is fitted up to",
     )
     rate_analysis = parser.add_argument_group(
@@ -915,7 +929,7 @@ def build_parser() -> argparse.ArgumentParser:
     rate_analysis.add_argument(
         "--max-rate-extrapolation-decades",
         type=float,
-        default=2.0,
+        default=MAX_EXTRAPOLATION_DECADES,
         help="largest extrapolation distance allowed to resolve (default: "
         "%(default)s); this is a reporting guard",
     )
@@ -975,13 +989,13 @@ def build_parser() -> argparse.ArgumentParser:
     _flag(
         failure,
         "--failure-fraction",
-        0.5,
+        DEFAULT_FAILURE_FRACTION,
         "fraction of peak nominal stress below which the terminal drop must remain",
     )
     _flag(
         failure,
         "--confirmation-steps",
-        3,
+        DEFAULT_CONFIRMATION_STEPS,
         "consecutive terminal holds needed to confirm the stress drop",
     )
     yielding = parser.add_argument_group(
@@ -992,19 +1006,19 @@ def build_parser() -> argparse.ArgumentParser:
     _flag(
         yielding,
         "--yield-offset-strain",
-        0.002,
+        DEFAULT_OFFSET_STRAIN,
         "strain offset for the proof-stress line; 0.002 means 0.2%%",
     )
     _flag(
         yielding,
         "--yield-fit-min-strain",
-        0.0,
+        DEFAULT_FIT_MIN_STRAIN,
         "lower engineering strain for the initial elastic fit",
     )
     _flag(
         yielding,
         "--yield-fit-max-strain",
-        0.02,
+        DEFAULT_FIT_MAX_STRAIN,
         "upper engineering strain for the initial elastic fit",
     )
     relaxation = parser.add_argument_group(
@@ -1091,7 +1105,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--window-fractions",
         type=_floats,
         default=DEFAULT_WINDOW_FRACTIONS,
-        help="increasing observed fractions ending at 1 (default: 0.25,0.5,0.75,1)",
+        help="increasing observed fractions ending at 1 (default: "
+        + ",".join(f"{fraction:g}" for fraction in DEFAULT_WINDOW_FRACTIONS)
+        + ")",
     )
     _flag(
         convergence,
@@ -1161,7 +1177,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=1,
         help="measure every Nth frame (default: %(default)s); g(r) and S(q) "
-        "are further capped at 50 and 8 frames",
+        f"are further capped at {MAX_DISTRIBUTION_FRAMES} and "
+        f"{MAX_STRUCTURE_FACTOR_FRAMES} frames",
     )
     analysis.add_argument(
         "--no-figures",
@@ -1379,6 +1396,15 @@ _UNRECORDED = frozenset(
 _RUNTIME = ("openmm", "rdkit", "forcefill", "openff-toolkit", "numpy")
 
 
+@contextmanager
+def _refusals(parser: argparse.ArgumentParser) -> Iterator[None]:
+    """Show a refused CLI request as a usage error at the dispatch boundary."""
+    try:
+        yield
+    except _REFUSED as error:
+        parser.error(str(error))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line interface.
 
@@ -1403,7 +1429,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("--convergence requires exactly one --analyse directory")
         if _property_rates_requested(arguments):
             parser.error("run --convergence separately from imposed-rate analysis")
-        try:
+        with _refusals(parser):
             windows = analyse_convergence(
                 arguments.analyse[0],
                 stage=arguments.convergence_stage or arguments.structure_stage,
@@ -1421,13 +1447,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 write_convergence_report,
                 arguments.output_dir,
             )
-        except _REFUSED as error:
-            parser.error(str(error))
         return 0
 
     rates = None
     if _property_rates_requested(arguments):
-        try:
+        with _refusals(parser):
             rates = _property_rate_request(arguments)
             if arguments.analyse:
                 saved = analyse_property_rates(
@@ -1445,14 +1469,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     arguments.output_dir,
                 )
                 return 0
-        except _REFUSED as error:
-            parser.error(str(error))
     if arguments.analyse:
         if arguments.protocol == "modulus" and len(arguments.analyse) > 1:
             parser.error(
                 "analysing multiple modulus rates requires --target-property-rate"
             )
-        return _analyse(arguments)
+        with _refusals(parser):
+            return _analyse(arguments)
 
     crystalline = arguments.protocol == "tm"
     if crystalline:
@@ -1471,11 +1494,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("a monomer SMILES is required unless --analyse is given")
     entry = PROTOCOLS[arguments.protocol]
     # Everything is checked and priced before a file is read or written.
-    try:
+    with _refusals(parser):
         chain = None if crystalline else ChainSpec(**_keywords(arguments, _CHAIN))
         spec = entry.settings(arguments)
         if rates is None:
-            total_ns = entry.price(spec, arguments) / 1000.0
+            total_ns = entry.price(spec, arguments) / PS_PER_NS
             cost = f"{arguments.protocol} run: {total_ns:.3g} ns of dynamics in total"
             budget = arguments.max_total_ns
             if budget is not None and total_ns > budget:
@@ -1496,13 +1519,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{rates.property_name} rate scan: {total_ns:.3g} ns total "
                 "including preparation and all replicas"
             )
-    except _REFUSED as error:
-        parser.error(str(error))
     print(cost)
 
     output = Path(arguments.output_dir or "run")
     if chain is None:
-        try:
+        with _refusals(parser):
             run = load_crystal(
                 arguments.crystal_pdb,
                 arguments.system_xml,
@@ -1510,8 +1531,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 platform=arguments.platform,
                 seed=arguments.seed,
             )
-        except _REFUSED as error:
-            parser.error(str(error))
         options: dict[str, Any] = {"state_in": arguments.state_in, "crystalline": True}
     else:
         built, run = _build(parser, arguments, chain, output)
@@ -1529,20 +1548,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if rates is None:
-        entry.run(_Job(arguments, spec, run, output, options))
+        with _refusals(parser):
+            entry.run(_Job(arguments, spec, run, output, options))
         return 0
-    report = run_property_rate_scan(
-        run,
-        output,
-        property_name=rates.property_name,
-        target_rate=rates.target_rate,
-        spec=spec,
-        hold_times_ps=rates.hold_times_ps,
-        n_replicas=arguments.thermal_rate_replicas,
-        max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
-        **options,
-    )
-    _emit(arguments, report, _rate_lines, write_rate_report, output / "analysis")
+    with _refusals(parser):
+        report = run_property_rate_scan(
+            run,
+            output,
+            property_name=rates.property_name,
+            target_rate=rates.target_rate,
+            spec=spec,
+            hold_times_ps=rates.hold_times_ps,
+            n_replicas=arguments.thermal_rate_replicas,
+            max_extrapolation_decades=arguments.max_rate_extrapolation_decades,
+            **options,
+        )
+        _emit(arguments, report, _rate_lines, write_rate_report, output / "analysis")
     return 0
 
 

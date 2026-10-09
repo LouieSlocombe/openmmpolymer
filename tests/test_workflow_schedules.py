@@ -190,3 +190,30 @@ def test_tensile_chunks_copy_the_callers_reference_box_independently() -> None:
     boxes[0][1] = 8
     assert reference == [7, 5, 6]
     assert boxes[1:] == [[4, 5, 6], [4, 5, 6]]
+
+
+@pytest.mark.parametrize("maximum", [None, 1.0, 2.0])
+def test_budget_accepts_exact_limit_and_does_not_render_refusal(
+    maximum: float | None,
+) -> None:
+    from openmmpolymer._workflow import enforce_budget
+
+    def unexpected() -> str:
+        pytest.fail("An accepted budget must not render its refusal message")
+
+    enforce_budget(1.0, maximum, error=RuntimeError, message=unexpected)
+
+
+def test_budget_preserves_the_callers_error_and_advice() -> None:
+    import math
+
+    from openmmpolymer._workflow import enforce_budget
+    from openmmpolymer.mechanical import MechanicalError
+
+    with pytest.raises(MechanicalError, match="shorten this scan"):
+        enforce_budget(
+            math.nextafter(1.0, math.inf),
+            1.0,
+            error=MechanicalError,
+            message=lambda: "shorten this scan",
+        )

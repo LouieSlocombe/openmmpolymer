@@ -24,7 +24,7 @@ os.environ.setdefault("OPENMM_CPU_THREADS", "1")
 from openmmpolymer.forcefield import PolymerForceField
 from openmmpolymer.mdsystem import PackedBox
 
-from .helpers import DIMER_FFXML, argon_context, argon_system
+from .helpers import DIMER_FFXML, argon_cell, argon_context, write_manifest
 
 
 @pytest.fixture(autouse=True)
@@ -49,14 +49,7 @@ def dimer_forcefield(tmp_path: Path) -> PolymerForceField:
 @pytest.fixture
 def argon_box() -> tuple[PackedBox, Any]:
     """A 64-atom argon cell and its System, ready for any stage."""
-    system, topology, positions = argon_system(64, 2.4)
-    box = PackedBox(
-        topology=topology,
-        positions_nm=positions,
-        box_nm=(2.4, 2.4, 2.4),
-        n_molecules=64,
-    )
-    return box, system
+    return argon_cell(64, 2.4)
 
 
 @pytest.fixture
@@ -117,14 +110,9 @@ def dimer_run_directory(dimer_trajectory: Any, tmp_path: Path) -> Path:
     needs is the manifest's shape, and a protocol run would cost every stage to
     get it.
     """
-    import json
-
-    manifest = {
-        "protocol": "fixture",
-        "seed": 11,
-        "versions": {},
-        "system": {},
-        "stages": {
+    write_manifest(
+        tmp_path,
+        {
             "02_nvt": {
                 "name": "02_nvt",
                 "steps": dimer_trajectory.steps,
@@ -134,14 +122,14 @@ def dimer_run_directory(dimer_trajectory: Any, tmp_path: Path) -> Path:
                 "samples": {},
             }
         },
-        "chains": None,
-        "box": {
+        protocol="fixture",
+        seed=11,
+        box={
             "n_molecules": 32,
             "atoms_per_chain": 2,
             "box_nm": [2.4, 2.4, 2.4],
         },
-    }
-    (tmp_path / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    )
     return tmp_path
 
 
@@ -244,3 +232,18 @@ def no_build(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
 
     monkeypatch.setattr(melt, "build_chain", build)
     return asked
+
+
+@pytest.fixture
+def manifest_reads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Count manifest file reads, including readers that parse raw JSON directly."""
+    reads: list[Path] = []
+    original = Path.read_text
+
+    def read(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path.name == "manifest.json":
+            reads.append(path.resolve())
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    return reads

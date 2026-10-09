@@ -14,7 +14,7 @@ public function is refused rather than read in the wrong unit.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 
@@ -99,6 +99,43 @@ def require_positive(value: object, expected_unit: Any, *, name: str) -> float:
     return number
 
 
+def require_nonnegative(value: object, expected_unit: Any, *, name: str) -> float:
+    """Return a finite float at least zero, retaining zero where it is meaningful."""
+    number = _as_float(value, expected_unit, name=name)
+    if not math.isfinite(number) or number < 0.0:
+        raise ValueError(
+            f"{name}={value!r} must be nonnegative (finite and zero or more)."
+        )
+    return number
+
+
+def require_in_range(
+    value: object,
+    expected_unit: Any,
+    *,
+    name: str,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    include_minimum: bool = True,
+    include_maximum: bool = True,
+) -> float:
+    """Return a finite float within the requested open or closed bounds."""
+    number = require_finite(value, expected_unit, name=name)
+    below = minimum is not None and (
+        number < minimum if include_minimum else number <= minimum
+    )
+    above = maximum is not None and (
+        number > maximum if include_maximum else number >= maximum
+    )
+    if below or above:
+        left = "[" if include_minimum and minimum is not None else "("
+        right = "]" if include_maximum and maximum is not None else ")"
+        low = "-inf" if minimum is None else f"{minimum:g}"
+        high = "inf" if maximum is None else f"{maximum:g}"
+        raise ValueError(f"{name}={value!r} must be in {left}{low}, {high}{right}.")
+    return number
+
+
 def require_integer(value: object, *, name: str, minimum: int = 1) -> int:
     """Return *value* as an integer no smaller than *minimum*.
 
@@ -152,13 +189,20 @@ def require_plane(value: Sequence[int], *, name: str = "plane") -> tuple[int, in
     return axes[0], axes[1]
 
 
-def require_choice(value: str, valid: tuple[str, ...], *, name: str) -> str:
+def require_choice(
+    value: str,
+    valid: tuple[str, ...],
+    *,
+    name: str,
+    message: Callable[[], str] | None = None,
+) -> str:
     """Return *value* if it is one of *valid*, else raise naming the options.
 
     Args:
         value: The candidate.
         valid: Every accepted value.
         name: Parameter name, used in the error message.
+        message: Optional existing diagnostic, evaluated only for a refused value.
 
     Returns:
         The validated value.
@@ -167,5 +211,7 @@ def require_choice(value: str, valid: tuple[str, ...], *, name: str) -> str:
         ValueError: The value is not in *valid*.
     """
     if value not in valid:
+        if message is not None:
+            raise ValueError(message())
         raise ValueError(f"{name}={value!r} is not one of {', '.join(sorted(valid))}.")
     return value
