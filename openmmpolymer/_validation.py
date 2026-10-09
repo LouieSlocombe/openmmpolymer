@@ -99,6 +99,43 @@ def require_positive(value: object, expected_unit: Any, *, name: str) -> float:
     return number
 
 
+def require_nonnegative(value: object, expected_unit: Any, *, name: str) -> float:
+    """Return a finite float at least zero, retaining zero where it is meaningful."""
+    number = _as_float(value, expected_unit, name=name)
+    if not math.isfinite(number) or number < 0.0:
+        raise ValueError(
+            f"{name}={value!r} must be nonnegative (finite and zero or more)."
+        )
+    return number
+
+
+def require_in_range(
+    value: object,
+    expected_unit: Any,
+    *,
+    name: str,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    include_minimum: bool = True,
+    include_maximum: bool = True,
+) -> float:
+    """Return a finite float within the requested open or closed bounds."""
+    number = require_finite(value, expected_unit, name=name)
+    below = minimum is not None and (
+        number < minimum if include_minimum else number <= minimum
+    )
+    above = maximum is not None and (
+        number > maximum if include_maximum else number >= maximum
+    )
+    if below or above:
+        left = "[" if include_minimum and minimum is not None else "("
+        right = "]" if include_maximum and maximum is not None else ")"
+        low = "-inf" if minimum is None else f"{minimum:g}"
+        high = "inf" if maximum is None else f"{maximum:g}"
+        raise ValueError(f"{name}={value!r} must be in {left}{low}, {high}{right}.")
+    return number
+
+
 def require_integer(value: object, *, name: str, minimum: int = 1) -> int:
     """Return *value* as an integer no smaller than *minimum*.
 

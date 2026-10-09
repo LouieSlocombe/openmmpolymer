@@ -35,10 +35,12 @@ from openmm import unit
 
 from ._files import file_sha256, write_json
 from ._state import positions_nm, read_state
+from ._validation import require_finite, require_nonnegative, require_positive
 from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .reporters import TrajectoryOptions
 from .simulate import (
     RunContext,
+    Segment,
     StageResult,
     _anneal_segments,
     _compress_segments,
@@ -146,25 +148,48 @@ class Stage:
                 pressures_bar=options["pressures_bar"],
                 duration_ps_each=options["duration_ps_each"],
             )
+        elif self.kind in {"nvt", "npt", "production", "pushoff"}:
+            pressure = options.get("pressure_bar")
+            segments = [
+                Segment(
+                    options["temperature_k"],
+                    options["duration_ps"],
+                    1.0 if pressure is None else pressure,
+                )
+            ]
         else:
             segments = None
         if segments is not None:
             return sum((segment.duration_ps for segment in segments), 0.0)
         if self.kind == "deform":
-            return float(options["relax_ps"]) * int(options["n_steps"])
-        if self.kind == "load":
-            return float(options["duration_ps_each"]) * len(options["stresses_bar"])
-        if self.kind == "shear":
-            return float(options["duration_ps_each"]) * len(options["strains"])
+            return require_positive(options["relax_ps"], None, name="relax_ps") * int(
+                options["n_steps"]
+            )
+        if self.kind in {"load", "shear"}:
+            key = "stresses_bar" if self.kind == "load" else "strains"
+            for value in options[key]:
+                require_finite(value, None, name=key)
+            return require_positive(
+                options["duration_ps_each"], None, name="duration_ps_each"
+            ) * len(options[key])
         if self.kind == "relax":
             # A chunk that opens an already-strained cell repeats neither the
             # baseline nor the ramp, so counting them would price a resumed
             # ladder as several first chunks.
+            duration_ps = require_positive(
+                options["duration_ps"], None, name="duration_ps"
+            )
+            for key in ("baseline_ps", "ramp_ps", "time_offset_ps"):
+                require_nonnegative(options[key], None, name=key)
             held = 0.0 if options["strain_applied"] else float(options["baseline_ps"])
             ramp = 0.0 if options["strain_applied"] else float(options["ramp_ps"])
-            return held + ramp + float(options["duration_ps"])
+            return held + ramp + duration_ps
         duration = options.get("duration_ps")
-        return 0.0 if duration is None else float(duration)
+        return (
+            0.0
+            if duration is None
+            else require_positive(duration, None, name="duration_ps")
+        )
 
 
 @dataclass(frozen=True)

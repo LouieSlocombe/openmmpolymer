@@ -88,7 +88,7 @@ Removed: `set_pressure`, `_BlockEnsemble`, the four `polyfit` calls, the duplica
 - [x] F6 `first_frame`
 - [x] F9 numerics (centre x in `fit_line` before any `polyfit` swap)
 - [ ] F18 small bypasses
-- [ ] F5 validation (separate commit: it is a behaviour fix; needs D6)
+- [x] F5 validation (separate behavior-fix commit; D6 resolved below)
 
 ### Stage 2: reports and shared readers (about -100 lines)
 
@@ -454,6 +454,13 @@ remain above so the changes and decisions can be reviewed against the audit.
   exactly two decades or 10% relative change. U1/U3 numerical sharing stops at
   these primitives; the different fitted models and residual guards stay apart.
   Gate: 2,075 passed, eight expected failures; ruff, formatting and mypy clean.
+
+- F5/D6: no repository caller depended on zero holds. Segment holds now require
+  positive finite temperatures/durations and finite pressures before writing;
+  load/shear ladders reject nonfinite entries. Dry-run duration estimates use the
+  same checks. Shared scalar and tensile-criterion validation keeps intentional
+  zero baseline/ramp/time-offset values and finite zero/negative pressures.
+  Gate: 2,255 passed, eight expected failures; ruff, formatting and mypy clean.
 
 ## Appendix A. Builder and request digest harness (Stage 0)
 

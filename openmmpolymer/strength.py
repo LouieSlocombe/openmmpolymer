@@ -18,7 +18,12 @@ import numpy as np
 import numpy.typing as npt
 
 from ._fitting import ROUNDING, finite_or_none
-from ._validation import require_integer
+from ._validation import (
+    require_in_range,
+    require_integer,
+    require_nonnegative,
+    require_positive,
+)
 from .elasticity import StressStrain, youngs_modulus
 
 #: Default apparent failure and offset-yield criteria.
@@ -27,6 +32,36 @@ DEFAULT_CONFIRMATION_STEPS = 3
 DEFAULT_OFFSET_STRAIN = 0.002
 DEFAULT_FIT_MIN_STRAIN = 0.0
 DEFAULT_FIT_MAX_STRAIN = 0.02
+
+
+def require_breaking_criterion(failure_fraction: float, confirmation_steps: int) -> int:
+    """Validate the same terminal stress-loss criterion for scans and analysis."""
+    require_in_range(
+        failure_fraction,
+        None,
+        name="failure_fraction",
+        minimum=0.0,
+        maximum=1.0,
+        include_minimum=False,
+        include_maximum=False,
+    )
+    return require_integer(confirmation_steps, name="confirmation_steps", minimum=2)
+
+
+def require_yield_criterion(
+    offset_strain: float, fit_min_strain: float, fit_max_strain: float
+) -> None:
+    """Validate the offset and elastic fitting interval shared with tensile scans."""
+    require_positive(offset_strain, None, name="offset_strain")
+    require_positive(fit_max_strain, None, name="fit_max_strain")
+    require_nonnegative(fit_min_strain, None, name="fit_min_strain")
+    require_in_range(
+        fit_min_strain,
+        None,
+        name="fit_min_strain",
+        maximum=fit_max_strain,
+        include_maximum=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -101,12 +136,9 @@ def _nominal_tensile_stress(
         raise ValueError(
             "lateral_strain must give strictly positive lateral stretches."
         )
-    if not math.isfinite(curve.temperature_k) or curve.temperature_k <= 0.0:
-        raise ValueError("temperature_k must be finite and greater than zero.")
-    if curve.strain_rate_per_ns is not None and (
-        not math.isfinite(curve.strain_rate_per_ns) or curve.strain_rate_per_ns < 0.0
-    ):
-        raise ValueError("strain_rate_per_ns must be finite and nonnegative, or None.")
+    require_positive(curve.temperature_k, None, name="temperature_k")
+    if curve.strain_rate_per_ns is not None:
+        require_nonnegative(curve.strain_rate_per_ns, None, name="strain_rate_per_ns")
 
     # Finite inputs can still overflow while forming area or stress. Reject
     # that explicitly rather than finding a peak in an infinite curve.
@@ -157,10 +189,8 @@ def breaking_strength(
             strain-controlled, or a numeric argument is outside its range.
         TypeError: ``confirmation_steps`` is not an integer.
     """
-    if not math.isfinite(failure_fraction) or not 0.0 < failure_fraction < 1.0:
-        raise ValueError("failure_fraction must be finite and between zero and one.")
-    confirmation_steps = require_integer(
-        confirmation_steps, name="confirmation_steps", minimum=2
+    confirmation_steps = require_breaking_criterion(
+        failure_fraction, confirmation_steps
     )
     strain, nominal = _nominal_tensile_stress(curve)
 
@@ -353,12 +383,7 @@ def yield_strength(
     Raises:
         ValueError: Invalid controls or malformed/nonfinite tensile data.
     """
-    if not math.isfinite(offset_strain) or offset_strain <= 0.0:
-        raise ValueError("offset_strain must be finite and greater than zero.")
-    if not math.isfinite(fit_min_strain) or fit_min_strain < 0.0:
-        raise ValueError("fit_min_strain must be finite and nonnegative.")
-    if not math.isfinite(fit_max_strain) or fit_max_strain <= fit_min_strain:
-        raise ValueError("fit_max_strain must be finite and above fit_min_strain.")
+    require_yield_criterion(offset_strain, fit_min_strain, fit_max_strain)
     strain, nominal = _nominal_tensile_stress(curve)
     inside = (strain >= fit_min_strain) & (strain <= fit_max_strain)
     count = int(np.count_nonzero(inside))

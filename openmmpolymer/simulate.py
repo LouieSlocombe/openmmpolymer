@@ -40,6 +40,7 @@ from ._validation import (
     require_choice,
     require_finite,
     require_integer,
+    require_nonnegative,
     require_plane,
     require_positive,
 )
@@ -636,6 +637,12 @@ class Segment:
     pressure_bar: float = 1.0
     label: str = ""
 
+    def __post_init__(self) -> None:
+        """Reject invalid holds before either budget estimation or execution."""
+        require_positive(self.temperature_k, None, name="temperature_k")
+        require_positive(self.duration_ps, None, name="duration_ps")
+        require_finite(self.pressure_bar, None, name="pressure_bar")
+
 
 #: Readings taken per segment unless a stage asks for more.
 _SAMPLES_PER_SEGMENT = 10
@@ -1066,6 +1073,7 @@ def run_pushoff(
     Returns:
         What the stage did.
     """
+    require_positive(duration_ps, None, name="duration_ps")
     prefix = Path(output_prefix)
     started = time.monotonic()
     state: str | Path | None = state_in
@@ -2137,7 +2145,7 @@ def run_load(
         ValueError: The axis is not 0, 1 or 2, or no stresses were given.
     """
     require_axis(axis)
-    rungs = [float(value) for value in stresses_bar]
+    rungs = [require_finite(value, None, name="stresses_bar") for value in stresses_bar]
     if not rungs:
         raise ValueError("stresses_bar is empty, so there is nothing to pull with.")
     require_integer(samples_per_step, minimum=1, name="samples_per_step")
@@ -2267,7 +2275,7 @@ def run_shear(
         ValueError: The plane or the strain ladder is not usable.
     """
     driven, gradient = require_plane(plane)
-    ladder = [float(value) for value in strains]
+    ladder = [require_finite(value, None, name="strains") for value in strains]
     if not ladder:
         raise ValueError("strains is empty, so there is nothing to shear.")
     require_integer(samples_per_step, minimum=1, name="samples_per_step")
@@ -2705,14 +2713,12 @@ def run_relax(
     require_positive(sample_every_ps, None, name="sample_every_ps")
     require_positive(late_sample_every_ps, None, name="late_sample_every_ps")
     require_positive(abs(step_strain), None, name="step_strain")
-    if not all(
-        math.isfinite(value) and value >= 0.0
-        for value in (baseline_ps, ramp_ps, time_offset_ps)
+    for name, value in (
+        ("baseline_ps", baseline_ps),
+        ("ramp_ps", ramp_ps),
+        ("time_offset_ps", time_offset_ps),
     ):
-        raise ValueError(
-            f"baseline_ps={baseline_ps}, ramp_ps={ramp_ps} and "
-            f"time_offset_ps={time_offset_ps} must all be finite and zero or more."
-        )
+        require_nonnegative(value, None, name=name)
     timestep_fs = _timestep_fs(timestep_fs, temperature_k, run.spec)
 
     # A shear step measures G directly: sigma_xz = G gamma. A tensile step

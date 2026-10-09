@@ -18,7 +18,9 @@ from openmmpolymer._validation import (
     require_axis,
     require_choice,
     require_finite,
+    require_in_range,
     require_integer,
+    require_nonnegative,
     require_plane,
     require_positive,
 )
@@ -110,6 +112,70 @@ def test_a_non_positive_value_is_refused_where_one_is_needed(value: float) -> No
     """A timestep or a density of zero is not a setting."""
     with pytest.raises(ValueError, match="greater than zero"):
         require_positive(value, unit.kelvin, name="temperature_k")
+
+
+@pytest.mark.parametrize("value", [0.0, 0.5])
+def test_nonnegative_allows_zero(value: float) -> None:
+    assert require_nonnegative(value, None, name="baseline_ps") == value
+
+
+@pytest.mark.parametrize("value", [-1.0, math.nan, math.inf, -math.inf])
+def test_nonnegative_rejects_negative_and_nonfinite_values(value: float) -> None:
+    with pytest.raises(
+        ValueError, match=r"baseline_ps=.*nonnegative.*finite and zero or more"
+    ):
+        require_nonnegative(value, None, name="baseline_ps")
+
+
+@pytest.mark.parametrize("include_minimum", [False, True])
+@pytest.mark.parametrize("include_maximum", [False, True])
+def test_range_endpoints_can_be_open_or_closed(
+    include_minimum: bool, include_maximum: bool
+) -> None:
+    options = {
+        "include_minimum": include_minimum,
+        "include_maximum": include_maximum,
+    }
+    for value, accepted in (
+        (-0.1, False),
+        (0.0, include_minimum),
+        (0.5, True),
+        (1.0, include_maximum),
+        (1.1, False),
+    ):
+        if accepted:
+            assert (
+                require_in_range(
+                    value, None, name="fraction", minimum=0.0, maximum=1.0, **options
+                )
+                == value
+            )
+        else:
+            with pytest.raises(ValueError, match=r"fraction=.*must be in"):
+                require_in_range(
+                    value, None, name="fraction", minimum=0.0, maximum=1.0, **options
+                )
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_an_unbounded_range_still_requires_finite_values(value: float) -> None:
+    with pytest.raises(ValueError, match=r"count=.*finite"):
+        require_in_range(value, None, name="count", minimum=1.0)
+
+
+def test_ranges_and_nonnegative_values_follow_the_shared_unit_rules() -> None:
+    assert (
+        require_nonnegative(0.5 * unit.picosecond, unit.femtosecond, name="time")
+        == 500.0
+    )
+    assert (
+        require_in_range(
+            0.5 * unit.picosecond, unit.femtosecond, name="time", maximum=1000.0
+        )
+        == 500.0
+    )
+    assert require_in_range(2.0, None, name="count", minimum=1.0) == 2.0
+    assert require_in_range(-2.0, None, name="offset", maximum=-1.0) == -2.0
 
 
 def test_an_integer_is_required_where_one_is_meant() -> None:

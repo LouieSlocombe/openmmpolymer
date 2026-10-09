@@ -80,6 +80,8 @@ SCAN = RelaxationSpec(
         ({"axis": 3}, "axis"),
         ({"plane": (1, 1)}, "plane"),
         ({"ramp_ps": -1.0}, "ramp_ps"),
+        ({"ramp_ps": float("nan")}, "ramp_ps"),
+        ({"ramp_ps": float("inf")}, "ramp_ps"),
         ({"sample_every_ps": 1.0e6}, "no time axis"),
         ({"linearity_strains": ()}, "pass None"),
         ({"linearity_strains": (0.0,)}, "non-zero"),

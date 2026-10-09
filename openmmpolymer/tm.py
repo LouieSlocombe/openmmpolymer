@@ -29,7 +29,7 @@ from ._files import ReportFiles, file_sha256, write_json
 from ._fitting import PS_PER_NS
 from ._seeds import DEFAULT_SEED
 from ._state import box_vectors_nm, positions_nm, read_state
-from ._validation import require_integer
+from ._validation import require_choice, require_integer
 from ._workflow import (
     require_positive_fields,
     resume_chunks,
@@ -115,8 +115,7 @@ class TmSpec:
         require_integer(
             self.min_points_per_branch, minimum=3, name="min_points_per_branch"
         )
-        if self.barostat not in ("isotropic", "anisotropic"):
-            raise ValueError("barostat must be 'isotropic' or 'anisotropic'.")
+        require_choice(self.barostat, ("isotropic", "anisotropic"), name="barostat")
         if self.stage_ps < self.hold_ps:
             raise ValueError("stage_ps must be at least hold_ps: a hold is not split.")
         if len(self.temperatures_k) < 2 * self.min_points_per_branch:

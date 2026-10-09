@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 
 from ._fitting import finite_or_none
-from ._validation import require_integer, require_positive
+from ._validation import require_in_range, require_integer, require_positive
 from .conformation import (
     centre_of_mass_msd,
     chain_conformation,
@@ -505,8 +505,14 @@ def structural_window_convergence(
     require_integer(q_bins, name="q_bins")
     require_integer(min_vectors_per_bin, name="min_vectors_per_bin")
     require_positive(q_max_per_nm, None, name="q_max_per_nm")
-    if not math.isfinite(max_lag_fraction) or not 0 < max_lag_fraction <= 0.5:
-        raise ValueError("max_lag_fraction must be in (0, 0.5].")
+    require_in_range(
+        max_lag_fraction,
+        None,
+        name="max_lag_fraction",
+        minimum=0.0,
+        maximum=0.5,
+        include_minimum=False,
+    )
     if ensemble.n_frames < 1:
         raise AnalysisError("The ensemble contains no frames.")
     if not ensemble.is_snapshot and (

@@ -46,13 +46,14 @@ import numpy as np
 
 from ._files import ReportFiles, json_value, write_json
 from ._fitting import PS_PER_NS
-from ._validation import require_axis, require_finite, require_integer, require_positive
+from ._validation import require_axis, require_integer, require_positive
 from ._workflow import (
     StrainSchedule,
     chain_options,
     deformation_stages,
     equilibrated_box_nm,
     equilibration_at,
+    require_positive_fields,
     run_fingerprint,
     sample_spread,
     scan_listing,
@@ -74,6 +75,8 @@ from .strength import (
     YieldStrength,
     breaking_strength,
     elongation_at_break,
+    require_breaking_criterion,
+    require_yield_criterion,
     yield_strength,
 )
 from .trajectory import AnalysisError
@@ -134,15 +137,18 @@ class TensileSpec:
 
     def __post_init__(self) -> None:
         """Reject unusable settings before any dynamics or output."""
-        for name in (
-            "temperature_k",
-            "pressure_bar",
-            "strain_increment",
-            "max_strain",
-            "relax_ps",
-            "stage_ps",
-        ):
-            require_positive(getattr(self, name), None, name=name)
+        require_positive_fields(
+            self,
+            (
+                "temperature_k",
+                "pressure_bar",
+                "strain_increment",
+                "max_strain",
+                "relax_ps",
+                "stage_ps",
+            ),
+            optional=("trajectory_ps", "max_total_ns"),
+        )
         require_axis(self.axis)
         require_integer(self.n_replicas, name="n_replicas")
         require_integer(self.samples_per_step, minimum=2, name="samples_per_step")
@@ -150,10 +156,6 @@ class TensileSpec:
             raise ValueError("strain_increment must be below max_strain.")
         if self.stage_ps < self.relax_ps:
             raise ValueError("stage_ps must hold at least one relax_ps increment.")
-        for name in ("trajectory_ps", "max_total_ns"):
-            value = getattr(self, name)
-            if value is not None:
-                require_positive(value, None, name=name)
 
 
 @dataclass(frozen=True)
@@ -172,10 +174,7 @@ class BreakingSpec(TensileSpec):
     def __post_init__(self) -> None:
         """Reject an unusable criterion as well as an unusable ladder."""
         super().__post_init__()
-        require_positive(self.failure_fraction, None, name="failure_fraction")
-        if self.failure_fraction >= 1.0:
-            raise ValueError("failure_fraction must be strictly between zero and one.")
-        require_integer(self.confirmation_steps, minimum=2, name="confirmation_steps")
+        require_breaking_criterion(self.failure_fraction, self.confirmation_steps)
 
 
 @dataclass(frozen=True)
@@ -207,13 +206,9 @@ class YieldSpec(TensileSpec):
     def __post_init__(self) -> None:
         """Reject an unusable criterion as well as an unusable ladder."""
         super().__post_init__()
-        require_positive(self.offset_strain, None, name="offset_strain")
-        require_positive(self.fit_max_strain, None, name="fit_max_strain")
-        require_finite(self.fit_min_strain, None, name="fit_min_strain")
-        if not 0.0 <= self.fit_min_strain < self.fit_max_strain:
-            raise ValueError(
-                "fit_min_strain must be nonnegative and below fit_max_strain."
-            )
+        require_yield_criterion(
+            self.offset_strain, self.fit_min_strain, self.fit_max_strain
+        )
         if self.fit_max_strain >= self.max_strain:
             raise ValueError("fit_max_strain must be below max_strain.")
         if self.offset_strain >= self.max_strain:

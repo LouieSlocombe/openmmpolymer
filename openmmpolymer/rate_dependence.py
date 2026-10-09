@@ -23,7 +23,12 @@ from ._fitting import (
     group_nearby_rates,
     rms,
 )
-from ._validation import require_positive
+from ._validation import (
+    require_choice,
+    require_finite,
+    require_nonnegative,
+    require_positive,
+)
 from .trajectory import AnalysisError
 
 #: The two empirical relations every rate series is fitted with.
@@ -60,11 +65,10 @@ class RateProperty:
     def __post_init__(self) -> None:
         if not self.name.strip() or not self.label.strip():
             raise ValueError("Property name and label must be nonempty.")
-        if self.trend not in ("increasing", "decreasing", "any"):
-            raise ValueError("trend must be increasing, decreasing, or any.")
+        require_choice(self.trend, ("increasing", "decreasing", "any"), name="trend")
         for bound in (self.lower_bound, self.upper_bound):
-            if bound is not None and not math.isfinite(bound):
-                raise ValueError("Property bounds must be finite or None.")
+            if bound is not None:
+                require_finite(bound, None, name="Property bounds")
         if (
             self.lower_bound is not None
             and self.upper_bound is not None
@@ -191,9 +195,9 @@ def validate_rate_request(
     or runs anything, rather than after the dynamics they would qualify.
     """
     target = require_positive(target_rate, None, name="target_rate")
-    maximum = float(max_extrapolation_decades)
-    if not math.isfinite(maximum) or maximum < 0.0:
-        raise ValueError("max_extrapolation_decades must be finite and nonnegative.")
+    maximum = require_nonnegative(
+        max_extrapolation_decades, None, name="max_extrapolation_decades"
+    )
     return target, maximum
 
 
@@ -277,8 +281,12 @@ def _pool_observations(
     """
     temperatures: list[float] = []
     for index, observation in enumerate(observations):
-        if not math.isfinite(observation.rate) or observation.rate <= 0.0:
-            raise AnalysisError(f"Observation {index} needs a finite positive rate.")
+        try:
+            require_positive(observation.rate, None, name="rate")
+        except ValueError as invalid:
+            raise AnalysisError(
+                f"Observation {index} needs a finite positive rate."
+            ) from invalid
         if observation.value is None:
             raise AnalysisError(
                 f"Observation {index} is missing or censored; rate fitting cannot "
@@ -289,16 +297,19 @@ def _pool_observations(
                 f"Observation {index} is nonfinite or outside strict physical bounds."
             )
         error = observation.standard_error
-        if error is not None and (not math.isfinite(error) or error < 0.0):
-            raise AnalysisError(
-                f"Observation {index} standard error must be finite and nonnegative or None."
-            )
         temperature = observation.temperature_k
-        if temperature is not None:
-            if not math.isfinite(temperature) or temperature <= 0.0:
-                raise AnalysisError(
-                    f"Observation {index} temperature must be finite and positive or None."
+        try:
+            if error is not None:
+                require_nonnegative(
+                    error, None, name=f"Observation {index} standard error"
                 )
+            if temperature is not None:
+                require_positive(
+                    temperature, None, name=f"Observation {index} temperature"
+                )
+        except ValueError as invalid:
+            raise AnalysisError(str(invalid)) from invalid
+        if temperature is not None:
             temperatures.append(temperature)
         if not _same_conditions(observation.conditions, observations[0].conditions):
             raise AnalysisError(
@@ -381,8 +392,7 @@ def rate_extrapolation(
     are reporting guards, not a statistical test of empirical model validity.
     The target is required because neither form defines a zero-rate value.
     """
-    if form not in RATE_FORMS:
-        raise ValueError(f"form must be one of {RATE_FORMS}, got {form!r}.")
+    require_choice(form, RATE_FORMS, name="form")
     target, maximum = validate_rate_request(target_rate, max_extrapolation_decades)
     rates, measured, errors = _pool_observations(observations, property)
     if form == "power_law" and np.any(measured <= 0.0):

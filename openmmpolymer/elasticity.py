@@ -42,6 +42,7 @@ import numpy.typing as npt
 
 from ._fitting import MAX_RELATIVE_STANDARD_ERROR as MAX_RELATIVE_STANDARD_ERROR
 from ._fitting import NEGLIGIBLE, PS_PER_NS, fit_line, slope_error
+from ._validation import require_positive
 from .stress import STRESS_ESTIMATOR_VERSION
 from .trajectory import (
     AnalysisError,
@@ -596,8 +597,7 @@ def _window(
     Raises:
         ValueError: The window is not a strain.
     """
-    if strain_limit <= 0.0:
-        raise ValueError(f"strain_limit={strain_limit} must be above zero.")
+    require_positive(strain_limit, None, name="strain_limit")
     return np.asarray(np.abs(strain) <= strain_limit + NEGLIGIBLE, dtype=np.bool_)
 
 

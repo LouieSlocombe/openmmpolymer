@@ -33,7 +33,7 @@ from ._fitting import (
     standard_error,
     statistical_inefficiency,
 )
-from ._validation import require_positive
+from ._validation import require_in_range, require_positive
 from .rate_dependence import (
     MAX_RATE_RESIDUAL_TO_ERROR,
     MAX_RELATIVE_RATE_RESIDUAL,
@@ -262,10 +262,17 @@ def require_window_options(
     """
     fractions = require_fractions(window_fractions)
     require_positive(relative_tolerance, None, name="relative_tolerance")
-    if not math.isfinite(min_effective_samples) or min_effective_samples < 1.0:
-        raise ValueError("min_effective_samples must be finite and at least one.")
-    if not math.isfinite(discard_fraction) or not 0.0 <= discard_fraction < 1.0:
-        raise ValueError("discard_fraction must be finite and in [0, 1).")
+    require_in_range(
+        min_effective_samples, None, name="min_effective_samples", minimum=1.0
+    )
+    require_in_range(
+        discard_fraction,
+        None,
+        name="discard_fraction",
+        minimum=0.0,
+        maximum=1.0,
+        include_maximum=False,
+    )
     return fractions
 
 

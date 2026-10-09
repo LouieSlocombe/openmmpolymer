@@ -308,13 +308,14 @@ def test_too_few_points_is_not_resolved(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("fit", [youngs_modulus, poisson_ratio])
+@pytest.mark.parametrize("strain_limit", [0.0, -1.0, float("nan"), float("inf")])
 def test_a_window_that_is_not_a_strain_is_refused(
-    tmp_path: Path, fit: Callable[..., object]
+    tmp_path: Path, fit: Callable[..., object], strain_limit: float
 ) -> None:
     """Both fits read the same window, so both refuse the same nonsense."""
     write_deformation(tmp_path)
     with pytest.raises(ValueError, match="strain_limit"):
-        fit(stress_strain(tmp_path), strain_limit=0.0)
+        fit(stress_strain(tmp_path), strain_limit=strain_limit)
 
 
 def test_an_unphysical_poissons_ratio_is_not_resolved(tmp_path: Path) -> None:

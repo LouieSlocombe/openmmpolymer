@@ -51,6 +51,7 @@ from ._validation import (
     require_axis,
     require_choice,
     require_integer,
+    require_nonnegative,
     require_plane,
     require_positive,
 )
@@ -206,8 +207,7 @@ class RelaxationSpec:
         require_choice(self.mode, RELAX_MODES, name="mode")
         require_axis(self.axis)
         require_plane(self.plane)
-        if self.ramp_ps < 0.0:
-            raise ValueError(f"ramp_ps={self.ramp_ps} cannot be negative.")
+        require_nonnegative(self.ramp_ps, None, name="ramp_ps")
         if self.sample_every_ps >= self.relax_ps:
             raise ValueError(
                 f"sample_every_ps={self.sample_every_ps} is not below "
