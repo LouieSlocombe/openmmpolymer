@@ -41,6 +41,8 @@ from openmmpolymer.trajectory import AnalysisError
 from .helpers import (
     QUICK_EQUILIBRATION,
     argon_context,
+    forbidden,
+    quench_entry,
     two_line_curve,
     write_quench,
     write_quenches,
@@ -197,10 +199,10 @@ def test_an_invalid_explicit_window_stops_before_files_or_dynamics(
     argon_run: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def unexpected_dynamics(*args: Any, **kwargs: Any) -> Any:
-        pytest.fail("an invalid explicit window started dynamics")
-
-    monkeypatch.setattr("openmmpolymer.tg.run_protocol", unexpected_dynamics)
+    monkeypatch.setattr(
+        "openmmpolymer.tg.run_protocol",
+        forbidden("an invalid explicit window started dynamics"),
+    )
     with pytest.raises(error, match=message):
         scan(argon_run, "run", spec=QUICK, tg_approx_k=approximate)
     assert not Path("run").exists()
@@ -420,21 +422,15 @@ def two_pass_directory(directory: Path) -> Path:
     return write_quenches(
         directory,
         {
-            "06_coarse_quench_00": {
-                "temperature_k": list(coarse_t[::-1]),
-                "density_g_cm3": list(coarse_d[::-1]),
-                "segment_duration_ps": [1000.0] * 11,
-            },
-            "08_fine_quench_00": {
-                "temperature_k": list(fine_t[::-1][:11]),
-                "density_g_cm3": list(fine_d[::-1][:11]),
-                "segment_duration_ps": [4000.0] * 11,
-            },
-            "08_fine_quench_01": {
-                "temperature_k": list(fine_t[::-1][11:]),
-                "density_g_cm3": list(fine_d[::-1][11:]),
-                "segment_duration_ps": [4000.0] * 10,
-            },
+            "06_coarse_quench_00": quench_entry(
+                coarse_t[::-1], coarse_d[::-1], segment_duration_ps=[1000.0] * 11
+            ),
+            "08_fine_quench_00": quench_entry(
+                fine_t[::-1][:11], fine_d[::-1][:11], segment_duration_ps=[4000.0] * 11
+            ),
+            "08_fine_quench_01": quench_entry(
+                fine_t[::-1][11:], fine_d[::-1][11:], segment_duration_ps=[4000.0] * 10
+            ),
         },
     )
 
@@ -472,16 +468,12 @@ def test_passes_are_found_by_shape_rather_than_by_the_names_they_were_given(
     write_quenches(
         tmp_path,
         {
-            "screen": {
-                "temperature_k": list(coarse_t[::-1]),
-                "density_g_cm3": list(coarse_d[::-1]),
-                "segment_duration_ps": [1000.0] * 11,
-            },
-            "resolve": {
-                "temperature_k": list(fine_t[::-1]),
-                "density_g_cm3": list(fine_d[::-1]),
-                "segment_duration_ps": [4000.0] * 21,
-            },
+            "screen": quench_entry(
+                coarse_t[::-1], coarse_d[::-1], segment_duration_ps=[1000.0] * 11
+            ),
+            "resolve": quench_entry(
+                fine_t[::-1], fine_d[::-1], segment_duration_ps=[4000.0] * 21
+            ),
         },
     )
     report = analyse_tg(tmp_path, melt_stage=None)
@@ -558,19 +550,15 @@ def test_only_the_finest_scans_are_weighed_against_each_other(
     """
     coarse_t, coarse_d = two_line_curve(transition_k=340.0, n_points=11)
     stages: dict[str, Any] = {
-        "06_coarse": {
-            "temperature_k": list(coarse_t[::-1]),
-            "density_g_cm3": list(coarse_d[::-1]),
-            "segment_duration_ps": [1000.0] * 11,
-        }
+        "06_coarse": quench_entry(
+            coarse_t[::-1], coarse_d[::-1], segment_duration_ps=[1000.0] * 11
+        )
     }
     for transition_k, hold_ps in ((340.0, 4000.0), (360.0, 8000.0)):
         temperature, density = two_line_curve(transition_k=transition_k)
-        stages[f"08_fine_{hold_ps:.0f}"] = {
-            "temperature_k": list(temperature[::-1]),
-            "density_g_cm3": list(density[::-1]),
-            "segment_duration_ps": [hold_ps] * 21,
-        }
+        stages[f"08_fine_{hold_ps:.0f}"] = quench_entry(
+            temperature[::-1], density[::-1], segment_duration_ps=[hold_ps] * 21
+        )
     write_quenches(tmp_path, stages)
 
     report = analyse_tg(tmp_path, melt_stage=None)
@@ -610,21 +598,15 @@ def test_a_curve_too_short_to_fit_drops_out_without_shifting_the_others(
     write_quenches(
         tmp_path,
         {
-            "06_coarse": {
-                "temperature_k": list(long_t[::-1]),
-                "density_g_cm3": list(long_d[::-1]),
-                "segment_duration_ps": [1000.0] * 21,
-            },
-            "07_stub": {
-                "temperature_k": list(short_t[::-1]),
-                "density_g_cm3": list(short_d[::-1]),
-                "segment_duration_ps": [1000.0] * 4,
-            },
-            "08_fine": {
-                "temperature_k": list(fine_t[::-1]),
-                "density_g_cm3": list(fine_d[::-1]),
-                "segment_duration_ps": [4000.0] * 41,
-            },
+            "06_coarse": quench_entry(
+                long_t[::-1], long_d[::-1], segment_duration_ps=[1000.0] * 21
+            ),
+            "07_stub": quench_entry(
+                short_t[::-1], short_d[::-1], segment_duration_ps=[1000.0] * 4
+            ),
+            "08_fine": quench_entry(
+                fine_t[::-1], fine_d[::-1], segment_duration_ps=[4000.0] * 41
+            ),
         },
     )
     report = analyse_tg(tmp_path, melt_stage=None)
@@ -695,16 +677,10 @@ def test_the_equilibration_figure_is_drawn_when_the_melt_was_checked(
     write_quenches(
         tmp_path,
         {
-            "05_npt": {
-                "temperature_k": [650.0],
-                "density_g_cm3": [0.85],
-                "total_ps": 2000.0,
-            },
-            "06_quench": {
-                "temperature_k": list(temperature[::-1]),
-                "density_g_cm3": list(density[::-1]),
-                "segment_duration_ps": [1000.0] * 21,
-            },
+            "05_npt": quench_entry([650.0], [0.85], total_ps=2000.0),
+            "06_quench": quench_entry(
+                temperature[::-1], density[::-1], segment_duration_ps=[1000.0] * 21
+            ),
         },
     )
     report = analyse_tg(tmp_path, melt_stage="05_npt")

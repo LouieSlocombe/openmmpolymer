@@ -24,6 +24,7 @@ from openmmpolymer.trajectory import AnalysisError
 from .helpers import (
     PLANTED_TENSILE,
     QUICK_EQUILIBRATION,
+    edited_json,
     fake_scan_dynamics,
     write_manifest,
     write_tensile_rate_series,
@@ -90,13 +91,12 @@ def test_missing_yield_replica_blocks_fits_and_preserves_survivor_index(
 ) -> None:
     directories = write_tensile_rate_series(tmp_path, "yield_strength")
     path = directories[1] / "manifest.json"
-    record = json.loads(path.read_text())
-    record["stages"] = {
-        name: stage
-        for name, stage in record["stages"].items()
-        if f"_r{missing_replica}_" not in name
-    }
-    path.write_text(json.dumps(record))
+    with edited_json(path) as record:
+        record["stages"] = {
+            name: stage
+            for name, stage in record["stages"].items()
+            if f"_r{missing_replica}_" not in name
+        }
     report = analyse_tensile_rates(
         directories, property_name="yield_strength", target_rate=0.1
     )
@@ -116,9 +116,8 @@ def test_different_yield_criteria_cannot_be_combined(
 ) -> None:
     directories = write_tensile_rate_series(tmp_path, "yield_strength")
     path = directories[1] / "yield_workflow.json"
-    record = json.loads(path.read_text())
-    record["request"]["spec"][criterion] *= 0.9
-    path.write_text(json.dumps(record))
+    with edited_json(path) as record:
+        record["request"]["spec"][criterion] *= 0.9
     report = analyse_tensile_rates(
         directories, property_name="yield_strength", target_rate=0.1
     )
@@ -235,10 +234,9 @@ def test_recorded_physics_must_match_saved_settings(
 ) -> None:
     directories = write_tensile_rate_series(tmp_path, "breaking_strength")
     path = directories[0] / "manifest.json"
-    record = json.loads(path.read_text())
-    first = next(iter(record["stages"].values()))
-    first["samples"][key] = value
-    path.write_text(json.dumps(record))
+    with edited_json(path) as record:
+        first = next(iter(record["stages"].values()))
+        first["samples"][key] = value
     with pytest.raises(AnalysisError, match=r"different|changes"):
         analyse_tensile_rates(
             directories, property_name="breaking_strength", target_rate=0.1

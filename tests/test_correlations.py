@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import fields
 from typing import Any
 
@@ -16,9 +16,9 @@ from openmmpolymer.correlations import (
     radial_distribution,
     structure_factor,
 )
-from openmmpolymer.trajectory import AnalysisError, Ensemble, Frame, chain_positions
+from openmmpolymer.trajectory import AnalysisError, chain_positions
 
-from .helpers import lattice, synthetic_ensemble
+from .helpers import lattice, record_frame_reads, synthetic_ensemble
 
 #: The simple cubic lattice the argon fixtures use: 64 sites, 0.6 nm apart, in
 #: a 2.4 nm cell. Its neighbour shells are exactly 6, 12 and 8 at 0.6,
@@ -226,17 +226,7 @@ def test_correlations_collect_coordinates_and_cells_in_one_pass(
     expected = measure(
         selected, stride=1, heavy_atoms_only=heavy_atoms_only, n_bins=24, **options
     )
-    read_frames = Ensemble.frames
-    passes: list[int] = []
-    visited: list[int] = []
-
-    def frames_once(self: Ensemble, *, stride: int = 1) -> Iterator[Frame]:
-        passes.append(stride)
-        for frame in read_frames(self, stride=stride):
-            visited.append(frame.index)
-            yield frame
-
-    monkeypatch.setattr(Ensemble, "frames", frames_once)
+    passes, visited = record_frame_reads(monkeypatch)
     measured = measure(
         ensemble,
         stride=stride,

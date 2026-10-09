@@ -9,6 +9,8 @@ import pytest
 
 from openmmpolymer import __main__ as cli
 
+from .helpers import forbidden
+
 CRYSTAL = "--protocol tm --crystal-pdb crystal.pdb --system-xml system.xml"
 YOUNGS_RATE = "--modulus-relax-times 10,50,100 --target-strain-rate 0.01"
 
@@ -159,8 +161,7 @@ def test_invalid_request_has_no_side_effects(
     no_build: list[Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def unexpected_read(*args: Any, **kwargs: Any) -> Any:
-        pytest.fail("an invalid request read the crystal")
+    unexpected_read = forbidden("an invalid request read the crystal")
 
     monkeypatch.setattr(cli, "load_crystal", unexpected_read)
     with pytest.raises(SystemExit, match="2"):

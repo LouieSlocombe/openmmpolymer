@@ -22,14 +22,7 @@ from openmmpolymer._fitting import (
     statistical_inefficiency,
 )
 
-
-def ar1(n_samples: int, memory: float, *, seed: int = 5) -> np.ndarray:
-    """A correlated series: each sample keeps *memory* of the last one."""
-    generator = np.random.default_rng(seed)
-    values = np.zeros(n_samples)
-    for index in range(1, n_samples):
-        values[index] = memory * values[index - 1] + generator.normal(0.0, 0.1)
-    return values
+from .helpers import ar1
 
 
 def test_a_line_through_two_points_is_fitted_without_residuals() -> None:

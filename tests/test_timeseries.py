@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 from pathlib import Path
 
@@ -26,11 +25,14 @@ from openmmpolymer.trajectory import AnalysisError
 
 from .helpers import (
     VFT_PLANTED,
+    ar1,
     log_linear_transitions,
+    quench_entry,
     state_data_csv,
     transition_at,
     two_line_curve,
     vft_transitions,
+    write_manifest,
     write_quench,
     write_quenches,
 )
@@ -142,19 +144,10 @@ def test_a_series_that_never_moves_is_handled_rather_than_dividing_by_zero() -> 
     assert settled.relative_drift == pytest.approx(0.0, abs=1.0e-9)
 
 
-def correlated_series() -> np.ndarray:
-    """Two thousand rows of a series that remembers 95 per cent of its last."""
-    rng = np.random.default_rng(5)
-    values = np.zeros(2000)
-    for index in range(1, values.size):
-        values[index] = 0.95 * values[index - 1] + rng.normal(0.0, 0.1)
-    return values + 10.0
-
-
 def test_a_correlated_series_is_worth_fewer_samples_than_it_has_rows() -> None:
     """Reporting often does not buy independent evidence, and quoting a
     standard error over the row count would understate it."""
-    values = correlated_series()
+    values = ar1(2000, 0.95, seed=5) + 10.0
     settled = equilibration(np.arange(values.size, dtype=np.float64), values)
     assert settled.n_independent_samples < settled.n_samples / 5
     assert settled.correlation_time_ps > 1.0
@@ -163,7 +156,7 @@ def test_a_correlated_series_is_worth_fewer_samples_than_it_has_rows() -> None:
 def test_a_series_in_tiny_units_is_worth_the_samples_it_is_worth_in_any_other() -> None:
     """A variance floor read a series in small enough units as constant, so
     every row counted as independent and the standard error collapsed."""
-    values = correlated_series()
+    values = ar1(2000, 0.95, seed=5) + 10.0
     times = np.arange(values.size, dtype=np.float64)
     ordinary = equilibration(times, values)
     tiny = equilibration(times, values * 1.0e-20)
@@ -234,17 +227,10 @@ def test_without_a_csv_the_cooling_rate_is_none_rather_than_guessed(
 
 def test_a_stage_that_was_not_a_quench_is_refused(tmp_path: Path) -> None:
     """A stage that recorded no density per temperature was not a quench."""
-    (tmp_path / "manifest.json").write_text(
-        json.dumps(
-            {
-                "protocol": "equilibrate",
-                "seed": 1,
-                "versions": {},
-                "system": {},
-                "stages": {"05_npt": {"name": "05_npt", "samples": {}}},
-                "chains": None,
-            }
-        )
+    write_manifest(
+        tmp_path,
+        {"05_npt": {"name": "05_npt", "samples": {}}},
+        protocol="equilibrate",
     )
     with pytest.raises(AnalysisError, match="not a quench"):
         quench_curve(tmp_path, "05_npt")
@@ -351,10 +337,7 @@ def test_a_curve_whose_branches_are_the_wrong_way_round_is_not_resolved(
 def test_the_correlation_time_is_reported_in_picoseconds() -> None:
     """Every other time in this package is, and a correlation time in rows
     would be a number that changed when the reporting interval did."""
-    rng = np.random.default_rng(9)
-    values = np.zeros(4000)
-    for index in range(1, values.size):
-        values[index] = 0.98 * values[index - 1] + rng.normal(0.0, 0.1)
+    values = ar1(4000, 0.98, seed=9)
     spacing = 0.5
     times = np.arange(values.size, dtype=np.float64) * spacing
     coarse = equilibration(times, values + 5.0)
@@ -499,19 +482,12 @@ def test_quench_stages_finds_the_ladders_and_skips_everything_else(
     write_quenches(
         tmp_path,
         {
-            "03_compress": {
-                "temperature_k": [600.0] * 7,
-                "density_g_cm3": [0.9] * 7,
-            },
-            "04_anneal": {
-                "temperature_k": [300.0, 600.0, 300.0, 600.0],
-                "density_g_cm3": [1.0, 0.9, 1.0, 0.9],
-            },
-            "05_npt": {"temperature_k": [450.0], "density_g_cm3": [0.95]},
-            "06_quench": {
-                "temperature_k": list(temperature[::-1]),
-                "density_g_cm3": list(density[::-1]),
-            },
+            "03_compress": quench_entry([600.0] * 7, [0.9] * 7),
+            "04_anneal": quench_entry(
+                [300.0, 600.0, 300.0, 600.0], [1.0, 0.9, 1.0, 0.9]
+            ),
+            "05_npt": quench_entry([450.0], [0.95]),
+            "06_quench": quench_entry(temperature[::-1], density[::-1]),
         },
     )
     assert quench_stages(tmp_path) == ("06_quench",)
@@ -523,7 +499,7 @@ def test_a_run_with_no_quench_in_it_says_which_stages_there_are(
     """Naming what is there is the difference between a hint and a dead end."""
     write_quenches(
         tmp_path,
-        {"05_npt": {"temperature_k": [450.0], "density_g_cm3": [0.95]}},
+        {"05_npt": quench_entry([450.0], [0.95])},
     )
     with pytest.raises(AnalysisError, match="05_npt"):
         quench_stages(tmp_path)
@@ -536,16 +512,12 @@ def test_a_curve_can_be_assembled_from_several_stages(tmp_path: Path) -> None:
     write_quenches(
         tmp_path,
         {
-            "06_quench_00": {
-                "temperature_k": descending_t[:11],
-                "density_g_cm3": descending_d[:11],
-                "segment_duration_ps": [200.0] * 11,
-            },
-            "06_quench_01": {
-                "temperature_k": descending_t[11:],
-                "density_g_cm3": descending_d[11:],
-                "segment_duration_ps": [200.0] * 10,
-            },
+            "06_quench_00": quench_entry(
+                descending_t[:11], descending_d[:11], segment_duration_ps=[200.0] * 11
+            ),
+            "06_quench_01": quench_entry(
+                descending_t[11:], descending_d[11:], segment_duration_ps=[200.0] * 10
+            ),
         },
     )
     curve = quench_curve(tmp_path, ("06_quench_00", "06_quench_01"))
@@ -585,14 +557,8 @@ def test_a_multi_stage_curve_without_recorded_holds_has_no_rate(
     write_quenches(
         tmp_path,
         {
-            "a": {
-                "temperature_k": list(temperature[:11][::-1]),
-                "density_g_cm3": list(density[:11][::-1]),
-            },
-            "b": {
-                "temperature_k": list(temperature[11:][::-1]),
-                "density_g_cm3": list(density[11:][::-1]),
-            },
+            "a": quench_entry(temperature[:11][::-1], density[:11][::-1]),
+            "b": quench_entry(temperature[11:][::-1], density[11:][::-1]),
         },
     )
     assert quench_curve(tmp_path, ("a", "b")).cooling_rate_k_per_ns is None
@@ -635,11 +601,9 @@ def log_linear_rates(tmp_path: Path) -> tuple[GlassTransition, ...]:
         (380.0, 4200.0),
     ):
         temperature, density = two_line_curve(transition_k=transition_k)
-        stages[f"q{transition_k:.0f}"] = {
-            "temperature_k": list(temperature[::-1]),
-            "density_g_cm3": list(density[::-1]),
-            "total_ps": total_ps,
-        }
+        stages[f"q{transition_k:.0f}"] = quench_entry(
+            temperature[::-1], density[::-1], total_ps=total_ps
+        )
     write_quenches(tmp_path, stages)
     return tuple(
         glass_transition(quench_curve(tmp_path, name)) for name in sorted(stages)

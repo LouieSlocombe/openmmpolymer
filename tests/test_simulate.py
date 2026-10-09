@@ -62,7 +62,7 @@ from openmmpolymer.simulate import (
 )
 from openmmpolymer.stress import STRESS_ESTIMATOR_VERSION, StressError, affine_scale
 
-from .helpers import argon_context, bare_simulation, rigid_rotor_system
+from .helpers import argon_context, bare_simulation, forbidden, rigid_rotor_system
 
 
 @pytest.fixture(scope="module")
@@ -574,8 +574,9 @@ def test_density_and_temperature_helpers_agree_with_openmm(
 
     state = simulation.context.getState(getEnergy=True)
 
-    def unexpected_fetch(**kwargs: Any) -> Any:
-        pytest.fail("An existing state must not trigger another state fetch.")
+    unexpected_fetch = forbidden(
+        "An existing state must not trigger another state fetch."
+    )
 
     monkeypatch.setattr(simulation.context, "getState", unexpected_fetch)
     assert _density_g_cm3(

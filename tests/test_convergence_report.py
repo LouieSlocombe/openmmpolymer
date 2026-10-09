@@ -23,6 +23,7 @@ from openmmpolymer.trajectory import AnalysisError
 
 from .helpers import (
     STRUCTURAL_OPTIONS,
+    forbidden,
     frozen_rods,
     state_data_csv,
     write_manifest,
@@ -236,8 +237,7 @@ def test_json_only_report_does_not_plot(
         str(tmp_path), "hold", {"radius": result}, relaxation, (), structural
     )
 
-    def unexpected_plot(*args: object, **kwargs: object) -> None:
-        pytest.fail("A JSON-only report must not construct figures.")
+    unexpected_plot = forbidden("A JSON-only report must not construct figures.")
 
     for name in (
         "plot_window_convergence",

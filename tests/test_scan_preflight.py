@@ -14,7 +14,7 @@ from openmmpolymer import _workflow, mechanical, tensile, tg, tm, viscoelastic
 from openmmpolymer.protocols import Protocol, ProtocolError, RunManifest, run_protocol
 from openmmpolymer.simulate import RunContext
 
-from .helpers import QUICK_EQUILIBRATION
+from .helpers import QUICK_EQUILIBRATION, snapshot_files
 
 
 @dataclass(frozen=True)
@@ -66,15 +66,6 @@ def _patch_dynamics(
     for module in (_workflow, tensile, tg, tm):
         if hasattr(module, "run_protocol"):
             monkeypatch.setattr(module, "run_protocol", runner)
-
-
-def _files(directory: Path) -> dict[Path, tuple[bytes, int]]:
-    """A refusal must preserve both contents and modification times."""
-    return {
-        path.relative_to(directory): (path.read_bytes(), path.stat().st_mtime_ns)
-        for path in directory.rglob("*")
-        if path.is_file()
-    }
 
 
 def _begin_scan(
@@ -143,7 +134,7 @@ def test_scan_refuses_unverifiable_resume_before_writing_or_dynamics(
         manifest.save(directory)
         error = ProtocolError
         message = "starting inputs changed"
-    before = _files(directory)
+    before = snapshot_files(directory, mtimes=True)
 
     def unexpected_dynamics(*args: Any, **options: Any) -> None:
         raise DynamicsReached("An unverifiable scan reached dynamics")
@@ -151,7 +142,7 @@ def test_scan_refuses_unverifiable_resume_before_writing_or_dynamics(
     _patch_dynamics(monkeypatch, unexpected_dynamics)
     with pytest.raises(error, match=message):
         scan.run(argon_run, directory, **scan.options)
-    assert _files(directory) == before
+    assert snapshot_files(directory, mtimes=True) == before
 
 
 @pytest.mark.parametrize("name", SCANS)
@@ -163,7 +154,7 @@ def test_missing_state_preserves_each_scans_repair_or_refusal_policy(
     stage_name, stage = next(iter(manifest.stages.items()))
     state = Path(stage["final_state"])
     state.unlink()
-    before = _files(directory)
+    before = snapshot_files(directory, mtimes=True)
     repaired: list[str] = []
 
     def repair_first_stage(protocol: Protocol, *args: Any, **options: Any) -> None:
@@ -180,7 +171,7 @@ def test_missing_state_preserves_each_scans_repair_or_refusal_policy(
         with pytest.raises(scan.error, match="missing state files"):
             scan.run(argon_run, directory, **scan.options)
         assert not repaired
-        assert _files(directory) == before
+        assert snapshot_files(directory, mtimes=True) == before
     else:
         with pytest.raises(DynamicsReached):
             scan.run(argon_run, directory, **scan.options)
@@ -198,7 +189,7 @@ def test_empty_manifest_without_workflow_preserves_the_tensile_exception(
     manifest.provenance["stages"].clear()
     manifest.save(directory)
     (directory / scan.record_name).unlink()
-    before = _files(directory)
+    before = snapshot_files(directory, mtimes=True)
 
     def interrupted(*args: Any, **kwargs: Any) -> None:
         raise DynamicsReached
@@ -211,7 +202,7 @@ def test_empty_manifest_without_workflow_preserves_the_tensile_exception(
     else:
         with pytest.raises(scan.error, match="without a request"):
             scan.run(argon_run, directory, **scan.options)
-        assert _files(directory) == before
+        assert snapshot_files(directory, mtimes=True) == before
 
 
 @pytest.mark.parametrize("name", ("breaking", "elongation", "yield"))
@@ -225,7 +216,7 @@ def test_tensile_refuses_malformed_nested_request_without_writes(
     directory = Path("run")
     directory.mkdir()
     (directory / scan.record_name).write_text(json.dumps(record))
-    before = _files(directory)
+    before = snapshot_files(directory, mtimes=True)
 
     def unexpected(*args: Any, **kwargs: Any) -> None:
         raise DynamicsReached
@@ -233,4 +224,4 @@ def test_tensile_refuses_malformed_nested_request_without_writes(
     _patch_dynamics(monkeypatch, unexpected)
     with pytest.raises(scan.error, match="different settings"):
         scan.run(argon_run, directory, **scan.options)
-    assert _files(directory) == before
+    assert snapshot_files(directory, mtimes=True) == before

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import weakref
-from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
@@ -21,12 +20,13 @@ from openmmpolymer.conformation import (
     persistence_length,
 )
 from openmmpolymer.protocols import chain_dimensions
-from openmmpolymer.trajectory import AnalysisError, Ensemble, Frame
+from openmmpolymer.trajectory import AnalysisError
 
 from .helpers import (
     dimer_cell,
     freely_rotating_chain,
     random_walk_frames,
+    record_frame_reads,
     rod_positions,
     rotating_dimer,
     synthetic_ensemble,
@@ -401,17 +401,7 @@ def test_displacement_collects_coordinates_and_cells_in_one_pass(
     """Correcting affine motion needs the box from the same selected frame,
     without loading the trajectory a second time."""
     ensemble = shrinking_cell(n_frames=12, n_chains=8)
-    read_frames = Ensemble.frames
-    passes: list[int] = []
-    visited: list[int] = []
-
-    def frames_once(self: Ensemble, *, stride: int = 1) -> Iterator[Frame]:
-        passes.append(stride)
-        for frame in read_frames(self, stride=stride):
-            visited.append(frame.index)
-            yield frame
-
-    monkeypatch.setattr(Ensemble, "frames", frames_once)
+    passes, visited = record_frame_reads(monkeypatch)
     measured = centre_of_mass_msd(ensemble, stride=stride)
 
     selected_edges = np.linspace(4.0, 3.6, 12)[::stride]

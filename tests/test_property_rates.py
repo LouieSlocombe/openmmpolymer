@@ -5,15 +5,12 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
-import numpy as np
 import pytest
 
 from openmmpolymer import elastic_rates, rate_dependence
 from openmmpolymer.elastic_rates import YOUNGS_WORKFLOW_NAME
-from openmmpolymer.mdsystem import SystemSpec
 from openmmpolymer.mechanical import ModulusSpec
 from openmmpolymer.property_rates import (
     RATE_PROPERTIES,
@@ -28,6 +25,7 @@ from openmmpolymer.thermal_rates import ThermalRatePlan
 from openmmpolymer.tm import TmSpec
 
 from .helpers import (
+    fake_run_context,
     fake_scan_dynamics,
     planted_extension_runner,
     write_modulus_rate_series,
@@ -148,12 +146,7 @@ def test_a_youngs_scan_runs_and_reads_back_through_the_common_entry_point(
 ) -> None:
     calls: list[dict[str, Any]] = []
     fake_scan_dynamics(monkeypatch, elastic_rates, planted_extension_runner(calls))
-    run: Any = SimpleNamespace(
-        spec=SystemSpec(),
-        seed=11,
-        system_xml="system",
-        box=SimpleNamespace(positions_nm=np.zeros((2, 3)), box_nm=(5.0, 5.0, 5.0)),
-    )
+    run = fake_run_context(seed=11)
     spec = ModulusSpec(n_replicas=2, max_strain=0.02)
     report = run_property_rate_scan(
         run,

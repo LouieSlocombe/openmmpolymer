@@ -75,11 +75,11 @@ from openmmpolymer.timeseries import (
 from .helpers import (
     STRUCTURAL_OPTIONS,
     dimer_cell,
+    failure_curve,
     freely_rotating_chain,
     frozen_rods,
     lattice,
     log_linear_transitions,
-    nominal_curve,
     planted_rate_report,
     planted_relaxation,
     random_walk_frames,
@@ -91,6 +91,7 @@ from .helpers import (
     two_line_curve,
     write_deformation,
     write_quench,
+    yield_curve,
 )
 
 
@@ -184,13 +185,9 @@ def _rate_fit(
     return fit
 
 
-FAILED = nominal_curve(
-    np.arange(8) * 0.1, [0.0, 20.0, 60.0, 100.0, 70.0, 35.0, 30.0, 20.0]
-)
-YIELDED = nominal_curve(
-    [0.0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05],
-    [2.0, 7.0, 12.0, 17.0, 22.0, 24.0, 25.0, 26.0, 26.0],
-)
+FAILED = failure_curve(stage="06_tensile_r0_00")
+YIELDED = yield_curve(stage="06_tensile_r0_00")
+
 
 FIGURES: dict[str, Callable[[Path], Any]] = {
     "state_data": lambda d: plot_state_data(settling_state_data(d)),

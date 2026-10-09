@@ -16,7 +16,7 @@ import openmmpolymer
 from openmmpolymer.rate_dependence import RateObservation, analyse_rate_observations
 from openmmpolymer.rate_reports import write_rate_report
 
-from .helpers import planted_rate_report
+from .helpers import forbidden, planted_rate_report
 
 
 def test_strict_json_preserves_measurements_model_difference_and_units(
@@ -79,8 +79,7 @@ def test_json_writes_unknown_and_nonfinite_errors_as_null(tmp_path: Path) -> Non
 def test_json_only_report_does_not_plot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def unexpected_plot(*args: object, **kwargs: object) -> None:
-        pytest.fail("A JSON-only report must not construct figures.")
+    unexpected_plot = forbidden("A JSON-only report must not construct figures.")
 
     monkeypatch.setattr(
         "openmmpolymer.rate_reports.plot_rate_dependence", unexpected_plot

@@ -22,7 +22,7 @@ from openmmpolymer.protocols import (
 )
 from openmmpolymer.simulate import RunContext
 
-from .helpers import QUICK_EQUILIBRATION
+from .helpers import QUICK_EQUILIBRATION, snapshot_files
 
 
 @dataclass(frozen=True)
@@ -127,19 +127,10 @@ def test_rate_missing_state_refusal_keeps_short_circuiting(
             }
         )
     )
-    before = _files(tmp_path)
+    before = snapshot_files(tmp_path, mtimes=True)
     with pytest.raises(ValueError, match="completed stages with missing states"):
         resumable_record(argon_run, workflow, {}, [], resume=True, error=ValueError)
-    assert _files(tmp_path) == before
-
-
-def _files(directory: Path) -> dict[Path, tuple[bytes, int]]:
-    """Refused requests must not rewrite even an otherwise identical file."""
-    return {
-        path.relative_to(directory): (path.read_bytes(), path.stat().st_mtime_ns)
-        for path in directory.rglob("*")
-        if path.is_file()
-    }
+    assert snapshot_files(tmp_path, mtimes=True) == before
 
 
 @pytest.mark.parametrize(
@@ -194,7 +185,7 @@ def test_forced_rerun_ignores_records_that_cannot_be_resumed(
     manifest.save(branch)
     if damage != "orphan":
         workflow.write_text(json.dumps(record))
-    before = _files(tmp_path)
+    before = snapshot_files(tmp_path, mtimes=True)
 
     with pytest.raises(error, match=message):
         resumable_record(
@@ -206,7 +197,7 @@ def test_forced_rerun_ignores_records_that_cannot_be_resumed(
         )
         == {}
     )
-    assert _files(tmp_path) == before
+    assert snapshot_files(tmp_path, mtimes=True) == before
 
 
 @pytest.mark.parametrize("resume", [False, True])
@@ -295,7 +286,7 @@ def test_interrupted_request_refuses_changed_inputs_without_writing(
     monkeypatch.setattr(_workflow, "run_protocol", interrupt)
     with pytest.raises(Interrupted):
         scan.run(argon_run, "run", spec=scan.spec, **QUICK_EQUILIBRATION)
-    before = _files(Path("run"))
+    before = snapshot_files(Path("run"), mtimes=True)
 
     run, spec = argon_run, scan.spec
     options = dict(QUICK_EQUILIBRATION)
@@ -327,7 +318,7 @@ def test_interrupted_request_refuses_changed_inputs_without_writing(
     with pytest.raises(scan.error, match="different settings"):
         scan.run(run, "run", spec=spec, **options)
     assert calls == 1
-    assert _files(Path("run")) == before
+    assert snapshot_files(Path("run"), mtimes=True) == before
 
 
 @pytest.mark.parametrize(
@@ -377,7 +368,7 @@ def test_unverifiable_runs_require_an_explicit_fresh_start(
         seed=argon_run.seed,
         stages={"unverified_measurement": {"samples": {}}},
     ).save(directory)
-    before = _files(directory)
+    before = snapshot_files(directory, mtimes=True)
 
     if isinstance(scan.spec, tensile.TensileSpec):
         if existing == "orphan-manifest":
@@ -387,7 +378,7 @@ def test_unverifiable_runs_require_an_explicit_fresh_start(
     with pytest.raises(scan.error, match=message):
         scan.run(argon_run, directory, spec=scan.spec, **QUICK_EQUILIBRATION)
     assert len(protocols) == 1
-    assert _files(directory) == before
+    assert snapshot_files(directory, mtimes=True) == before
 
     with pytest.raises(Interrupted):
         scan.run(
@@ -435,11 +426,11 @@ def test_interrupted_replicas_resume_consistently_and_force_rerun_replaces_them(
         scan.run(argon_scan_run, "run", spec=scan.spec, **QUICK_EQUILIBRATION)
 
     directory = Path("run")
-    before = _files(directory)
+    before = snapshot_files(directory, mtimes=True)
     one_replica = replace(scan.spec, n_replicas=1)
     with pytest.raises(scan.error, match="different settings"):
         scan.run(argon_scan_run, directory, spec=one_replica, **QUICK_EQUILIBRATION)
-    assert _files(directory) == before
+    assert snapshot_files(directory, mtimes=True) == before
 
     manifest_before = (directory / "manifest.json").read_bytes()
     resumed = scan.run(argon_scan_run, directory, spec=scan.spec, **QUICK_EQUILIBRATION)

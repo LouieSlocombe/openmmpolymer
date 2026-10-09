@@ -116,7 +116,7 @@ Removed: the `tensile._run_scan` body and most of `_check_resume`, two replica l
 
 ### Stage 4: drift guards (add a test or one shared table; do not merge)
 
-- [x] F13: `run_heat`/`run_production` options table shared by `simulate.py` and `protocols._stage_options`; stage file-name helpers; `tg` pricing function used by the CLI; one tensile record-schema builder; help text formatted from constants
+- [x] F13: guard `run_heat`/`run_production` execution options against `protocols._stage_options`; stage file-name helpers; `tg` pricing function used by the CLI; one tensile record-schema builder; help text formatted from constants
 
 ### Stage 5: owner decisions on the public surface
 
@@ -125,8 +125,8 @@ Removed: the `tensile._run_scan` body and most of `_check_resume`, two replica l
 
 ### Stage 6: tests
 
-- [ ] T1, T2, T4, T5 first (about -135 lines)
-- [ ] T3, T6-T8 only when touching those tests anyway; add the missing direct tests (Stage 0) before trimming any per-caller test matrix
+- [x] T1, T2, T4, T5 shared fixtures, preserving independent expected values
+- [x] T3 and T6–T8 selectively consolidated; direct helper contracts added in Stage 0; distinctions retained below
 
 ## 5. Findings reference (confirmed)
 
@@ -523,6 +523,25 @@ remain above so the changes and decisions can be reviewed against the audit.
   logging-only, exception-conversion and bespoke-suffix handlers stay separate.
   Tg figures still reread the volume CSV: carrying that series through
   `MeltEquilibration` would change the report model for a minor plotting shortcut.
+  Gate: 2,409 passed, coverage 96.13%; ruff, formatting and mypy clean.
+
+- Stage 6: test fixtures share handwritten manifest construction, exact load
+  ladders and bulk-density overrides, scalar-draw AR(1) generators, and matching
+  tensile plotting profiles. Manifest merge versus replacement is explicit;
+  prior parsed fixtures and tensile workflow bytes match, including provenance
+  fields on the fixtures that previously used `RunManifest.save`. Minimal legacy
+  manifests remain literal test oracles. The audit's “dead” `write_bulk(merge=)`
+  parameter had a live caller; that caller was migrated before removing it.
+  T3 uses `edited_json` for three simple mutations in an already-touched file;
+  timing-sensitive and nested mutations remain explicit. T6/T7 share simple
+  forbidden-operation callbacks, fresh ensemble-control factories, exact argon
+  cells, stand-in run contexts, frame-read instrumentation, and quench entries
+  that retain supplied temperature order. Snapshot checks still compare bytes
+  and nanosecond mtimes. Conditional/counting interruptions, deliberately corrupt
+  or Reference-platform preparation, separate scan/plot yield plateaus, and
+  independent expected stress arrays remain local. T8's matching empty-heavy-atom
+  cases were parametrized in Stage 1; the remaining per-caller refusal matrices
+  retain their integration coverage. No production code changed in this stage.
   Gate: 2,409 passed, coverage 96.13%; ruff, formatting and mypy clean.
 
 ## Appendix A. Builder and request digest harness (Stage 0)

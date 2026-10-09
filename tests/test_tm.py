@@ -32,7 +32,13 @@ from openmmpolymer.tm import (
 )
 from openmmpolymer.trajectory import AnalysisError
 
-from .helpers import planted_curve, write_crystal, write_heating
+from .helpers import (
+    ensemble_controls,
+    forbidden,
+    planted_curve,
+    write_crystal,
+    write_heating,
+)
 
 
 def test_matching_enthalpy_and_volume_jumps_resolve_a_temperature_bracket() -> None:
@@ -378,36 +384,11 @@ def test_an_unsupported_figure_format_is_refused(tmp_path: Path) -> None:
 def test_unconfirmed_amorphous_coordinates_are_refused_before_dynamics(
     argon_run: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def unexpected_run(*args: Any, **kwargs: Any) -> None:
-        pytest.fail("The crystalline-start guard must run before dynamics")
+    unexpected_run = forbidden("The crystalline-start guard must run before dynamics")
 
     monkeypatch.setattr("openmmpolymer.tm.run_protocol", unexpected_run)
     with pytest.raises(TmError, match="crystall"):
         run_tm_scan(argon_run, crystalline=False)
-
-
-def _ensemble_controls(control: str) -> list[Any]:
-    """Forces that would fight the heating stages' own thermostat and barostat."""
-    import openmm as mm
-
-    return {
-        "thermostat": [mm.AndersenThermostat(100.0, 100.0)],
-        "barostat": [mm.MonteCarloBarostat(1.0, 100.0)],
-        "anisotropic": [mm.MonteCarloAnisotropicBarostat(mm.Vec3(1, 1, 1), 100.0)],
-        "membrane": [
-            mm.MonteCarloMembraneBarostat(
-                1.0,
-                0.0,
-                100.0,
-                mm.MonteCarloMembraneBarostat.XYIsotropic,
-                mm.MonteCarloMembraneBarostat.ZFree,
-            )
-        ],
-        "two_barostats": [
-            mm.MonteCarloBarostat(1.0, 100.0),
-            mm.MonteCarloFlexibleBarostat(1.0, 100.0),
-        ],
-    }[control]
 
 
 def test_a_prepared_crystal_loads_as_it_was_written(
@@ -481,7 +462,9 @@ def test_a_crystal_the_scan_could_not_heat_is_refused_as_it_loads(
         "membrane",
         "two_barostats",
     ):
-        for force in _ensemble_controls(invalid):
+        for force in ensemble_controls(
+            invalid, temperature_k=100.0, collision_rate_ps=100.0
+        ):
             system.addForce(force)
     elif invalid == "periodicity":
         system.getForce(0).setNonbondedMethod(mm.NonbondedForce.NoCutoff)
@@ -515,7 +498,9 @@ def test_imported_ensemble_controls_are_refused_before_heating(
     import openmm as mm
 
     system = mm.XmlSerializer.deserialize(argon_run.system_xml)
-    for force in _ensemble_controls(control):
+    for force in ensemble_controls(
+        control, temperature_k=100.0, collision_rate_ps=100.0
+    ):
         system.addForce(force)
     argon_run.system_xml = mm.XmlSerializer.serialize(system)
     directory = tmp_path / "conflicting_controls"
@@ -527,8 +512,7 @@ def test_imported_ensemble_controls_are_refused_before_heating(
 def test_the_budget_guard_includes_low_temperature_equilibration(
     argon_run: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def unexpected_run(*args: Any, **kwargs: Any) -> None:
-        pytest.fail("An over-budget scan must not run dynamics")
+    unexpected_run = forbidden("An over-budget scan must not run dynamics")
 
     monkeypatch.setattr("openmmpolymer.tm.run_protocol", unexpected_run)
     with pytest.raises(TmError):

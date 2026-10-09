@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -24,22 +23,7 @@ from openmmpolymer.trajectory import (
     stages_holding,
 )
 
-from .helpers import synthetic_ensemble
-
-
-def write_manifest(directory: Path, stages: dict[str, Any], **extra: Any) -> Path:
-    """Write a manifest holding *stages*, as ``run_protocol`` would."""
-    payload = {
-        "protocol": "test",
-        "seed": 1,
-        "versions": {},
-        "system": {},
-        "stages": stages,
-        "chains": None,
-        **extra,
-    }
-    (directory / "manifest.json").write_text(json.dumps(payload))
-    return directory
+from .helpers import synthetic_ensemble, write_manifest
 
 
 def test_a_directory_without_a_manifest_is_not_a_run_directory(tmp_path: Path) -> None:

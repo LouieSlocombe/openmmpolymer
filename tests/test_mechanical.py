@@ -52,6 +52,8 @@ from .helpers import (
     QUICK_EQUILIBRATION,
     write_bulk,
     write_deformation,
+    write_load,
+    write_manifest,
     write_shear,
 )
 
@@ -369,19 +371,7 @@ def test_a_bulk_pass_that_did_run_is_read(tmp_path: Path) -> None:
 
 def test_a_directory_with_no_mechanics_in_it_says_so(tmp_path: Path) -> None:
     """Rather than reporting a modulus of nothing."""
-    (tmp_path / "manifest.json").write_text(
-        json.dumps(
-            {
-                "protocol": "t",
-                "seed": 1,
-                "versions": {},
-                "system": {},
-                "stages": {},
-                "chains": None,
-                "box": None,
-            }
-        )
-    )
+    write_manifest(tmp_path, {}, protocol="t")
     with pytest.raises(AnalysisError, match="mechanical measurement"):
         analyse_mechanics(tmp_path)
 
@@ -389,19 +379,7 @@ def test_a_directory_with_no_mechanics_in_it_says_so(tmp_path: Path) -> None:
 def test_the_two_methods_are_compared_when_both_ran(tmp_path: Path) -> None:
     """They share no machinery, so the gap between them is the real check."""
     write_deformation(tmp_path, modulus_mpa=2000.0)
-    manifest = tmp_path / "manifest.json"
-    record = json.loads(manifest.read_text())
-    record["stages"][LOAD_STEM] = {
-        "samples": {
-            "segment_applied_stress_bar": [0.0, 100.0, 200.0],
-            "segment_box_x_nm": [5.0, 5.0, 5.0],
-            "segment_box_y_nm": [5.0, 5.0, 5.0],
-            "segment_box_z_nm": [5.0, 5.025, 5.05],
-            "load_axis": [2.0],
-        },
-        "mean_temperature_k": 298.15,
-    }
-    manifest.write_text(json.dumps(record))
+    write_load(tmp_path, stage=LOAD_STEM, axial_lengths_nm=(5.0, 5.025, 5.05))
     report = analyse_mechanics(tmp_path, strain_limit=0.05, min_points=3)
     assert report.load_modulus is not None
     assert report.load_modulus.modulus_mpa == pytest.approx(2000.0)

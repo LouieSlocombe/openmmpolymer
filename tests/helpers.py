@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, NoReturn, cast, overload
 
 import numpy as np
 import numpy.typing as npt
@@ -56,13 +57,95 @@ DIMER_FFXML = """<ForceField>
 """
 
 
-def snapshot_files(directory: Path) -> dict[Path, bytes]:
+@overload
+def snapshot_files(
+    directory: Path, *, mtimes: Literal[False] = False
+) -> dict[Path, bytes]: ...
+
+
+@overload
+def snapshot_files(
+    directory: Path, *, mtimes: Literal[True]
+) -> dict[Path, tuple[bytes, int]]: ...
+
+
+def snapshot_files(
+    directory: Path, *, mtimes: bool = False
+) -> dict[Path, bytes] | dict[Path, tuple[bytes, int]]:
     """Capture a tree's relative paths and contents for non-destructive-run checks."""
+    if mtimes:
+        return {
+            path.relative_to(directory): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in directory.rglob("*")
+            if path.is_file()
+        }
     return {
         path.relative_to(directory): path.read_bytes()
         for path in directory.rglob("*")
         if path.is_file()
     }
+
+
+def forbidden(message: str) -> Callable[..., NoReturn]:
+    """Fail with *message* if a patched operation is reached."""
+
+    def fail(*args: Any, **kwargs: Any) -> NoReturn:
+        pytest.fail(message)
+
+    return fail
+
+
+@contextmanager
+def edited_json(path: Path) -> Iterator[dict[str, Any]]:
+    """Edit a JSON object, writing it back only when the edit succeeds."""
+    record: dict[str, Any] = json.loads(path.read_text())
+    yield record
+    path.write_text(json.dumps(record))
+
+
+def ensemble_controls(
+    control: str, *, temperature_k: float = 300.0, collision_rate_ps: float = 1.0
+) -> list[Any]:
+    """Fresh OpenMM forces that compete with a stage's ensemble controls."""
+    import openmm as mm
+
+    factories: dict[str, Callable[[], Any]] = {
+        "isotropic": lambda: mm.MonteCarloBarostat(1.0, temperature_k),
+        "anisotropic": lambda: mm.MonteCarloAnisotropicBarostat(
+            mm.Vec3(1.0, 1.0, 1.0), temperature_k
+        ),
+        "flexible": lambda: mm.MonteCarloFlexibleBarostat(1.0, temperature_k),
+        "membrane": lambda: mm.MonteCarloMembraneBarostat(
+            1.0,
+            0.0,
+            temperature_k,
+            mm.MonteCarloMembraneBarostat.XYIsotropic,
+            mm.MonteCarloMembraneBarostat.ZFree,
+        ),
+        "andersen": lambda: mm.AndersenThermostat(temperature_k, collision_rate_ps),
+    }
+    if control == "two_barostats":
+        return [factories[name]() for name in ("isotropic", "flexible")]
+    name = {"thermostat": "andersen", "barostat": "isotropic"}.get(control, control)
+    return [factories[name]()]
+
+
+def record_frame_reads(monkeypatch: pytest.MonkeyPatch) -> tuple[list[int], list[int]]:
+    """Record each trajectory pass and every frame it visits, in reading order."""
+    from openmmpolymer.trajectory import Ensemble, Frame
+
+    read_frames = Ensemble.frames
+    passes: list[int] = []
+    visited: list[int] = []
+
+    def frames_once(self: Ensemble, *, stride: int = 1) -> Iterator[Frame]:
+        passes.append(stride)
+        for frame in read_frames(self, stride=stride):
+            visited.append(frame.index)
+            yield frame
+
+    monkeypatch.setattr(Ensemble, "frames", frames_once)
+    return passes, visited
 
 
 def build_dimer_pdb(path: Path, *, separation_nm: float = 0.153) -> str:
@@ -103,19 +186,40 @@ def argon_context(
 ) -> Any:
     """A run context over an argon cell, on the deterministic CPU platform."""
     from openmmpolymer.forcefield import PolymerForceField
-    from openmmpolymer.mdsystem import PackedBox
     from openmmpolymer.simulate import prepare_run
 
-    system, topology, positions = argon_system(
-        n_atoms, box_nm, atoms_per_molecule=atoms_per_molecule
-    )
-    box = PackedBox(topology, positions, (box_nm,) * 3, n_atoms // atoms_per_molecule)
+    box, system = argon_cell(n_atoms, box_nm, atoms_per_molecule=atoms_per_molecule)
     return prepare_run(
         box,
         PolymerForceField("unused.xml", (), "AR", "smirnoff"),
         platform="CPU",
         seed=11,
         system=system,
+    )
+
+
+def argon_cell(
+    n_atoms: int = 64, box_nm: float = 2.4, *, atoms_per_molecule: int = 1
+) -> tuple[Any, Any]:
+    """A packed argon cell and its matching System, ready for a run."""
+    from openmmpolymer.mdsystem import PackedBox
+
+    system, topology, positions = argon_system(
+        n_atoms, box_nm, atoms_per_molecule=atoms_per_molecule
+    )
+    box = PackedBox(topology, positions, (box_nm,) * 3, n_atoms // atoms_per_molecule)
+    return box, system
+
+
+def fake_run_context(*, seed: int = 17) -> Any:
+    """The two-atom run identity used by stand-ins for rate-scan dynamics."""
+    from openmmpolymer.mdsystem import SystemSpec
+
+    return SimpleNamespace(
+        spec=SystemSpec(),
+        seed=seed,
+        system_xml="system",
+        box=SimpleNamespace(positions_nm=np.zeros((2, 3)), box_nm=(5.0, 5.0, 5.0)),
     )
 
 
@@ -230,6 +334,19 @@ def state_data_csv(rows: Sequence[Sequence[float]]) -> str:
     return f"{header}\n{body}\n"
 
 
+def quench_entry(
+    temperature: npt.NDArray[np.float64] | Sequence[float],
+    density: npt.NDArray[np.float64] | Sequence[float],
+    **extra: Any,
+) -> dict[str, Any]:
+    """Samples for one recorded thermal stage, preserving their supplied order."""
+    return {
+        "temperature_k": list(temperature),
+        "density_g_cm3": list(density),
+        **extra,
+    }
+
+
 def write_quenches(
     directory: Path,
     stages: Mapping[str, Mapping[str, object]],
@@ -279,16 +396,7 @@ def write_quenches(
             entry["waypoints"] = list(cast(Sequence[object], waypoints))
         recorded[stage] = entry
 
-    payload = {
-        "protocol": "melt-quench",
-        "seed": 1,
-        "versions": {},
-        "system": {},
-        "stages": recorded,
-        "chains": None,
-        "box": None,
-    }
-    (directory / "manifest.json").write_text(json.dumps(payload))
+    write_manifest(directory, recorded, merge=False, protocol="melt-quench")
     return directory
 
 
@@ -312,13 +420,13 @@ def write_quench(
     return write_quenches(
         directory,
         {
-            stage: {
-                "temperature_k": list(temperature_k),
-                "density_g_cm3": list(density_g_cm3),
-                "total_ps": total_ps if with_csv else None,
-                "segment_duration_ps": segment_duration_ps,
-                "waypoints": waypoints,
-            }
+            stage: quench_entry(
+                temperature_k,
+                density_g_cm3,
+                total_ps=total_ps if with_csv else None,
+                segment_duration_ps=segment_duration_ps,
+                waypoints=waypoints,
+            )
         },
     )
 
@@ -735,24 +843,59 @@ def write_bulk(
     modulus_mpa: float = 1500.0,
     pressures_bar: Sequence[float] = (1.0, 100.0, 200.0, 300.0, 200.0, 100.0, 1.0),
     density_g_cm3: float = 0.9,
+    densities_g_cm3: Sequence[float] | None = None,
     stage: str = "08_bulk",
     temperature_k: float = 298.15,
-    merge: dict[str, Any] | None = None,
 ) -> Path:
     """Write a manifest holding an exactly log-linear pressure ladder."""
-    densities = [
-        density_g_cm3 * math.exp(pressure * 0.1 / modulus_mpa)
-        for pressure in pressures_bar
-    ]
-    stages = dict(merge or {})
-    stages[stage] = {
+    densities = (
+        [
+            density_g_cm3 * math.exp(pressure * 0.1 / modulus_mpa)
+            for pressure in pressures_bar
+        ]
+        if densities_g_cm3 is None
+        else list(densities_g_cm3)
+    )
+    stage_record = {
         "samples": {
             "segment_pressure_bar": list(pressures_bar),
             "segment_density_g_cm3": densities,
         },
         "mean_temperature_k": temperature_k,
     }
-    return write_manifest(run_dir, stages)
+    return write_manifest(run_dir, {stage: stage_record})
+
+
+def write_load(
+    run_dir: Path,
+    *,
+    modulus_mpa: float = 2000.0,
+    stresses_bar: Sequence[float] = (0.0, 100.0, 200.0),
+    reference_nm: float = 5.0,
+    axial_lengths_nm: Sequence[float] | None = None,
+    stage: str = "07_load",
+    temperature_k: float = 298.15,
+    axis: int = 2,
+) -> Path:
+    """Write an axial load ladder, optionally retaining exact planted lengths."""
+    lengths = (
+        [reference_nm * (1 + stress * 0.1 / modulus_mpa) for stress in stresses_bar]
+        if axial_lengths_nm is None
+        else list(axial_lengths_nm)
+    )
+    samples = {
+        "segment_applied_stress_bar": list(stresses_bar),
+        "load_axis": [float(axis)],
+        **{
+            f"segment_box_{name}_nm": lengths
+            if index == axis
+            else [reference_nm] * len(stresses_bar)
+            for index, name in enumerate("xyz")
+        },
+    }
+    return write_manifest(
+        run_dir, {stage: {"samples": samples, "mean_temperature_k": temperature_k}}
+    )
 
 
 def write_shear(
@@ -779,13 +922,15 @@ def write_shear(
     return write_manifest(run_dir, {stage: stage_record})
 
 
-def write_manifest(run_dir: Path, stages: dict[str, Any]) -> Path:
-    """Write a minimal manifest holding *stages*, merging with any already there."""
+def write_manifest(
+    run_dir: Path, stages: dict[str, Any], *, merge: bool = True, **extra: Any
+) -> Path:
+    """Write a hand-built manifest, merging by default or replacing the whole record."""
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / "manifest.json"
     record: dict[str, Any] = (
         json.loads(path.read_text())
-        if path.is_file()
+        if merge and path.is_file()
         else {
             "protocol": "test",
             "seed": 1,
@@ -797,6 +942,7 @@ def write_manifest(run_dir: Path, stages: dict[str, Any]) -> Path:
         }
     )
     record["stages"].update(stages)
+    record.update(extra)
     path.write_text(json.dumps(record, indent=2))
     return path
 
@@ -933,7 +1079,7 @@ def write_polymer_snapshot(
     pdb = run_dir / f"{stage}.pdb"
     with pdb.open("w") as handle:
         app.PDBFile.writeFile(topology, positions * unit.nanometer, handle)
-    path = write_manifest(
+    write_manifest(
         run_dir,
         {
             stage: {
@@ -944,14 +1090,12 @@ def write_polymer_snapshot(
                 "samples": {},
             }
         },
+        box={
+            "n_molecules": n_chains,
+            "atoms_per_chain": topology.getNumAtoms() // n_chains,
+            "box_nm": [box_nm, box_nm, box_nm],
+        },
     )
-    record = json.loads(path.read_text())
-    record["box"] = {
-        "n_molecules": n_chains,
-        "atoms_per_chain": topology.getNumAtoms() // n_chains,
-        "box_nm": [box_nm, box_nm, box_nm],
-    }
-    path.write_text(json.dumps(record, indent=2))
     return (0, 1, 2, 3, 4)
 
 
@@ -990,7 +1134,6 @@ def write_tensile_scan(run_dir: Path, spec: TensileSpec) -> Path:
     *spec* must keep its planted ladder; its criterion and replica count are
     free. Returns the workflow record's path.
     """
-    from openmmpolymer.protocols import RunManifest
     from openmmpolymer.tensile import tensile_protocol, tensile_schedule
 
     n_steps = tensile_schedule(spec).n_steps
@@ -1005,7 +1148,7 @@ def write_tensile_scan(run_dir: Path, spec: TensileSpec) -> Path:
         if isinstance(spec, YieldSpec):
             nominal = np.minimum(1000.0 * strains + 2.0, 18.0) * scale
         else:
-            nominal = np.asarray([0.0, 20.0, 60.0, 100.0, 70.0, 35.0, 30.0, 20.0])
+            nominal = np.asarray(FAILING)
             nominal *= scale
             if replica == 1:
                 nominal[4] = 45.0
@@ -1032,7 +1175,9 @@ def write_tensile_scan(run_dir: Path, spec: TensileSpec) -> Path:
             }
     run_dir.mkdir(parents=True, exist_ok=True)
     name = ladders[0].name
-    RunManifest(protocol=name, seed=11, stages=stages).save(run_dir)
+    write_manifest(
+        run_dir, stages, merge=False, protocol=name, seed=11, provenance=None
+    )
     record = {
         "request": {"spec": asdict(spec)},
         "reference_box_nm": [5.0] * 3,
@@ -1128,6 +1273,41 @@ def nominal_curve(
         temperature_k=298.15,
         strain_rate_per_ns=rate_per_ns,
     )
+
+
+#: A response that peaks on its fourth hold and then loses stress for good.
+FAILING = [0.0, 20.0, 60.0, 100.0, 70.0, 35.0, 30.0, 20.0]
+
+
+def failure_curve(
+    *, failed: bool = True, rate: float | None = 0.2, stage: str = "06_breaking_r0_00"
+) -> StressStrain:
+    """Eight holds 10% apart, failing after the peak or rising throughout."""
+    strain = np.arange(8, dtype=np.float64) * 0.1
+    nominal = FAILING if failed else np.linspace(0.0, 100.0, strain.size)
+    return nominal_curve(strain, nominal, stage=stage, rate_per_ns=rate)
+
+
+def yield_curve(
+    *, yielded: bool = True, rate: float | None = 0.2, stage: str = "06_yield_r0_00"
+) -> StressStrain:
+    """A yielding response, or a purely elastic one at the same strains."""
+    strain = np.asarray([0.0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05])
+    nominal = (
+        [2.0, 7.0, 12.0, 17.0, 22.0, 24.0, 25.0, 26.0, 26.0]
+        if yielded
+        else 1000.0 * strain + 2.0
+    )
+    return nominal_curve(strain, nominal, stage=stage, rate_per_ns=rate)
+
+
+def ar1(n_samples: int, memory: float, *, seed: int = 5) -> np.ndarray:
+    """A correlated series, retaining the original scalar RNG draw order."""
+    generator = np.random.default_rng(seed)
+    values = np.zeros(n_samples)
+    for index in range(1, n_samples):
+        values[index] = memory * values[index - 1] + generator.normal(0.0, 0.1)
+    return values
 
 
 def planted_relaxation(
@@ -1393,8 +1573,6 @@ def write_heating(
 
     The manifest has the schema a real heating stage records.
     """
-    from openmmpolymer.protocols import RunManifest
-
     directory.mkdir(parents=True, exist_ok=True)
     stages: dict[str, Any] = {}
     start = 0
@@ -1413,7 +1591,9 @@ def write_heating(
         }
         start = stop
     assert start == curve.n_points
-    RunManifest(protocol="tm_heating", seed=11, stages=stages).save(directory)
+    write_manifest(
+        directory, stages, merge=False, protocol="tm_heating", seed=11, provenance=None
+    )
     return directory
 
 

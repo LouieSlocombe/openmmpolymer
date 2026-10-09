@@ -35,7 +35,7 @@ from openmmpolymer.elasticity import (
 )
 from openmmpolymer.trajectory import AnalysisError
 
-from .helpers import write_bulk, write_deformation, write_shear
+from .helpers import write_bulk, write_deformation, write_load, write_shear
 
 E_PLANTED = 2000.0
 NU_PLANTED = 0.35
@@ -90,23 +90,16 @@ def test_a_bulk_ladder_gives_back_its_modulus_and_no_hysteresis(
     assert fit.resolved
 
 
-def _write_bulk_samples(
-    directory: Path, pressures: list[float], densities: list[float]
-) -> None:
-    path = write_bulk(directory)
-    record = json.loads(path.read_text())
-    samples = record["stages"]["08_bulk"]["samples"]
-    samples["segment_pressure_bar"] = pressures
-    samples["segment_density_g_cm3"] = densities
-    path.write_text(json.dumps(record))
-
-
 def test_bulk_uncertainty_rejects_a_reversible_noisy_ladder(tmp_path: Path) -> None:
     """Retracing a noisy curve does not make its slope well determined."""
     pressure = np.asarray([1.0, 11.0, 21.0, 31.0, 21.0, 11.0, 1.0])
     noise = np.asarray([0.0, -0.04, 0.04, 0.0, 0.04, -0.04, 0.0])
     log_density = 0.0001 * pressure + noise
-    _write_bulk_samples(tmp_path, pressure.tolist(), np.exp(log_density).tolist())
+    write_bulk(
+        tmp_path,
+        pressures_bar=pressure.tolist(),
+        densities_g_cm3=np.exp(log_density).tolist(),
+    )
     fit = bulk_modulus(tmp_path)
     # Calculate the slope and uncertainty independently of the shared fitter.
     centered = pressure - pressure.mean()
@@ -126,7 +119,11 @@ def test_bulk_checks_linearity_across_pressure_ranges(tmp_path: Path) -> None:
     """Smooth curvature has small fit uncertainty and no branch hysteresis."""
     pressure = np.asarray([1.0, 11.0, 21.0, 31.0, 21.0, 11.0, 1.0])
     log_density = 0.0001 * pressure + 0.00001 * pressure**2
-    _write_bulk_samples(tmp_path, pressure.tolist(), np.exp(log_density).tolist())
+    write_bulk(
+        tmp_path,
+        pressures_bar=pressure.tolist(),
+        densities_g_cm3=np.exp(log_density).tolist(),
+    )
     fit = bulk_modulus(tmp_path)
     assert fit.relative_standard_error < 0.25
     assert fit.hysteresis == pytest.approx(0.0, abs=1e-12)
@@ -137,8 +134,10 @@ def test_bulk_checks_linearity_across_pressure_ranges(tmp_path: Path) -> None:
 def test_bulk_resolves_a_well_supported_noisy_slope(tmp_path: Path) -> None:
     pressure = np.asarray([1.0, 11.0, 21.0, 31.0, 21.0, 11.0, 1.0])
     noise = np.asarray([0.0, -1.0, 1.0, 0.0, 1.0, -1.0, 0.0]) * 1e-6
-    _write_bulk_samples(
-        tmp_path, pressure.tolist(), np.exp(0.0001 * pressure + noise).tolist()
+    write_bulk(
+        tmp_path,
+        pressures_bar=pressure.tolist(),
+        densities_g_cm3=np.exp(0.0001 * pressure + noise).tolist(),
     )
     fit = bulk_modulus(tmp_path)
     assert fit.resolved
@@ -153,7 +152,7 @@ def test_bulk_needs_distinct_pressures_and_residual_degrees_of_freedom(
     tmp_path: Path, pressure: list[float]
 ) -> None:
     density = np.exp(0.0001 * np.asarray(pressure))
-    _write_bulk_samples(tmp_path, pressure, density.tolist())
+    write_bulk(tmp_path, pressures_bar=pressure, densities_g_cm3=density.tolist())
     fit = bulk_modulus(tmp_path, min_points=2)
     assert not fit.resolved
     if len(set(pressure)) == 1:
@@ -168,8 +167,10 @@ def test_bulk_refuses_zero_or_negative_compressibility(
     tmp_path: Path, slope: float
 ) -> None:
     pressure = [1.0, 11.0, 21.0, 31.0]
-    _write_bulk_samples(
-        tmp_path, pressure, np.exp(slope * np.asarray(pressure)).tolist()
+    write_bulk(
+        tmp_path,
+        pressures_bar=pressure,
+        densities_g_cm3=np.exp(slope * np.asarray(pressure)).tolist(),
     )
     assert not bulk_modulus(tmp_path).resolved
 
@@ -190,7 +191,7 @@ def test_bulk_refuses_zero_or_negative_compressibility(
 def test_bulk_rejects_unpaired_or_nonfinite_data(
     tmp_path: Path, pressure: list[float], density: list[float]
 ) -> None:
-    _write_bulk_samples(tmp_path, pressure, density)
+    write_bulk(tmp_path, pressures_bar=pressure, densities_g_cm3=density)
     with pytest.raises(AnalysisError, match="paired finite pressures"):
         bulk_modulus(tmp_path, "08_bulk")
 
@@ -240,19 +241,8 @@ def test_a_constant_stress_curve_measures_strain_against_its_own_zero(
     tmp_path: Path,
 ) -> None:
     """The zero-stress rung is the origin, in the same ensemble as the rest."""
-    stages = {
-        "07_load": {
-            "samples": {
-                "segment_applied_stress_bar": [0.0, 100.0, 200.0],
-                "segment_box_x_nm": [5.0, 5.0, 5.0],
-                "segment_box_y_nm": [5.0, 5.0, 5.0],
-                "segment_box_z_nm": [5.0, 5.025, 5.05],
-                "load_axis": [2.0],
-            },
-            "mean_temperature_k": 298.15,
-        }
-    }
-    write_bulk(tmp_path, stage="08_bulk", merge=stages)
+    write_load(tmp_path, axial_lengths_nm=(5.0, 5.025, 5.05))
+    write_bulk(tmp_path, stage="08_bulk")
     curve = load_curve(tmp_path)
     assert curve.controlled == "stress"
     assert curve.strain == pytest.approx([0.0, 0.005, 0.01])
@@ -334,10 +324,10 @@ def test_a_negative_modulus_is_not_resolved(tmp_path: Path) -> None:
 
 def test_a_ladder_that_does_not_come_back_is_not_resolved(tmp_path: Path) -> None:
     """Hysteresis means the ladder deformed the cell rather than probing it."""
-    _write_bulk_samples(
+    write_bulk(
         tmp_path,
-        [1.0, 100.0, 200.0, 100.0, 1.0],
-        [0.90, 0.906, 0.912, 0.930, 0.950],
+        pressures_bar=[1.0, 100.0, 200.0, 100.0, 1.0],
+        densities_g_cm3=[0.90, 0.906, 0.912, 0.930, 0.950],
     )
     fit = bulk_modulus(tmp_path)
     assert fit.hysteresis > 0.25

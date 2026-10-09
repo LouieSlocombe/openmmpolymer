@@ -30,34 +30,20 @@ from openmmpolymer.strength import (
 )
 
 from .helpers import (
+    failure_curve,
     nominal_curve,
     write_bulk,
     write_deformation,
     write_shear,
+    yield_curve,
 )
 
+# These expected plot coordinates stay independent of the shared fixture curves.
 #: A response that peaks at 30% strain and then loses its stress for good.
 FAILING = [0.0, 20.0, 60.0, 100.0, 70.0, 35.0, 30.0, 20.0]
 
 #: An elastic line with a nonzero intercept, then a plateau.
 YIELDING = [2.0, 7.0, 12.0, 17.0, 22.0, 24.0, 25.0, 26.0, 26.0]
-YIELD_STRAINS = [0.0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05]
-
-
-def failure_curve(*, failed: bool = True, rate: float | None = 0.2) -> StressStrain:
-    """Eight holds 10% apart, failing after the peak or rising throughout."""
-    strain = np.arange(8, dtype=np.float64) * 0.1
-    nominal = FAILING if failed else np.linspace(0.0, 100.0, strain.size)
-    return nominal_curve(strain, nominal, stage="06_breaking_r0_00", rate_per_ns=rate)
-
-
-def yield_curve(
-    *, yielded: bool = True, rate: float | None = 0.2, stage: str = "06_yield_r0_00"
-) -> StressStrain:
-    """A yielding response, or a purely elastic one at the same strains."""
-    strain = np.asarray(YIELD_STRAINS)
-    nominal = YIELDING if yielded else 1000.0 * strain + 2.0
-    return nominal_curve(strain, nominal, stage=stage, rate_per_ns=rate)
 
 
 def linear_curve(
