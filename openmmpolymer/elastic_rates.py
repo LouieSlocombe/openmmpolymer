@@ -32,14 +32,17 @@ from ._fitting import (
     finite_or_none,
     group_nearby_rates,
 )
-from ._validation import require_positive
+from ._validation import require_choice, require_positive
 from ._workflow import (
     chain_options,
+    enforce_budget,
     equilibrate,
     group_by_stem,
+    rate_request,
     record_scan_request,
     require_distinct,
     resumable_record,
+    run_branches,
     run_fingerprint,
     sample_spread,
     start_fingerprint,
@@ -68,7 +71,7 @@ from .mechanical import (
     equilibration_protocol,
     extra_stages,
 )
-from .protocols import Protocol, RunManifest, Stage, run_protocol
+from .protocols import Protocol, RunManifest, Stage
 from .rate_dependence import (
     _TEMPERATURE_TOLERANCE_K,
     RateObservation,
@@ -109,26 +112,32 @@ ELASTIC_RATE_PROPERTIES = {
         trend="increasing",
     ),
 }
-_PATH_KEYS = {
-    "poisson_ratio": "segment_strain",
-    "shear_modulus": "segment_shear_strain",
-    "bulk_modulus": "segment_pressure_bar",
-    "load_modulus": "segment_applied_stress_bar",
+
+
+@dataclass(frozen=True)
+class _ElasticPath:
+    """The builder settings and recorded samples for one loading path."""
+
+    kind: str
+    hold_field: str
+    sample_key: str
+    path_option: str | None = None
+
+
+_PATHS = {
+    "youngs_modulus": _ElasticPath("deform", "relax_ps", "segment_strain"),
+    "poisson_ratio": _ElasticPath("deform", "relax_ps", "segment_strain"),
+    "shear_modulus": _ElasticPath(
+        "shear", "shear_ps_each", "segment_shear_strain", "strains"
+    ),
+    "bulk_modulus": _ElasticPath(
+        "compress", "bulk_ps_each", "segment_pressure_bar", "pressures_bar"
+    ),
+    "load_modulus": _ElasticPath(
+        "load", "load_ps_each", "segment_applied_stress_bar", "stresses_bar"
+    ),
 }
-_KIND = {
-    "youngs_modulus": "deform",
-    "poisson_ratio": "deform",
-    "shear_modulus": "shear",
-    "bulk_modulus": "compress",
-    "load_modulus": "load",
-}
-_HOLD = {
-    "youngs_modulus": "relax_ps",
-    "poisson_ratio": "relax_ps",
-    "shear_modulus": "shear_ps_each",
-    "bulk_modulus": "bulk_ps_each",
-    "load_modulus": "load_ps_each",
-}
+_PATHS_BY_KIND = {path.kind: path for path in _PATHS.values()}
 
 
 @dataclass(frozen=True)
@@ -150,16 +159,19 @@ class ElasticRatePlan:
 
 
 def _property(name: str) -> RateProperty:
-    try:
-        return ELASTIC_RATE_PROPERTIES[name]
-    except KeyError:
-        raise ValueError(
+    require_choice(
+        name,
+        tuple(ELASTIC_RATE_PROPERTIES),
+        name="property_name",
+        message=lambda: (
             f"Unknown elastic property {name!r}; choose {', '.join(ELASTIC_RATE_PROPERTIES)}."
-        ) from None
+        ),
+    )
+    return ELASTIC_RATE_PROPERTIES[name]
 
 
 def _rate_spec(spec: ModulusSpec, name: str, hold: float) -> ModulusSpec:
-    options: dict[str, Any] = {_HOLD[name]: hold}
+    options: dict[str, Any] = {_PATHS[name].hold_field: hold}
     return replace(spec, **options)
 
 
@@ -171,7 +183,7 @@ def _protocol(
     timestep_fs: float = 2.0,
     reference_box_nm: Sequence[float] | None = None,
 ) -> Protocol:
-    if _KIND[name] == "deform":
+    if _PATHS[name].kind == "deform":
         return deform_protocol(
             spec,
             timestep_fs=timestep_fs,
@@ -179,7 +191,9 @@ def _protocol(
             reference_box_nm=reference_box_nm,
         )
     selected = [
-        s for s in extra_stages(spec, timestep_fs=timestep_fs) if s.kind == _KIND[name]
+        s
+        for s in extra_stages(spec, timestep_fs=timestep_fs)
+        if s.kind == _PATHS[name].kind
     ]
     if not selected:
         raise ValueError(f"{name} needs its loading ladder enabled in ModulusSpec.")
@@ -206,12 +220,13 @@ def _expected_path(stage: Stage) -> tuple[str, list[float], float]:
             options["strain_start"], options["strain_increment"], options["n_steps"]
         )
         return "segment_strain", path.tolist(), float(options["relax_ps"])
-    name, key = {
-        "shear": ("strains", "segment_shear_strain"),
-        "compress": ("pressures_bar", "segment_pressure_bar"),
-        "load": ("stresses_bar", "segment_applied_stress_bar"),
-    }[stage.kind]
-    return key, [float(v) for v in options[name]], float(options["duration_ps_each"])
+    definition = _PATHS_BY_KIND[stage.kind]
+    assert definition.path_option is not None  # deform's ladder returned above
+    return (
+        definition.sample_key,
+        [float(value) for value in options[definition.path_option]],
+        float(options["duration_ps_each"]),
+    )
 
 
 def validate_elastic_rate_scan(
@@ -258,11 +273,15 @@ def validate_elastic_rate_scan(
     plan = ElasticRatePlan(
         equilibration_protocol(spec, **equilibration), groups, holds, property_name
     )
-    if spec.max_total_ns is not None and plan.total_ns > spec.max_total_ns:
-        raise MechanicalError(
+    enforce_budget(
+        plan.total_ns,
+        spec.max_total_ns,
+        error=MechanicalError,
+        message=lambda: (
             f"The elastic rate scan is {plan.total_ns:.3g} ns across every rate and replica, "
             f"over the {spec.max_total_ns:.3g} ns budget."
-        )
+        ),
+    )
     return plan
 
 
@@ -299,10 +318,7 @@ def _request(
             **run_fingerprint(run),
         }
     )
-    request: dict[str, Any] = json.loads(
-        json.dumps(fields, allow_nan=False, default=str)
-    )
-    return request
+    return rate_request(fields)
 
 
 def run_elastic_rate_scan(
@@ -380,24 +396,23 @@ def run_elastic_rate_scan(
     write_json(workflow, record)
     for i, (name, hold) in enumerate(zip(names, plan.hold_times_ps, strict=True)):
         rate_spec = _rate_spec(spec, property_name, hold)
-        for replica in range(spec.n_replicas):
-            protocol = _protocol(
-                rate_spec,
-                property_name,
-                i * spec.n_replicas + replica,
-                timestep_fs=timestep,
-                reference_box_nm=origin,
-            )
-            run_protocol(
-                protocol,
-                run,
-                directory / name,
-                state_in=start,
-                # The first replica creates each rate's fresh manifest;
-                # later replicas keep the ones completed before them.
-                resume=resume or replica > 0,
-                **chains,
-            )
+        run_branches(
+            (
+                _protocol(
+                    rate_spec,
+                    property_name,
+                    i * spec.n_replicas + replica,
+                    timestep_fs=timestep,
+                    reference_box_nm=origin,
+                )
+                for replica in range(spec.n_replicas)
+            ),
+            run,
+            directory / name,
+            start,
+            resume_first=resume,
+            **chains,
+        )
     return analyse_elastic_rates(
         [directory],
         property_name=property_name,
@@ -573,7 +588,7 @@ def _observations(
     the notes, rather than dropped from the series.
     """
     stages = raw_manifest.get("stages", {})
-    key = _PATH_KEYS[name]
+    key = _PATHS[name].sample_key
     if name == "poisson_ratio":
         groups = group_by_stem(
             deform_stages(directory, manifest=RunManifest(**raw_manifest))

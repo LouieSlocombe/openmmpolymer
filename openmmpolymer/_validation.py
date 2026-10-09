@@ -14,7 +14,7 @@ public function is refused rather than read in the wrong unit.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 
@@ -189,13 +189,20 @@ def require_plane(value: Sequence[int], *, name: str = "plane") -> tuple[int, in
     return axes[0], axes[1]
 
 
-def require_choice(value: str, valid: tuple[str, ...], *, name: str) -> str:
+def require_choice(
+    value: str,
+    valid: tuple[str, ...],
+    *,
+    name: str,
+    message: Callable[[], str] | None = None,
+) -> str:
     """Return *value* if it is one of *valid*, else raise naming the options.
 
     Args:
         value: The candidate.
         valid: Every accepted value.
         name: Parameter name, used in the error message.
+        message: Optional existing diagnostic, evaluated only for a refused value.
 
     Returns:
         The validated value.
@@ -204,5 +211,7 @@ def require_choice(value: str, valid: tuple[str, ...], *, name: str) -> str:
         ValueError: The value is not in *valid*.
     """
     if value not in valid:
+        if message is not None:
+            raise ValueError(message())
         raise ValueError(f"{name}={value!r} is not one of {', '.join(sorted(valid))}.")
     return value

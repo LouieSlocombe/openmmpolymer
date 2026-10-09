@@ -1426,14 +1426,15 @@ def fake_scan_dynamics(
 ) -> None:
     """Route a rate scan's equilibration and branches through *runner*.
 
-    The shared workflow helpers run the equilibration and the scan's own
-    module its branches, so both are replaced; the equilibrated cell is
+    Shared workflow helpers run preparation and branches; scans that still
+    call the engine directly are patched too. The equilibrated cell is
     *box_nm* rather than whatever a state file holds.
     """
     from openmmpolymer import _workflow
 
     monkeypatch.setattr(_workflow, "run_protocol", runner)
-    monkeypatch.setattr(module, "run_protocol", runner)
+    if hasattr(module, "run_protocol"):
+        monkeypatch.setattr(module, "run_protocol", runner)
     monkeypatch.setattr(_workflow, "equilibrated_box_nm", lambda state: list(box_nm))
 
 

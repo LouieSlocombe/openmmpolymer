@@ -49,15 +49,15 @@ from ._workflow import (
     StrainSchedule,
     chain_options,
     deformation_stages,
+    enforce_budget,
     equilibration_at,
     group_by_stem,
     optional,
     remaining_ps,
     require_positive_fields,
-    run_branched_scan,
+    run_measurement_scan,
     sample_spread,
     scan_listing,
-    scan_request,
     with_reference_box,
     write_report_files,
 )
@@ -81,7 +81,7 @@ from .elasticity import (
 )
 from .plots import plot_moduli, plot_stress_strain
 from .protocols import Protocol, RunManifest, Stage
-from .simulate import RunContext, safe_timestep_fs
+from .simulate import RunContext
 from .trajectory import AnalysisError
 
 if TYPE_CHECKING:
@@ -476,12 +476,16 @@ def _report_cost(
         total_ps / PS_PER_NS,
         remaining_ps(listing.stages, manifest) / PS_PER_NS,
     )
-    if spec.max_total_ns is not None and total_ps / PS_PER_NS > spec.max_total_ns:
-        raise MechanicalError(
+    enforce_budget(
+        total_ps / PS_PER_NS,
+        spec.max_total_ns,
+        error=MechanicalError,
+        message=lambda: (
             f"The scan is {total_ps / PS_PER_NS:.1f} ns, over the "
             f"{spec.max_total_ns:.1f} ns budget. Shorten relax_ps, drop a "
             "replica, skip a pass, or raise max_total_ns."
-        )
+        ),
+    )
 
 
 def run_modulus_scan(
@@ -526,28 +530,23 @@ def run_modulus_scan(
     settle = equilibration_protocol(spec, **equilibration)
     _report_cost(spec, settle, RunManifest.load(directory) if resume else None)
 
-    timestep_fs = safe_timestep_fs(spec.temperature_k, run.spec)
-    chains = chain_options(
-        chain_backbone, atoms_per_chain, expected_characteristic_ratio
-    )
-    run_branched_scan(
+    return run_measurement_scan(
         run,
         directory / WORKFLOW_NAME,
-        scan_request(run, spec, settle, **chains),
+        spec,
         settle,
-        lambda origin: _branches(
+        lambda timestep_fs, origin: _branches(
             spec, timestep_fs=timestep_fs, reference_box_nm=origin
         ),
+        lambda directory: analyse_mechanics(
+            directory, strain_limit=spec.elastic_strain_limit
+        ),
+        lambda report: _log_result(report, deform_schedule(spec)),
         resume=resume,
         error=MechanicalError,
         verb="deform",
-        metadata={"timestep_fs": timestep_fs, "n_replicas": spec.n_replicas},
-        **chains,
+        **chain_options(chain_backbone, atoms_per_chain, expected_characteristic_ratio),
     )
-
-    report = analyse_mechanics(directory, strain_limit=spec.elastic_strain_limit)
-    _log_result(report, deform_schedule(spec))
-    return report
 
 
 def _log_result(report: ModulusReport, schedule: ModulusSchedule) -> None:

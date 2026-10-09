@@ -44,26 +44,27 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ._files import ReportFiles, write_json
+from ._files import ReportFiles
 from ._fitting import PS_PER_NS
 from ._validation import require_axis, require_integer, require_positive
 from ._workflow import (
     StrainSchedule,
     chain_options,
     deformation_stages,
-    equilibrated_box_nm,
+    enforce_budget,
     equilibration_at,
+    missing_state_names,
     require_positive_fields,
+    run_branched_scan,
     run_fingerprint,
     sample_spread,
     scan_listing,
-    settled_state,
     write_report_files,
 )
 from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .elasticity import StressStrain, stress_strain
 from .plots import plot_breaking_strength, plot_elongation_at_break, plot_yield_strength
-from .protocols import Protocol, RunManifest, run_protocol, validate_run_inputs
+from .protocols import Protocol, RunManifest
 from .simulate import RunContext, safe_timestep_fs
 from .strength import (
     DEFAULT_CONFIRMATION_STEPS,
@@ -530,7 +531,6 @@ def _check_resume(
     directory: Path,
     previous: dict[str, Any],
     manifest: RunManifest | None,
-    request: dict[str, Any],
     settle: Protocol,
     ladders: Sequence[Protocol],
 ) -> None:
@@ -541,11 +541,7 @@ def _check_resume(
     finished and no completed state missing: new predecessors would otherwise
     feed old descendants.
     """
-    if manifest is not None and manifest.protocol != measurement.name:
-        raise measurement.error(
-            f"{directory} contains a different protocol; use a fresh directory."
-        )
-    if previous and previous.get("request") != request:
+    if previous and previous.get("request") is None:
         raise measurement.error(
             f"Cannot resume {measurement.name} scan with different settings. Restore "
             "the original request, use a fresh directory, or rerun with resume=False."
@@ -578,17 +574,37 @@ def _check_resume(
             "Cannot resume: tensile stages exist before equilibration is complete. "
             "Restore missing stages or rerun with resume=False."
         )
-    missing = [
-        name
-        for name, stage in manifest.stages.items()
-        if not Path(stage.get("final_state", "")).is_file()
-    ]
+    missing = list(missing_state_names(manifest.stages))
     if missing:
         raise measurement.error(
             "Cannot resume: completed stages have missing state files "
             f"({', '.join(missing)}). Restore them or rerun with resume=False so "
             "old descendants are not mixed with new dynamics."
         )
+
+
+def workflow_record(
+    request: dict[str, Any],
+    spec: TensileSpec,
+    ladders: Sequence[Protocol],
+    timestep_fs: float,
+    *,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The tensile record shared by standalone and rate scans.
+
+    Optional state fields retain their caller's insertion order and omitted
+    fields remain absent, preserving the existing workflow JSON layouts.
+    """
+    return {
+        "request": request,
+        "replica_stages": [
+            [stage.name for stage in ladder.stages] for ladder in ladders
+        ],
+        "steps_per_replica": tensile_schedule(spec).n_steps,
+        "timestep_fs": timestep_fs,
+        **({} if state is None else state),
+    }
 
 
 def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
@@ -620,14 +636,20 @@ def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
     total_ns = (
         settle.total_duration_ps + sum(ladder.total_duration_ps for ladder in ladders)
     ) / PS_PER_NS
-    if spec.max_total_ns is not None and total_ns > spec.max_total_ns:
-        raise measurement.error(
+    enforce_budget(
+        total_ns,
+        spec.max_total_ns,
+        error=measurement.error,
+        message=lambda: (
             f"The {measurement.name} scan costs {total_ns:.3g} ns, above "
             f"max_total_ns={spec.max_total_ns:g}; shorten the ladder or raise the "
             "budget."
-        )
+        ),
+    )
     settings = asdict(spec)
     settings.pop("max_total_ns")
+    # Preserve the standalone tensile request's refusal of unsupported JSON
+    # scalars; other spec requests historically stringify those values.
     request = json.loads(
         json.dumps(
             {
@@ -637,23 +659,7 @@ def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
             }
         )
     )
-    previous = _read_record(measurement, directory) if resume else {}
-    manifest = RunManifest.load(directory) if resume else None
-    _check_resume(measurement, directory, previous, manifest, request, settle, ladders)
     schedule = tensile_schedule(spec)
-    record = {
-        "request": request,
-        "replica_stages": [
-            [stage.name for stage in ladder.stages] for ladder in ladders
-        ],
-        "steps_per_replica": schedule.n_steps,
-        "timestep_fs": timestep,
-    }
-    if resume:
-        validate_run_inputs(run, directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    workflow = directory / measurement.workflow_name
-    write_json(workflow, record)
     log.info(
         "%s scan: %d replicas, %.3g ns total, %.3g average strain/ns.",
         measurement.name.capitalize(),
@@ -664,28 +670,37 @@ def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
     chains = chain_options(
         chain_backbone, atoms_per_chain, expected_characteristic_ratio
     )
-    start_state = settled_state(
-        run_protocol(settle, run, directory, resume=resume, **chains),
-        directory,
-        error=measurement.error,
-        verb="stretch",
-    )
-    origin = equilibrated_box_nm(start_state)
-    record.update({"reference_box_nm": origin, "start_state": start_state})
-    write_json(workflow, record)
-    for replica in range(spec.n_replicas):
-        run_protocol(
+    run_branched_scan(
+        run,
+        directory / measurement.workflow_name,
+        request,
+        settle,
+        lambda origin: (
             tensile_protocol(
                 spec, timestep_fs=timestep, replica=replica, reference_box_nm=origin
-            ),
-            run,
-            directory,
-            # The equilibration alone resets a manifest for an explicit rerun.
-            # The replicas preserve it and each other.
-            resume=True,
-            state_in=start_state,
-            **chains,
-        )
+            )
+            for replica in range(spec.n_replicas)
+        ),
+        resume=resume,
+        error=measurement.error,
+        verb="stretch",
+        metadata={},
+        read_record=lambda: _read_record(measurement, directory),
+        precheck=lambda previous, manifest: _check_resume(
+            measurement, directory, previous, manifest, settle, ladders
+        ),
+        record_builder=lambda start, origin: workflow_record(
+            request,
+            spec,
+            ladders,
+            timestep,
+            state=None
+            if start is None
+            else {"reference_box_nm": origin, "start_state": start},
+        ),
+        require_record_for_empty_manifest=False,
+        **chains,
+    )
     return _analyse(measurement, directory)
 
 

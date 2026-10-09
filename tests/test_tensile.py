@@ -6,6 +6,7 @@ each one reads off its curves is checked against the curves planted for it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -16,7 +17,8 @@ import numpy as np
 import pytest
 
 import openmmpolymer
-import openmmpolymer.tensile as tensile
+from openmmpolymer import _workflow, tensile
+from openmmpolymer._files import write_json
 from openmmpolymer.protocols import RunManifest, standard_melt_equilibration
 from openmmpolymer.tensile import (
     BreakingError,
@@ -157,7 +159,7 @@ def _interrupt(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
         calls.append(args)
         raise RuntimeError("interrupted before the first stage")
 
-    monkeypatch.setattr(tensile, "run_protocol", interrupt)
+    monkeypatch.setattr("openmmpolymer._workflow.run_protocol", interrupt)
     return calls
 
 
@@ -723,3 +725,75 @@ def test_every_tensile_entry_point_is_exported() -> None:
         "tensile_scan",
     ):
         assert name in openmmpolymer.__all__
+
+
+@pytest.mark.parametrize("name", MEASUREMENTS)
+def test_tensile_workflow_json_preserves_request_and_record_order(
+    argon_scan_run: Any, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """Digests captured before the shared runner pin both writes, including resume."""
+    expected = {
+        "breaking": ("b1cb4425b6316245", "4ccf27be9f8cf5ba", "0effb10374242827"),
+        "elongation": ("b1cb4425b6316245", "f1daad09c612ff96", "71e660c0ff2d75c6"),
+        "yield": ("b9294496fd5d04a6", "e09f1b34393bce9a", "ddaf63e2f3430e48"),
+    }[name]
+    records: list[dict[str, Any]] = []
+
+    def capture(path: Path, record: dict[str, Any], **options: Any) -> str:
+        copied = json.loads(json.dumps(record))
+        request = copied["request"]
+        for key in {
+            "system",
+            "system_spec",
+            "seed",
+            "system_sha256",
+            "coordinates_sha256",
+            "box_nm",
+        } & request.keys():
+            request[key] = "<input fingerprint>"
+        for key in ("start_state", "reference_box_nm"):
+            if key in copied:
+                copied[key] = "<equilibrated cell>"
+        records.append(copied)
+        return write_json(path, record, **options)
+
+    monkeypatch.setattr(_workflow, "write_json", capture)
+    monkeypatch.setattr(
+        _workflow,
+        "equilibrate",
+        lambda *args, **kwargs: ("run/05_npt_state.xml", [2.8] * 3),
+    )
+    monkeypatch.setattr(_workflow, "run_branches", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tensile, "_analyse", lambda *args, **kwargs: None)
+
+    def digest(record: dict[str, Any]) -> str:
+        return hashlib.sha256(json.dumps(record, indent=2).encode()).hexdigest()[:16]
+
+    workflow = Path("run") / f"{name}_workflow.json"
+    for resume in (False, True):
+        if resume:
+            prior = json.loads(workflow.read_text())
+            prior["old_metadata"] = "A resume rebuilt this record before consolidation."
+            workflow.write_text(json.dumps(prior))
+        API[name].run(
+            argon_scan_run,
+            "run",
+            spec=QUICK[name],
+            resume=resume,
+            **QUICK_EQUILIBRATION,
+        )
+        initial, final = records[-2:]
+        assert (digest(initial["request"]), digest(initial), digest(final)) == expected
+        assert "old_metadata" not in json.loads(workflow.read_text())
+
+
+@pytest.mark.parametrize("name", MEASUREMENTS)
+def test_request_keeps_unsupported_json_scalar_refusal_before_writing(
+    argon_scan_run: Any, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    calls = _interrupt(monkeypatch)
+    spec = replace(QUICK[name], temperature_k=np.float32(120.0))
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        API[name].run(argon_scan_run, "run", spec=spec, **QUICK_EQUILIBRATION)
+    assert not calls
+    assert not Path("run").exists()

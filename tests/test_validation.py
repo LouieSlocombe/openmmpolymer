@@ -205,6 +205,22 @@ def test_a_typo_in_a_choice_lists_the_options() -> None:
         require_choice("gaf", ("gaff", "smirnoff"), name="backend")
 
 
+def test_custom_choice_message_is_only_built_for_a_refusal() -> None:
+    messages: list[str] = []
+
+    def message() -> str:
+        messages.append("called")
+        return "Unknown recorded property."
+
+    assert (
+        require_choice("known", ("known",), name="property", message=message) == "known"
+    )
+    assert messages == []
+    with pytest.raises(ValueError, match=r"^Unknown recorded property\.$"):
+        require_choice("unknown", ("known",), name="property", message=message)
+    assert messages == ["called"]
+
+
 def test_derived_seeds_are_stable_and_distinct() -> None:
     """One master seed, several streams, and they must not collide."""
     assert derive_seed(7, "thermostat") == derive_seed(7, "thermostat")

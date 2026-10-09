@@ -61,8 +61,8 @@ class DynamicsReached(RuntimeError):
 def _patch_dynamics(
     monkeypatch: pytest.MonkeyPatch, runner: Callable[..., Any]
 ) -> None:
-    # Tensile will move to _workflow during consolidation. Patch the existing
-    # entry points so the tests keep testing the public scan contract afterward.
+    # Patch the shared runner and the thermal entry points so every public
+    # scan stops at the same dynamics boundary.
     for module in (_workflow, tensile, tg, tm):
         if hasattr(module, "run_protocol"):
             monkeypatch.setattr(module, "run_protocol", runner)
@@ -108,15 +108,6 @@ def _begin_scan(
             name,
             damage,
             id=f"{name}-{damage}",
-            marks=(
-                pytest.mark.xfail(
-                    strict=True,
-                    raises=DynamicsReached,
-                    reason="F1/D1: Tg does not check missing records or foreign protocols before writing",
-                )
-                if name == "tg" and damage in ("foreign-protocol", "missing-record")
-                else ()
-            ),
         )
         for name in SCANS
         for damage in (
@@ -194,3 +185,52 @@ def test_missing_state_preserves_each_scans_repair_or_refusal_policy(
         with pytest.raises(DynamicsReached):
             scan.run(argon_run, directory, **scan.options)
         assert repaired == [stage_name]
+
+
+@pytest.mark.parametrize("name", SCANS)
+def test_empty_manifest_without_workflow_preserves_the_tensile_exception(
+    name: str, argon_run: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scan = SCANS[name]
+    directory, manifest = _begin_scan(scan, argon_run, monkeypatch)
+    manifest.stages.clear()
+    assert manifest.provenance is not None
+    manifest.provenance["stages"].clear()
+    manifest.save(directory)
+    (directory / scan.record_name).unlink()
+    before = _files(directory)
+
+    def interrupted(*args: Any, **kwargs: Any) -> None:
+        raise DynamicsReached
+
+    _patch_dynamics(monkeypatch, interrupted)
+    if name in ("breaking", "elongation", "yield"):
+        with pytest.raises(DynamicsReached):
+            scan.run(argon_run, directory, **scan.options)
+        assert (directory / scan.record_name).is_file()
+    else:
+        with pytest.raises(scan.error, match="without a request"):
+            scan.run(argon_run, directory, **scan.options)
+        assert _files(directory) == before
+
+
+@pytest.mark.parametrize("name", ("breaking", "elongation", "yield"))
+@pytest.mark.parametrize(
+    "record", [{"request": []}, {"request": {"spec": []}}, {"request": None}]
+)
+def test_tensile_refuses_malformed_nested_request_without_writes(
+    name: str, record: dict[str, Any], argon_run: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scan = SCANS[name]
+    directory = Path("run")
+    directory.mkdir()
+    (directory / scan.record_name).write_text(json.dumps(record))
+    before = _files(directory)
+
+    def unexpected(*args: Any, **kwargs: Any) -> None:
+        raise DynamicsReached
+
+    _patch_dynamics(monkeypatch, unexpected)
+    with pytest.raises(scan.error, match="different settings"):
+        scan.run(argon_run, directory, **scan.options)
+    assert _files(directory) == before

@@ -11,19 +11,23 @@ import math
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
 from ._files import write_json
 from ._fitting import MAX_EXTRAPOLATION_DECADES
 from ._seeds import derive_seed
+from ._validation import require_choice
 from ._workflow import (
     chain_options,
+    enforce_budget,
     equilibrate,
+    rate_request,
     record_scan_request,
     require_distinct,
     resumable_record,
+    run_branches,
     run_fingerprint,
     start_fingerprint,
     strain_ladder,
@@ -33,7 +37,6 @@ from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .protocols import (
     Protocol,
     RunManifest,
-    run_protocol,
     standard_melt_equilibration,
 )
 from .rate_dependence import (
@@ -48,13 +51,17 @@ from .tensile import (
     BREAKING,
     ELONGATION,
     YIELD,
+    BreakingSpec,
+    ElongationSpec,
     TensileMeasurement,
     TensileSpec,
+    YieldSpec,
     analyse_breaking,
     analyse_elongation,
     analyse_yield,
     tensile_protocol,
     tensile_schedule,
+    workflow_record,
 )
 from .trajectory import AnalysisError
 
@@ -92,10 +99,22 @@ _EVENTS: dict[str, tuple[TensileMeasurement[Any], Callable[..., Any], str]] = {
 def _event(
     property_name: str,
 ) -> tuple[TensileMeasurement[Any], Callable[..., Any], str]:
-    try:
-        return _EVENTS[property_name]
-    except KeyError:
-        raise ValueError(f"Unknown tensile rate property {property_name!r}.") from None
+    require_choice(
+        property_name,
+        tuple(_EVENTS),
+        name="property_name",
+        message=lambda: f"Unknown tensile rate property {property_name!r}.",
+    )
+    return _EVENTS[property_name]
+
+
+def tensile_rate_spec_type(
+    property_name: str,
+) -> type[BreakingSpec | ElongationSpec | YieldSpec]:
+    """Settings type supplied by the same descriptor used to run and read events."""
+    return cast(
+        type[BreakingSpec | ElongationSpec | YieldSpec], _event(property_name)[0].spec
+    )
 
 
 @dataclass(frozen=True)
@@ -140,10 +159,14 @@ def validate_tensile_rate_scan(
         settle.total_duration_ps
         + sum(item.n_replicas * tensile_schedule(item).total_ps for item in specs)
     ) / 1000
-    if spec.max_total_ns is not None and cost > spec.max_total_ns:
-        raise ValueError(
+    enforce_budget(
+        cost,
+        spec.max_total_ns,
+        error=ValueError,
+        message=lambda: (
             f"Tensile rate scan needs {cost:.3g} ns across all rates and replicas, above max_total_ns={spec.max_total_ns:g}."
-        )
+        ),
+    )
     return TensileRatePlan(property_name, settle, specs, cost)
 
 
@@ -184,17 +207,13 @@ def run_tensile_rate_scan(
     directory = Path(output_dir).resolve()
     workflow = directory / WORKFLOW_NAME
     names = [f"rate_{index:02d}" for index in range(len(plan.specs))]
-    request = json.loads(
-        json.dumps(
-            {
-                "property_name": property_name,
-                "specs": [asdict(item) for item in plan.specs],
-                "equilibration": asdict(plan.equilibration),
-                **run_fingerprint(run),
-            },
-            default=str,
-            allow_nan=False,
-        )
+    request = rate_request(
+        {
+            "property_name": property_name,
+            "specs": [asdict(item) for item in plan.specs],
+            "equilibration": asdict(plan.equilibration),
+            **run_fingerprint(run),
+        }
     )
     record = resumable_record(
         run, workflow, request, names, resume=resume, error=ValueError
@@ -241,33 +260,22 @@ def run_tensile_rate_scan(
         # that measurement's own analysis reads under the criterion it ran.
         write_json(
             rate_dir / measurement.workflow_name,
-            {
-                "request": {
+            workflow_record(
+                {
                     "spec": asdict(rate_spec),
                     "system_sha256": request["system_sha256"],
                     "system": request["system"],
                     "equilibration": request["equilibration"]["stages"],
                     "preparation_state_sha256": fingerprint,
                 },
-                "replica_stages": [
-                    [stage.name for stage in ladder.stages] for ladder in ladders
-                ],
-                "steps_per_replica": tensile_schedule(rate_spec).n_steps,
-                "timestep_fs": timestep,
-                "start_state": start,
-                "reference_box_nm": origin,
-            },
+                rate_spec,
+                ladders,
+                timestep,
+                state={"start_state": start, "reference_box_nm": origin},
+            ),
         )
         rate_run = replace(run, seed=derive_seed(run.seed, "tensile_rates", str(index)))
-        for replica, ladder in enumerate(ladders):
-            run_protocol(
-                ladder,
-                rate_run,
-                rate_dir,
-                resume=resume or replica > 0,
-                state_in=start,
-                **chains,
-            )
+        run_branches(ladders, rate_run, rate_dir, start, resume_first=resume, **chains)
     return analyse_tensile_rates(
         [directory],
         property_name=property_name,

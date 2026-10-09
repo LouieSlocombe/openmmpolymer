@@ -87,7 +87,7 @@ Removed: `set_pressure`, `_BlockEnsemble`, the four `polyfit` calls, the duplica
 - [x] F12 engine micro-duplicates
 - [x] F6 `first_frame`
 - [x] F9 numerics (centre x in `fit_line` before any `polyfit` swap)
-- [ ] F18 small bypasses
+- [x] F18 small bypasses (completed across Stages 1–3; exceptions recorded below)
 - [x] F5 validation (separate behavior-fix commit; D6 resolved below)
 
 ### Stage 2: reports and shared readers (about -100 lines)
@@ -107,12 +107,12 @@ Order matters. Reuse: `run_branches`, `equilibrate`, `run_branched_scan`, `check
 Callers changed: `elastic_rates`, `tensile_rates`, `tensile` (all three scans through `_run_scan`), `tg._approach`, `tm.run_tm_scan`, `mechanical`, `viscoelastic`; test helpers `helpers.fake_scan_dynamics` and `tests/test_tensile.py::_interrupt`, which must patch `_workflow.run_protocol`.
 Removed: the `tensile._run_scan` body and most of `_check_resume`, two replica loops, `tm`'s inline pre-flight, the duplicated mechanical/viscoelastic driver bodies.
 
-- [ ] F2 `run_branches` in `elastic_rates` and `tensile_rates`
-- [ ] F1 shared pre-flight; tensile onto `run_branched_scan` (needs D1, D2)
-- [ ] F1 tg and tm onto the pre-flight
-- [ ] F3 mechanical/viscoelastic driver
-- [ ] F8 budget helper (optional; do it while F1/F3 touch the same functions)
-- [ ] F2 optional `prepare_rate_scan` for elastic and tensile_rates only
+- [x] F2 `run_branches` in `elastic_rates` and `tensile_rates`
+- [x] F1 shared pre-flight; tensile onto `run_branched_scan` (needs D1, D2)
+- [x] F1 tg and tm onto the pre-flight
+- [x] F3 mechanical/viscoelastic driver
+- [x] F8 budget helper (optional; do it while F1/F3 touch the same functions)
+- [x] F2 optional `prepare_rate_scan` reviewed; retained explicit preparation (see section 10)
 
 ### Stage 4: drift guards (add a test or one shared table; do not merge)
 
@@ -482,6 +482,32 @@ remain above so the changes and decisions can be reviewed against the audit.
   unchanged (D3 option B); adding automatic analysis reports remains deferred.
   F18 report directories, safe figure stems and plotting-helper bypasses are done.
   Gate: 2,302 passed, two expected Tg failures; ruff, formatting and mypy clean.
+
+- Stage 3: shared preflight covers protocol/request/input checks, with tensile
+  prefix and state checks retained as domain hooks. Tg now refuses foreign
+  protocols and missing workflow records before writing (D1). Tensile still
+  permits an empty manifest without a record; Tm still refuses foreign protocols
+  even on a forced rerun. Mechanical/relaxation share their driver; tensile and
+  the two mechanical rate families share branch execution. The first rate replica
+  retains its original resume flag on forced reruns, despite the audit's proposed
+  unconditional-resume equivalence. Budget checks share strict `>` semantics and
+  lazy caller-specific messages. Tensile initial/final record field order is
+  preserved by a shared schema builder, also used by its rate family (F13).
+  All eleven rate requests match the captured 31,355 serialized bytes. Only
+  their identical strict/stringifying normalization is shared. The audit's
+  tensile `spec_request` equivalence does not hold for unsupported scientific
+  scalar types: its original non-stringifying serializer remains, with a
+  regression requiring refusal before writing. Missing-state checks preserve
+  rate scans' short-circuit behavior. Property dispatch shares descriptors and
+  choice validation without tightening legacy Young's-ladder verification.
+  The optional `prepare_rate_scan` would need numerous policies and would change
+  metadata-update ordering without simplifying the existing four helpers, so
+  the explicit preparation sequence stays. Thermal keeps its directory loop
+  and `run_protocol`/`settled_state` pair: using `equilibrate` would unnecessarily
+  parse/log a reference cell. F18's remaining dispatch and compatible rate
+  normalization bypasses are completed.
+  Gate: 2,387 passed with no expected failures, coverage 96.10%; ruff,
+  formatting and mypy clean.
 
 ## Appendix A. Builder and request digest harness (Stage 0)
 

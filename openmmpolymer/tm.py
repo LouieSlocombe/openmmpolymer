@@ -31,7 +31,10 @@ from ._seeds import DEFAULT_SEED
 from ._state import box_vectors_nm, positions_nm, read_state
 from ._validation import require_choice, require_integer
 from ._workflow import (
+    check_scan_resume,
+    enforce_budget,
     require_positive_fields,
+    require_scan_protocol,
     resume_chunks,
     run_fingerprint,
     spec_request,
@@ -48,7 +51,6 @@ from .protocols import (
     RunSummary,
     Stage,
     run_protocol,
-    validate_run_inputs,
 )
 from .reporters import TrajectoryOptions
 from .simulate import RunContext, heating_temperatures, prepare_run, safe_timestep_fs
@@ -312,10 +314,14 @@ def melting_scan(spec: TmSpec = DEFAULT_SPEC) -> Protocol:
         )
     protocol = Protocol(PROTOCOL_NAME, tuple(stages))
     total_ns = protocol.total_duration_ps / PS_PER_NS
-    if spec.max_total_ns is not None and total_ns > spec.max_total_ns:
-        raise TmError(
+    enforce_budget(
+        total_ns,
+        spec.max_total_ns,
+        error=TmError,
+        message=lambda: (
             f"Heating scan needs {total_ns:g} ns, above max_total_ns={spec.max_total_ns:g}."
-        )
+        ),
+    )
     return protocol
 
 
@@ -752,23 +758,29 @@ def run_tm_scan(
     )
     directory = Path(run_dir)
     path = directory / WORKFLOW_NAME
-    manifest = RunManifest.load(directory)
-    if manifest is not None and manifest.protocol != PROTOCOL_NAME:
-        raise TmError(
-            f"{directory} already contains a different protocol; use a new run directory."
+    if not resume:
+        # A supplied crystal cannot overwrite a different workflow even on
+        # an explicit rerun, unlike the other scan entry points.
+        require_scan_protocol(
+            directory, RunManifest.load(directory), PROTOCOL_NAME, error=TmError
         )
-    if resume and manifest is not None and not path.is_file():
-        raise TmError(
-            "The melting workflow record is missing; use a new run directory."
-        )
-    if resume and path.is_file():
-        previous = json.loads(path.read_text())
-        if previous.get("request") != request:
+
+    def check_record(previous: dict[str, Any], manifest: RunManifest | None) -> None:
+        if path.is_file() and previous.get("request") is None:
             raise TmError(
                 "Melting settings or starting inputs changed; use a new run directory."
             )
-    if resume:
-        validate_run_inputs(run, directory)
+
+    check_scan_resume(
+        run,
+        path,
+        request,
+        PROTOCOL_NAME,
+        resume=resume,
+        error=TmError,
+        read_record=lambda: json.loads(path.read_text()) if path.is_file() else {},
+        precheck=check_record,
+    )
     directory.mkdir(parents=True, exist_ok=True)
     write_json(
         path,

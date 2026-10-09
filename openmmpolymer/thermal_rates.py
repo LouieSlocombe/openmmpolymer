@@ -19,9 +19,11 @@ import numpy as np
 
 from ._files import file_sha256, write_json
 from ._fitting import MAX_EXTRAPOLATION_DECADES, PS_PER_NS
-from ._validation import require_integer
+from ._validation import require_choice, require_integer
 from ._workflow import (
     chain_options,
+    enforce_budget,
+    rate_request,
     record_scan_request,
     require_distinct,
     resumable_record,
@@ -102,13 +104,15 @@ class ThermalRatePlan:
 
 
 def _property(property_name: str) -> RateProperty:
-    try:
-        return THERMAL_RATE_PROPERTIES[property_name]
-    except KeyError as error:
-        raise ValueError(
-            f"Unknown thermal property {property_name!r}; choose "
-            f"{', '.join(THERMAL_RATE_PROPERTIES)}."
-        ) from error
+    require_choice(
+        property_name,
+        tuple(THERMAL_RATE_PROPERTIES),
+        name="property_name",
+        message=lambda: (
+            f"Unknown thermal property {property_name!r}; choose {', '.join(THERMAL_RATE_PROPERTIES)}."
+        ),
+    )
+    return THERMAL_RATE_PROPERTIES[property_name]
 
 
 def _thermal_protocol(
@@ -203,11 +207,15 @@ def validate_thermal_rate_scan(
         holds,
         n_replicas,
     )
-    if spec.max_total_ns is not None and plan.total_ns > spec.max_total_ns:
-        raise ThermalRateError(
+    enforce_budget(
+        plan.total_ns,
+        spec.max_total_ns,
+        error=ThermalRateError,
+        message=lambda: (
             f"Thermal rate scan requires {plan.total_ns:.3g} ns across all rates and "
             f"replicas, over the {spec.max_total_ns:.3g} ns budget."
-        )
+        ),
+    )
     return plan
 
 
@@ -296,26 +304,22 @@ def run_thermal_rate_scan(
     chains = chain_options(
         chain_backbone, atoms_per_chain, expected_characteristic_ratio
     )
-    request = json.loads(
-        json.dumps(
-            {
-                "property_name": property_name,
-                "spec": asdict(spec),
-                "hold_times_ps": plan.hold_times_ps,
-                "n_replicas": n_replicas,
-                "equilibration": asdict(plan.equilibration),
-                "target_rate": target_rate,
-                "max_extrapolation_decades": max_extrapolation_decades,
-                **run_fingerprint(run, spec_key="system_spec"),
-                "state_sha256": None if state_in is None else file_sha256(state_in),
-                "crystalline_supplied": crystalline
-                if property_name == "melting_temperature"
-                else None,
-                **chains,
-            },
-            allow_nan=False,
-            default=str,
-        )
+    request = rate_request(
+        {
+            "property_name": property_name,
+            "spec": asdict(spec),
+            "hold_times_ps": plan.hold_times_ps,
+            "n_replicas": n_replicas,
+            "equilibration": asdict(plan.equilibration),
+            "target_rate": target_rate,
+            "max_extrapolation_decades": max_extrapolation_decades,
+            **run_fingerprint(run, spec_key="system_spec"),
+            "state_sha256": None if state_in is None else file_sha256(state_in),
+            "crystalline_supplied": crystalline
+            if property_name == "melting_temperature"
+            else None,
+            **chains,
+        }
     )
     directory = Path(output_dir).resolve()
     workflow = directory / WORKFLOW_NAME

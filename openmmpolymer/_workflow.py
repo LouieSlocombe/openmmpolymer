@@ -21,7 +21,7 @@ import hashlib
 import json
 import logging
 import math
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -308,6 +308,18 @@ def scan_listing(name: str, protocols: Iterable[Protocol]) -> Protocol:
     )
 
 
+def rate_request(fields: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a rate request with its strict, stringifying JSON policy.
+
+    This is intentionally distinct from spec_request's permissive NaN policy
+    and from the fail-closed protocol canonicalizer and report null encoding.
+    """
+    recorded: dict[str, Any] = json.loads(
+        json.dumps(fields, allow_nan=False, default=str)
+    )
+    return recorded
+
+
 def spec_request(
     spec: Any, *, drop: Iterable[str] = (), **extra: Any
 ) -> dict[str, Any]:
@@ -342,23 +354,108 @@ def check_request(
     if not path.is_file():
         return {}
     record: dict[str, Any] = json.loads(path.read_text())
+    _check_request_record(path, record, request, error=error)
+    return record
+
+
+def _check_request_record(
+    path: Path,
+    record: dict[str, Any],
+    request: dict[str, Any],
+    *,
+    error: type[Exception],
+) -> None:
+    """Compare an already-read workflow record with the requested settings."""
     previous = record.get("request")
     if previous is not None and previous != request:
         raise error(
             f"{path} records a scan run with different settings "
             f"({', '.join(_changed(previous, request)) or 'unknown'}), and "
-            "resuming would keep results measured under the old ones. Run into "
+            "resuming would keep results measured under the old ones. Settings or starting inputs changed. Run into "
             "a fresh directory, put the settings back, or rerun with resume=False."
         )
+
+
+def require_scan_protocol(
+    directory: Path,
+    manifest: RunManifest | None,
+    protocol: str,
+    *,
+    error: type[Exception],
+) -> None:
+    """Refuse a manifest belonging to another workflow."""
+    if manifest is not None and manifest.protocol != protocol:
+        raise error(
+            f"{directory} contains a different protocol; use a fresh directory."
+        )
+
+
+def check_scan_resume(
+    run: RunContext,
+    workflow: Path,
+    request: dict[str, Any],
+    protocol: str,
+    *,
+    resume: bool,
+    error: type[Exception],
+    read_record: Callable[[], dict[str, Any]] | None = None,
+    precheck: Callable[[dict[str, Any], RunManifest | None], None] | None = None,
+    require_record_for_empty_manifest: bool = True,
+) -> dict[str, Any]:
+    """Verify a single-manifest scan before changing files or starting dynamics.
+
+    Domain checks run before input provenance, so damaged tensile prefixes keep
+    their precise refusal. Most scans require a request even for an empty
+    manifest; tensile historically allows that unstarted directory.
+    """
+    if not resume:
+        return {}
+    record = (
+        check_request(workflow, request, error=error)
+        if read_record is None
+        else read_record()
+    )
+    directory = workflow.parent
+    manifest = RunManifest.load(directory)
+    require_scan_protocol(directory, manifest, protocol, error=error)
+    if read_record is not None:
+        _check_request_record(workflow, record, request, error=error)
+    if precheck is not None:
+        precheck(record, manifest)
+    if (
+        manifest is not None
+        and (manifest.stages or require_record_for_empty_manifest)
+        and record.get("request") is None
+    ):
+        raise error(
+            f"{directory} already holds runs without a request in {workflow.name}; "
+            "the workflow record is missing or incomplete, so their settings cannot "
+            "be verified. Use a fresh directory or rerun with resume=False."
+        )
+    validate_run_inputs(run, directory)
     return record
 
 
-def _changed(previous: dict[str, Any], request: dict[str, Any]) -> list[str]:
+def missing_state_names(stages: dict[str, dict[str, Any]]) -> Iterator[str]:
+    """Completed stages whose recorded state files are unavailable."""
+    for name, stage in stages.items():
+        if not Path(stage.get("final_state", "")).is_file():
+            yield name
+
+
+def _changed(previous: Any, request: dict[str, Any]) -> list[str]:
     """The settings two requests disagree on, a spec's by field name."""
+    if not isinstance(previous, dict):
+        return ["request"]
     before, after = previous.get("spec", {}), request.get("spec", {})
-    changed = {
-        key for key in before.keys() | after.keys() if before.get(key) != after.get(key)
-    }
+    if isinstance(before, dict) and isinstance(after, dict):
+        changed = {
+            key
+            for key in before.keys() | after.keys()
+            if before.get(key) != after.get(key)
+        }
+    else:
+        changed = {"spec"} if before != after else set()
     changed |= {
         key
         for key in (previous.keys() | request.keys()) - {"spec"}
@@ -417,16 +514,25 @@ def run_branches(
     run: RunContext,
     directory: Path,
     state_in: str,
+    *,
+    resume_first: bool = True,
     **chains: Any,
 ) -> None:
     """Run each branch from the equilibrated state, keeping what is recorded.
 
-    Always resuming: a forced rerun resets the manifest once, in the
-    equilibration, and every branch after that has to keep what the
-    equilibration and the branches before it recorded.
+    A shared manifest already contains the equilibration, so branches normally
+    resume. Rate scans use separate directories: on a forced rerun their first
+    branch starts a fresh manifest, then later replicas keep earlier branches.
     """
-    for protocol in branches:
-        run_protocol(protocol, run, directory, resume=True, state_in=state_in, **chains)
+    for index, protocol in enumerate(branches):
+        run_protocol(
+            protocol,
+            run,
+            directory,
+            resume=resume_first or index > 0,
+            state_in=state_in,
+            **chains,
+        )
 
 
 def record_scan_request(
@@ -465,6 +571,53 @@ def scan_request(
     )
 
 
+def enforce_budget(
+    total_ns: float,
+    max_total_ns: float | None,
+    *,
+    error: type[Exception],
+    message: Callable[[], str],
+) -> None:
+    """Refuse costs strictly over the budget; None leaves it unlimited."""
+    if max_total_ns is not None and total_ns > max_total_ns:
+        raise error(message())
+
+
+def run_measurement_scan[T](
+    run: RunContext,
+    workflow: Path,
+    spec: Any,
+    settle: Protocol,
+    branches: Callable[[float, Sequence[float]], Iterable[Protocol]],
+    analyse: Callable[[Path], T],
+    log_result: Callable[[T], None],
+    *,
+    resume: bool,
+    error: type[Exception],
+    verb: str,
+    **chains: Any,
+) -> T:
+    """Run and read a mechanical measurement with its recorded chain options."""
+    from .simulate import safe_timestep_fs
+
+    timestep_fs = safe_timestep_fs(spec.temperature_k, run.spec)
+    run_branched_scan(
+        run,
+        workflow,
+        scan_request(run, spec, settle, **chains),
+        settle,
+        lambda origin: branches(timestep_fs, origin),
+        resume=resume,
+        error=error,
+        verb=verb,
+        metadata={"timestep_fs": timestep_fs, "n_replicas": spec.n_replicas},
+        **chains,
+    )
+    report = analyse(workflow.parent)
+    log_result(report)
+    return report
+
+
 def run_branched_scan(
     run: RunContext,
     workflow: Path,
@@ -476,6 +629,11 @@ def run_branched_scan(
     error: type[Exception],
     verb: str,
     metadata: dict[str, Any],
+    read_record: Callable[[], dict[str, Any]] | None = None,
+    precheck: Callable[[dict[str, Any], RunManifest | None], None] | None = None,
+    record_builder: Callable[[str | None, list[float] | None], dict[str, Any]]
+    | None = None,
+    require_record_for_empty_manifest: bool = True,
     **chains: Any,
 ) -> None:
     """Record, equilibrate and run a budgeted scan in one manifest.
@@ -486,30 +644,37 @@ def run_branched_scan(
     without their settings. A forced rerun discards the old manifest before
     replacing its request; only equilibration resets it, and the branches
     preserve each other's results.
+
+    A custom reader retains a workflow's corrupt-record diagnostics, and
+    *precheck* verifies domain-specific stage relationships before input checks.
+    *record_builder* rebuilds records that historically reset their metadata;
+    it receives no state for the first write and the equilibrated state for
+    the second, retaining the caller's field order.
     """
     directory = workflow.parent
-    record = check_request(workflow, request, error=error) if resume else {}
-    if resume:
-        manifest = RunManifest.load(directory)
-        if manifest is not None:
-            if manifest.protocol != settle.name:
-                raise error(
-                    f"{directory} contains a different protocol; use a fresh directory."
-                )
-            if record.get("request") is None:
-                raise error(
-                    f"{directory} already holds runs without a request in "
-                    f"{workflow.name}, so their settings cannot be verified. "
-                    "Use a fresh directory or rerun with resume=False."
-                )
-            validate_run_inputs(run, directory)
+    record = check_scan_resume(
+        run,
+        workflow,
+        request,
+        settle.name,
+        resume=resume,
+        error=error,
+        read_record=read_record,
+        precheck=precheck,
+        require_record_for_empty_manifest=require_record_for_empty_manifest,
+    )
+    if record_builder is not None:
+        record = record_builder(None, None)
     record_scan_request(
         workflow, record, request, [directory], resume=resume, **metadata
     )
     start, origin = equilibrate(
         settle, run, directory, resume=resume, error=error, verb=verb, **chains
     )
-    record.update(start_state=start, reference_box_nm=origin)
+    if record_builder is None:
+        record.update(start_state=start, reference_box_nm=origin)
+    else:
+        record = record_builder(start, origin)
     write_json(workflow, record, strict=False)
     run_branches(branches(origin), run, directory, start, **chains)
 
@@ -606,9 +771,13 @@ def resumable_record(
     runs = [directory / "equilibration", *(directory / name for name in branches)]
     for path in runs:
         manifest = path / MANIFEST_NAME
-        if manifest.is_file() and any(
-            not Path(entry.get("final_state", "")).is_file()
-            for entry in json.loads(manifest.read_text()).get("stages", {}).values()
+        if (
+            manifest.is_file()
+            and next(
+                missing_state_names(json.loads(manifest.read_text()).get("stages", {})),
+                None,
+            )
+            is not None
         ):
             raise error(
                 f"{path} has completed stages with missing states; restore them "

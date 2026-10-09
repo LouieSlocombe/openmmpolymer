@@ -44,7 +44,8 @@ from ._fitting import PS_PER_NS
 from ._validation import require_integer, require_positive
 from ._workflow import (
     chain_options,
-    check_request,
+    check_scan_resume,
+    enforce_budget,
     optional,
     remaining_ps,
     require_positive_fields,
@@ -62,7 +63,6 @@ from .protocols import (
     Stage,
     run_protocol,
     standard_melt_equilibration,
-    validate_run_inputs,
 )
 from .reporters import TrajectoryOptions
 from .simulate import RunContext, quench_temperatures, safe_timestep_fs
@@ -594,12 +594,16 @@ def _report_cost(
         total_ps / PS_PER_NS,
         (remaining_ps(coarse.stages, manifest) + fine_ps) / PS_PER_NS,
     )
-    if spec.max_total_ns is not None and total_ps / PS_PER_NS > spec.max_total_ns:
-        raise TgError(
+    enforce_budget(
+        total_ps / PS_PER_NS,
+        spec.max_total_ns,
+        error=TgError,
+        message=lambda: (
             f"This scan is {total_ps / PS_PER_NS:.1f} ns against a max_total_ns "
             f"of {spec.max_total_ns:.1f}. Shorten the holds, widen the steps, "
             "or raise the limit - but decide before it starts, not after."
-        )
+        ),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -669,9 +673,9 @@ def _approach(
 
     path = directory / WORKFLOW_NAME
     request = spec_request(spec, tg_approx_k=tg_approx_k)
-    record = check_request(path, request, error=TgError) if resume else {}
-    if resume:
-        validate_run_inputs(run, directory)
+    record = check_scan_resume(
+        run, path, request, coarse.name, resume=resume, error=TgError
+    )
     record["request"] = request
     directory.mkdir(parents=True, exist_ok=True)
     write_json(path, record, strict=False)

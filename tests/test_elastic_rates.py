@@ -44,6 +44,14 @@ from .helpers import (
     write_shear,
 )
 
+# Independent fixture vocabulary for the saved loading paths.
+PATH_KEYS = {
+    "poisson_ratio": "segment_strain",
+    "shear_modulus": "segment_shear_strain",
+    "bulk_modulus": "segment_pressure_bar",
+    "load_modulus": "segment_applied_stress_bar",
+}
+
 HOLDS = (20.0, 60.0, 200.0)
 SPEC = ModulusSpec(n_replicas=2, max_strain=0.02)
 #: Every elastic property; all but Young's modulus observe each replica.
@@ -56,7 +64,7 @@ def _stamp(directory: Path, hold: float) -> None:
     record = json.loads(manifest.read_text())
     for stage in record["stages"].values():
         samples = stage["samples"]
-        key = next(key for key in elastic_rates._PATH_KEYS.values() if key in samples)
+        key = next(key for key in PATH_KEYS.values() if key in samples)
         n = len(samples[key])
         samples["segment_duration_ps"] = [hold] * n
         samples["segment_temperature_k"] = [298.15] * n
@@ -208,7 +216,7 @@ def test_nominal_rate_counts_both_branches_and_every_hold(
         file = directory / "manifest.json"
         record = json.loads(file.read_text())
         samples = next(iter(record["stages"].values()))["samples"]
-        key = elastic_rates._PATH_KEYS[name]
+        key = PATH_KEYS[name]
         if name == "shear_modulus":
             samples[key] = [0.01, 0.02, 0.01, 0.0]
             expected_path = 0.04
