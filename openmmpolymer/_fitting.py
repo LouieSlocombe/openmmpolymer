@@ -9,7 +9,8 @@ one of them, and the statistics of a correlated series.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from typing import overload
 
 import numpy as np
 import numpy.typing as npt
@@ -27,6 +28,18 @@ NEGLIGIBLE = 1.0e-12
 #: a few dozen ulps, rather than anything that was sampled.
 ROUNDING = 64.0 * float(np.finfo(np.float64).eps)
 
+#: Unit conversion for dynamics durations and rates.
+PS_PER_NS = 1000.0
+
+#: Largest relative standard error for a resolved fitted modulus.
+MAX_RELATIVE_STANDARD_ERROR = 0.25
+
+#: Largest relative scatter among replicas for a resolved measurement.
+MAX_REPLICA_SPREAD = 0.3
+
+#: A finite-rate fit remains resolved at most two decades outside its data.
+MAX_EXTRAPOLATION_DECADES = 2.0
+
 #: The grid :func:`separable_fit` sweeps, and the zooms it then makes a grid
 #: step either side of the best point so far.
 _SWEEP_POINTS = 181
@@ -39,18 +52,138 @@ def fit_line(
 ) -> tuple[tuple[float, float], float]:
     """Least-squares line through *x*, *y*, with its sum of squared residuals.
 
+    Centre and scale x so that a narrow window at a large offset remains
+    full rank. Degenerate x keeps the original minimum-norm solution.
     ``numpy.linalg.lstsq`` returns an empty residual array for an exactly
     determined fit, so the sum is worked out when it is not handed back.
     """
-    design = np.vstack([x, np.ones_like(x)]).T
+    origin = float(x.mean()) if x.size else 0.0
+    centred = x - origin
+    scale = float(np.max(np.abs(centred))) if x.size and not np.all(x == x[0]) else 0.0
+    design_x = centred / scale if scale else x
+    design = np.vstack([design_x, np.ones_like(x)]).T
     solution, residuals, *_ = np.linalg.lstsq(design, y, rcond=None)
     slope, intercept = float(solution[0]), float(solution[1])
+    if scale:
+        slope /= scale
+        intercept -= slope * origin
     if residuals.size:
         total = float(residuals[0])
     else:
         predicted = design @ solution
         total = float(((y - predicted) ** 2).sum())
     return (slope, intercept), total
+
+
+def rms(values: npt.NDArray[np.float64]) -> float:
+    """Compute RMS without squaring the original dimensional values."""
+    scale = float(np.max(np.abs(values)))
+    if scale == 0.0 or not math.isfinite(scale):
+        return scale
+    return float(np.sqrt(np.mean((values / scale) ** 2))) * scale
+
+
+def finite_or_none(value: float | None) -> float | None:
+    """A measured value, or None when it is missing or nonfinite."""
+    return None if value is None or not math.isfinite(value) else float(value)
+
+
+def group_nearby_rates[T](
+    items: Iterable[T], *, rate: Callable[[T], float]
+) -> list[list[T]]:
+    """Group sorted rates within 1e-8 of each group's first rate.
+
+    Compare against the representative, not the preceding member: a chain of
+    close neighbours need not represent one rate.
+    """
+    groups: list[list[T]] = []
+    for item in sorted(items, key=rate):
+        if groups and math.isclose(
+            rate(item), rate(groups[-1][0]), rel_tol=1e-8, abs_tol=0.0
+        ):
+            groups[-1].append(item)
+        else:
+            groups.append([item])
+    return groups
+
+
+def extrapolation_decades(
+    rates: npt.NDArray[np.float64], target: float, *, log_difference: bool = False
+) -> float:
+    """Distance beyond positive measured rates, preserving boundary arithmetic.
+
+    Thermal fits historically take the log of ratios, whereas property-rate
+    fits subtract logs. These can differ by an ulp at their acceptance limit;
+    each caller retains its original order. Ratios use log differences only
+    when the intermediate ratio overflows or underflows.
+    """
+    if log_difference:
+        logs = np.log10(rates)
+        value = math.log10(target)
+        return max(float(logs.min()) - value, value - float(logs.max()), 0.0)
+
+    def log_ratio(numerator: float, denominator: float) -> float:
+        ratio = numerator / denominator
+        if 0.0 < ratio < math.inf:
+            return math.log10(ratio)
+        return math.log10(numerator) - math.log10(denominator)
+
+    return max(
+        0.0,
+        log_ratio(float(rates.min()), target),
+        log_ratio(target, float(rates.max())),
+    )
+
+
+def relative_span(values: npt.NDArray[np.float64], scale: float) -> float:
+    """How far values spread over a scale; infinite for missing/undefined data."""
+    if not values.size or np.any(~np.isfinite(values)):
+        return math.inf
+    if scale == 0.0:
+        return 0.0 if np.all(values == 0.0) else math.inf
+    return float(np.ptp(values / scale))
+
+
+def median_spacing(values: npt.NDArray[np.float64], *, absolute: bool = False) -> float:
+    """Typical adjacent gap, optionally independent of direction."""
+    if values.size < 2:
+        return 0.0
+    steps = np.diff(values)
+    return float(np.median(np.abs(steps) if absolute else steps))
+
+
+@overload
+def standard_error_from_moments(mean: float, mean_sq: float, count: float) -> float: ...
+
+
+@overload
+def standard_error_from_moments(
+    mean: npt.NDArray[np.float64],
+    mean_sq: npt.NDArray[np.float64],
+    count: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]: ...
+
+
+def standard_error_from_moments(
+    mean: float | npt.NDArray[np.float64],
+    mean_sq: float | npt.NDArray[np.float64],
+    count: float | npt.NDArray[np.float64],
+) -> float | npt.NDArray[np.float64]:
+    """Population-variance SE, clamping roundoff; NaN with at most one sample.
+
+    This assumes independent readings. It is distinct from standard_error's
+    Bessel-corrected sample variance and effective independent sample count.
+    Keep scalar and array arithmetic in their original operation order.
+    """
+    if not isinstance(mean, np.ndarray):
+        n = float(count)
+        return (
+            math.sqrt(max(0.0, float(mean_sq) - mean**2) / n) if n > 1.0 else math.nan
+        )
+    variance = np.maximum(mean_sq - mean * mean, 0.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        error = np.sqrt(variance / count)
+    return np.where(np.asarray(count) > 1.0, error, np.nan)
 
 
 def slope_error(x: npt.NDArray[np.float64], residual_sum: float) -> float:

@@ -562,3 +562,12 @@ def test_a_cell_with_no_size_reports_no_box_drift() -> None:
     from openmmpolymer.conformation import _box_drift
 
     assert _box_drift(np.zeros((3, 3))) == 0.0
+
+
+def test_constant_lags_keep_the_former_polyfit_rank_warning() -> None:
+    """The migrated slope fits must not quietly fit an unidentifiable slope."""
+    from openmmpolymer.conformation import _diffusion_cm2_s, _log_slope
+
+    for measure in (_log_slope, _diffusion_cm2_s):
+        with pytest.warns(np.exceptions.RankWarning, match="poorly conditioned"):
+            measure(np.full(6, 10.0), np.arange(1.0, 7.0))

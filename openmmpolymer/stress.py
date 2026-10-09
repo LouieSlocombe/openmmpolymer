@@ -100,14 +100,11 @@ def pressure_bar(simulation: Any) -> float:
         StressError: There is no barostat, so there is nothing to ask.
     """
     kind, barostat = _require_barostat(simulation)
-    if kind == "flexible":
-        return float(
-            np.trace(_flexible_pressure_tensor_bar(simulation, barostat)) / 3.0
-        )
-    value = barostat.computeCurrentPressure(simulation.context).value_in_unit(unit.bar)
     if kind == "isotropic":
-        return float(value)
-    return float(np.mean([value[axis] for axis in range(3)]))
+        return float(
+            barostat.computeCurrentPressure(simulation.context).value_in_unit(unit.bar)
+        )
+    return float(np.trace(pressure_tensor_bar(simulation)) / 3.0)
 
 
 def pressure_tensor_bar(simulation: Any) -> npt.NDArray[np.float64]:

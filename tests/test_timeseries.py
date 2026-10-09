@@ -839,3 +839,14 @@ def test_an_unknown_extrapolation_form_is_refused_at_the_call_site() -> None:
         cooling_rate_extrapolation(
             log_linear_transitions((1.0, 10.0)), form="arrhenius"
         )
+
+
+@pytest.mark.parametrize("target", [0.99 / 100.0, 99.0 * 100.0])
+def test_two_decade_thermal_boundary_retains_ratio_arithmetic(target: float) -> None:
+    transitions = [
+        transition_at(rate, temperature)
+        for rate, temperature in ((0.99, 340.0), (9.9, 360.0), (99.0, 380.0))
+    ]
+    fit = cooling_rate_extrapolation(transitions, target_rate_k_per_ns=target)
+    assert fit.extrapolation_decades == 2.0
+    assert fit.resolved

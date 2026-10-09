@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ._files import ReportFiles, write_json
+from ._fitting import PS_PER_NS
 from ._validation import require_integer, require_positive
 from ._workflow import (
     chain_options,
@@ -51,6 +52,7 @@ from ._workflow import (
     spec_request,
     write_report_files,
 )
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .melt_check import MeltEquilibration, melt_equilibration
 from .plots import plot_cooling_rate, plot_quench_curve, plot_state_data
 from .protocols import (
@@ -205,7 +207,7 @@ class TgSchedule:
     @property
     def cooling_rate_k_per_ns(self) -> float:
         """The rate the ladder amounts to, in kelvin per nanosecond."""
-        return self.step_k / self.hold_ps * 1000.0
+        return self.step_k / self.hold_ps * PS_PER_NS
 
 
 @dataclass(frozen=True)
@@ -581,20 +583,20 @@ def _report_cost(
         "Tg scan: %.1f ns equilibration, %.1f ns coarse (%d points at %.1f "
         "K/ns), %.1f ns fine over %d pass(es) at %s K/ns, %d points each - "
         "%.1f ns in total, %.1f ns of it still to run.",
-        (coarse.total_duration_ps - coarse_ladder.total_ps) / 1000.0,
-        coarse_ladder.total_ps / 1000.0,
+        (coarse.total_duration_ps - coarse_ladder.total_ps) / PS_PER_NS,
+        coarse_ladder.total_ps / PS_PER_NS,
         coarse_ladder.n_temperatures,
         coarse_ladder.cooling_rate_k_per_ns,
-        fine_ps / 1000.0,
+        fine_ps / PS_PER_NS,
         len(fine_ladders),
         ", ".join(f"{ladder.cooling_rate_k_per_ns:.2f}" for ladder in fine_ladders),
         fine_ladders[0].n_temperatures if fine_ladders else 0,
-        total_ps / 1000.0,
-        (remaining_ps(coarse.stages, manifest) + fine_ps) / 1000.0,
+        total_ps / PS_PER_NS,
+        (remaining_ps(coarse.stages, manifest) + fine_ps) / PS_PER_NS,
     )
-    if spec.max_total_ns is not None and total_ps / 1000.0 > spec.max_total_ns:
+    if spec.max_total_ns is not None and total_ps / PS_PER_NS > spec.max_total_ns:
         raise TgError(
-            f"This scan is {total_ps / 1000.0:.1f} ns against a max_total_ns "
+            f"This scan is {total_ps / PS_PER_NS:.1f} ns against a max_total_ns "
             f"of {spec.max_total_ns:.1f}. Shorten the holds, widen the steps, "
             "or raise the limit - but decide before it starts, not after."
         )
@@ -894,7 +896,7 @@ def _run_fine(
         schedule.temperatures_k[0],
         schedule.temperatures_k[-1],
         schedule.cooling_rate_k_per_ns,
-        schedule.total_ps / 1000.0,
+        schedule.total_ps / PS_PER_NS,
         approach.restart,
         approach.start_temperature_k,
     )
@@ -925,7 +927,7 @@ def run_tg_scan(
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> TgResult:
     """Equilibrate, screen coarsely for the transition, then resolve it.
@@ -1023,7 +1025,7 @@ def cooling_rate_series(
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> tuple[GlassTransition, ...]:
     """Walk the fine window several times, each at a different cooling rate.
@@ -1099,7 +1101,7 @@ def _fine_holds(rates_k_per_ns: Sequence[float], spec: TgSpec) -> tuple[float, .
         rate_k_per_ns = require_positive(rate, None, name="rates_k_per_ns")
         holds.append(
             require_positive(
-                spec.fine_step_k / rate_k_per_ns * 1000.0, None, name="hold_ps"
+                spec.fine_step_k / rate_k_per_ns * PS_PER_NS, None, name="hold_ps"
             )
         )
     return tuple(holds)

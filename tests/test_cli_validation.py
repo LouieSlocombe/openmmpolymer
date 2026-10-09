@@ -167,3 +167,28 @@ def test_invalid_request_has_no_side_effects(
         cli.main([*mode.split(), *flags.split(), "-o", "output"])
     assert not no_build
     assert not Path("output").exists()
+
+
+@pytest.mark.parametrize("mode", ["analysis", "scan"])
+def test_report_refusals_are_cli_errors_without_a_traceback(
+    mode: str,
+    staged_melt: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Both entry paths report a refused output option like other CLI errors."""
+
+    def refused(*args: Any, **kwargs: Any) -> Any:
+        raise ValueError("figure_format must be a filename extension")
+
+    if mode == "analysis":
+        monkeypatch.setattr(cli, "_analyse", refused)
+        argv = ["--analyse", "saved"]
+    else:
+        monkeypatch.setattr(cli, "run_breaking_scan", refused)
+        argv = ["[*]CC[*]", "--protocol", "breaking"]
+    with pytest.raises(SystemExit, match="2"):
+        cli.main([*argv, "--figure-format", "not-a-format"])
+    error = capsys.readouterr().err
+    assert "error: figure_format" in error
+    assert "Traceback" not in error

@@ -16,7 +16,7 @@ from openmmpolymer.correlations import (
     radial_distribution,
     structure_factor,
 )
-from openmmpolymer.trajectory import AnalysisError, Ensemble, Frame
+from openmmpolymer.trajectory import AnalysisError, Ensemble, Frame, chain_positions
 
 from .helpers import lattice, synthetic_ensemble
 
@@ -136,7 +136,12 @@ def test_a_cell_of_one_molecule_has_no_intermolecular_pairs() -> None:
         radial_distribution(lattice_ensemble(n_chains=1), heavy_atoms_only=False)
 
 
-def test_dropping_hydrogens_from_an_all_hydrogen_cell_is_refused() -> None:
+@pytest.mark.parametrize(
+    "measure", [radial_distribution, structure_factor, chain_positions]
+)
+def test_dropping_hydrogens_from_an_all_hydrogen_cell_is_refused(
+    measure: Callable[..., Any],
+) -> None:
     """It leaves nothing to measure, and an empty array is not an answer."""
     ensemble = synthetic_ensemble(
         lattice(64, LATTICE_EDGE_NM),
@@ -145,7 +150,7 @@ def test_dropping_hydrogens_from_an_all_hydrogen_cell_is_refused() -> None:
         is_hydrogen=np.ones(2, dtype=bool),
     )
     with pytest.raises(AnalysisError, match="left no atoms"):
-        radial_distribution(ensemble)
+        measure(ensemble, heavy_atoms_only=True)
 
 
 def test_hydrogens_can_be_dropped() -> None:
@@ -292,18 +297,6 @@ def test_asking_for_more_wavevectors_than_will_be_summed_is_refused() -> None:
     wait for a sum that will not finish."""
     with pytest.raises(AnalysisError, match="Lower q_max_per_nm"):
         structure_factor(lattice_ensemble(), q_max_per_nm=1.0e6, heavy_atoms_only=False)
-
-
-def test_the_structure_factor_also_refuses_a_cell_with_no_heavy_atoms() -> None:
-    """Same reason as the pair distribution: nothing left to sum over."""
-    ensemble = synthetic_ensemble(
-        lattice(64, LATTICE_EDGE_NM),
-        n_chains=32,
-        box_nm=LATTICE_EDGE_NM,
-        is_hydrogen=np.ones(2, dtype=bool),
-    )
-    with pytest.raises(AnalysisError, match="left no atoms"):
-        structure_factor(ensemble)
 
 
 @pytest.mark.parametrize("bad", [0, -1])

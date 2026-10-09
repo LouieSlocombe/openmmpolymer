@@ -25,6 +25,13 @@ from typing import Any
 import numpy as np
 
 from ._files import write_json
+from ._fitting import (
+    MAX_EXTRAPOLATION_DECADES,
+    MAX_REPLICA_SPREAD,
+    PS_PER_NS,
+    finite_or_none,
+    group_nearby_rates,
+)
 from ._validation import require_positive
 from ._workflow import (
     chain_options,
@@ -39,7 +46,9 @@ from ._workflow import (
     strain_ladder,
     validate_hold_times,
 )
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .elasticity import (
+    DEFAULT_STRAIN_LIMIT,
     StressStrain,
     bulk_modulus,
     deform_stages,
@@ -52,7 +61,6 @@ from .elasticity import (
 from .mechanical import (
     BULK_STEM,
     DEFAULT_SPEC,
-    MAX_REPLICA_SPREAD,
     MechanicalError,
     ModulusSpec,
     _pool,
@@ -138,7 +146,7 @@ class ElasticRatePlan:
         return (
             self.equilibration.total_duration_ps
             + sum(p.total_duration_ps for group in self.protocols for p in group)
-        ) / 1000.0
+        ) / PS_PER_NS
 
 
 def _property(name: str) -> RateProperty:
@@ -212,7 +220,7 @@ def validate_elastic_rate_scan(
     *,
     property_name: str,
     target_rate: float,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
     **equilibration: Any,
 ) -> ElasticRatePlan:
     """Validate a selected property and price all rates before any output exists."""
@@ -305,11 +313,11 @@ def run_elastic_rate_scan(
     hold_times_ps: Sequence[float],
     target_rate: float,
     spec: ModulusSpec = DEFAULT_SPEC,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> RateReport:
     """Vary only the holds; start each replica from one common relaxed cell.
@@ -539,10 +547,6 @@ def _expand(
     return result
 
 
-def _finite(value: float) -> float | None:
-    return float(value) if math.isfinite(value) else None
-
-
 def _observations(
     directory: Path, name: str, spec: dict[str, Any] | None, strain_limit: float
 ) -> list[RateObservation]:
@@ -601,7 +605,7 @@ def _observations(
         # measured leg.
         origin = path[0] if name == "bulk_modulus" else 0.0
         distance = float(np.abs(np.diff(np.r_[origin, path])).sum())
-        rate = distance / float(duration.sum()) * 1000.0
+        rate = distance / float(duration.sum()) * PS_PER_NS
         if not math.isfinite(rate) or rate <= 0:
             raise AnalysisError(
                 "Every loading path must record a positive nominal rate."
@@ -729,8 +733,8 @@ def _observations(
         observations.append(
             RateObservation(
                 rate=rate,
-                value=_finite(value),
-                standard_error=None if error is None else _finite(error),
+                value=finite_or_none(value),
+                standard_error=finite_or_none(error),
                 resolved=bool(
                     resolved
                     and temperature is not None
@@ -897,16 +901,9 @@ def _youngs_observations(
             curve = stress_strain(directory, group)
             curves.append((f"{directory}: {curve.stage}", curve))
     _check_comparable([curve for _, curve in curves])
-    by_rate: list[list[tuple[str, StressStrain]]] = []
-    for item in sorted(curves, key=lambda item: float(item[1].strain_rate_per_ns or 0)):
-        if by_rate and math.isclose(
-            float(item[1].strain_rate_per_ns or 0),
-            float(by_rate[-1][0][1].strain_rate_per_ns or 0),
-            rel_tol=1.0e-8,
-        ):
-            by_rate[-1].append(item)
-        else:
-            by_rate.append([item])
+    by_rate = group_nearby_rates(
+        curves, rate=lambda item: float(item[1].strain_rate_per_ns or 0)
+    )
     observations: list[RateObservation] = []
     for members in by_rate:
         replicas = [curve for _, curve in members]
@@ -950,8 +947,8 @@ def analyse_elastic_rates(
     *,
     property_name: str,
     target_rate: float,
-    strain_limit: float = 0.015,
-    max_extrapolation_decades: float = 2.0,
+    strain_limit: float = DEFAULT_STRAIN_LIMIT,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
 ) -> RateReport:
     """Fit logarithmic and power-law responses to matching saved loading paths.
 

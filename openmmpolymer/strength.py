@@ -17,8 +17,16 @@ from dataclasses import dataclass, replace
 import numpy as np
 import numpy.typing as npt
 
+from ._fitting import ROUNDING, finite_or_none
 from ._validation import require_integer
 from .elasticity import StressStrain, youngs_modulus
+
+#: Default apparent failure and offset-yield criteria.
+DEFAULT_FAILURE_FRACTION = 0.5
+DEFAULT_CONFIRMATION_STEPS = 3
+DEFAULT_OFFSET_STRAIN = 0.002
+DEFAULT_FIT_MIN_STRAIN = 0.0
+DEFAULT_FIT_MAX_STRAIN = 0.02
 
 
 @dataclass(frozen=True)
@@ -117,8 +125,8 @@ def _nominal_tensile_stress(
 def breaking_strength(
     curve: StressStrain,
     *,
-    failure_fraction: float = 0.5,
-    confirmation_steps: int = 3,
+    failure_fraction: float = DEFAULT_FAILURE_FRACTION,
+    confirmation_steps: int = DEFAULT_CONFIRMATION_STEPS,
 ) -> BreakingStrength:
     """Read an apparent ultimate tensile strength from a deformation curve.
 
@@ -241,8 +249,8 @@ class ElongationAtBreak:
 def elongation_at_break(
     curve: StressStrain,
     *,
-    failure_fraction: float = 0.5,
-    confirmation_steps: int = 3,
+    failure_fraction: float = DEFAULT_FAILURE_FRACTION,
+    confirmation_steps: int = DEFAULT_CONFIRMATION_STEPS,
 ) -> ElongationAtBreak:
     """Read apparent elongation at break from a tensile deformation curve.
 
@@ -316,9 +324,9 @@ class YieldStrength:
 def yield_strength(
     curve: StressStrain,
     *,
-    offset_strain: float = 0.002,
-    fit_min_strain: float = 0.0,
-    fit_max_strain: float = 0.02,
+    offset_strain: float = DEFAULT_OFFSET_STRAIN,
+    fit_min_strain: float = DEFAULT_FIT_MIN_STRAIN,
+    fit_max_strain: float = DEFAULT_FIT_MAX_STRAIN,
 ) -> YieldStrength:
     """Calculate a configurable offset yield strength (0.2% by default).
 
@@ -386,9 +394,7 @@ def yield_strength(
         # Least-squares roundoff can place an exact sampled intersection a
         # few ulps above the line, including at the final sample. Treat only
         # that numerical-scale residual as equality, not a physical tolerance.
-        tolerance = (
-            64 * np.finfo(np.float64).eps * np.maximum(abs(nominal), abs(offset_line))
-        )
+        tolerance = ROUNDING * np.maximum(abs(nominal), abs(offset_line))
         difference[abs(difference) <= tolerance] = 0.0
         # Start at the final elastic sample to retain a crossing bracket that
         # straddles the requested window boundary. A curve already below the
@@ -443,19 +449,15 @@ def yield_strength(
         yield_strain=crossing,
         yield_bracket=bracket,
         resolved=strength is not None,
-        modulus_mpa=fit.modulus_mpa if math.isfinite(fit.modulus_mpa) else None,
-        intercept_mpa=fit.intercept_mpa if math.isfinite(fit.intercept_mpa) else None,
+        modulus_mpa=finite_or_none(fit.modulus_mpa),
+        intercept_mpa=finite_or_none(fit.intercept_mpa),
         offset_strain=offset_strain,
         fit_min_strain=fit_min_strain,
         fit_max_strain=fit_max_strain,
         fit_points=count,
         fit_resolved=fit.resolved,
-        standard_error_mpa=fit.standard_error_mpa
-        if math.isfinite(fit.standard_error_mpa)
-        else None,
-        half_disagreement=fit.half_disagreement
-        if math.isfinite(fit.half_disagreement)
-        else None,
+        standard_error_mpa=finite_or_none(fit.standard_error_mpa),
+        half_disagreement=finite_or_none(fit.half_disagreement),
         temperature_k=curve.temperature_k,
         strain_rate_per_ns=curve.strain_rate_per_ns,
         nominal_stress_mpa=nominal,

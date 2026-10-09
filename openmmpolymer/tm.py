@@ -23,18 +23,23 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 import openmm as mm
-from openmm import app, unit
+from openmm import unit
 
 from ._files import ReportFiles, file_sha256, write_json
+from ._fitting import PS_PER_NS
+from ._seeds import DEFAULT_SEED
+from ._state import box_vectors_nm, positions_nm, read_state
 from ._validation import require_integer
 from ._workflow import (
     require_positive_fields,
     resume_chunks,
     run_fingerprint,
     spec_request,
+    with_timestep,
 )
 from .forcefield import PolymerForceField
-from .mdsystem import PackedBox, SystemSpec, ensemble_controls
+from .mdsystem import PackedBox, SystemSpec, require_no_ensemble_controls
+from .packing import read_pdb
 from .protocols import (
     Protocol,
     RunManifest,
@@ -191,7 +196,7 @@ class HeatingCurve:
             return None
         if not np.allclose(steps[:-1], steps[0]) or steps[-1] > steps[0] * (1 + 1e-8):
             return None
-        return float(steps[0] / self.hold_ps[0] * 1000.0)
+        return float(steps[0] / self.hold_ps[0] * PS_PER_NS)
 
 
 @dataclass(frozen=True)
@@ -302,7 +307,7 @@ def melting_scan(spec: TmSpec = DEFAULT_SPEC) -> Protocol:
             )
         )
     protocol = Protocol(PROTOCOL_NAME, tuple(stages))
-    total_ns = protocol.total_duration_ps / 1000.0
+    total_ns = protocol.total_duration_ps / PS_PER_NS
     if spec.max_total_ns is not None and total_ns > spec.max_total_ns:
         raise TmError(
             f"Heating scan needs {total_ns:g} ns, above max_total_ns={spec.max_total_ns:g}."
@@ -395,6 +400,15 @@ class _Jump:
     multiple: bool
 
 
+def _sse(
+    design: npt.NDArray[np.float64], values: npt.NDArray[np.float64]
+) -> tuple[npt.NDArray[np.float64], float]:
+    """Least-squares coefficients and explicitly evaluated squared residuals."""
+    coef, _, _, _ = np.linalg.lstsq(design, values, rcond=None)
+    residual = values - design @ coef
+    return coef, float(residual @ residual)
+
+
 def _jump_fit(
     temperature: npt.NDArray[np.float64],
     values: npt.NDArray[np.float64],
@@ -420,9 +434,7 @@ def _jump_fit(
         dx = x - midpoint
         right = (np.arange(n) >= index).astype(float)
         design = np.column_stack((np.ones(n), dx, right, right * dx))
-        coef, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
-        residual = y - design @ coef
-        sse = float(residual @ residual)
+        coef, sse = _sse(design, y)
         variance = max(0.0, sse / (n - 4))
         error = float(np.sqrt(variance * np.linalg.inv(design.T @ design)[2, 2]))
         candidates.append((sse, index, float(coef[2]), error))
@@ -436,14 +448,11 @@ def _jump_fit(
     # A smooth cubic is also a four-parameter null: broad curved expansion
     # must not be reduced to a narrow temperature-grid melting bracket.
     cubic = np.column_stack((np.ones(n), x, x**2, x**3))
-    coef, _, _, _ = np.linalg.lstsq(cubic, y, rcond=None)
-    residual = y - cubic @ coef
-    null_sse = float(residual @ residual)
+    _, null_sse = _sse(cubic, y)
     for knot in knots:
         design = np.column_stack((np.ones(n), x, np.maximum(x - knot, 0)))
-        coef, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
-        residual = y - design @ coef
-        null_sse = min(null_sse, float(residual @ residual))
+        _, hinge_sse = _sse(design, y)
+        null_sse = min(null_sse, hinge_sse)
     floor = 1e-24 * n
     bic_gain = n * np.log(max(null_sse, floor) / max(sse, floor)) - np.log(n)
     supported = jump > max(3 * error, 1e-8) and bic_gain >= 10.0
@@ -466,9 +475,7 @@ def _jump_fit(
                         after_second * x,
                     )
                 )
-                coef, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
-                residual = y - design @ coef
-                two_sse = float(residual @ residual)
+                _, two_sse = _sse(design, y)
                 gain = n * np.log(max(sse, floor) / max(two_sse, floor)) - 3 * np.log(n)
                 if gain >= 10.0:
                     multiple = True
@@ -559,7 +566,7 @@ def load_crystal(
     *,
     state_in: str | Path | None = None,
     platform: str | None = None,
-    seed: int = 0xF0,
+    seed: int = DEFAULT_SEED,
 ) -> RunContext:
     """Read a prepared crystal and its System, ready for :func:`run_tm_scan`.
 
@@ -588,7 +595,7 @@ def load_crystal(
         ValueError: A file cannot be read, or does not describe such a cell.
     """
     try:
-        pdb = app.PDBFile(str(crystal_pdb))
+        pdb = read_pdb(crystal_pdb)
         system = mm.XmlSerializer.deserialize(Path(system_xml).read_text())
     except Exception as error:
         raise ValueError(
@@ -598,7 +605,7 @@ def load_crystal(
         raise ValueError("system_xml must contain a serialised OpenMM System")
     if system.getNumParticles() != pdb.topology.getNumAtoms():
         raise ValueError("Crystal PDB and System must contain the same number of atoms")
-    _refuse_ensemble_controls(system, ValueError)
+    require_no_ensemble_controls(system, ValueError, stages="heating")
     if not system.usesPeriodicBoundaryConditions():
         raise ValueError("The supplied System must use periodic boundary conditions")
     vectors = pdb.topology.getPeriodicBoxVectors()
@@ -613,17 +620,11 @@ def load_crystal(
     system.setDefaultPeriodicBoxVectors(*vectors)
     if state_in is not None:
         try:
-            state = mm.XmlSerializer.deserialize(Path(state_in).read_text())
+            state = read_state(state_in)
             if not isinstance(state, mm.State):
                 raise ValueError("state_in must contain a serialised OpenMM State")
-            saved_positions = np.asarray(
-                state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
-                dtype=float,
-            )
-            saved_vectors = np.asarray(
-                state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer),
-                dtype=float,
-            )
+            saved_positions = positions_nm(state)
+            saved_vectors = box_vectors_nm(state)
         except Exception as error:
             raise ValueError(
                 f"Could not read the crystalline starting State: {error}"
@@ -659,21 +660,6 @@ def load_crystal(
         seed=seed,
         system=system,
     )
-
-
-def _refuse_ensemble_controls(system: Any, error: type[Exception]) -> None:
-    """Refuse a System that brings its own barostat or Andersen thermostat.
-
-    The heating stages control temperature and pressure themselves, and
-    OpenMM applies every barostat a System carries, a second one included.
-    """
-    controls = ensemble_controls(system)
-    if controls:
-        raise error(
-            "The supplied System must contain no barostat or Andersen thermostat; "
-            "the heating stages provide their own temperature and pressure "
-            f"control. It carries {', '.join(controls)}."
-        )
 
 
 def _molecule_count(topology: Any) -> int:
@@ -741,22 +727,16 @@ def run_tm_scan(
             "A melting scan requires a supplied crystalline or semicrystalline "
             "cell. Pass crystalline=True only after preparing that structure."
         )
-    _refuse_ensemble_controls(mm.XmlSerializer.deserialize(run.system_xml), TmError)
+    require_no_ensemble_controls(
+        mm.XmlSerializer.deserialize(run.system_xml), TmError, stages="heating"
+    )
     protocol = melting_scan(spec)
-    total_ns = protocol.total_duration_ps / 1000.0
+    total_ns = protocol.total_duration_ps / PS_PER_NS
     # Pinned for every stage that integrates, at the hottest hold's safe step:
     # left alone, each chunk would derate to its own hottest temperature, and
     # one heating curve integrated several ways is a confound.
     timestep = safe_timestep_fs(spec.t_end_k, run.spec)
-    protocol = replace(
-        protocol,
-        stages=tuple(
-            stage
-            if stage.kind == "minimise"
-            else replace(stage, options={**stage.options, "timestep_fs": timestep})
-            for stage in protocol.stages
-        ),
-    )
+    protocol = replace(protocol, stages=with_timestep(protocol.stages, timestep))
     request = spec_request(
         spec,
         drop=("max_total_ns",),

@@ -26,12 +26,17 @@ from itertools import pairwise
 import numpy as np
 import numpy.typing as npt
 
-from ._fitting import ROUNDING, standard_error, statistical_inefficiency
+from ._fitting import (
+    ROUNDING,
+    relative_span,
+    rms,
+    standard_error,
+    statistical_inefficiency,
+)
 from ._validation import require_positive
 from .rate_dependence import (
     MAX_RATE_RESIDUAL_TO_ERROR,
     MAX_RELATIVE_RATE_RESIDUAL,
-    _rms,
 )
 from .relaxation import (
     SIGNAL_TO_NOISE_FLOOR,
@@ -321,15 +326,6 @@ def _sample_estimate(data: npt.NDArray[np.float64]) -> tuple[float, float, float
     return mean, standard_error(data, effective), effective
 
 
-def _relative_span(values: npt.NDArray[np.float64], scale: float) -> float:
-    """How far *values* spread, over *scale*; infinite when that means nothing."""
-    if not values.size or np.any(~np.isfinite(values)):
-        return math.inf
-    if scale == 0.0:
-        return 0.0 if np.all(values == 0.0) else math.inf
-    return float(np.ptp(values / scale))
-
-
 def time_window_convergence(
     time_ps: npt.ArrayLike,
     values: npt.ArrayLike,
@@ -400,10 +396,10 @@ def time_window_convergence(
     block_means = np.asarray([item[0] for item in estimates])
     block_errors = np.asarray([item[1] for item in estimates])
     block_effective = np.asarray([item[2] for item in estimates])
-    relative_change = _relative_span(
+    relative_change = relative_span(
         np.asarray([item.mean for item in windows[-3:]]), scale
     )
-    block_spread = _relative_span(block_means, scale)
+    block_spread = relative_span(block_means, scale)
     refusals: list[str] = []
     if data.size < 3:
         refusals.append(
@@ -541,7 +537,7 @@ def relaxation_window_convergence(
         window_notes: list[str] = []
         if fitted_values.size and math.isfinite(prony.residual_mpa):
             response_scale = float(np.mean(np.abs(fitted_values)))
-            reported_error = _rms(fitted_errors)
+            reported_error = rms(fitted_errors)
             rounding = ROUNDING * float(np.max(np.abs(fitted_values)))
             residual_ok = bool(
                 prony.residual_mpa <= MAX_RELATIVE_RATE_RESIDUAL * response_scale
@@ -612,7 +608,7 @@ def relaxation_window_convergence(
             if name == "equilibrium_modulus_mpa"
             else abs(float(final[-1]))
         )
-        change = _relative_span(final, scale)
+        change = relative_span(final, scale)
         refusals: list[str] = []
         if not distinct:
             refusals.append(ENDPOINTS_REFUSAL)

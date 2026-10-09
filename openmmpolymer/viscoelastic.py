@@ -45,7 +45,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from ._files import ReportFiles
-from ._fitting import NEGLIGIBLE
+from ._fitting import MAX_REPLICA_SPREAD as MAX_REPLICA_SPREAD
+from ._fitting import NEGLIGIBLE, PS_PER_NS
 from ._validation import (
     require_axis,
     require_choice,
@@ -66,6 +67,7 @@ from ._workflow import (
     with_reference_box,
     write_report_files,
 )
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .plots import plot_relaxation, plot_relaxation_spectrum
 from .protocols import Protocol, RunManifest, Stage
 from .relaxation import (
@@ -91,10 +93,6 @@ PROTOCOL_NAME = "viscoelastic"
 RELAX_STEM = "06_relax"
 LINEARITY_STEM = "07_linearity"
 WORKFLOW_NAME = "viscoelastic_workflow.json"
-
-#: How far the replicas may disagree about the initial modulus, relative to
-#: their mean, before the report stops claiming to be resolved.
-MAX_REPLICA_SPREAD = 0.3
 
 #: How large the pre-strain deviatoric stress may be, as a fraction of the
 #: initial response, before the cell was carrying too much to measure from.
@@ -523,21 +521,21 @@ def _report_cost(
         "Relaxation scan: %.1f ns equilibration, %.1f ns of relaxation (%d "
         "replicas of %.1f ns at %+.3f strain%s, %d chunks each, %d bins over "
         "%.1f decades) - %.1f ns in total, %.1f ns of it still to run.",
-        settle.total_duration_ps / 1000.0,
-        relax_ps / 1000.0,
+        settle.total_duration_ps / PS_PER_NS,
+        relax_ps / PS_PER_NS,
         spec.n_replicas,
-        relax_ps / (spec.n_replicas * passes) / 1000.0,
+        relax_ps / (spec.n_replicas * passes) / PS_PER_NS,
         spec.step_strain,
         "" if passes == 1 else f" and {passes - 1} more for linearity",
         schedule.n_chunks,
         schedule.n_bins,
         schedule.decades,
-        total_ps / 1000.0,
-        remaining_ps(listing.stages, manifest) / 1000.0,
+        total_ps / PS_PER_NS,
+        remaining_ps(listing.stages, manifest) / PS_PER_NS,
     )
-    if spec.max_total_ns is not None and total_ps / 1000.0 > spec.max_total_ns:
+    if spec.max_total_ns is not None and total_ps / PS_PER_NS > spec.max_total_ns:
         raise ViscoelasticError(
-            f"The scan is {total_ps / 1000.0:.1f} ns, over the "
+            f"The scan is {total_ps / PS_PER_NS:.1f} ns, over the "
             f"{spec.max_total_ns:.1f} ns budget. Shorten relax_ps, drop a "
             "replica, skip the linearity pass, or raise max_total_ns."
         )
@@ -551,7 +549,7 @@ def run_relaxation_scan(
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> RelaxationReport:
     """Equilibrate a cell, strain it once, and watch the stress decay.

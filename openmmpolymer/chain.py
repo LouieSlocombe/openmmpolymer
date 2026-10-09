@@ -37,7 +37,7 @@ from rdkit import Chem
 from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
 from rdkit.Geometry import Point3D
 
-from ._seeds import derive_seed
+from ._seeds import DEFAULT_SEED, derive_seed
 from ._validation import require_choice, require_integer, require_positive
 from .packing import ANGSTROM_PER_NM, CellList
 
@@ -45,6 +45,9 @@ log = logging.getLogger(__name__)
 
 #: How a monomer's two open valences are marked.
 DUMMY_ATOMIC_NUMBER = 0
+
+#: Polyethylene reference used when no characteristic ratio is supplied.
+DEFAULT_CHARACTERISTIC_RATIO = 7.0
 
 #: Accepted values for ``ChainSpec.tacticity``.
 TACTICITIES = ("atactic", "isotactic", "syndiotactic")
@@ -125,8 +128,8 @@ class ChainSpec:
     head_cap: str | None = None
     tail_cap: str | None = None
     residue_name: str = "POL"
-    characteristic_ratio: float = 7.0
-    seed: int = 0xF0
+    characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO
+    seed: int = DEFAULT_SEED
 
     def __post_init__(self) -> None:
         """Reject a malformed spec at construction, not mid-build."""

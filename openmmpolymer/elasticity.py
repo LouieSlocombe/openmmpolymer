@@ -40,7 +40,8 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
-from ._fitting import NEGLIGIBLE, fit_line, slope_error
+from ._fitting import MAX_RELATIVE_STANDARD_ERROR as MAX_RELATIVE_STANDARD_ERROR
+from ._fitting import NEGLIGIBLE, PS_PER_NS, fit_line, slope_error
 from .stress import STRESS_ESTIMATOR_VERSION
 from .trajectory import (
     AnalysisError,
@@ -52,13 +53,12 @@ from .trajectory import (
 
 log = logging.getLogger(__name__)
 
+#: Largest engineering strain included by the default linear elastic fit.
+DEFAULT_STRAIN_LIMIT = 0.015
+
 #: 1 bar in MPa. Stress is recorded in bar, to match the pressures every other
 #: stage is set in, and reported in MPa, which is what a modulus is quoted in.
 MPA_PER_BAR = 0.1
-
-#: Largest relative standard error a fitted modulus may carry and still call
-#: itself resolved.
-MAX_RELATIVE_STANDARD_ERROR = 0.25
 
 #: How far the two halves of a fitting window may disagree about the slope,
 #: relative to the whole-window slope, before the fit is reporting a curve
@@ -437,7 +437,7 @@ def _strain_rate_per_ns(
     """
     if not durations or len(durations) != len(strains) or min(durations) <= 0.0:
         return None
-    return abs(float(strains[-1])) / float(sum(durations)) * 1000.0
+    return abs(float(strains[-1])) / float(sum(durations)) * PS_PER_NS
 
 
 def stress_strain(
@@ -604,7 +604,7 @@ def _window(
 def youngs_modulus(
     curve: StressStrain,
     *,
-    strain_limit: float = 0.015,
+    strain_limit: float = DEFAULT_STRAIN_LIMIT,
     min_points: int = 5,
 ) -> ElasticModulus:
     """Fit Young's modulus to the linear part of a stress-strain curve.
@@ -667,7 +667,7 @@ def youngs_modulus(
 def poisson_ratio(
     curve: StressStrain,
     *,
-    strain_limit: float = 0.015,
+    strain_limit: float = DEFAULT_STRAIN_LIMIT,
     min_points: int = 5,
 ) -> PoissonRatio:
     """Fit Poisson's ratio to the transverse response of a curve.

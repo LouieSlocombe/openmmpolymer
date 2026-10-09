@@ -31,6 +31,7 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
+from ._seeds import DEFAULT_SEED
 from ._validation import require_integer, require_positive
 
 log = logging.getLogger(__name__)
@@ -260,7 +261,7 @@ def pack_box(
     output_pdb: str | Path = "packed.pdb",
     *,
     tolerance_nm: float = DEFAULT_TOLERANCE_NM,
-    seed: int = 0xF0,
+    seed: int = DEFAULT_SEED,
     timeout_s: float | None = PACKMOL_TIMEOUT_S,
     workdir: str | Path | None = None,
 ) -> PackResult:

@@ -15,9 +15,15 @@ from typing import Any, overload
 import numpy as np
 import numpy.typing as npt
 
-from ._fitting import ROUNDING
+from ._fitting import (
+    MAX_EXTRAPOLATION_DECADES,
+    MAX_RELATIVE_STANDARD_ERROR,
+    ROUNDING,
+    extrapolation_decades,
+    group_nearby_rates,
+    rms,
+)
 from ._validation import require_positive
-from .elasticity import MAX_RELATIVE_STANDARD_ERROR
 from .trajectory import AnalysisError
 
 #: The two empirical relations every rate series is fitted with.
@@ -173,7 +179,7 @@ class RateReport:
     notes: tuple[str, ...]
     run_dirs: tuple[str, ...] = ()
     target_rate: float | None = None
-    max_extrapolation_decades: float = 2.0
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES
 
 
 def validate_rate_request(
@@ -189,14 +195,6 @@ def validate_rate_request(
     if not math.isfinite(maximum) or maximum < 0.0:
         raise ValueError("max_extrapolation_decades must be finite and nonnegative.")
     return target, maximum
-
-
-def _rms(values: npt.NDArray[np.float64]) -> float:
-    """Compute RMS without squaring the original dimensional values."""
-    scale = float(np.max(np.abs(values)))
-    if scale == 0.0 or not math.isfinite(scale):
-        return scale
-    return float(np.sqrt(np.mean((values / scale) ** 2))) * scale
 
 
 def _regression(
@@ -278,7 +276,6 @@ def _pool_observations(
     is NaN where it is unknown, never zero.
     """
     temperatures: list[float] = []
-    grouped: dict[float, list[RateObservation]] = {}
     for index, observation in enumerate(observations):
         if not math.isfinite(observation.rate) or observation.rate <= 0.0:
             raise AnalysisError(f"Observation {index} needs a finite positive rate.")
@@ -307,7 +304,6 @@ def _pool_observations(
             raise AnalysisError(
                 "Fit observations with the same measurement conditions."
             )
-        grouped.setdefault(observation.rate, []).append(observation)
     if (
         temperatures
         and max(temperatures) - min(temperatures) > _TEMPERATURE_TOLERANCE_K
@@ -315,16 +311,10 @@ def _pool_observations(
         raise AnalysisError("Fit observations at the same temperature (within 1 K).")
     # Rates inferred from resumed chunks can differ by rounding. They are
     # replicas of one rate, not extra independent logarithmic abscissae.
-    merged: dict[float, list[RateObservation]] = {}
-    representative: float | None = None
-    for rate in sorted(grouped):
-        if representative is None or not math.isclose(
-            rate, representative, rel_tol=1e-8, abs_tol=0.0
-        ):
-            representative = rate
-            merged[representative] = []
-        merged[representative].extend(grouped[rate])
-    grouped = merged
+    grouped = {
+        group[0].rate: group
+        for group in group_nearby_rates(observations, rate=lambda item: item.rate)
+    }
     if len(grouped) < 3:
         raise AnalysisError("Measure the property at three or more distinct rates.")
     rates = np.asarray(sorted(grouped), dtype=np.float64)
@@ -341,9 +331,9 @@ def _pool_observations(
         input_errors = np.asarray(
             [item.standard_error or 0.0 for item in replicas], dtype=np.float64
         )
-        mean_error = _rms(input_errors) / math.sqrt(len(replicas))
+        mean_error = rms(input_errors) / math.sqrt(len(replicas))
         replica_error = (
-            _rms(data / scale - mean / scale)
+            rms(data / scale - mean / scale)
             * scale
             * math.sqrt(len(replicas) / (len(replicas) - 1))
             if len(replicas) > 1
@@ -363,7 +353,7 @@ def rate_extrapolation(
     property: RateProperty,
     target_rate: float,
     form: str = "log_linear",
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
 ) -> RateExtrapolation:
     """Fit a logarithmic line or positive-valued power law at a finite rate.
 
@@ -422,8 +412,8 @@ def rate_extrapolation(
         intercept, slope, fitted, prediction, error = _regression(
             x, values, np.nan_to_num(input_errors, nan=0.0), target_x
         )
-        response_residual = _rms(values - fitted)
-        response_error = _rms(input_errors)
+        response_residual = rms(values - fitted)
+        response_error = rms(input_errors)
         residual_to_error = (
             response_residual / response_error
             if math.isfinite(response_error) and response_error > 0.0
@@ -449,7 +439,7 @@ def rate_extrapolation(
                 "reference_value": reference_value,
                 "exponent": slope / math.log(10.0),
             }
-        residual = _rms(measured - fitted)
+        residual = rms(measured - fitted)
         scale = float(np.max(np.abs(measured)))
         mean_absolute = (
             float(np.mean(np.abs(measured) / scale)) * scale if scale else 0.0
@@ -459,11 +449,7 @@ def rate_extrapolation(
             if mean_absolute
             else (0.0 if residual == 0.0 else math.inf)
         )
-    decades = max(
-        float(log_rate[0]) - math.log10(target),
-        math.log10(target) - float(log_rate[-1]),
-        0.0,
-    )
+    decades = extrapolation_decades(rates, target, log_difference=True)
     if not all(item.resolved for item in observations):
         refusals.append("At least one input observation is unresolved.")
     temperatures = [item.temperature_k for item in observations]
@@ -548,7 +534,7 @@ def analyse_rate_observations(
     *,
     property: RateProperty,
     target_rate: float,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
     run_dirs: Sequence[str] = (),
 ) -> RateReport:
     """Attempt both models without dropping unavailable or censored data.

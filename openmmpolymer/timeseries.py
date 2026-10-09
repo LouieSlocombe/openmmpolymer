@@ -45,9 +45,13 @@ from typing import Any, overload
 import numpy as np
 import numpy.typing as npt
 
+from ._fitting import MAX_EXTRAPOLATION_DECADES as MAX_EXTRAPOLATION_DECADES
 from ._fitting import (
+    PS_PER_NS,
     TINY,
+    extrapolation_decades,
     fit_line,
+    median_spacing,
     separable_fit,
     standard_error,
     statistical_inefficiency,
@@ -109,12 +113,6 @@ DSC_COOLING_RATE_K_PER_NS = 10.0 / 60.0 * 1.0e-9
 
 #: How the transition may be taken to depend on cooling rate.
 EXTRAPOLATION_FORMS = ("log_linear", "vft")
-
-#: How far past the measured rates an extrapolation may reach and still be
-#: called resolved. Two decades is generous; the gap between a quench and a
-#: calorimeter is about ten, so this is the threshold that keeps the honest
-#: answer honest.
-MAX_EXTRAPOLATION_DECADES = 2.0
 
 #: Free parameters in each form, which is what decides whether a residual
 #: means anything.
@@ -852,7 +850,7 @@ def cooling_rate_extrapolation(
         sensitivity = math.log(10.0) * parameters["b_k"] / gap**2
         physical = parameters["b_k"] > 0.0 and not degenerate
 
-    decades = _extrapolation_decades(rate, target)
+    decades = extrapolation_decades(rate, target)
     return CoolingRateExtrapolation(
         form=form,
         cooling_rate_k_per_ns=rate,
@@ -924,18 +922,6 @@ def _transition_at(
     )
 
 
-def _extrapolation_decades(
-    rate_k_per_ns: npt.NDArray[np.float64], target_k_per_ns: float
-) -> float:
-    """How far past the measured rates the target sits, in decades."""
-    slowest, fastest = float(rate_k_per_ns.min()), float(rate_k_per_ns.max())
-    return max(
-        0.0,
-        math.log10(slowest / target_k_per_ns),
-        math.log10(target_k_per_ns / fastest),
-    )
-
-
 def _is_transition(
     temperature_k: npt.NDArray[np.float64],
     break_index: int,
@@ -973,9 +959,7 @@ def _scale_of(values: npt.NDArray[np.float64]) -> float:
 
 def _spacing_ps(times: npt.NDArray[np.float64]) -> float:
     """Time between rows, from the series rather than assumed."""
-    if times.size < 2:
-        return 0.0
-    return float(np.median(np.diff(times)))
+    return median_spacing(times)
 
 
 def _relative_drift(
@@ -987,7 +971,7 @@ def _relative_drift(
     span = float(times[-1] - times[0])
     if abs(span) < TINY:
         return 0.0
-    slope = float(np.polyfit(times, values, 1)[0])
+    (slope, _), _ = fit_line(times, values)
     return abs(slope * span) / scale
 
 
@@ -1042,9 +1026,7 @@ def _hold_ps(csv_path: Any, n_segments: int) -> float | None:
 
 def _temperature_step(temperature_k: npt.NDArray[np.float64]) -> float:
     """The typical gap between the temperatures on a ladder."""
-    if temperature_k.size < 2:
-        return 0.0
-    return float(np.median(np.abs(np.diff(temperature_k))))
+    return median_spacing(temperature_k, absolute=True)
 
 
 def _cooling_rate(
@@ -1059,4 +1041,4 @@ def _cooling_rate(
     if hold_ps is None or hold_ps <= 0.0 or temperature_k.size < 2:
         return None
     step = _temperature_step(temperature_k)
-    return None if step <= 0.0 else step / hold_ps * 1000.0
+    return None if step <= 0.0 else step / hold_ps * PS_PER_NS

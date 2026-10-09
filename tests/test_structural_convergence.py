@@ -53,6 +53,11 @@ def test_disjoint_blocks_read_tail_frames_and_have_no_overlap() -> None:
     assert [frame.index for frame in frames] == list(range(24, 36))
     assert frames[0].positions_nm[0, 2] == pytest.approx(2.4)
     assert frames[-1].positions_nm[0, 2] == pytest.approx(3.5)
+    nested = convergence._block(block, 2, 5)
+    assert nested.first_frame == 26
+    assert [frame.index for frame in nested.frames()] == [26, 27, 28]
+    assert [frame.time_ps for frame in nested.frames()] == [27.0, 28.0, 29.0]
+    assert [frame.index for frame in nested.frames(start=-2)] == [27, 28]
     report = structural_window_convergence(ensemble, range(5), **STRUCTURAL_OPTIONS)
     assert [(block.first_frame, block.n_frames) for block in report.blocks] == [
         (36, 12),
@@ -266,3 +271,11 @@ def test_invalid_recorded_frame_interval_is_rejected(interval: float) -> None:
         structural_window_convergence(
             replace(frozen_rods(), interval_ps=interval), range(5), **STRUCTURAL_OPTIONS
         )
+
+
+def test_structural_relative_change_retains_spread_before_division_at_tolerance() -> (
+    None
+):
+    change = convergence._relative_change([6.3, 7.0])
+    assert change == 0.10000000000000002
+    assert change > 0.1

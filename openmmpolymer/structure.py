@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 from ._files import ReportFiles
 from ._validation import require_integer, require_positive
 from ._workflow import optional, write_report_files
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .conformation import (
     ConformationSeries,
     EndToEndRelaxation,
@@ -486,7 +487,7 @@ def analyse_structure(
     if expected_characteristic_ratio is None:
         recorded = manifest.chains if isinstance(manifest.chains, dict) else {}
         expected_characteristic_ratio = recorded.get(
-            "expected_characteristic_ratio", 7.0
+            "expected_characteristic_ratio", DEFAULT_CHARACTERISTIC_RATIO
         )
     expected_characteristic_ratio = require_positive(
         expected_characteristic_ratio, None, name="expected_characteristic_ratio"

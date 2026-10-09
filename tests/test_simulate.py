@@ -980,6 +980,49 @@ def test_a_strain_leaves_every_constraint_satisfied() -> None:
     assert along == pytest.approx(0.0, abs=1e-6)
 
 
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_shared_tensile_increment_preserves_the_recorded_affine_transform(
+    axis: int,
+) -> None:
+    """Consolidating strain application must not perturb a resumed trajectory."""
+    before = bare_simulation(*rigid_rotor_system(30, 3.0))
+    after = bare_simulation(*rigid_rotor_system(30, 3.0))
+    vectors = np.array([[3.0, 0.0, 0.0], [0.4, 3.0, 0.0], [0.2, 0.3, 3.0]])
+    velocities = np.random.default_rng(3).normal(0.0, 0.5, (60, 3))
+    for simulation in (before, after):
+        simulation.context.setPeriodicBoxVectors(*(vectors * unit.nanometer))
+        simulation.context.setVelocities(velocities * unit.nanometer / unit.picosecond)
+
+    # The original deformation arithmetic is an independent compatibility
+    # oracle: the other two vectors used to be retained without multiplying.
+    increment = 0.013
+    factors = [1.0, 1.0, 1.0]
+    factors[axis] = 1.0 + increment
+    previous = before.context.getState().getPeriodicBoxVectors()
+    _apply_positions(
+        before,
+        affine_scale(_positions_nm(before), factors),
+        [
+            vector * factors[axis] if index == axis else vector
+            for index, vector in enumerate(previous)
+        ],
+    )
+    simulate._strain_increment(
+        after, mode="tensile", axis=axis, plane=(0, 1), increment=increment, poisson=0.0
+    )
+    expected = before.context.getState(getPositions=True, getVelocities=True)
+    actual = after.context.getState(getPositions=True, getVelocities=True)
+    for getter, units in (
+        ("getPositions", unit.nanometer),
+        ("getVelocities", unit.nanometer / unit.picosecond),
+        ("getPeriodicBoxVectors", unit.nanometer),
+    ):
+        np.testing.assert_array_equal(
+            getattr(actual, getter)(asNumpy=True).value_in_unit(units),
+            getattr(expected, getter)(asNumpy=True).value_in_unit(units),
+        )
+
+
 def test_a_shear_past_the_reduced_form_is_refused_before_the_ladder_runs(
     argon_run: Any, minimised: StageResult
 ) -> None:

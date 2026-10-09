@@ -42,6 +42,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from ._files import ReportFiles
+from ._fitting import MAX_REPLICA_SPREAD as MAX_REPLICA_SPREAD
+from ._fitting import NEGLIGIBLE, PS_PER_NS
 from ._validation import require_axis, require_integer
 from ._workflow import (
     StrainSchedule,
@@ -59,7 +61,9 @@ from ._workflow import (
     with_reference_box,
     write_report_files,
 )
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .elasticity import (
+    DEFAULT_STRAIN_LIMIT,
     BulkModulus,
     ElasticConsistency,
     ElasticModulus,
@@ -91,13 +95,6 @@ LOAD_STEM = "07_load"
 BULK_STEM = "08_bulk"
 SHEAR_STEM = "09_shear"
 WORKFLOW_NAME = "mechanical_workflow.json"
-
-#: How far the replicas may disagree - their sample standard deviation,
-#: relative to the pooled modulus - before that modulus stops claiming to be
-#: resolved. Generous, because three replicas of a forty-chain cell is a small
-#: sample of a noisy quantity - and still worth having, because the
-#: alternative is quoting one run's number with no spread at all.
-MAX_REPLICA_SPREAD = 0.3
 
 
 class MechanicalError(RuntimeError):
@@ -154,7 +151,7 @@ class ModulusSpec:
     strain_increment: float = 0.002
     max_strain: float = 0.05
     relax_ps: float = 50.0
-    elastic_strain_limit: float = 0.015
+    elastic_strain_limit: float = DEFAULT_STRAIN_LIMIT
     n_replicas: int = 3
     samples_per_step: int = 250
     stage_ps: float = 10_000.0
@@ -468,20 +465,20 @@ def _report_cost(
         "Mechanical scan: %.1f ns equilibration, %.1f ns of extension (%d "
         "replicas of %d steps to %.1f%% strain at %.3g /ns), %.1f ns of "
         "load, bulk and shear - %.1f ns in total, %.1f ns of it still to run.",
-        settle.total_duration_ps / 1000.0,
-        schedule.total_ps * spec.n_replicas / 1000.0,
+        settle.total_duration_ps / PS_PER_NS,
+        schedule.total_ps * spec.n_replicas / PS_PER_NS,
         spec.n_replicas,
         schedule.n_steps,
         100.0 * schedule.max_strain,
         schedule.strain_rate_per_ns,
         sum(stage.duration_ps for stage in extra_stages(spec, timestep_fs=2.0))
-        / 1000.0,
-        total_ps / 1000.0,
-        remaining_ps(listing.stages, manifest) / 1000.0,
+        / PS_PER_NS,
+        total_ps / PS_PER_NS,
+        remaining_ps(listing.stages, manifest) / PS_PER_NS,
     )
-    if spec.max_total_ns is not None and total_ps / 1000.0 > spec.max_total_ns:
+    if spec.max_total_ns is not None and total_ps / PS_PER_NS > spec.max_total_ns:
         raise MechanicalError(
-            f"The scan is {total_ps / 1000.0:.1f} ns, over the "
+            f"The scan is {total_ps / PS_PER_NS:.1f} ns, over the "
             f"{spec.max_total_ns:.1f} ns budget. Shorten relax_ps, drop a "
             "replica, skip a pass, or raise max_total_ns."
         )
@@ -495,7 +492,7 @@ def run_modulus_scan(
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> ModulusReport:
     """Equilibrate a cell, measure its elastic constants, and report them.
@@ -607,7 +604,7 @@ def _log_result(report: ModulusReport, schedule: ModulusSchedule) -> None:
 def analyse_mechanics(
     run_dir: str | Path,
     *,
-    strain_limit: float = 0.015,
+    strain_limit: float = DEFAULT_STRAIN_LIMIT,
     min_points: int = 5,
 ) -> ModulusReport:
     """Read everything a finished run has to say about its mechanics.
@@ -702,7 +699,7 @@ def analyse_mechanics(
     if (
         youngs is not None
         and load_fit is not None
-        and abs(youngs.modulus_mpa) > 1.0e-12
+        and abs(youngs.modulus_mpa) > NEGLIGIBLE
     ):
         gap = abs(load_fit.modulus_mpa - youngs.modulus_mpa) / abs(youngs.modulus_mpa)
 

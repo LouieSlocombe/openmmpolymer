@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from openmmpolymer.structural_convergence import _block
 from openmmpolymer.trajectory import (
     AnalysisError,
     _load_chain_frames,
@@ -285,12 +286,17 @@ def test_every_frame_reports_its_own_box(dimer_run_directory: Path) -> None:
     ("start", "stop", "stride"),
     [(-3, None, 1), (-20, -1, 2), (2, -1, 3), (20, None, 1)],
 )
+@pytest.mark.parametrize("block", [False, True])
 def test_frame_slices_keep_absolute_indices_and_times(
-    dimer_run_directory: Path, start: int, stop: int | None, stride: int
+    dimer_run_directory: Path, start: int, stop: int | None, stride: int, block: bool
 ) -> None:
     """Negative bounds select from the end without changing frame metadata."""
     ensemble = open_run(dimer_run_directory, "02_nvt")
-    expected = list(ensemble.frames())[start:stop:stride]
+    frames = list(ensemble.frames())
+    if block:
+        ensemble = _block(ensemble, 3, 9)
+        frames = frames[3:9]
+    expected = frames[start:stop:stride]
     actual = list(ensemble.frames(start=start, stop=stop, stride=stride))
     assert [frame.index for frame in actual] == [frame.index for frame in expected]
     assert [frame.time_ps for frame in actual] == [frame.time_ps for frame in expected]

@@ -70,7 +70,7 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 
-from ._fitting import NEGLIGIBLE, separable_fit
+from ._fitting import NEGLIGIBLE, separable_fit, standard_error_from_moments
 from .elasticity import MPA_PER_BAR, _gather, _ladder, _require_stress_estimator
 from .trajectory import AnalysisError, stage_names, stages_holding
 
@@ -417,27 +417,6 @@ def _merge_bins(samples: dict[str, list[float]]) -> dict[str, npt.NDArray[np.flo
     }
 
 
-def _standard_error(
-    mean: npt.NDArray[np.float64],
-    mean_sq: npt.NDArray[np.float64],
-    count: npt.NDArray[np.float64],
-) -> npt.NDArray[np.float64]:
-    """The standard error of each bin's mean, or NaN for a bin of one.
-
-    Clamped at zero before the square root: the variance is a difference of
-    two large similar numbers and can come out a hair negative.
-
-    It is also an underestimate, and knowingly so. It assumes the readings in
-    a bin are independent, and stress readings a tenth of a picosecond apart
-    in a melt are not. The error bar worth believing is the one across
-    replicas, which :func:`mean_curve` computes.
-    """
-    variance = np.maximum(mean_sq - mean * mean, 0.0)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        error = np.sqrt(variance / count)
-    return np.where(count > 1.0, error, np.nan)
-
-
 def relaxation_curve(
     run_dir: str | Path, stage: str | Sequence[str] | None = None
 ) -> RelaxationCurve:
@@ -485,7 +464,7 @@ def relaxation_curve(
     order = np.argsort(merged["time_ps"])
     scale = MPA_PER_BAR / measure
     baseline = _first(samples, "baseline_stress_bar", 0.0)
-    zero_level_error = _standard_error(
+    zero_level_error = standard_error_from_moments(
         np.asarray([baseline]),
         np.asarray([_first(samples, "baseline_stress_sq_bar2", 0.0)]),
         np.asarray([_first(samples, "baseline_samples", 0.0)]),
@@ -499,7 +478,7 @@ def relaxation_curve(
         bin_index=merged["bin"][order].astype(np.int64),
         time_ps=merged["time_ps"][order],
         modulus_mpa=(merged["mean"][order] - baseline) * scale,
-        standard_error_mpa=_standard_error(
+        standard_error_mpa=standard_error_from_moments(
             merged["mean"][order], merged["mean_sq"][order], merged["n"][order]
         )
         * abs(scale),

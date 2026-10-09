@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 
 from ._files import write_json
+from ._fitting import MAX_EXTRAPOLATION_DECADES
 from ._seeds import derive_seed
 from ._workflow import (
     chain_options,
@@ -28,6 +29,7 @@ from ._workflow import (
     strain_ladder,
     validate_hold_times,
 )
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .protocols import (
     Protocol,
     RunManifest,
@@ -112,7 +114,7 @@ def validate_tensile_rate_scan(
     *,
     property_name: str,
     target_rate: float,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
     **equilibration: Any,
 ) -> TensileRatePlan:
     """Validate all holds and the total budget before writing or building MD."""
@@ -153,11 +155,11 @@ def run_tensile_rate_scan(
     hold_times_ps: Sequence[float],
     target_rate: float,
     spec: TensileSpec | None = None,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> RateReport:
     """Vary hold time from one equilibrated cell, retaining all failure criteria.
@@ -325,7 +327,7 @@ def analyse_tensile_rates(
     *,
     property_name: str,
     target_rate: float,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
 ) -> RateReport:
     """Compare saved scans with matching ladders and event criteria.
 

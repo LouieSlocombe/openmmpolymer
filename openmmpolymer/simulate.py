@@ -22,7 +22,7 @@ import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, ExitStack
 from copy import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cached_property, partial
 from pathlib import Path
 from typing import Any
@@ -32,7 +32,9 @@ import numpy.typing as npt
 import openmm as mm
 from openmm import unit
 
-from ._seeds import derive_seed, seed_random_stream
+from ._fitting import standard_error_from_moments
+from ._seeds import DEFAULT_SEED, derive_seed, seed_random_stream
+from ._state import box_diagonal_nm, positions_nm, read_state
 from ._validation import (
     require_axis,
     require_choice,
@@ -44,6 +46,7 @@ from ._validation import (
 from .forcefield import PolymerForceField
 from .mdsystem import (
     BAROSTATS,
+    MINIMUM_BOX_FACTOR,
     PackedBox,
     SystemSpec,
     build_system,
@@ -78,7 +81,7 @@ log = logging.getLogger(__name__)
 MAX_FORCE_AFTER_MINIMISATION = 1.0e5
 
 #: One bar nm³, in the molar energy units OpenMM uses for a full cell.
-_BAR_NM3_TO_KJ_MOL = 0.0602214076
+_BAR_NM3_TO_KJ_MOL = AVOGADRO * 1e-25
 
 #: What an energy gone to NaN means, by what was being done to the cell.
 _BLEW_UP_HOLDING = (
@@ -169,7 +172,7 @@ class RunContext:
     spec: SystemSpec
     platform_name: str | None = None
     precision: str = "mixed"
-    seed: int = 0xF0
+    seed: int = DEFAULT_SEED
     total_mass_g_mol: float = 0.0
 
 
@@ -180,7 +183,7 @@ def prepare_run(
     *,
     platform: str | None = None,
     precision: str = "mixed",
-    seed: int = 0xF0,
+    seed: int = DEFAULT_SEED,
     system: Any | None = None,
 ) -> RunContext:
     """Build the System once and wrap it up for the stages to use.
@@ -298,7 +301,7 @@ class _Live:
         whatever was just done to it, and should not drag the window's average.
 
         What the window was asked for and what it ran at are appended to the
-        four per-window lists *samples* already holds. The duration is recorded
+        four per-window lists in *samples*, created when absent. The duration is recorded
         rather than inferred because a stage's CSV knows only its total time:
         a ladder split across stages, or resumed part-way through, would
         otherwise have its cooling rate worked out wrong rather than reported
@@ -337,10 +340,10 @@ class _Live:
         half = max(1, len(densities) // 2)
         density = float(np.mean(densities[-half:]))
         realised = float(np.mean(temperatures[-half:]))
-        samples["segment_temperature_k"].append(temperature_k)
-        samples["segment_mean_temperature_k"].append(realised)
-        samples["segment_density_g_cm3"].append(density)
-        samples["segment_duration_ps"].append(duration_ps)
+        samples.setdefault("segment_temperature_k", []).append(temperature_k)
+        samples.setdefault("segment_mean_temperature_k", []).append(realised)
+        samples.setdefault("segment_density_g_cm3", []).append(density)
+        samples.setdefault("segment_duration_ps", []).append(duration_ps)
         return measured[-half:], density, realised
 
     def finish(
@@ -487,7 +490,7 @@ def _initialise(
     if state_in is None:
         context.setPositions(run.box.positions)
     else:
-        state = mm.XmlSerializer.deserialize(Path(state_in).read_text())
+        state = read_state(state_in)
         context.setPeriodicBoxVectors(*state.getPeriodicBoxVectors())
         context.setPositions(state.getPositions())
         if reuse_velocities:
@@ -527,25 +530,13 @@ def set_temperature(
         simulation.context.setParameter(BAROSTATS[barostat].temperature, temperature_k)
 
 
-def set_pressure(simulation: Any, pressure_bar: float, barostat: str) -> None:
-    """Set the barostat's pressure, in bar.
-
-    Args:
-        simulation: The running simulation.
-        pressure_bar: The pressure to set.
-        barostat: Which barostat is attached.
-    """
-    for name in BAROSTATS[barostat].pressures:
-        simulation.context.setParameter(name, pressure_bar)
-
-
 def set_pressures(
     simulation: Any, pressures_bar: Sequence[float], barostat: str
 ) -> None:
     """Set a different pressure on each axis, in bar.
 
-    Only the anisotropic barostat has three; for the other two this is
-    :func:`set_pressure` and every entry must agree, because silently
+    Only the anisotropic barostat has three; for the other two every entry
+    must agree, because silently
     applying the first of three to all of them is how a uniaxial load becomes
     a hydrostatic one without anything saying so.
 
@@ -916,7 +907,7 @@ def run_segments(
         for index, segment in enumerate(segments):
             set_temperature(simulation, segment.temperature_k, barostat)
             if barostat is not None:
-                set_pressure(simulation, segment.pressure_bar, barostat)
+                set_pressures(simulation, (segment.pressure_bar,) * 3, barostat)
             enthalpies, density, temperature = live.hold(
                 samples,
                 segment.temperature_k,
@@ -1098,16 +1089,12 @@ def run_pushoff(
         results.append(result)
 
     last = results[-1]
-    return StageResult(
+    return replace(
+        last,
         name=prefix.name,
         steps=steps,
         wall_seconds=time.monotonic() - started,
-        final_state=last.final_state,
         temperature_k=temperature_k,
-        mean_temperature_k=last.mean_temperature_k,
-        mean_density_g_cm3=last.mean_density_g_cm3,
-        final_pdb=last.final_pdb,
-        csv=last.csv,
         samples={"timestep_fs": list(timesteps_fs)},
     )
 
@@ -1668,9 +1655,7 @@ LATERAL_PRESSURE_FLOOR_BAR = 100.0
 
 def _box_lengths_nm(simulation: Any) -> npt.NDArray[np.float64]:
     """The three cell edge lengths, in nanometres."""
-    vectors = simulation.context.getState().getPeriodicBoxVectors(asNumpy=True)
-    lengths = np.asarray(vectors.value_in_unit(unit.nanometer), dtype=np.float64)
-    return np.asarray([lengths[axis][axis] for axis in range(3)], dtype=np.float64)
+    return box_diagonal_nm(simulation.context.getState())
 
 
 def _positions_nm(simulation: Any) -> npt.NDArray[np.float64]:
@@ -1681,10 +1666,7 @@ def _positions_nm(simulation: Any) -> npt.NDArray[np.float64]:
     centre of mass somewhere in the middle of neither.
     """
     state = simulation.context.getState(getPositions=True)
-    return np.asarray(
-        state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
-        dtype=np.float64,
-    )
+    return positions_nm(state)
 
 
 #: Relative tolerance the constraints are repaired to after a strain.
@@ -1883,10 +1865,6 @@ def run_deform(
         "segment_box_x_nm": [],
         "segment_box_y_nm": [],
         "segment_box_z_nm": [],
-        "segment_temperature_k": [],
-        "segment_mean_temperature_k": [],
-        "segment_density_g_cm3": [],
-        "segment_duration_ps": [],
     }
     waypoint_paths: list[str] = []
     log.info(
@@ -1906,17 +1884,13 @@ def run_deform(
     with live.reporters(total_steps, report_interval_ps, trajectory) as paths:
         strain = float(strain_start)
         for index in range(n_steps):
-            factors = [1.0, 1.0, 1.0]
-            factors[axis] = 1.0 + strain_increment
-            vectors = simulation.context.getState().getPeriodicBoxVectors()
-            scaled_vectors = [
-                vector * factors[axis] if which == axis else vector
-                for which, vector in enumerate(vectors)
-            ]
-            _apply_positions(
+            _strain_increment(
                 simulation,
-                affine_scale(_positions_nm(simulation), factors),
-                scaled_vectors,
+                mode="tensile",
+                axis=axis,
+                plane=(0, 1),
+                increment=strain_increment,
+                poisson=0.0,
             )
             strain = (1.0 + strain) * (1.0 + strain_increment) - 1.0
 
@@ -2017,7 +1991,7 @@ def _check_deformed_box(
         return
     edges = _box_lengths_nm(simulation)
     shortest = float(edges.min())
-    if shortest < 2.0 * cutoff_nm:
+    if shortest < MINIMUM_BOX_FACTOR * cutoff_nm:
         raise SimulationError(
             f"{name}: at {strain:+.4g} the cell is "
             f"{edges.round(3).tolist()} nm, and its shortest edge is below "
@@ -2190,10 +2164,6 @@ def run_load(
         "segment_box_x_nm": [],
         "segment_box_y_nm": [],
         "segment_box_z_nm": [],
-        "segment_temperature_k": [],
-        "segment_mean_temperature_k": [],
-        "segment_density_g_cm3": [],
-        "segment_duration_ps": [],
     }
     log.info(
         "%s: %d applied stresses on axis %d, %.1f ps each at %.2f fs (%d steps).",
@@ -2329,10 +2299,6 @@ def run_shear(
         "shear_plane": [float(driven), float(gradient)],
         "stress_estimator_version": [STRESS_ESTIMATOR_VERSION],
         "segment_shear_stress_bar": [],
-        "segment_temperature_k": [],
-        "segment_mean_temperature_k": [],
-        "segment_density_g_cm3": [],
-        "segment_duration_ps": [],
     }
     log.info(
         "%s: %d shear strains in the %s%s plane, %.1f ps each at %.2f fs "
@@ -2863,8 +2829,9 @@ def run_relax(
         baseline_mean = baseline_sum / baseline_n if baseline_n else 0.0
         baseline_error = 0.0
         if baseline_n > 1:
-            variance = max(0.0, baseline_sum_sq / baseline_n - baseline_mean**2)
-            baseline_error = math.sqrt(variance / baseline_n)
+            baseline_error = standard_error_from_moments(
+                baseline_mean, baseline_sum_sq / baseline_n, baseline_n
+            )
         _check_baseline(live.name, baseline_mean, baseline_error, baseline_n)
 
         if not strain_applied:

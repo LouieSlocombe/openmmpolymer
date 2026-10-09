@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ._files import write_atomically
+from ._files import write_atomically, write_json
 from ._validation import require_choice
 from .charges import read_chain_molecule
 
@@ -44,6 +44,9 @@ log = logging.getLogger(__name__)
 
 #: The force fields the generated XML is meant to be loaded beside.
 DEFAULT_BASE_FORCEFIELD = ("amber14-all.xml", "amber14/tip3p.xml")
+
+#: Backend paired with the default preset charges.
+DEFAULT_BACKEND = "smirnoff"
 
 #: Backends forcefill offers that make sense for a whole polymer chain.
 #: ``espaloma`` is omitted because it pulls in PyTorch, and the NAGL charges
@@ -127,7 +130,7 @@ def build_polymer_forcefield(
     output_xml: str | Path = "polymer_ff.xml",
     *,
     residue_name: str = "POL",
-    backend: str = "smirnoff",
+    backend: str = DEFAULT_BACKEND,
     smirnoff_forcefield: str = DEFAULT_SMIRNOFF_FORCEFIELD,
     cache_dir: str | Path | None = None,
     workdir: str | Path | None = None,
@@ -230,10 +233,7 @@ def build_polymer_forcefield(
         if entry is not None:
             entry.parent.mkdir(parents=True, exist_ok=True)
             write_atomically(entry, written.read_text())
-            write_atomically(
-                entry.with_suffix(".json"),
-                json.dumps(options, indent=2, sort_keys=True, default=str) + "\n",
-            )
+            write_json(entry.with_suffix(".json"), options, strict=False)
 
     return PolymerForceField(
         forcefield_xml=str(written),

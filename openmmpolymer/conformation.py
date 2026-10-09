@@ -26,14 +26,16 @@ from __future__ import annotations
 
 import logging
 import math
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
 import numpy.typing as npt
 
-from ._fitting import TINY
+from ._fitting import TINY, fit_line
 from ._validation import require_integer
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .protocols import ChainDimensions, _chain_dimension_sums, _ChainDimensionSums
 from .timeseries import Equilibration, equilibration
 from .trajectory import (
@@ -196,7 +198,7 @@ def chain_conformation(
     ensemble: Ensemble,
     backbone: Sequence[int],
     *,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     stride: int = 1,
 ) -> ConformationSeries:
     """Measure chain dimensions over a stage.
@@ -529,7 +531,7 @@ def _decay_length(
     y = np.log(correlation[:cut])
     if float(x[-1] - x[0]) < TINY:
         return 0.0
-    slope = float(np.polyfit(x, y, 1)[0])
+    (slope, _), _ = fit_line(x, y)
     if slope >= -TINY:
         return math.inf
     return -1.0 / slope
@@ -545,7 +547,12 @@ def _log_slope(lag_ps: npt.NDArray[np.float64], msd: npt.NDArray[np.float64]) ->
     window = x >= x[-1] - _SLOPE_DECADES
     if window.sum() < 2:
         window = np.ones_like(x, dtype=bool)
-    return float(np.polyfit(x[window], y[window], 1)[0])
+    if float(np.ptp(x[window])) == 0.0:
+        warnings.warn(
+            "Polyfit may be poorly conditioned", np.exceptions.RankWarning, stacklevel=2
+        )
+    (slope, _), _ = fit_line(x[window], y[window])
+    return slope
 
 
 def _diffusion_cm2_s(
@@ -561,7 +568,11 @@ def _diffusion_cm2_s(
     y = msd[start:]
     if x.size < 2:
         return None
-    slope = float(np.polyfit(x, y, 1)[0])
+    if float(np.ptp(x)) == 0.0:
+        warnings.warn(
+            "Polyfit may be poorly conditioned", np.exceptions.RankWarning, stacklevel=2
+        )
+    (slope, _), _ = fit_line(x, y)
     if slope <= 0.0:
         return None
     return slope / 6.0 * NM2_PS_TO_CM2_S

@@ -20,6 +20,9 @@ from typing import Any
 #: at 1 and stops below the 32-bit signed maximum.
 _MAX_SEED = 2**31 - 2
 
+#: The reproducible master seed used by default throughout the package.
+DEFAULT_SEED = 0xF0
+
 
 def derive_seed(master: int, *labels: str) -> int:
     """Return a stable, non-zero seed for *labels* under *master*.

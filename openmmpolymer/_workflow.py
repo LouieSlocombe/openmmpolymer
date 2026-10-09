@@ -31,6 +31,7 @@ import numpy as np
 import numpy.typing as npt
 
 from ._files import ReportFiles, file_sha256, write_json, write_report
+from ._fitting import PS_PER_NS
 from ._validation import require_positive
 from .protocols import (
     MANIFEST_NAME,
@@ -96,14 +97,9 @@ def equilibrated_box_nm(state_path: str | Path) -> list[float]:
     cell: strain measured against the packed edges would be measured against
     a cell that stopped existing at the first barostat move.
     """
-    import openmm as mm
-    from openmm import unit
+    from ._state import box_diagonal_nm, read_state
 
-    state = mm.XmlSerializer.deserialize(Path(state_path).read_text())
-    vectors = state.getPeriodicBoxVectors()
-    return [
-        float(vectors[axis][axis].value_in_unit(unit.nanometer)) for axis in range(3)
-    ]
+    return [float(length) for length in box_diagonal_nm(read_state(state_path))]
 
 
 def group_by_stem(names: Sequence[str]) -> list[tuple[str, ...]]:
@@ -217,7 +213,7 @@ class StrainSchedule:
     @property
     def strain_rate_per_ns(self) -> float:
         """Average engineering strain rate, in strain per nanosecond."""
-        return self.max_strain / self.total_ps * 1000.0
+        return self.max_strain / self.total_ps * PS_PER_NS
 
 
 def deformation_stages(
@@ -264,6 +260,18 @@ def deformation_stages(
             options["trajectory"] = TrajectoryOptions("xtc", trajectory_ps)
         stages.append(Stage(f"{stem}_{index:0{chunk_digits}d}", "deform", options))
     return tuple(stages)
+
+
+def with_timestep(stages: Iterable[Stage], timestep_fs: float) -> tuple[Stage, ...]:
+    """Pin every integrating stage to one timestep, retaining minimisation unchanged."""
+    return tuple(
+        stage
+        if stage.kind == "minimise"
+        else Stage(
+            stage.name, stage.kind, {**stage.options, "timestep_fs": timestep_fs}
+        )
+        for stage in stages
+    )
 
 
 def with_reference_box(

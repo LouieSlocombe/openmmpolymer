@@ -34,6 +34,8 @@ import openmm as mm
 from openmm import unit
 
 from ._files import file_sha256, write_json
+from ._state import positions_nm, read_state
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .reporters import TrajectoryOptions
 from .simulate import (
     RunContext,
@@ -896,7 +898,7 @@ def run_protocol(
     state_in: str | Path | None = None,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
 ) -> RunSummary:
     """Run a protocol's stages in order, skipping any already finished.
 
@@ -1020,11 +1022,7 @@ def _measure_chains(
     if backbone is None or atoms_per_chain is None or state_path is None:
         return None
 
-    state = mm.XmlSerializer.deserialize(Path(state_path).read_text())
-    positions = np.asarray(
-        state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
-        dtype=np.float64,
-    )
+    positions = positions_nm(read_state(state_path))
     system = mm.XmlSerializer.deserialize(run.system_xml)
     masses = np.array(
         [

@@ -42,6 +42,9 @@ log = logging.getLogger(__name__)
 #: Constraint settings, by the name used in configuration.
 CONSTRAINTS = ("none", "hbonds", "allbonds", "hangles")
 
+#: OpenMM's hard cell-edge limit, before any extra compression margin.
+MINIMUM_BOX_FACTOR = 2.0
+
 
 class BarostatKind(NamedTuple):
     """What one kind of barostat is to OpenMM.
@@ -170,7 +173,7 @@ class SystemSpec:
                     f"switch_distance_nm={self.switch_distance_nm} must be below "
                     f"nonbonded_cutoff_nm={self.nonbonded_cutoff_nm} and nonnegative."
                 )
-        if self.minimum_box_factor < 2.0:
+        if self.minimum_box_factor < MINIMUM_BOX_FACTOR:
             raise ValueError(
                 f"minimum_box_factor={self.minimum_box_factor} must be at least 2: "
                 "OpenMM requires a cell edge at least twice the cutoff."
@@ -326,7 +329,7 @@ def check_box(box_nm: Sequence[float], spec: SystemSpec) -> None:
     Raises:
         SystemAssemblyError: The cell is too small.
     """
-    required = spec.minimum_box_factor * spec.nonbonded_cutoff_nm
+    required = minimum_box_edge_nm(spec)
     smallest = min(box_nm)
     if smallest >= required:
         return
@@ -339,6 +342,11 @@ def check_box(box_nm: Sequence[float], spec: SystemSpec) -> None:
     )
 
 
+def minimum_box_edge_nm(spec: SystemSpec) -> float:
+    """The cutoff plus the margin needed while the barostat compresses a cell."""
+    return spec.minimum_box_factor * spec.nonbonded_cutoff_nm
+
+
 def minimum_mass_g_mol(density_g_cm3: float, spec: SystemSpec) -> float:
     """Return the least material a cell needs to be big enough for the cutoff.
 
@@ -349,7 +357,7 @@ def minimum_mass_g_mol(density_g_cm3: float, spec: SystemSpec) -> float:
     Returns:
         The total molar mass required, in g/mol.
     """
-    edge = spec.minimum_box_factor * spec.nonbonded_cutoff_nm
+    edge = minimum_box_edge_nm(spec)
     return float(edge**3 * density_g_cm3 * AVOGADRO / NM3_PER_CM3)
 
 
@@ -682,6 +690,19 @@ def ensemble_controls(system: Any) -> list[str]:
     ]
 
 
+def require_no_ensemble_controls(
+    system: Any, error: type[Exception], *, stages: str
+) -> None:
+    """Refuse controls that would compete with a stage's own thermostat or barostat."""
+    controls = ensemble_controls(system)
+    if controls:
+        raise error(
+            "The supplied System must contain no barostat or Andersen thermostat; "
+            f"the {stages} stages provide their own temperature and pressure "
+            f"control. It carries {', '.join(controls)}."
+        )
+
+
 @functools.cache
 def platform_is_usable(name: str) -> bool:
     """Whether a Context can actually be built on the named platform.
@@ -797,7 +818,7 @@ def check_target_density(
     """
     settings = spec or SystemSpec()
     edge = box_edge_nm(counts, molar_masses_g_mol, target_density_g_cm3)
-    required = settings.minimum_box_factor * settings.nonbonded_cutoff_nm
+    required = minimum_box_edge_nm(settings)
     if edge >= required:
         return edge
 

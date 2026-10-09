@@ -82,11 +82,11 @@ Reuse or extract: named constants (F7); `mdsystem.require_no_ensemble_controls` 
 Callers changed: about 25 call sites across `chain`, `packing`, `trajectory`, `simulate`, `stress`, `melt`, `tm`, `thermal_rates`, `conformation`, `timeseries`, `relaxation`, `rate_dependence`, `elastic_rates`, `structural_convergence`, `convergence`, `benchmarks/pe_melt`, `forcefield`.
 Removed: `set_pressure`, `_BlockEnsemble`, the four `polyfit` calls, the duplicate `_finite`/`_relative_change`/`_spacing_ps`, the local hash and sidecar code.
 
-- [ ] F7 constants
-- [ ] F11 ensemble-control refusal
-- [ ] F12 engine micro-duplicates
-- [ ] F6 `first_frame`
-- [ ] F9 numerics (centre x in `fit_line` before any `polyfit` swap)
+- [x] F7 constants
+- [x] F11 ensemble-control refusal
+- [x] F12 engine micro-duplicates
+- [x] F6 `first_frame`
+- [x] F9 numerics (centre x in `fit_line` before any `polyfit` swap)
 - [ ] F18 small bypasses
 - [ ] F5 validation (separate commit: it is a behaviour fix; needs D6)
 
@@ -438,6 +438,22 @@ remain above so the changes and decisions can be reviewed against the audit.
   convergence/rate writer tests already pin their report key sets. F17 also
   cross-checks the chain kernels to 1e-12 without rerouting their arithmetic.
   Gate: 2,043 passed, eight expected failures; ruff, formatting and mypy clean.
+
+- Stage 1: shared constants preserve all recorded defaults; `Ensemble.first_frame`
+  fixes block slicing for negative bounds; shared ensemble refusal and engine
+  state/pressure/strain helpers preserve the existing scientific operations.
+  Keep the explicit `run_segments` sample lists to preserve their key order.
+  F18 file/hash/PDB/chunk/timestep/CLI-refusal bypasses are consolidated; remaining
+  report and scan bypasses are tracked with their later stages. The public scalar
+  `pressure_bar` keeps its isotropic support and delegates tensor-compatible cases.
+  F9 centres/scales line fits and shares moments, clustering, RMS, finite-value and
+  spacing helpers. Boundary regressions showed two audit equivalence claims were
+  not bit-identical: rate extrapolation retains ratio-log versus log-difference
+  arithmetic per caller; structural relative change retains `ptp(values)/scale`
+  rather than `ptp(values/scale)`. This avoids changing scientific verdicts at
+  exactly two decades or 10% relative change. U1/U3 numerical sharing stops at
+  these primitives; the different fitted models and residual guards stay apart.
+  Gate: 2,075 passed, eight expected failures; ruff, formatting and mypy clean.
 
 ## Appendix A. Builder and request digest harness (Stage 0)
 

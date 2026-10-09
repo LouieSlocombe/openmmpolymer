@@ -45,6 +45,7 @@ from typing import Any
 import numpy as np
 
 from ._files import ReportFiles, json_value, write_json
+from ._fitting import PS_PER_NS
 from ._validation import require_axis, require_finite, require_integer, require_positive
 from ._workflow import (
     StrainSchedule,
@@ -57,11 +58,17 @@ from ._workflow import (
     scan_listing,
     settled_state,
 )
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .elasticity import StressStrain, stress_strain
 from .plots import plot_breaking_strength, plot_elongation_at_break, plot_yield_strength
 from .protocols import Protocol, RunManifest, run_protocol, validate_run_inputs
 from .simulate import RunContext, safe_timestep_fs
 from .strength import (
+    DEFAULT_CONFIRMATION_STEPS,
+    DEFAULT_FAILURE_FRACTION,
+    DEFAULT_FIT_MAX_STRAIN,
+    DEFAULT_FIT_MIN_STRAIN,
+    DEFAULT_OFFSET_STRAIN,
     BreakingStrength,
     ElongationAtBreak,
     YieldStrength,
@@ -159,8 +166,8 @@ class BreakingSpec(TensileSpec):
     strengthening stays unresolved.
     """
 
-    failure_fraction: float = 0.5
-    confirmation_steps: int = 3
+    failure_fraction: float = DEFAULT_FAILURE_FRACTION
+    confirmation_steps: int = DEFAULT_CONFIRMATION_STEPS
 
     def __post_init__(self) -> None:
         """Reject an unusable criterion as well as an unusable ladder."""
@@ -193,9 +200,9 @@ class YieldSpec(TensileSpec):
 
     strain_increment: float = 0.002
     max_strain: float = 0.3
-    offset_strain: float = 0.002
-    fit_min_strain: float = 0.0
-    fit_max_strain: float = 0.02
+    offset_strain: float = DEFAULT_OFFSET_STRAIN
+    fit_min_strain: float = DEFAULT_FIT_MIN_STRAIN
+    fit_max_strain: float = DEFAULT_FIT_MAX_STRAIN
 
     def __post_init__(self) -> None:
         """Reject an unusable criterion as well as an unusable ladder."""
@@ -613,7 +620,7 @@ def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
     )
     total_ns = (
         settle.total_duration_ps + sum(ladder.total_duration_ps for ladder in ladders)
-    ) / 1000.0
+    ) / PS_PER_NS
     if spec.max_total_ns is not None and total_ns > spec.max_total_ns:
         raise measurement.error(
             f"The {measurement.name} scan costs {total_ns:.3g} ns, above "
@@ -691,7 +698,7 @@ def run_breaking_scan(
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> BreakingReport:
     """Equilibrate, stretch every replica and read the apparent tensile strength.
@@ -720,7 +727,7 @@ def run_elongation_scan(
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> ElongationReport:
     """Equilibrate, stretch every replica and read the apparent elongation at break.
@@ -749,7 +756,7 @@ def run_yield_scan(
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> YieldReport:
     """Equilibrate, stretch every replica and read the apparent yield strength.

@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 
 from ._files import file_sha256, write_json
+from ._fitting import MAX_EXTRAPOLATION_DECADES, PS_PER_NS
 from ._validation import require_integer
 from ._workflow import (
     chain_options,
@@ -29,8 +30,10 @@ from ._workflow import (
     settled_state,
     start_fingerprint,
     validate_hold_times,
+    with_timestep,
 )
-from .mdsystem import ensemble_controls
+from .chain import DEFAULT_CHARACTERISTIC_RATIO
+from .mdsystem import require_no_ensemble_controls
 from .protocols import Protocol, RunManifest, Stage, run_protocol
 from .rate_dependence import (
     RateObservation,
@@ -41,7 +44,14 @@ from .rate_dependence import (
 )
 from .reporters import TrajectoryOptions
 from .simulate import RunContext, safe_timestep_fs
-from .tg import TgSpec, _group_passes, coarse_schedule, tg_coarse_scan
+from .tg import (
+    TgSchedule,
+    TgSpec,
+    _chunks,
+    _group_passes,
+    coarse_schedule,
+    tg_coarse_scan,
+)
 from .timeseries import glass_transition, quench_curve, quench_stages
 from .tm import TmSpec, heating_curve, melting_scan, melting_temperature
 from .trajectory import AnalysisError
@@ -88,7 +98,7 @@ class ThermalRatePlan:
         return (
             self.equilibration.total_duration_ps
             + self.n_replicas * sum(item.total_duration_ps for item in self.protocols)
-        ) / 1000.0
+        ) / PS_PER_NS
 
 
 def _property(property_name: str) -> RateProperty:
@@ -104,16 +114,14 @@ def _property(property_name: str) -> RateProperty:
 def _thermal_protocol(
     temperatures: tuple[float, ...], hold: float, spec: TgSpec | TmSpec
 ) -> Protocol:
-    chunks = [
-        temperatures[chunk.start : chunk.stop]
-        for chunk in resume_chunks(len(temperatures), hold, spec.stage_ps)
-    ]
-    # As in a Tg scan, a trailing one-temperature quench chunk has no step of
-    # its own to be grouped by, so it joins the one before; a heating chunk
-    # is found by the enthalpy it records and stays as it is.
-    if isinstance(spec, TgSpec) and len(chunks) > 1 and len(chunks[-1]) == 1:
-        tail = chunks.pop()
-        chunks[-1] += tail
+    chunks = (
+        _chunks(TgSchedule(temperatures, hold, spec.coarse_step_k), spec.stage_ps)
+        if isinstance(spec, TgSpec)
+        else [
+            temperatures[chunk.start : chunk.stop]
+            for chunk in resume_chunks(len(temperatures), hold, spec.stage_ps)
+        ]
+    )
     stages = []
     for index, chunk in enumerate(chunks):
         options: dict[str, Any] = {
@@ -147,7 +155,7 @@ def validate_thermal_rate_scan(
     property_name: str,
     target_rate: float,
     n_replicas: int = 3,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
     **equilibration: Any,
 ) -> ThermalRatePlan:
     """Validate three or more rates and the full budget without filesystem writes.
@@ -183,7 +191,10 @@ def validate_thermal_rate_scan(
             raise ValueError("Tm preparation is specified by TmSpec.equilibration_ps.")
         temperatures = spec.temperatures_k
         preparation = melting_scan(replace(spec, max_total_ns=None))
-        preparation = replace(preparation, stages=preparation.stages[:2])
+        preparation = replace(
+            preparation,
+            stages=tuple(stage for stage in preparation.stages if stage.kind != "heat"),
+        )
     plan = ThermalRatePlan(
         property_name,
         preparation,
@@ -204,13 +215,9 @@ def _check_system(run: RunContext) -> None:
     """Refuse a System that would fight the stages' own thermostat and barostat."""
     import openmm as mm
 
-    controls = ensemble_controls(mm.XmlSerializer.deserialize(run.system_xml))
-    if controls:
-        raise ThermalRateError(
-            "The supplied System must contain no barostat or Andersen thermostat; "
-            "the thermal stages provide their own temperature and pressure "
-            f"control. It carries {', '.join(controls)}."
-        )
+    require_no_ensemble_controls(
+        mm.XmlSerializer.deserialize(run.system_xml), ThermalRateError, stages="thermal"
+    )
 
 
 def _replica_protocol(
@@ -219,12 +226,8 @@ def _replica_protocol(
     return replace(
         protocol,
         stages=tuple(
-            replace(
-                stage,
-                name=f"r{rate:02d}_rep{replica:02d}_{stage.name}",
-                options={**stage.options, "timestep_fs": timestep},
-            )
-            for stage in protocol.stages
+            replace(stage, name=f"r{rate:02d}_rep{replica:02d}_{stage.name}")
+            for stage in with_timestep(protocol.stages, timestep)
         ),
     )
 
@@ -238,13 +241,13 @@ def run_thermal_rate_scan(
     target_rate: float,
     spec: TgSpec | TmSpec | None = None,
     n_replicas: int = 3,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
     state_in: str | Path | None = None,
     crystalline: bool = False,
     resume: bool = True,
     chain_backbone: Sequence[int] | None = None,
     atoms_per_chain: int | None = None,
-    expected_characteristic_ratio: float = 7.0,
+    expected_characteristic_ratio: float = DEFAULT_CHARACTERISTIC_RATIO,
     **equilibration: Any,
 ) -> RateReport:
     """Prepare once and branch every rate/replica from the same saved state.
@@ -482,7 +485,7 @@ def analyse_thermal_rates(
     *,
     property_name: str,
     target_rate: float,
-    max_extrapolation_decades: float = 2.0,
+    max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES,
 ) -> RateReport:
     """Fit comparable saved thermal histories without rerunning dynamics.
 

@@ -58,7 +58,7 @@ import numpy.typing as npt
 from openmm import unit
 
 from ._validation import require_integer
-from .packing import read_pdb
+from .packing import ANGSTROM_PER_NM, read_pdb
 from .protocols import RunManifest
 
 log = logging.getLogger(__name__)
@@ -67,10 +67,6 @@ log = logging.getLogger(__name__)
 #: for. ``pdb`` is deliberately absent: it carries no frame times, so nothing
 #: here could put a lag on an axis. See this module's docstring.
 READABLE_FORMATS = ("xtc", "dcd")
-
-#: Ångström per nanometre. MDAnalysis reports both coordinates and box lengths
-#: in Ångström; this module is the only place in the package that sees them.
-_ANGSTROM_PER_NM = 10.0
 
 #: Biggest position array a load will build without being asked twice, in
 #: gibibytes. A long run of a large cell will not fit in memory, and saying so
@@ -147,6 +143,8 @@ class Ensemble:
         topology_path: Where the topology was read from.
         trajectory_path: Where the coordinates were read from, or None when
             they came from the topology file itself.
+        first_frame: Offset into the underlying trajectory. Slices are relative
+            to this view; yielded indices and times remain absolute.
     """
 
     stage: str
@@ -160,6 +158,7 @@ class Ensemble:
     interval_ps: float
     topology_path: str
     trajectory_path: str | None
+    first_frame: int = 0
 
     @property
     def is_snapshot(self) -> bool:
@@ -191,15 +190,17 @@ class Ensemble:
         """
         require_integer(stride, name="stride")
         start, last, stride = slice(start, stop, stride).indices(self.n_frames)
+        start += self.first_frame
+        last += self.first_frame
         for index, step in enumerate(self.universe.trajectory[start:last:stride]):
             frame_index = start + index * stride
             yield Frame(
                 index=frame_index,
                 time_ps=self._time_ps(frame_index),
                 positions_nm=np.asarray(self.universe.atoms.positions, dtype=np.float64)
-                / _ANGSTROM_PER_NM,
+                / ANGSTROM_PER_NM,
                 box_nm=np.asarray(step.dimensions[:3], dtype=np.float64)
-                / _ANGSTROM_PER_NM,
+                / ANGSTROM_PER_NM,
             )
 
     def per_chain(
@@ -704,6 +705,10 @@ def chain_positions(
     Returns:
         ``(n_frames, n_chains, atoms, 3)`` positions in nanometres, and the
         matching ``(n_frames,)`` times in picoseconds.
+
+    Raises:
+        AnalysisError: Filtering leaves no atoms, or the selected positions
+            exceed the memory budget.
     """
     positions, times, _ = _load_chain_frames(
         ensemble, stride=stride, heavy_atoms_only=heavy_atoms_only
@@ -728,6 +733,10 @@ def _load_chain_frames(
     require_integer(stride, name="stride")
     keep = ~ensemble.is_hydrogen if heavy_atoms_only else None
     n_atoms = ensemble.atoms_per_chain if keep is None else int(np.count_nonzero(keep))
+    if n_atoms == 0:
+        raise AnalysisError(
+            "Dropping hydrogens left no atoms. Pass heavy_atoms_only=False."
+        )
     n_frames = len(range(0, ensemble.n_frames, stride))
     _check_size(ensemble.n_chains * n_atoms, n_frames)
     positions = np.empty((n_frames, ensemble.n_chains, n_atoms, 3), dtype=np.float64)
