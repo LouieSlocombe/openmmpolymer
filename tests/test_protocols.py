@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 from collections.abc import Sequence
@@ -102,6 +103,54 @@ def quick_run(tmp_path_factory: pytest.TempPathFactory) -> RunSummary:
     return run_protocol(
         QUICK, argon_context(64, 2.4), tmp_path_factory.mktemp("quick") / "run"
     )
+
+
+@pytest.mark.parametrize(
+    ("kind", "options"),
+    [
+        ("heat", {}),
+        ("heat", {"measure_enthalpy": False}),
+        (
+            "heat",
+            {
+                "barostat": "isotropic",
+                "samples_per_segment": 12,
+                "trajectory": TrajectoryOptions("dcd", 0.5),
+            },
+        ),
+        ("production", {}),
+        ("production", {"pressure_bar": None}),
+        ("production", {"pressure_bar": 0.0}),
+        (
+            "production",
+            {
+                "pressure_bar": 2.5,
+                "samples_per_segment": 12,
+                "trajectory": "none",
+                "new_velocities": True,
+            },
+        ),
+    ],
+)
+def test_forwarded_runner_options_match_recorded_provenance(
+    monkeypatch: pytest.MonkeyPatch, kind: str, options: dict[str, Any]
+) -> None:
+    """Heating forces enthalpy and production selects its barostat at execution."""
+    signature = inspect.signature(simulate.run_segments)
+
+    def capture(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        return bound.arguments
+
+    monkeypatch.setattr(simulate, "run_segments", capture)
+    recorded = _stage_options(Stage("recorded", kind, options))
+    observed = getattr(simulate, f"run_{kind}")(None, "custom/prefix", **options)
+    assert observed["barostat"] == recorded["barostat"]
+    assert observed["measure_enthalpy"] == recorded["measure_enthalpy"]
+    for name in signature.parameters:
+        if name in recorded and name != "output_prefix":
+            assert observed[name] == recorded[name], name
 
 
 def test_the_defaults_every_manifest_records_are_pinned() -> None:

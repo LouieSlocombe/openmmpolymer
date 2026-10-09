@@ -200,7 +200,7 @@ def rotate_existing(path: str | Path) -> str | None:
         attempt += 1
 
 
-def _path_for(output_prefix: str | Path, trajectory_format: str) -> Path:
+def trajectory_path(output_prefix: str | Path, trajectory_format: str) -> Path:
     """Where a stage's trajectory goes, for *trajectory_format*.
 
     ``<stem>.<format>``, except that a PDB trajectory goes to
@@ -220,6 +220,12 @@ def _path_for(output_prefix: str | Path, trajectory_format: str) -> Path:
     if trajectory_format == "pdb":
         return prefix.with_name(f"{prefix.name}_trajectory.pdb")
     return prefix.with_suffix(f".{trajectory_format}")
+
+
+def topology_path(output_prefix: str | Path) -> Path:
+    """The starting topology written beside a binary trajectory."""
+    prefix = Path(output_prefix)
+    return prefix.with_name(f"{prefix.name}_topology.pdb")
 
 
 @contextmanager
@@ -266,8 +272,8 @@ def reporting(
 
     csv_path = prefix.with_suffix(".csv")
     log_path = prefix.with_suffix(".log")
-    trajectory_path: Path | None = None
-    topology_path: Path | None = None
+    trajectory_file: Path | None = None
+    topology_file: Path | None = None
     state_reporter = AtomicStateReporter(prefix, max(1, total_steps // 10))
 
     with ExitStack() as stack:
@@ -298,14 +304,14 @@ def reporting(
         )
 
         if options.format != "none":
-            trajectory_path = _path_for(prefix, options.format)
-            rotate_existing(trajectory_path)
+            trajectory_file = trajectory_path(prefix, options.format)
+            rotate_existing(trajectory_file)
             if options.format in {"xtc", "dcd"}:
                 # Neither format carries a topology, and this is written now
                 # rather than at the end because a run that crashes is exactly
                 # the one whose trajectory has to stay readable.
-                topology_path = prefix.with_name(f"{prefix.name}_topology.pdb")
-                with topology_path.open("w") as handle:
+                topology_file = topology_path(prefix)
+                with topology_file.open("w") as handle:
                     app.PDBFile.writeFile(
                         simulation.topology,
                         simulation.context.getState(getPositions=True).getPositions(),
@@ -318,7 +324,7 @@ def reporting(
             }[options.format]
             simulation.reporters.append(
                 writer(
-                    str(trajectory_path),
+                    str(trajectory_file),
                     frames,
                     enforcePeriodicBox=options.enforce_periodic_box,
                 )
@@ -329,8 +335,8 @@ def reporting(
             yield ReporterPaths(
                 csv=str(csv_path),
                 log=str(log_path),
-                trajectory=None if trajectory_path is None else str(trajectory_path),
-                topology=None if topology_path is None else str(topology_path),
+                trajectory=None if trajectory_file is None else str(trajectory_file),
+                topology=None if topology_file is None else str(topology_file),
                 state=str(state_reporter.pointer_path),
             )
         finally:

@@ -16,10 +16,11 @@ from openmmpolymer.reporters import (
     CSV_COLUMNS,
     AtomicStateReporter,
     TrajectoryOptions,
-    _path_for,
     reporting,
     rotate_existing,
     steps_for,
+    topology_path,
+    trajectory_path,
 )
 from openmmpolymer.simulate import run_nvt
 from openmmpolymer.timeseries import CSV_FIELDS, read_state_data
@@ -358,4 +359,37 @@ def test_the_reported_trajectory_path_is_the_trajectory(
 def test_each_format_has_its_own_path(trajectory_format: str, expected: str) -> None:
     """Only pdb is special, and the binary formats must keep the names every
     run already on disk used."""
-    assert _path_for("05_npt", trajectory_format).name == expected
+    assert trajectory_path("05_npt", trajectory_format).name == expected
+
+
+@pytest.mark.parametrize(
+    ("prefix", "binary", "pdb", "topology"),
+    [
+        (
+            "run/05_npt",
+            "run/05_npt.xtc",
+            "run/05_npt_trajectory.pdb",
+            "run/05_npt_topology.pdb",
+        ),
+        (
+            "run/05_npt.old",
+            "run/05_npt.xtc",
+            "run/05_npt.old_trajectory.pdb",
+            "run/05_npt.old_topology.pdb",
+        ),
+        (
+            "run/05_npt.old.ext",
+            "run/05_npt.old.xtc",
+            "run/05_npt.old.ext_trajectory.pdb",
+            "run/05_npt.old.ext_topology.pdb",
+        ),
+    ],
+)
+def test_paths_preserve_existing_suffix_rules(
+    prefix: str, binary: str, pdb: str, topology: str
+) -> None:
+    """Binary paths replace a suffix; PDB trajectory/topology paths retain it."""
+    assert trajectory_path(prefix, "xtc") == Path(binary)
+    assert trajectory_path(Path(prefix), "dcd") == Path(binary).with_suffix(".dcd")
+    assert trajectory_path(prefix, "pdb") == Path(pdb)
+    assert topology_path(Path(prefix)) == Path(topology)

@@ -578,7 +578,10 @@ def test_only_the_finest_scans_are_weighed_against_each_other(
     assert report.log_linear is not None
     assert report.log_linear.n_rates == 2
     assert report.vft is None
-    assert any("vft" in note for note in report.notes)
+    assert (
+        "vft rate fit: A 'vft' fit has 3 parameters and there are 2 rates, "
+        "so it is not determined. Measure at least 3 rates, or use form='log_linear'."
+    ) in report.notes
 
 
 def test_one_quench_alone_has_no_rate_dependence_to_fit(tmp_path: Path) -> None:
@@ -630,7 +633,10 @@ def test_a_curve_too_short_to_fit_drops_out_without_shifting_the_others(
     assert len(report.curves) == len(report.transitions) == 2
     assert report.curves[1].temperature_step_k == pytest.approx(10.0)
     assert report.fine is report.transitions[1]
-    assert any("07_stub" in note for note in report.notes)
+    assert (
+        "07_stub: 4 temperatures cannot give two branches of 4 points. "
+        "Quench in smaller steps, or lower min_points_per_branch."
+    ) in report.notes
 
 
 # --------------------------------------------------------------------------
@@ -710,3 +716,31 @@ def test_the_equilibration_figure_is_drawn_when_the_melt_was_checked(
 
     files = write_tg_report(report)
     assert any(Path(path).name.startswith("equilibration") for path in files.figures)
+
+
+@pytest.mark.parametrize(
+    ("decimal_steps", "rates", "expected"),
+    [
+        (False, None, 100110.0),
+        (False, (10.0, 5.0, 2.0), 125110.0),
+        (False, (0.3, 1.7, 9.0), 529194.9673202615),
+        (True, None, 44565.5),
+        (True, (10.0, 5.0, 2.0), 132070.0),
+        (True, (0.3, 1.7, 9.0), 580442.6797385621),
+    ],
+)
+def test_scan_duration_keeps_the_original_cli_price(
+    decimal_steps: bool, rates: tuple[float, ...] | None, expected: float
+) -> None:
+    from openmmpolymer.tg import tg_scan_duration_ps
+
+    spec = TgSpec()
+    if decimal_steps:
+        spec = replace(
+            spec,
+            coarse_step_k=33.3,
+            window_k=63.0,
+            fine_step_k=7.3,
+            fine_hold_ps=1234.5,
+        )
+    assert tg_scan_duration_ps(spec, rates_k_per_ns=rates) == expected

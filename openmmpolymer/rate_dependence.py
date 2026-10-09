@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, overload
 
 import numpy as np
@@ -29,6 +30,7 @@ from ._validation import (
     require_nonnegative,
     require_positive,
 )
+from ._workflow import optional
 from .trajectory import AnalysisError
 
 #: The two empirical relations every rate series is fitted with.
@@ -563,17 +565,18 @@ def analyse_rate_observations(
         notes.extend(f"Observation {index}: {note}" for note in observation.notes)
     fits: dict[str, RateExtrapolation | None] = {}
     for form in RATE_FORMS:
-        try:
-            fits[form] = rate_extrapolation(
+        fits[form] = optional(
+            partial(
+                rate_extrapolation,
                 inputs,
                 property=property,
                 target_rate=target,
                 form=form,
                 max_extrapolation_decades=maximum,
-            )
-        except AnalysisError as exc:
-            fits[form] = None
-            notes.append(f"{form} unavailable: {exc}")
+            ),
+            notes,
+            f"{form} unavailable",
+        )
     return RateReport(
         property=property,
         observations=inputs,

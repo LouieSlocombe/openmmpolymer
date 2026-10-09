@@ -39,6 +39,7 @@ import logging
 import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -60,6 +61,7 @@ from ._workflow import (
     enforce_budget,
     equilibration_at,
     group_by_stem,
+    optional,
     remaining_ps,
     require_positive_fields,
     run_measurement_scan,
@@ -734,10 +736,13 @@ def analyse_relaxation(
     curves: list[RelaxationCurve] = []
 
     for group in group_by_stem(relax_stages(directory, manifest=manifest)):
-        try:
-            curves.append(relaxation_curve(directory, group, manifest=manifest))
-        except AnalysisError as error:
-            notes.append(f"Skipped {', '.join(group)}: {error}")
+        curve = optional(
+            partial(relaxation_curve, directory, group, manifest=manifest),
+            notes,
+            f"Skipped {', '.join(group)}",
+        )
+        if curve is not None:
+            curves.append(curve)
 
     if not curves:
         raise AnalysisError(

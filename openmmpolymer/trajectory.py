@@ -61,6 +61,7 @@ from openmm import unit
 from ._validation import require_integer
 from .packing import ANGSTROM_PER_NM, read_pdb
 from .protocols import RunManifest
+from .reporters import topology_path, trajectory_path
 
 log = logging.getLogger(__name__)
 
@@ -490,9 +491,9 @@ def _coordinate_paths(prefix: Path) -> tuple[str | None, str | None]:
     stage start; with no trajectory, the end-of-stage ``<stem>.pdb`` is both.
     """
     for extension in READABLE_FORMATS:
-        candidate = prefix.with_suffix(f".{extension}")
+        candidate = trajectory_path(prefix, extension)
         if candidate.is_file():
-            topology = prefix.with_name(f"{prefix.name}_topology.pdb")
+            topology = topology_path(prefix)
             if topology.is_file():
                 return str(candidate), str(topology)
             snapshot = prefix.with_suffix(".pdb")
@@ -509,7 +510,7 @@ def _coordinate_paths(prefix: Path) -> tuple[str | None, str | None]:
                 f"no topology of its own, so {topology.name} is needed to read "
                 "it."
             )
-    written_as_pdb = prefix.with_name(f"{prefix.name}_trajectory.pdb")
+    written_as_pdb = trajectory_path(prefix, "pdb")
     if written_as_pdb.is_file():
         log.info(
             "%s holds this stage's frames, but a PDB trajectory records no "

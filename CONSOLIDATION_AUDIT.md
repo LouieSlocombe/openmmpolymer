@@ -116,7 +116,7 @@ Removed: the `tensile._run_scan` body and most of `_check_resume`, two replica l
 
 ### Stage 4: drift guards (add a test or one shared table; do not merge)
 
-- [ ] F13: `run_heat`/`run_production` options table shared by `simulate.py` and `protocols._stage_options`; stage file-name helpers; `tg` pricing function used by the CLI; one tensile record-schema builder; help text formatted from constants
+- [x] F13: `run_heat`/`run_production` options table shared by `simulate.py` and `protocols._stage_options`; stage file-name helpers; `tg` pricing function used by the CLI; one tensile record-schema builder; help text formatted from constants
 
 ### Stage 5: owner decisions on the public surface
 
@@ -508,6 +508,22 @@ remain above so the changes and decisions can be reviewed against the audit.
   normalization bypasses are completed.
   Gate: 2,387 passed with no expected failures, coverage 96.10%; ruff,
   formatting and mypy clean.
+
+- Stage 4: reporter and reader share trajectory/topology filename helpers,
+  including suffix-bearing stems and existing snapshot fallback/format priority.
+  Direct execution-versus-provenance tests guard heat's forced enthalpy and
+  production's pressure-dependent barostat without merging their implementations.
+  The CLI uses Tg's shared pricing function and the model's minimum-rate source;
+  six pre-change prices match exactly. Help/criterion defaults come from their
+  constants while the complete parser digest remains unchanged. The guide's
+  eleven rate-property names/units and explicit package exports now have drift
+  guards. CSV round-trip and duration parity were already covered in earlier
+  stages. F10's five remaining prefix-only error-to-note loops use `optional`,
+  and a mechanical report reuses its manifest snapshot. Distinct tuple-return,
+  logging-only, exception-conversion and bespoke-suffix handlers stay separate.
+  Tg figures still reread the volume CSV: carrying that series through
+  `MeltEquilibration` would change the report model for a minor plotting shortcut.
+  Gate: 2,409 passed, coverage 96.13%; ruff, formatting and mypy clean.
 
 ## Appendix A. Builder and request digest harness (Stage 0)
 

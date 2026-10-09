@@ -633,17 +633,18 @@ def analyse_mechanics(
     """
     directory = Path(run_dir)
     notes: list[str] = []
+    manifest = RunManifest.load(directory)
     curves: list[StressStrain] = []
     replicas: list[ElasticModulus] = []
 
-    try:
-        groups = group_by_stem(deform_stages(directory))
-    except AnalysisError as error:
-        groups = []
-        notes.append(f"No extension to fit: {error}")
+    groups = optional(
+        lambda: group_by_stem(deform_stages(directory, manifest=manifest)),
+        notes,
+        "No extension to fit",
+    )
 
-    for group in groups:
-        curve = stress_strain(directory, group)
+    for group in groups or []:
+        curve = stress_strain(directory, group, manifest=manifest)
         curves.append(curve)
         replicas.append(
             youngs_modulus(curve, strain_limit=strain_limit, min_points=min_points)
@@ -667,11 +668,10 @@ def analyse_mechanics(
     # records exactly what the equilibration's compression ladder records -
     # and that one climbs to a kilobar at the melt temperature, which fitted
     # as a bulk modulus is a confident number about nothing.
-    manifest = RunManifest.load(directory)
     stage_names = list(manifest.stages) if manifest is not None else []
     if BULK_STEM in stage_names:
         bulk = optional(
-            lambda: bulk_modulus(directory, BULK_STEM),
+            lambda: bulk_modulus(directory, BULK_STEM, manifest=manifest),
             notes,
             "No bulk-modulus pass to fit",
         )
@@ -682,8 +682,16 @@ def analyse_mechanics(
             "compression ladder run as part of equilibration is not one - it "
             "is far outside linear response and at the wrong temperature."
         )
-    shear = optional(lambda: shear_modulus(directory), notes, "No shear ladder to fit")
-    load = optional(lambda: load_curve(directory), notes, "No constant-stress pass")
+    shear = optional(
+        lambda: shear_modulus(directory, manifest=manifest),
+        notes,
+        "No shear ladder to fit",
+    )
+    load = optional(
+        lambda: load_curve(directory, manifest=manifest),
+        notes,
+        "No constant-stress pass",
+    )
     load_fit = (
         youngs_modulus(load, strain_limit=strain_limit, min_points=2)
         if load is not None

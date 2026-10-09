@@ -89,7 +89,20 @@ from .rate_reports import write_rate_report
 from .relaxation import relax_stages
 from .reporters import TrajectoryOptions
 from .simulate import RELAX_MODES, RunContext
-from .structure import analyse_structure, structure_stages, write_structure_report
+from .strength import (
+    DEFAULT_CONFIRMATION_STEPS,
+    DEFAULT_FAILURE_FRACTION,
+    DEFAULT_FIT_MAX_STRAIN,
+    DEFAULT_FIT_MIN_STRAIN,
+    DEFAULT_OFFSET_STRAIN,
+)
+from .structure import (
+    MAX_DISTRIBUTION_FRAMES,
+    MAX_STRUCTURE_FACTOR_FRAMES,
+    analyse_structure,
+    structure_stages,
+    write_structure_report,
+)
 from .tensile import (
     BreakingSpec,
     ElongationSpec,
@@ -114,15 +127,15 @@ from .tg import (
     analyse_tg,
     cooling_rate_series,
     fine_window,
-    nominal_fine_schedule,
     run_tg_scan,
-    tg_coarse_scan,
+    tg_scan_duration_ps,
     write_tg_report,
 )
 from .timeseries import (
     DSC_COOLING_RATE_K_PER_NS,
     EXTRAPOLATION_FORMS,
     cooling_rate_extrapolation,
+    minimum_cooling_rates,
     quench_stages,
 )
 from .tm import (
@@ -227,15 +240,13 @@ def _tg_ps(spec: TgSpec, arguments: argparse.Namespace) -> float:
     if arguments.tg_approx is not None:
         fine_window(arguments.tg_approx, spec)
     rates = arguments.cooling_rates
-    if rates is not None and arguments.rate_form == "vft" and len(rates) < 3:
+    if (
+        rates is not None
+        and arguments.rate_form == "vft"
+        and len(rates) < minimum_cooling_rates(arguments.rate_form)
+    ):
         raise ValueError("--rate-form vft requires at least three --cooling-rates.")
-    holds = (
-        [spec.fine_hold_ps]
-        if rates is None
-        else [spec.fine_step_k / rate * PS_PER_NS for rate in rates]
-    )
-    fine = sum(nominal_fine_schedule(spec, hold_ps=hold).total_ps for hold in holds)
-    return tg_coarse_scan(spec).total_duration_ps + fine
+    return tg_scan_duration_ps(spec, rates_k_per_ns=rates)
 
 
 class _Job(NamedTuple):
@@ -978,13 +989,13 @@ def build_parser() -> argparse.ArgumentParser:
     _flag(
         failure,
         "--failure-fraction",
-        0.5,
+        DEFAULT_FAILURE_FRACTION,
         "fraction of peak nominal stress below which the terminal drop must remain",
     )
     _flag(
         failure,
         "--confirmation-steps",
-        3,
+        DEFAULT_CONFIRMATION_STEPS,
         "consecutive terminal holds needed to confirm the stress drop",
     )
     yielding = parser.add_argument_group(
@@ -995,19 +1006,19 @@ def build_parser() -> argparse.ArgumentParser:
     _flag(
         yielding,
         "--yield-offset-strain",
-        0.002,
+        DEFAULT_OFFSET_STRAIN,
         "strain offset for the proof-stress line; 0.002 means 0.2%%",
     )
     _flag(
         yielding,
         "--yield-fit-min-strain",
-        0.0,
+        DEFAULT_FIT_MIN_STRAIN,
         "lower engineering strain for the initial elastic fit",
     )
     _flag(
         yielding,
         "--yield-fit-max-strain",
-        0.02,
+        DEFAULT_FIT_MAX_STRAIN,
         "upper engineering strain for the initial elastic fit",
     )
     relaxation = parser.add_argument_group(
@@ -1094,7 +1105,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--window-fractions",
         type=_floats,
         default=DEFAULT_WINDOW_FRACTIONS,
-        help="increasing observed fractions ending at 1 (default: 0.25,0.5,0.75,1)",
+        help="increasing observed fractions ending at 1 (default: "
+        + ",".join(f"{fraction:g}" for fraction in DEFAULT_WINDOW_FRACTIONS)
+        + ")",
     )
     _flag(
         convergence,
@@ -1164,7 +1177,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=1,
         help="measure every Nth frame (default: %(default)s); g(r) and S(q) "
-        "are further capped at 50 and 8 frames",
+        f"are further capped at {MAX_DISTRIBUTION_FRAMES} and "
+        f"{MAX_STRUCTURE_FACTOR_FRAMES} frames",
     )
     analysis.add_argument(
         "--no-figures",

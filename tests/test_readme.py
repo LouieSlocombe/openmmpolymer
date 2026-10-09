@@ -68,3 +68,21 @@ def test_command_line_examples_parse(argv: list[str]) -> None:
 def test_the_examples_were_found() -> None:
     """A change to the fences must not quietly leave nothing to check."""
     assert PYTHON and COMMANDS
+
+
+def test_guide_rate_table_matches_registered_properties_and_units() -> None:
+    from openmmpolymer.property_rates import RATE_PROPERTIES
+
+    text = (ROOT / "docs" / "guide.md").read_text()
+    section = text.split("| `property_name` |", 1)[1].split("```", 1)[0]
+    rows = [
+        line.split("|")[1:-1] for line in section.splitlines() if line.startswith("| `")
+    ]
+    documented = {
+        row[0].strip().strip("`"): (row[2].strip(), row[3].strip()) for row in rows
+    }
+    assert len(rows) == len(documented)
+    assert documented == {
+        name: (property.value_unit, property.rate_unit)
+        for name, property in RATE_PROPERTIES.items()
+    }

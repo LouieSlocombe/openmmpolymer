@@ -36,6 +36,7 @@ import logging
 import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -559,6 +560,38 @@ def nominal_fine_schedule(spec: TgSpec, *, hold_ps: float | None = None) -> TgSc
     )
 
 
+def _total_scan_ps(coarse: Protocol, fine_ladders: Sequence[TgSchedule]) -> float:
+    """Price the coarse preparation and each complete fine ladder."""
+    return coarse.total_duration_ps + sum(ladder.total_ps for ladder in fine_ladders)
+
+
+def tg_scan_duration_ps(
+    spec: TgSpec = DEFAULT_SPEC,
+    *,
+    rates_k_per_ns: Sequence[float] | None = None,
+) -> float:
+    """Estimate coarse and fine dynamics before the fine window is located.
+
+    Each supplied rate sets its own fine hold; without rates the spec's fine
+    hold is used once. Uses the default coarse preparation; the ladder
+    arithmetic matches the runner.
+    """
+    holds = (
+        [spec.fine_hold_ps]
+        if rates_k_per_ns is None
+        else [
+            spec.fine_step_k
+            / require_positive(rate, None, name="rates_k_per_ns")
+            * PS_PER_NS
+            for rate in rates_k_per_ns
+        ]
+    )
+    return _total_scan_ps(
+        tg_coarse_scan(spec),
+        [nominal_fine_schedule(spec, hold_ps=hold) for hold in holds],
+    )
+
+
 def _report_cost(
     coarse: Protocol,
     coarse_ladder: TgSchedule,
@@ -578,7 +611,7 @@ def _report_cost(
         TgError: The total is over ``max_total_ns``.
     """
     fine_ps = sum(ladder.total_ps for ladder in fine_ladders)
-    total_ps = coarse.total_duration_ps + fine_ps
+    total_ps = _total_scan_ps(coarse, fine_ladders)
     log.info(
         "Tg scan: %.1f ns equilibration, %.1f ns coarse (%d points at %.1f "
         "K/ns), %.1f ns fine over %d pass(es) at %s K/ns, %d points each - "
@@ -1171,17 +1204,15 @@ def analyse_tg(
     # wrong curve with the wrong fit the moment one in the middle failed.
     pairs: list[tuple[QuenchCurve, GlassTransition]] = []
     for curve in curves:
-        try:
-            pairs.append(
-                (
-                    curve,
-                    glass_transition(
-                        curve, min_points_per_branch=min_points_per_branch
-                    ),
-                )
-            )
-        except AnalysisError as error:
-            notes.append(f"{curve.stage}: {error}")
+        transition = optional(
+            partial(
+                glass_transition, curve, min_points_per_branch=min_points_per_branch
+            ),
+            notes,
+            curve.stage,
+        )
+        if transition is not None:
+            pairs.append((curve, transition))
     if not pairs:
         raise AnalysisError(
             f"No quench in {directory} gave a curve long enough to fit. "
@@ -1295,15 +1326,18 @@ def _rate_fits(
         return None, None
     fits: list[CoolingRateExtrapolation | None] = []
     for form in ("log_linear", "vft"):
-        try:
-            fits.append(
-                cooling_rate_extrapolation(
-                    family, target_rate_k_per_ns=target_rate_k_per_ns, form=form
-                )
+        fits.append(
+            optional(
+                partial(
+                    cooling_rate_extrapolation,
+                    family,
+                    target_rate_k_per_ns=target_rate_k_per_ns,
+                    form=form,
+                ),
+                notes,
+                f"{form} rate fit",
             )
-        except AnalysisError as error:
-            fits.append(None)
-            notes.append(f"{form} rate fit: {error}")
+        )
     return fits[0], fits[1]
 
 

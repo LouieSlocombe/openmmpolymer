@@ -224,6 +224,24 @@ def test_replicas_are_grouped_by_their_stems_and_averaged(tmp_path: Path) -> Non
     assert report.replica_spread_mpa is not None
 
 
+def test_a_failed_replica_keeps_its_note_and_the_other_replica(tmp_path: Path) -> None:
+    write_relaxation(tmp_path, stem=f"{RELAX_STEM}_r0")
+    manifest_path = write_relaxation(tmp_path, stem=f"{RELAX_STEM}_r1")
+    manifest = json.loads(manifest_path.read_text())
+    broken = f"{RELAX_STEM}_r0_00"
+    manifest["stages"][broken]["samples"]["relax_strain_measure"] = [0.0]
+    manifest_path.write_text(json.dumps(manifest))
+
+    report = analyse_relaxation(tmp_path)
+
+    assert len(report.curves) == 1
+    assert report.curves[0].stage == f"{RELAX_STEM}_r1_00"
+    assert report.notes[0] == (
+        f"Skipped {broken}: {broken} recorded no strain to divide by, "
+        "so its stress cannot be turned into a modulus."
+    )
+
+
 def test_a_linearity_pass_is_reported_rather_than_averaged_in(
     tmp_path: Path,
 ) -> None:

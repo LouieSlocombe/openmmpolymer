@@ -751,6 +751,12 @@ def glass_transition(
     )
 
 
+def minimum_cooling_rates(form: str) -> int:
+    """The number of independent rates required by a cooling-rate model."""
+    require_choice(form, EXTRAPOLATION_FORMS, name="form")
+    return _FORM_PARAMETERS[form]
+
+
 def cooling_rate_extrapolation(
     transitions: Sequence[GlassTransition],
     *,
@@ -802,9 +808,8 @@ def cooling_rate_extrapolation(
         AnalysisError: There are too few transitions for the form, one has no
             recorded cooling rate, or two were measured at the same rate.
     """
-    require_choice(form, EXTRAPOLATION_FORMS, name="form")
+    n_parameters = minimum_cooling_rates(form)
     target = require_positive(target_rate_k_per_ns, None, name="target_rate_k_per_ns")
-    n_parameters = _FORM_PARAMETERS[form]
 
     if len(transitions) < 2:
         raise AnalysisError(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 import shutil
 import subprocess
@@ -31,6 +32,14 @@ def test_the_public_api_is_explicit_and_complete() -> None:
     """Every name in __all__ exists, and nothing is listed twice."""
     assert len(openmmpolymer.__all__) == len(set(openmmpolymer.__all__))
     assert all(hasattr(openmmpolymer, name) for name in openmmpolymer.__all__)
+    tree = ast.parse((ROOT / "openmmpolymer" / "__init__.py").read_text())
+    imported = {
+        alias.asname or alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.level == 1
+        for alias in node.names
+    }
+    assert imported == set(openmmpolymer.__all__) - {"__version__"}
 
 
 def test_every_stage_is_exported() -> None:

@@ -168,6 +168,20 @@ def test_both_readable_trajectory_formats_are_found(
     assert found.trajectory.endswith(extension)
 
 
+@pytest.mark.parametrize("stem", ["02_nvt", "02_nvt.old"])
+def test_trajectory_selection_keeps_binary_priority_and_topology_suffix(
+    tmp_path: Path, stem: str
+) -> None:
+    """XTC wins over DCD; the topology name retains the complete file stem."""
+    (tmp_path / "02_nvt.xtc").write_bytes(b"")
+    (tmp_path / "02_nvt.dcd").write_bytes(b"")
+    (tmp_path / f"{stem}_topology.pdb").write_text("")
+    write_manifest(tmp_path, {stem: {}})
+    found = stage_files(tmp_path, stem)
+    assert found.trajectory == str(tmp_path / "02_nvt.xtc")
+    assert found.topology == str(tmp_path / f"{stem}_topology.pdb")
+
+
 def test_a_pdb_is_never_taken_for_a_trajectory(tmp_path: Path) -> None:
     """<stem>.pdb is a stage's closing snapshot, never its trajectory: a
     pdb-format trajectory is written to <stem>_trajectory.pdb instead."""

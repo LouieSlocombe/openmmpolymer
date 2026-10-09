@@ -9,6 +9,7 @@ import pytest
 from openmmpolymer.convergence_report import analyse_convergence
 from openmmpolymer.elastic_rates import analyse_elastic_rates
 from openmmpolymer.elasticity import stress_strain
+from openmmpolymer.mechanical import BULK_STEM, analyse_mechanics
 from openmmpolymer.melt_check import melt_equilibration
 from openmmpolymer.protocols import RunManifest
 from openmmpolymer.relaxation import relaxation_curve
@@ -17,10 +18,12 @@ from openmmpolymer.trajectory import AnalysisError
 
 from .helpers import (
     planted_curve,
+    write_bulk,
     write_deformation,
     write_heating,
     write_polymer_snapshot,
     write_relaxation,
+    write_shear,
 )
 
 
@@ -32,6 +35,7 @@ from .helpers import (
         "relaxation_convergence",
         "heating",
         "stress",
+        "mechanics",
         "relaxation",
     ],
 )
@@ -42,8 +46,11 @@ def test_one_manifest_snapshot_serves_every_part_of_a_reader(
         write_polymer_snapshot(tmp_path)
     elif reader == "heating":
         write_heating(tmp_path, planted_curve())
-    elif reader == "stress":
+    elif reader in {"stress", "mechanics"}:
         write_deformation(tmp_path)
+        if reader == "mechanics":
+            write_bulk(tmp_path, stage=BULK_STEM)
+            write_shear(tmp_path)
     else:
         write_relaxation(tmp_path)
     manifest_reads.clear()
@@ -55,9 +62,19 @@ def test_one_manifest_snapshot_serves_every_part_of_a_reader(
         heating_curve(tmp_path)
     elif reader == "stress":
         stress_strain(tmp_path)
+    elif reader == "mechanics":
+        analyse_mechanics(tmp_path)
     else:
         relaxation_curve(tmp_path)
     assert manifest_reads == [tmp_path / "manifest.json"]
+
+
+def test_mechanics_without_a_manifest_keeps_its_final_refusal(tmp_path: Path) -> None:
+    with pytest.raises(AnalysisError) as failure:
+        analyse_mechanics(tmp_path)
+    assert str(failure.value) == (
+        f"Nothing in {tmp_path} was a mechanical measurement. It records: nothing."
+    )
 
 
 def test_heating_selection_keeps_empty_and_malformed_candidates_distinct(
