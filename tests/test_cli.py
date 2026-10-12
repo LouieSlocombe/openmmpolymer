@@ -22,7 +22,12 @@ from openmmpolymer import __main__ as cli
 from openmmpolymer.__main__ import PROTOCOLS, build_parser, main
 from openmmpolymer.conformation import PersistenceLength
 from openmmpolymer.elasticity import ElasticConsistency
-from openmmpolymer.mechanical import ModulusSpec, mechanical_scan
+from openmmpolymer.mechanical import (
+    ModulusReport,
+    ModulusSpec,
+    analyse_mechanics,
+    mechanical_scan,
+)
 from openmmpolymer.melt import build_melt
 from openmmpolymer.protocols import (
     Protocol,
@@ -32,9 +37,14 @@ from openmmpolymer.protocols import (
 )
 from openmmpolymer.reporters import TrajectoryOptions
 from openmmpolymer.tensile import BreakingSpec, ElongationSpec, YieldSpec, tensile_scan
-from openmmpolymer.tg import TgSpec, nominal_fine_schedule, tg_coarse_scan
+from openmmpolymer.tg import TgSpec, analyse_tg, nominal_fine_schedule, tg_coarse_scan
 from openmmpolymer.tm import TmSpec, melting_scan
-from openmmpolymer.viscoelastic import RelaxationSpec, relaxation_scan
+from openmmpolymer.viscoelastic import (
+    RelaxationReport,
+    RelaxationSpec,
+    analyse_relaxation,
+    relaxation_scan,
+)
 
 from .helpers import (
     BuildReached,
@@ -730,6 +740,28 @@ def test_a_dry_run_builds_packs_and_stops(
 # --------------------------------------------------------------------------
 
 
+def _write_tg_scan(directory: Path, rates: tuple[float, ...] = (1.0,)) -> None:
+    """A coarse pass and one fine pass per rate, with exact planted transitions."""
+    temperature, density = two_line_curve(transition_k=400.0, n_points=11)
+    stages: dict[str, Any] = {
+        "06_coarse": {
+            "temperature_k": list(temperature[::-1]),
+            "density_g_cm3": list(density[::-1]),
+            "segment_duration_ps": [200.0] * 11,
+        }
+    }
+    for rate in rates:
+        temperature, density = two_line_curve(
+            transition_k=340.0 + 20.0 * np.log10(rate)
+        )
+        stages[f"08_fine_{rate:g}"] = {
+            "temperature_k": list(temperature[::-1]),
+            "density_g_cm3": list(density[::-1]),
+            "segment_duration_ps": [20_000.0 / rate] * 21,
+        }
+    write_quenches(directory, stages)
+
+
 def test_a_tg_run_hands_the_flat_flags_to_the_scan_as_a_spec(
     staged_melt: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
@@ -740,6 +772,7 @@ def test_a_tg_run_hands_the_flat_flags_to_the_scan_as_a_spec(
 
     def scan(run: Any, run_dir: Any, **kwargs: Any) -> Any:
         seen.update(kwargs)
+        _write_tg_scan(run_dir)
         return SimpleNamespace(
             temperature_k=418.0,
             resolved=True,
@@ -771,6 +804,7 @@ def test_a_tg_run_at_several_rates_reports_each_and_then_the_fit(
     """Every measurement, then the extrapolation with its span attached."""
 
     def series(run: Any, run_dir: Any, **kwargs: Any) -> Any:
+        _write_tg_scan(run_dir, tuple(kwargs["rates_k_per_ns"]))
         return tuple(
             transition_at(rate, 340.0 + 20.0 * np.log10(rate))
             for rate in kwargs["rates_k_per_ns"]
@@ -791,17 +825,48 @@ def test_a_tg_run_at_several_rates_reports_each_and_then_the_fit(
         (
             "modulus",
             "run_modulus_scan",
-            {"youngs": None, "poisson": None, "bulk": None, "shear": None}
-            | {"load_modulus": None, "consistency": None},
+            ModulusReport(
+                run_dir="measured",
+                curves=(),
+                replicas=(),
+                youngs=None,
+                poisson=None,
+                bulk=None,
+                shear=None,
+                load=None,
+                load_modulus=None,
+                consistency=None,
+                replica_spread_mpa=None,
+                method_gap=0.0,
+                resolved=False,
+                notes=(),
+            ),
             "modulus: nothing was deformed",
         ),
-        ("relax", "run_relaxation_scan", {"mean": None}, "relax: nothing was strained"),
+        (
+            "relax",
+            "run_relaxation_scan",
+            RelaxationReport(
+                run_dir="measured",
+                curves=(),
+                mean=None,
+                kww=None,
+                prony=None,
+                replica_spread_mpa=None,
+                linearity=None,
+                plateau_conflict=False,
+                baseline_fraction=0.0,
+                resolved=False,
+                notes=(),
+            ),
+            "relax: nothing was strained",
+        ),
     ],
 )
 def test_a_scan_settles_its_melt_as_the_flags_ask_and_says_what_it_found(
     protocol: str,
     scan: str,
-    report: dict[str, Any],
+    report: Any,
     line: str,
     staged_melt: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
@@ -812,7 +877,7 @@ def test_a_scan_settles_its_melt_as_the_flags_ask_and_says_what_it_found(
 
     def run_scan(run: Any, output: Path, **kwargs: Any) -> Any:
         seen.update(kwargs, output=output)
-        return SimpleNamespace(**report)
+        return report
 
     monkeypatch.setattr(cli, scan, run_scan)
     flags = ["--melt-temperature", "620", "--check-melt", "5", "-o", "measured"]
@@ -823,6 +888,105 @@ def test_a_scan_settles_its_melt_as_the_flags_ask_and_says_what_it_found(
     assert seen["npt_trajectory"] == TrajectoryOptions("xtc", interval_ps=5.0)
     assert seen["expected_characteristic_ratio"] == 7.0
     assert line in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("figures", [False, True], ids=["no-figures", "svg"])
+@pytest.mark.parametrize(
+    ("protocol", "scan_name", "rates", "filename"),
+    [
+        ("modulus", "run_modulus_scan", None, "mechanics.json"),
+        ("relax", "run_relaxation_scan", None, "relaxation.json"),
+        ("tg", "run_tg_scan", None, "tg.json"),
+        ("tg", "cooling_rate_series", (10.0, 1.0), "tg.json"),
+        ("tg", "cooling_rate_series", (100.0, 10.0, 1.0), "tg.json"),
+    ],
+    ids=["modulus", "relax", "tg", "tg-two-rates", "tg-rate-series"],
+)
+def test_a_finished_scan_writes_its_analysis_and_requested_figures(
+    protocol: str,
+    scan_name: str,
+    rates: tuple[float, ...] | None,
+    filename: str,
+    figures: bool,
+    staged_melt: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Only dynamics are replaced; CLI analysis and report files are real."""
+    analysis_options: dict[str, Any] = {}
+
+    def read_tg(run_dir: Path, **options: Any) -> Any:
+        assert run_dir == Path("run")
+        analysis_options.update(options)
+        return analyse_tg(run_dir, **options)
+
+    def scan(run: Any, output: Path, **options: Any) -> Any:
+        if protocol == "modulus":
+            write_deformation(output, modulus_mpa=2000.0)
+            return analyse_mechanics(output)
+        if protocol == "relax":
+            write_relaxation(output, tau_ps=100.0)
+            return analyse_relaxation(output)
+        _write_tg_scan(output, rates or (1.0,))
+        if rates is not None:
+            assert tuple(options["rates_k_per_ns"]) == rates
+            return tuple(
+                transition_at(rate, 340.0 + 20.0 * np.log10(rate)) for rate in rates
+            )
+        return SimpleNamespace(
+            temperature_k=340.0,
+            resolved=True,
+            restart="waypoint",
+            approximate=SimpleNamespace(temperature_k=400.0),
+            fine_schedule=SimpleNamespace(cooling_rate_k_per_ns=1.0),
+            fine_summary=SimpleNamespace(chains=None),
+        )
+
+    monkeypatch.setattr(cli, scan_name, scan)
+    monkeypatch.setattr(cli, "analyse_tg", read_tg)
+    flags = ["--figure-format", "svg"] if figures else ["--no-figures"]
+    if protocol == "tg":
+        flags += [
+            "--no-melt-check",
+            "--min-points-per-branch",
+            "5",
+            "--target-rate",
+            "0.001",
+            "--rg",
+            "1.7",
+            "--rate-form",
+            "log_linear" if rates is not None and len(rates) == 2 else "vft",
+        ]
+        if rates is not None:
+            flags += ["--cooling-rates", ",".join(str(rate) for rate in rates)]
+    assert main(_argv(protocol, *flags)) == 0
+
+    analysis = Path("run/analysis")
+    report = json.loads((analysis / filename).read_text())
+    if protocol == "modulus":
+        assert report["youngs"]["modulus_mpa"] == pytest.approx(2000.0)
+    elif protocol == "relax":
+        assert report["kww"]["tau_ps"] == pytest.approx(100.0)
+    else:
+        assert analysis_options["melt_stage"] is None
+        assert analysis_options["min_points_per_branch"] == 5
+        assert analysis_options["target_rate_k_per_ns"] == 0.001
+        assert analysis_options["radius_of_gyration_nm"] == 1.7
+        assert report["fine"]["temperature_k"] == pytest.approx(340.0)
+        assert report["coarse"]["temperature_k"] == pytest.approx(400.0)
+        assert len(report["transitions"]) == len(rates or (1.0,)) + 1
+        for form in ("log_linear", "vft"):
+            minimum_rates = 3 if form == "vft" else 2
+            if rates is not None and len(rates) >= minimum_rates:
+                assert report[form]["target_rate_k_per_ns"] == 0.001
+            else:
+                assert report[form] is None
+    if figures:
+        assert list(analysis.glob("*.svg"))
+        assert {path.suffix for path in analysis.iterdir()} == {".json", ".svg"}
+    else:
+        assert sorted(path.name for path in analysis.iterdir()) == [filename]
+    assert f"wrote run/analysis/{filename}" in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------

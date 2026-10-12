@@ -134,7 +134,6 @@ from .tg import (
 from .timeseries import (
     DSC_COOLING_RATE_K_PER_NS,
     EXTRAPOLATION_FORMS,
-    cooling_rate_extrapolation,
     minimum_cooling_rates,
     quench_stages,
 )
@@ -265,7 +264,7 @@ class _Job(NamedTuple):
     def report(
         self,
         report: Any,
-        lines: Callable[[Any], Iterable[str]],
+        lines: Callable[[Any], Iterable[str]] | None,
         write: Callable[..., ReportFiles],
     ) -> None:
         """Say what a scan found, and write its report where the scan ran."""
@@ -303,20 +302,28 @@ def _run_tg(job: _Job) -> None:
             f"K/ns (coarse said {coarse}), started from the {result.restart} state"
         )
         _print_chains(result.fine_summary.chains)
-        return
-    transitions = job.scan(
-        cooling_rate_series, rates_k_per_ns=rates, tg_approx_k=arguments.tg_approx
-    )
-    for rate, fit in zip(rates, transitions, strict=True):
-        print(
-            f"tg: {fit.temperature_k:.0f} K at {rate:g} K/ns{_unresolved(fit.resolved)}"
+    else:
+        transitions = job.scan(
+            cooling_rate_series, rates_k_per_ns=rates, tg_approx_k=arguments.tg_approx
         )
-    extrapolation = cooling_rate_extrapolation(
-        transitions,
+        for rate, fit in zip(rates, transitions, strict=True):
+            print(
+                f"tg: {fit.temperature_k:.0f} K at {rate:g} K/ns{_unresolved(fit.resolved)}"
+            )
+    report = analyse_tg(
+        job.output,
+        melt_stage=None if arguments.no_melt_check else arguments.melt_stage,
+        min_points_per_branch=arguments.min_points_per_branch,
         target_rate_k_per_ns=arguments.target_rate,
-        form=arguments.rate_form,
+        radius_of_gyration_nm=arguments.rg,
     )
-    print(_extrapolation_line(extrapolation))
+    if rates is not None:
+        extrapolation = getattr(report, arguments.rate_form)
+        if extrapolation is not None:
+            print(_extrapolation_line(extrapolation))
+    # The scan summaries above already supply the console headline. Save the
+    # same full report as --analyse, including every available rate fit.
+    job.report(report, None, write_tg_report)
 
 
 def _run_tm(job: _Job) -> None:
@@ -326,7 +333,7 @@ def _run_tm(job: _Job) -> None:
 
 def _run_modulus(job: _Job) -> None:
     """Measure the elastic constants, and say what qualifies each one."""
-    _say(_modulus_lines(job.scan(run_modulus_scan)))
+    job.report(job.scan(run_modulus_scan), _modulus_lines, write_mechanical_report)
 
 
 def _run_breaking(job: _Job) -> None:
@@ -348,7 +355,9 @@ def _run_yield(job: _Job) -> None:
 
 def _run_relaxation(job: _Job) -> None:
     """Strain the cell once, watch the stress decay, and say what it decayed to."""
-    _say(_relaxation_lines(job.scan(run_relaxation_scan)))
+    job.report(
+        job.scan(run_relaxation_scan), _relaxation_lines, write_relaxation_report
+    )
 
 
 @dataclass(frozen=True)
@@ -1616,12 +1625,13 @@ def _build(
 def _emit(
     arguments: argparse.Namespace,
     report: Any,
-    lines: Callable[[Any], Iterable[str]],
+    lines: Callable[[Any], Iterable[str]] | None,
     write: Callable[..., ReportFiles],
     output_dir: str | Path | None,
 ) -> None:
     """Print what a report found and its notes, then write it and say where."""
-    _say(lines(report))
+    if lines is not None:
+        _say(lines(report))
     _say(f"note: {note}" for note in report.notes)
     files = write(
         report,

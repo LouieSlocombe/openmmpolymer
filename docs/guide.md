@@ -69,6 +69,11 @@ Every measurement follows the same pattern:
   never failed, a replica that is missing - and the headline is then `None`.
 - `analyse_*` rereads a finished directory without running dynamics, and
   `write_*_report` writes its JSON and figures to `<run>/analysis`.
+  CLI measurement runs write these reports automatically, including
+  `mechanics.json` for `--protocol modulus`, `relaxation.json` for
+  `--protocol relax`, and `tg.json` for single- and multiple-rate Tg scans.
+  `--no-figures` keeps the JSON and skips plots; `--figure-format` chooses
+  the plot format.
   `openmmpolymer --analyse RUN_DIR` works out from what a directory recorded
   which reports it can produce - a quench gets a glass transition, a heating
   scan a melting report, a tensile ladder its yield, breaking or elongation
