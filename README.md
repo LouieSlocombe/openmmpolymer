@@ -86,6 +86,8 @@ openmmpolymer '[*]OC(C)C(=O)[*]' -n 20 -c 40 -r PLA \
 ```
 
 `--head-cap` and `--tail-cap` each take a fragment with one `[*]`.
+`--tacticity` sets only backbone stereocentres; it does not assign or overwrite
+side-chain or cap stereochemistry.
 `--characteristic-ratio` sets the C-infinity the chains are grown to and
 checked against; the default, 7.0, is polyethylene's.
 

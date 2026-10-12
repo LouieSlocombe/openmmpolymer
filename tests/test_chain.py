@@ -144,6 +144,75 @@ def test_tacticity_sets_the_backbone_stereocentres(
     assert len(tags) == distinct_tags
 
 
+@pytest.mark.parametrize("tacticity", chain.TACTICITIES)
+@pytest.mark.parametrize("specified", [True, False])
+@pytest.mark.parametrize("has_backbone_centre", [True, False])
+@pytest.mark.parametrize("n_units", [None, 3])
+def test_tacticity_preserves_side_chain_and_cap_stereochemistry(
+    tacticity: str,
+    specified: bool,
+    has_backbone_centre: bool,
+    n_units: int | None,
+) -> None:
+    """Only the path between attachment anchors is controlled by tacticity."""
+    stereo = "@" if specified else ""
+    side_chain = f"[C{stereo}H:11](F)Cl"
+    monomer = (
+        f"[*]O[CH:10]({side_chain})C(=O)[*]"
+        if has_backbone_centre
+        else f"[*]CC({side_chain})=CC[*]"
+    )
+    spec = ChainSpec(
+        monomer_smiles=monomer,
+        degree_of_polymerization=6,
+        tacticity=tacticity,
+        head_cap=f"[*]C[C{stereo}H:21](F)Cl",
+        tail_cap=f"[*]C[C{stereo * 2}H:22](F)Cl",
+        seed=7,
+    )
+    molecule = assemble_chain(spec, n_units=n_units)
+    units = spec.degree_of_polymerization if n_units is None else n_units
+    backbone = set(chain.backbone_path(molecule, units))
+    cw = Chem.ChiralType.CHI_TETRAHEDRAL_CW
+    ccw = Chem.ChiralType.CHI_TETRAHEDRAL_CCW
+    unspecified = Chem.ChiralType.CHI_UNSPECIFIED
+    expected = {11: ccw, 21: ccw, 22: cw}
+    counts = dict.fromkeys(expected, 0)
+    backbone_tags = []
+    for atom in molecule.GetAtoms():  # type: ignore[no-untyped-call]
+        mapped = atom.GetAtomMapNum()
+        if mapped in expected:
+            counts[mapped] += 1
+            assert atom.GetIdx() not in backbone
+            assert atom.GetChiralTag() == (
+                expected[mapped] if specified else unspecified
+            )
+            if specified:
+                assert atom.GetProp("_CIPCode") == ("S" if mapped == 22 else "R")
+            else:
+                assert not atom.HasProp("_CIPCode")
+        elif mapped == 10:
+            assert atom.GetIdx() in backbone
+            # This centre is inside the repeat unit, rather than an anchor.
+            assert not atom.HasProp("_omp_head_anchor")
+            assert not atom.HasProp("_omp_tail_anchor")
+            backbone_tags.append(atom.GetChiralTag())
+        else:
+            assert atom.GetChiralTag() == unspecified
+    assert counts == {11: units, 21: 1, 22: 1}
+    assert len(backbone_tags) == (units if has_backbone_centre else 0)
+    if has_backbone_centre:
+        if tacticity == "isotactic":
+            assert backbone_tags == [cw] * units
+        elif tacticity == "syndiotactic":
+            assert backbone_tags == [cw, ccw] * (units // 2) + [cw] * (units % 2)
+        else:
+            assert all(tag in (cw, ccw) for tag in backbone_tags)
+            assert Chem.MolToSmiles(molecule) == Chem.MolToSmiles(
+                assemble_chain(spec, n_units=n_units)
+            )
+
+
 def test_atom_names_are_unique_and_fit_four_columns() -> None:
     """PDB atom names are truncated to four without complaint, so they must fit."""
     molecule = Chem.AddHs(

@@ -108,8 +108,10 @@ class ChainSpec:
         monomer_smiles: SMILES with exactly two ``[*]`` attachment points. The
             first in atom order is the head, the last the tail.
         degree_of_polymerization: Number of repeat units.
-        tacticity: One of ``atactic``, ``isotactic``, ``syndiotactic``. A no-op
-            for a monomer with no backbone stereocentre.
+        tacticity: One of ``atactic``, ``isotactic``, ``syndiotactic``. Applies
+            only to backbone stereocentres; side-chain and cap stereochemistry
+            is left unchanged. A no-op for a monomer with no backbone
+            stereocentre.
         head_cap: SMILES fragment with one ``[*]`` closing the first unit's open
             head, or None to choose one from the attachment chemistry.
         tail_cap: The same for the last unit's open tail.
@@ -402,14 +404,20 @@ def _apply_tacticity(mol: Chem.Mol, spec: ChainSpec, units: int) -> None:
     """Set backbone chiral tags according to ``spec.tacticity``.
 
     A monomer with no backbone stereocentre - polyethylene, say - has nothing
-    to set, and that is not an error.
+    to set, and that is not an error. Side chains and caps share repeat-unit
+    tags with the backbone, but their stereochemistry must remain unchanged.
     """
     Chem.AssignStereochemistry(
         mol, cleanIt=True, force=True, flagPossibleStereoCenters=True
     )
+    backbone = set(backbone_path(mol, units))
     centres: dict[int, list[Chem.Atom]] = {}
     for atom in _atoms(mol):
-        if atom.HasProp("_ChiralityPossible") and atom.HasProp("_omp_unit"):
+        if (
+            atom.GetIdx() in backbone
+            and atom.HasProp("_ChiralityPossible")
+            and atom.HasProp("_omp_unit")
+        ):
             centres.setdefault(atom.GetIntProp("_omp_unit"), []).append(atom)
     if not centres:
         log.debug(
