@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from rdkit import Chem
 
+from openmmpolymer import chain
 from openmmpolymer.chain import (
     ChainError,
     ChainResult,
@@ -205,47 +206,45 @@ def test_the_seed_decides_the_conformers(pe12: ChainResult, tmp_path: Path) -> N
     assert other.radius_of_gyration_nm != again.radius_of_gyration_nm
 
 
-@pytest.mark.parametrize(
-    ("seed", "radii", "extents", "ratio"),
-    [
-        (
-            5,
-            (0.5787275880836984, 0.7165536334243441),
-            (2.011338353852507, 2.53652057500043),
-            7.186237870164912,
-        ),
-        (
-            6,
-            (0.8130763029789595, 0.7995003794693913),
-            (2.7388088441624765, 2.8050869338411406),
-            11.185481234792949,
-        ),
-    ],
-)
 def test_chain_result_floats_keep_the_recorded_build_inputs(
-    tmp_path: Path,
-    seed: int,
-    radii: tuple[float, ...],
-    extents: tuple[float, ...],
-    ratio: float,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Even one ulp changes the exact floats compared by build/inputs.json.
 
-    These independent golden values were recorded before consolidation, with
-    the CPU environment's RDKit, for two grown conformers of each seed.
+    Fix the coordinates, since RDKit embedding and optimisation can vary
+    across environments even with the same seed. These synthetic conformers
+    pin the original dimension arithmetic, including conversion to nm after
+    measuring in angstrom: converting first changes the first radius by ulps.
     """
+    indices = np.arange(74, dtype=np.float64)
+    first = np.column_stack(
+        (indices * 0.25, (indices % 3) * 0.5, (indices % 5) * 0.125)
+    )
+    second = np.column_stack(
+        (indices * 0.125, (indices % 7) * 0.25, (indices % 3) * 0.5)
+    )
+    # Binary-exact inputs, with backbone endpoints separated on one axis to
+    # avoid platform-dependent dot-product rounding in the characteristic ratio.
+    first[23] = (10.0, 0.0, 0.0)
+    second[23] = (0.0, 20.0, 0.0)
+    conformers = iter((first, second))
+
+    def embed(molecule: Chem.Mol, seed: int) -> bool:
+        chain._set_conformer(molecule, next(conformers))
+        return True
+
+    monkeypatch.setattr(chain, "_embed_etkdg", embed)
     result = build_chain(
-        ChainSpec(
-            monomer_smiles=PE, degree_of_polymerization=12, residue_name="PE", seed=seed
-        ),
+        PE12,
         "golden",
         n_conformers=2,
         output_dir=tmp_path,
+        embedder="etkdg",
     )
     assert result.molar_mass_g_mol == 338.664
-    assert result.radius_of_gyration_nm == radii
-    assert result.max_extent_nm == extents
-    assert result.characteristic_ratio == ratio
+    assert result.radius_of_gyration_nm == (0.4073141443172232, 0.41367128630786976)
+    assert result.max_extent_nm == (1.8396255526688414, 3.90870996683318)
+    assert result.characteristic_ratio == 5.686168592683366
 
 
 def test_chain_and_protocol_dimension_kernels_agree(pe12: ChainResult) -> None:
