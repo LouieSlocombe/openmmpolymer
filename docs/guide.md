@@ -119,6 +119,11 @@ the scan checks the resolved total against `max_total_ns` again, including
 all requested cooling rates and any shared fallback pre-cool. Missing
 waypoints on resume can therefore cause a budget refusal before fine dynamics.
 
+`stage_ps` targets the size of resumable Tg stages. Each stage keeps at least
+two temperature holds together so analysis can recognise cooling; a short
+final chunk is merged with its predecessor. These stages can exceed the
+target, without adding any holds or changing the total simulation time.
+
 ```bash
 openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol tg --check-melt -o run -v
 ```

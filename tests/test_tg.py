@@ -33,6 +33,7 @@ from openmmpolymer.tg import (
     nominal_fine_schedule,
     pick_waypoint,
     run_tg_scan,
+    tg_coarse_scan,
     tg_fine_scan,
     write_tg_report,
 )
@@ -159,9 +160,10 @@ def test_the_chunks_visit_every_temperature_once_and_in_order() -> None:
     assert len(walked) == len(set(walked))
 
 
-def test_no_chunk_is_left_holding_a_single_temperature() -> None:
+@pytest.mark.parametrize("stage_ps", [0.2, 0.4, 0.6, 0.8, 2.0])
+def test_no_chunk_is_left_holding_a_single_temperature(stage_ps: float) -> None:
     """A stage with no temperature step is not recognised as a quench at all."""
-    spec = TgSpec(stage_ps=2.0, fine_hold_ps=0.4)
+    spec = TgSpec(stage_ps=stage_ps, fine_hold_ps=0.4)
     schedule = fine_schedule(140.0, 100.0, spec)
     stages = tg_fine_scan(schedule, spec, timestep_fs=1.0).stages
 
@@ -442,6 +444,56 @@ def test_the_chunks_of_one_pass_come_back_as_one_curve(tmp_path: Path) -> None:
     assert len(report.curves) == 2
     assert [curve.n_points for curve in report.curves] == [11, 21]
     assert report.stages[1] == "08_fine_quench_00, 08_fine_quench_01"
+
+
+@pytest.mark.parametrize(
+    ("stage_ps", "fine_hold_ps"),
+    [(500.0, 3000.0), (1500.0, 3000.0), (3000.0, 3000.0), (10000.0, 8000.0)],
+)
+@pytest.mark.parametrize(
+    ("floor_k", "fine_bottom_k"), [(150.0, 360.0), (152.0, 361.0), (152.0, 359.0)]
+)
+def test_short_stage_targets_preserve_both_ladders_for_analysis(
+    tmp_path: Path,
+    stage_ps: float,
+    fine_hold_ps: float,
+    floor_k: float,
+    fine_bottom_k: float,
+) -> None:
+    """Price, execute and read the same temperatures, even below one hold."""
+    spec = TgSpec(stage_ps=stage_ps, t_floor_k=floor_k)
+    coarse = tg_coarse_scan(spec)
+    fine_ladder = fine_schedule(500.0, fine_bottom_k, spec, hold_ps=fine_hold_ps)
+    fine = tg_fine_scan(fine_ladder, spec, timestep_fs=1.0)
+    samples = {}
+    for stage in (*coarse.stages, *fine.stages):
+        if stage.kind != "quench":
+            continue
+        temperatures = stage.options["temperatures_k"]
+        density = [
+            1.0 / (1.0 + (2.0e-4 if t <= 420.0 else 8.0e-4) * (t - 420.0))
+            for t in temperatures
+        ]
+        samples[stage.name] = quench_entry(
+            temperatures,
+            density,
+            segment_duration_ps=[stage.options["hold_ps"]] * len(temperatures),
+        )
+    write_quenches(tmp_path, samples)
+
+    report = analyse_tg(tmp_path, melt_stage=None)
+    assert len(report.curves) == 2
+    for curve, ladder in zip(
+        report.curves, (coarse_schedule(spec), fine_ladder), strict=True
+    ):
+        assert curve.temperature_k == pytest.approx(ladder.temperatures_k[::-1])
+        assert curve.hold_ps == ladder.hold_ps
+    assert report.temperature_k == pytest.approx(420.0)
+    assert fine.total_duration_ps == fine_ladder.total_ps
+    assert (
+        coarse.total_duration_ps
+        == tg_coarse_scan(replace(spec, stage_ps=100_000.0)).total_duration_ps
+    )
 
 
 def test_the_fine_pass_is_the_answer_and_the_coarse_one_is_the_evidence(

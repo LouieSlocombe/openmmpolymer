@@ -119,8 +119,10 @@ class TgSpec:
         fine_hold_ps: Time held at each fine temperature. The first half of
             each hold is discarded, so this is twice the averaging window.
         pressure_bar: The pressure held throughout.
-        stage_ps: Most dynamics one stage may hold before the ladder is split
-            into another; an interrupted run repeats at most this much.
+        stage_ps: Target duration for splitting each ladder into resumable
+            stages. Each stage keeps at least two temperature holds together;
+            a short final chunk is merged into its predecessor, so stages can
+            exceed this target.
         samples_per_segment: Density readings taken per temperature. The mean
             is over the second half, so this is twice the number of readings
             behind each point on the curve.
@@ -339,17 +341,26 @@ def fine_schedule(
 def _chunks(schedule: TgSchedule, stage_ps: float) -> list[tuple[float, ...]]:
     """A ladder's temperatures split for resume, with none left on its own.
 
-    A trailing chunk of one temperature would be a stage that never stepped,
+    A chunk of one temperature would be a stage that never stepped,
     which :func:`~openmmpolymer.timeseries.quench_stages` does not count as a
-    quench, so a curve read back from the directory would lose its coldest
-    point. It is folded into the one before it instead.
+    quench. Keep at least two holds per chunk even for a shorter stage target.
+    Fold a short tail into its predecessor. A tail with a shortened final
+    temperature step needs at least four points so its median spacing still
+    identifies it as part of the same cooling pass when read back.
     """
     ladder = schedule.temperatures_k
     chunks = [
         ladder[chunk.start : chunk.stop]
-        for chunk in resume_chunks(len(ladder), schedule.hold_ps, stage_ps)
+        for chunk in resume_chunks(
+            len(ladder), schedule.hold_ps, max(stage_ps, 2.0 * schedule.hold_ps)
+        )
     ]
-    if len(chunks) > 1 and len(chunks[-1]) == 1:
+    minimum_tail = 2
+    if len(ladder) > 1 and not math.isclose(
+        ladder[-2] - ladder[-1], schedule.step_k, rel_tol=1.0e-9, abs_tol=1.0e-9
+    ):
+        minimum_tail = 4
+    while len(chunks) > 1 and len(chunks[-1]) < minimum_tail:
         last = chunks.pop()
         chunks[-1] += last
     return chunks

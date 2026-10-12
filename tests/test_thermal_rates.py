@@ -14,7 +14,7 @@ import pytest
 
 from openmmpolymer import thermal_rates
 from openmmpolymer.protocols import Protocol, RunManifest
-from openmmpolymer.tg import TgSpec
+from openmmpolymer.tg import TgSpec, analyse_tg
 from openmmpolymer.thermal_rates import (
     WORKFLOW_NAME,
     ThermalRateError,
@@ -273,6 +273,42 @@ def fake_dynamics(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 
     monkeypatch.setattr(thermal_rates, "run_protocol", runner)
     return calls
+
+
+def test_short_tg_stages_preserve_rate_override_histories_on_readback(
+    tmp_path: Path,
+    argon_run: Any,
+    fake_dynamics: list[dict[str, Any]],
+) -> None:
+    """Every rate remains readable when one hold exceeds the stage target."""
+    holds = (1000.0, 3000.0, 10000.0)
+    temperatures = [*range(650, 174, -25), 152]
+    run_thermal_rate_scan(
+        argon_run,
+        tmp_path,
+        property_name="glass_transition",
+        spec=TgSpec(stage_ps=500.0, t_floor_k=152.0),
+        hold_times_ps=holds,
+        target_rate=0.1,
+        n_replicas=1,
+    )
+
+    assert len(fake_dynamics) == 1 + len(holds)
+    for call, hold in zip(fake_dynamics[1:], holds, strict=True):
+        protocol = call["protocol"]
+        chunks = [stage.options["temperatures_k"] for stage in protocol.stages]
+        assert all(len(chunk) >= 2 for chunk in chunks)
+        assert [
+            temperature for chunk in chunks for temperature in chunk
+        ] == temperatures
+        assert protocol.total_duration_ps == pytest.approx(len(temperatures) * hold)
+
+        report = analyse_tg(call["directory"], melt_stage=None)
+        assert len(report.curves) == 1
+        curve = report.curves[0]
+        assert curve.temperature_k.tolist() == temperatures[::-1]
+        assert curve.hold_ps == pytest.approx(hold)
+        assert curve.cooling_rate_k_per_ns == pytest.approx(25_000.0 / hold)
 
 
 @pytest.mark.parametrize(
