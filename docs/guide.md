@@ -323,6 +323,11 @@ before `sample_every_ps` down. A relaxation modulus is a material property only
 inside the linear region, and `linearity_strains` repeats the measurement at
 other strains to check.
 
+Shear planes use `(driven, gradient)` axes and support `(0, 1)`, `(0, 2)`,
+and `(1, 2)`. Reversed pairs are rejected before dynamics because the current
+shear construction must preserve
+[OpenMM's reduced box form](https://docs.openmm.org/latest/userguide/theory/05_other_features.html#periodic-boundary-conditions).
+
 ```bash
 openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol relax -t 298 \
   --step-strain 0.03 --linearity-strains 0.01,0.06 -o run -v

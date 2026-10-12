@@ -37,9 +37,18 @@ def test_an_axis_is_a_plain_cartesian_integer(axis: object) -> None:
         require_axis(axis, name="loading_axis")
 
 
-@pytest.mark.parametrize("plane", [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)])
+@pytest.mark.parametrize("plane", [(0, 1), (0, 2), (1, 2)])
 def test_a_plane_preserves_driven_and_gradient_order(plane: tuple[int, int]) -> None:
     assert require_plane(list(plane)) == plane
+
+
+@pytest.mark.parametrize("plane", [(1, 0), (2, 0), (2, 1)])
+def test_a_reversed_plane_is_refused_with_the_supported_choices(
+    plane: tuple[int, int],
+) -> None:
+    with pytest.raises(ValueError, match=r"shear_plane=.*OpenMM") as refusal:
+        require_plane(plane, name="shear_plane")
+    assert "(0, 1), (0, 2), (1, 2)" in str(refusal.value)
 
 
 @pytest.mark.parametrize(

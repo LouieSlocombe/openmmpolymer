@@ -392,6 +392,24 @@ def test_an_affine_shear_displaces_along_the_gradient() -> None:
         affine_shear(positions, 0.02, (2, 2))
 
 
+@pytest.mark.parametrize("plane", [(1, 0), (2, 0), (2, 1)])
+def test_shear_helpers_refuse_planes_that_openmm_cannot_represent(
+    plane: tuple[int, int],
+) -> None:
+    """Neither positions nor box vectors should promise an unusable shear."""
+    positions = np.asarray([[1.0, 2.0, 3.0]], dtype=np.float64)
+    vectors = [
+        mm.Vec3(3.0, 0, 0) * unit.nanometer,
+        mm.Vec3(0, 3.0, 0) * unit.nanometer,
+        mm.Vec3(0, 0, 3.0) * unit.nanometer,
+    ]
+    message = r"plane=.*\(0, 1\).*\(0, 2\).*\(1, 2\)"
+    with pytest.raises(ValueError, match=message):
+        affine_shear(positions, 0.02, plane)
+    with pytest.raises(ValueError, match=message):
+        shear_box_vectors(vectors, 0.02, plane)
+
+
 def test_straining_a_cell_does_not_depend_on_which_image_a_molecule_is_in() -> None:
     """The invariance the whole strain contract rests on.
 
@@ -443,21 +461,24 @@ def test_a_shear_past_the_reduced_form_is_refused_before_it_runs() -> None:
         shear_box_vectors(vectors, 0.9, (0, 2))
 
 
-def test_a_sheared_cell_is_accepted_by_openmm_and_energies_stay_finite() -> None:
+@pytest.mark.parametrize("plane", [(0, 1), (0, 2), (1, 2)])
+def test_a_sheared_cell_is_accepted_by_openmm_and_energies_stay_finite(
+    plane: tuple[int, int],
+) -> None:
     """The tilt and the displacement have to agree, or the cell is nonsense."""
     system, topology, positions = rigid_rotor_system(64, 3.0)
     simulation = _simulation(system, topology, positions, "flexible")
     original = simulation.context.getState().getPeriodicBoxVectors()
     for gamma in (0.005, 0.02, 0.05):
         simulation.context.setPeriodicBoxVectors(
-            *shear_box_vectors(original, gamma, (0, 2))
+            *shear_box_vectors(original, gamma, plane)
         )
         simulation.context.setPositions(
-            affine_shear(positions, gamma, (0, 2)) * unit.nanometer
+            affine_shear(positions, gamma, plane) * unit.nanometer
         )
         vectors = simulation.context.getState().getPeriodicBoxVectors(asNumpy=True)
         assert float(
-            np.asarray(vectors.value_in_unit(unit.nanometer))[2][0]
+            np.asarray(vectors.value_in_unit(unit.nanometer))[plane[1]][plane[0]]
         ) == pytest.approx(gamma * 3.0)
         assert math.isfinite(
             simulation.context.getState(getEnergy=True)

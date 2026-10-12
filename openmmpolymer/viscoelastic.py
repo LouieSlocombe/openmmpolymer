@@ -132,7 +132,8 @@ class RelaxationSpec:
             step does it without imposing a lateral contraction at all, which
             above the glass transition is the cleaner deformation.
         axis: The axis to stretch, for a tensile step.
-        plane: ``(driven, gradient)`` axes, for a shear step.
+        plane: ``(driven, gradient)`` axes, for a shear step. One of
+            ``(0, 1)``, ``(0, 2)``, ``(1, 2)``, matching OpenMM's reduced box form.
         step_strain: The strain applied, all at once. It has to be small
             enough to be inside the linear viscoelastic region and large
             enough to be seen over the virial noise, and those pull opposite

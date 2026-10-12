@@ -2254,7 +2254,8 @@ def run_shear(
         strains: The shear strains to step through, ascending.
         duration_ps_each: Time held at each strain.
         plane: ``(driven, gradient)`` axes - the displaced direction and the
-            direction it varies along.
+            direction it varies along. One of ``(0, 1)``, ``(0, 2)``,
+            ``(1, 2)``, matching OpenMM's reduced box form.
         new_velocities: Draw fresh velocities rather than inheriting them.
         samples_per_step: Stress readings per strain.
         timestep_fs: The integration timestep, or None for the longest safe
@@ -2649,7 +2650,8 @@ def run_relax(
             step does it without imposing a lateral contraction at all, which
             above the glass transition is the cleaner deformation.
         axis: The axis to stretch, for a tensile step.
-        plane: ``(driven, gradient)`` axes, for a shear step.
+        plane: ``(driven, gradient)`` axes, for a shear step. One of
+            ``(0, 1)``, ``(0, 2)``, ``(1, 2)``, matching OpenMM's reduced box form.
         step_strain: The strain applied, all at once. Small enough to stay
             inside the linear viscoelastic region, where the modulus does not
             depend on it - which nothing here can check from one run, and

@@ -174,6 +174,20 @@ def test_the_whole_load_or_shear_ladder_is_finite_before_any_dynamics(
     assert not list(tmp_path.iterdir())
 
 
+@pytest.mark.parametrize("runner", ["run_shear", "run_relax"])
+@pytest.mark.parametrize("plane", [(1, 0), (2, 0), (2, 1)])
+def test_unsupported_shear_planes_fail_before_accessing_run_or_writing(
+    tmp_path: Path, runner: str, plane: tuple[int, int]
+) -> None:
+    """Even the relaxation baseline must not run before a plane is refused."""
+    options = {"mode": "shear"} if runner == "run_relax" else {}
+    with pytest.raises(ValueError, match=r"plane=.*OpenMM"):
+        getattr(simulate, runner)(
+            None, output_prefix=tmp_path / "invalid", plane=plane, **options
+        )
+    assert not list(tmp_path.iterdir())
+
+
 def test_final_pdb_uses_the_live_cell_without_changing_the_packed_topology(
     argon_run: Any, tmp_path: Path
 ) -> None:

@@ -245,7 +245,7 @@ def affine_shear(
     """Shear every atom's position affinely with the cell.
 
     ``x += gamma * z`` for ``plane=(0, 2)``, and the matching displacement
-    for any other pair. Per atom for the reason :func:`affine_scale` is.
+    for another supported pair. Per atom for the reason :func:`affine_scale` is.
 
     The caller must tilt the box by the same amount, or the result is not a
     shear of a periodic cell but a shear of its contents inside an unchanged
@@ -257,13 +257,14 @@ def affine_shear(
         positions_nm: Whole-molecule positions, in nanometres.
         gamma: The shear strain to add.
         plane: ``(driven, gradient)`` axes - the displaced direction and the
-            direction it varies along.
+            direction it varies along. One of ``(0, 1)``, ``(0, 2)``,
+            ``(1, 2)``, matching OpenMM's reduced box form.
 
     Returns:
         New positions, in nanometres. The input is not modified.
 
     Raises:
-        ValueError: *plane* is not two different axes.
+        ValueError: *plane* is not a supported ordered axis pair.
     """
     driven, gradient = require_plane(plane)
     sheared = np.array(positions_nm, dtype=np.float64, copy=True)
@@ -282,15 +283,16 @@ def shear_box_vectors(vectors_nm: Any, gamma: float, plane: tuple[int, int]) -> 
     Args:
         vectors_nm: The current box vectors, as OpenMM returns them.
         gamma: The shear strain.
-        plane: ``(driven, gradient)`` axes.
+        plane: ``(driven, gradient)`` axes: ``(0, 1)``, ``(0, 2)``, or ``(1, 2)``.
 
     Returns:
         New box vectors, as a list of ``openmm.Vec3`` quantities.
 
     Raises:
+        ValueError: *plane* is not a supported ordered axis pair.
         StressError: The tilt is past OpenMM's reduced form.
     """
-    driven, gradient = plane
+    driven, gradient = require_plane(plane)
     rows = [
         [vector[axis].value_in_unit(unit.nanometer) for axis in range(3)]
         for vector in vectors_nm

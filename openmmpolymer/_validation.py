@@ -171,10 +171,14 @@ def require_axis(value: object, *, name: str = "axis") -> int:
 
 
 def require_plane(value: Sequence[int], *, name: str = "plane") -> tuple[int, int]:
-    """Return *value* as two different axes, ``(driven, gradient)``.
+    """Return a shear plane compatible with OpenMM's reduced box form.
+
+    The ``(driven, gradient)`` axes must be ordered: (0, 1), (0, 2), or
+    (1, 2). Reversing them would tilt a box vector out of OpenMM's required
+    triangular form; sorting them would instead change the deformation.
 
     Raises:
-        ValueError: The value is not two different axes of 0, 1 and 2.
+        ValueError: The value is not one of the supported ordered axis pairs.
     """
     axes = tuple(value)
     if (
@@ -186,6 +190,11 @@ def require_plane(value: Sequence[int], *, name: str = "plane") -> tuple[int, in
         )
     ):
         raise ValueError(f"{name}={value!r} must be two different axes of 0, 1, 2.")
+    if axes[0] > axes[1]:
+        raise ValueError(
+            f"{name}={value!r} is incompatible with OpenMM's reduced box form. "
+            "Choose (0, 1), (0, 2), (1, 2) as (driven, gradient) axes."
+        )
     return axes[0], axes[1]
 
 
