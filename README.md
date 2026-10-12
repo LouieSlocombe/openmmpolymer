@@ -60,7 +60,9 @@ print(summary.manifest_path)
 and `prepare_run` - each of which is usable on its own. What it adds is safe
 rebuilding: the build and a record of it go in `run/build`, and a second call
 rebuilds in scratch space and goes on only if the chain, cell and System match
-the record and every run already started there.
+the record and every run already started there. First builds also use scratch
+space and publish their assets and record together, so a failed attempt can
+be retried in the same directory without cleaning up `build/`.
 
 Or from the command line:
 

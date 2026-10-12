@@ -23,6 +23,7 @@ from openmmpolymer.__main__ import PROTOCOLS, build_parser, main
 from openmmpolymer.conformation import PersistenceLength
 from openmmpolymer.elasticity import ElasticConsistency
 from openmmpolymer.mechanical import ModulusSpec, mechanical_scan
+from openmmpolymer.melt import build_melt
 from openmmpolymer.protocols import (
     Protocol,
     _canonical,
@@ -356,21 +357,19 @@ def test_the_build_request_is_every_setting_but_where_and_how_it_runs(
     [["--seed", "7"], ["--temperature", "500"], ["--tail-cap", "[*]O"]],
 )
 def test_a_changed_request_is_refused_before_it_can_overwrite_the_build(
-    changed: list[str], no_build: list[Any]
+    changed: list[str], staged_melt: dict[str, Any]
 ) -> None:
-    arguments = ["[*]CC[*]", "-o", "run"]
-    with pytest.raises(BuildReached):
-        main(arguments)
-    artifact = Path("run/build/polymer_ff.xml")
-    artifact.parent.mkdir()
-    artifact.write_text("existing parameters")
+    arguments = ["[*]CC[*]", "-o", "run", "--dry-run"]
+    assert main(arguments) == 0
+    before = snapshot_files(Path("run"))
     with pytest.raises(SystemExit, match="2"):
         main([*arguments, *changed])
-    assert artifact.read_text() == "existing parameters"
-    # Presentation, device selection and switching between dynamics and
-    # build-only do not change the prepared physical system.
-    with pytest.raises(BuildReached):
-        main([*arguments, "--platform", "CPU", "--dry-run", "-v"])
+    assert len(staged_melt["builds"]) == 1
+    assert snapshot_files(Path("run")) == before
+    # Presentation and device selection do not change the prepared system.
+    assert main([*arguments, "--platform", "CPU", "-v"]) == 0
+    assert len(staged_melt["builds"]) == 2
+    assert snapshot_files(Path("run")) == before
 
 
 # --------------------------------------------------------------------------
@@ -587,6 +586,40 @@ def test_the_chain_flags_reach_the_builder(no_build: list[Any]) -> None:
     assert (spec.degree_of_polymerization, spec.characteristic_ratio) == (3, 5.5)
     assert (spec.tacticity, spec.residue_name, spec.seed) == ("isotactic", "PLA", 7)
     assert assemble_chain(spec).GetNumAtoms() > 0
+
+
+def test_a_failed_first_build_can_retry_the_same_request(
+    staged_melt: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted build keeps its request without publishing partial assets."""
+    completed: list[Any] = []
+
+    def capture_build(*args: Any, **options: Any) -> Any:
+        result = build_melt(*args, **options)
+        completed.append(result)
+        return result
+
+    monkeypatch.setattr(cli, "build_melt", capture_build)
+    arguments = ["[*]CC[*]", "--dry-run"]
+    staged_melt["fail"] = True
+    with pytest.raises(RuntimeError, match="preparation failed"):
+        main(arguments)
+    request = Path("run/build_request.json").read_bytes()
+    assert not Path("run/build").exists()
+
+    staged_melt["fail"] = False
+    assert main(arguments) == 0
+    assert Path("run/build_request.json").read_bytes() == request
+    assert Path("run/build/inputs.json").is_file()
+    assert len(staged_melt["builds"]) == 2
+    ((chain, run),) = completed
+    assert chain.sdf_paths == ("run/build/chain_0.sdf",)
+    assert chain.pdb_paths == ("run/build/chain_0.pdb",)
+    assert run.forcefield.forcefield_xml == "run/build/polymer_ff.xml"
+    assert all(
+        Path(path).is_file()
+        for path in (*chain.sdf_paths, *chain.pdb_paths, run.forcefield.forcefield_xml)
+    )
 
 
 @pytest.mark.parametrize("failure", ["refused", "broken"])

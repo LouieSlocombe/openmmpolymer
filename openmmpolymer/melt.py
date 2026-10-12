@@ -5,10 +5,12 @@ packing - builds the System, and returns the chain with the
 :class:`~openmmpolymer.simulate.RunContext` a protocol takes. What it adds to
 calling them yourself is what a second call into the same directory needs.
 
-The build goes into ``<directory>/build`` together with a record of what it
-produced. A rerun cannot simply reuse those files - new dependency versions can
-change the Hamiltonian even when nothing was asked differently - and must not
-overwrite them, because a finished run rests on them. So it rebuilds in
+The first build is prepared in scratch space and published to
+``<directory>/build`` together with a record of what it produced. A failed
+attempt leaves no partial build to block a retry. A rerun cannot simply reuse
+those files - new dependency versions can change the Hamiltonian even when
+nothing was asked differently - and must not overwrite them, because a finished
+run rests on them. So it rebuilds in
 scratch space inside the directory, from a copy of the force-field cache, and
 goes on only if the rebuilt chain, cell and System match the record and every
 run already started there. The originals are never touched: a failed or
@@ -22,7 +24,6 @@ import json
 import logging
 import shutil
 from collections.abc import Callable
-from contextlib import ExitStack
 from dataclasses import asdict, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -76,8 +77,9 @@ def build_melt(
         spec: The chain. Its seed also seeds the packing and the run.
         n_chains: Chains in the cell.
         directory: The run directory. The build goes in its ``build``
-            subdirectory, and a rebuild has to match the runs already started
-            in it or in its ``equilibration`` subdirectory, where the rate
+            subdirectory only after preparation and verification succeed.
+            A rebuild has to match the runs already started in it or in its
+            ``equilibration`` subdirectory, where the rate
             scans keep their shared preparation.
         target_density_g_cm3: The density the cell will be compressed to. It
             has to fit the cutoff there too, which is checked as soon as the
@@ -110,6 +112,12 @@ def build_melt(
     cache = root / "cache" if cache_dir is None else Path(cache_dir)
     record_path = build / _RECORD_NAME
     record = json.loads(record_path.read_text()) if record_path.is_file() else None
+    fresh = not build.exists()
+    if not fresh and record is None:
+        raise ProtocolError(
+            "The existing build lacks verified inputs. Its files were preserved; "
+            "restore inputs.json or use a fresh output directory."
+        )
     if record is not None:
         for name, digest in record["artifacts"].items():
             path = build / name
@@ -119,17 +127,20 @@ def build_melt(
                     "Restore it or use a fresh output directory."
                 )
 
-    fresh = not build.exists()
-    with ExitStack() as stack:
+    root.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix=".build-check-", dir=root) as temporary:
+        scratch = Path(temporary)
+        working = scratch / "build"
         if fresh:
-            working, working_cache = build, cache
-        else:
-            scratch = Path(
-                stack.enter_context(
-                    TemporaryDirectory(prefix=".build-check-", dir=root)
-                )
+            # A cache inside build/ must move with the assets; creating it at
+            # its final path would itself leave a partial published build.
+            working_cache = (
+                working / cache.resolve().relative_to(build.resolve())
+                if cache.resolve().is_relative_to(build.resolve())
+                else cache
             )
-            working, working_cache = scratch / "build", scratch / "cache"
+        else:
+            working_cache = scratch / "cache"
             if cache.is_dir():
                 shutil.copytree(cache, working_cache)
         chain, run = _prepare(
@@ -160,35 +171,36 @@ def build_melt(
                 },
             }
         )
-        if not fresh and (record is None or record["inputs"] != inputs):
+        if record is not None and record["inputs"] != inputs:
             raise ProtocolError(
-                "Prepared chemistry, force field or packed coordinates changed, "
-                "or the existing build lacks verified inputs. The original build "
-                "was preserved; use a fresh output directory."
+                "Prepared chemistry, force field or packed coordinates changed. "
+                "The original build was preserved; use a fresh output directory."
             )
         for run_dir in (root, root / "equilibration"):
             validate_run_inputs(run, run_dir)
 
-    if fresh:
-        artifacts = (
-            *chain.sdf_paths,
-            *chain.pdb_paths,
-            run.forcefield.forcefield_xml,
-            str(build / "packed.pdb"),
-        )
-        write_json(
-            record_path,
-            {
-                "inputs": inputs,
-                "artifacts": {
-                    str(Path(path).resolve().relative_to(build.resolve())): (
-                        file_sha256(path)
-                    )
-                    for path in artifacts
+        if fresh:
+            artifacts = (
+                *chain.sdf_paths,
+                *chain.pdb_paths,
+                run.forcefield.forcefield_xml,
+                str(working / "packed.pdb"),
+            )
+            write_json(
+                working / _RECORD_NAME,
+                {
+                    "inputs": inputs,
+                    "artifacts": {
+                        str(Path(path).resolve().relative_to(working.resolve())): (
+                            file_sha256(path)
+                        )
+                        for path in artifacts
+                    },
                 },
-            },
-        )
-        return chain, run
+            )
+            # Publish the complete directory, including its record, in one
+            # rename. Any earlier failure only discards this attempt's scratch.
+            working.rename(build)
     return (
         replace(
             chain,
