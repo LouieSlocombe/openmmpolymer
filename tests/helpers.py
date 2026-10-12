@@ -539,14 +539,23 @@ class StubUniverse:
     """
 
     def __init__(
-        self, positions_nm: npt.NDArray[np.float64], box_nm: npt.NDArray[np.float64]
+        self,
+        positions_nm: npt.NDArray[np.float64],
+        box_nm: npt.NDArray[np.float64],
+        box_angles_deg: npt.NDArray[np.float64] | None = None,
     ) -> None:
         self.positions_angstrom: npt.NDArray[np.float64] = (
             np.asarray(positions_nm, dtype=np.float64) * 10.0
         )
         boxes = np.asarray(box_nm, dtype=np.float64) * 10.0
         self.dimensions_angstrom: npt.NDArray[np.float64] = np.concatenate(
-            [boxes, np.full((boxes.shape[0], 3), 90.0)], axis=1
+            [
+                boxes,
+                np.full((boxes.shape[0], 3), 90.0)
+                if box_angles_deg is None
+                else box_angles_deg,
+            ],
+            axis=1,
         )
         self.interval_ps = 1.0
         self.current: npt.NDArray[np.float64] = self.positions_angstrom[0]
@@ -564,6 +573,7 @@ def synthetic_ensemble(
     *,
     n_chains: int,
     box_nm: float | np.ndarray = 10.0,
+    box_vectors_nm: np.ndarray | None = None,
     interval_ps: float = 1.0,
     masses_amu: np.ndarray | None = None,
     is_hydrogen: np.ndarray | None = None,
@@ -576,6 +586,8 @@ def synthetic_ensemble(
             and read as a snapshot.
         n_chains: How many equal blocks the atoms divide into.
         box_nm: One cube edge for every frame, or per-frame edges.
+        box_vectors_nm: A ``(3, 3)`` row-vector cell, or one per frame, replacing
+            *box_nm*. Positions may remain outside its primary cell.
         interval_ps: Time between frames.
         masses_amu: One chain's masses. Equal masses when None.
         is_hydrogen: One chain's hydrogen mask. All heavy when None.
@@ -590,14 +602,25 @@ def synthetic_ensemble(
     if frames.ndim == 2:
         frames = frames[None, :, :]
     n_frames, n_atoms, _ = frames.shape
-    if isinstance(box_nm, (int, float)):
+    angles = None
+    if box_vectors_nm is not None:
+        vectors = np.asarray(box_vectors_nm, dtype=np.float64)
+        if vectors.ndim == 2:
+            vectors = np.tile(vectors, (n_frames, 1, 1))
+        boxes = np.linalg.norm(vectors, axis=2)
+        first, second = (1, 0, 0), (2, 2, 1)
+        cosines = np.sum(vectors[:, first] * vectors[:, second], axis=2) / (
+            boxes[:, first] * boxes[:, second]
+        )
+        angles = np.rad2deg(np.arccos(np.clip(cosines, -1.0, 1.0)))
+    elif isinstance(box_nm, (int, float)):
         boxes = np.full((n_frames, 3), float(box_nm))
     else:
         boxes = np.asarray(box_nm, dtype=np.float64)
         if boxes.ndim == 1:
             boxes = np.tile(boxes, (n_frames, 1))
     atoms_per_chain = n_atoms // n_chains
-    universe = StubUniverse(frames, boxes)
+    universe = StubUniverse(frames, boxes, angles)
     universe.interval_ps = interval_ps
     return Ensemble(
         stage=stage,

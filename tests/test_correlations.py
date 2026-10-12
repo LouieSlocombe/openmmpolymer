@@ -5,9 +5,11 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import fields
+from itertools import combinations, product
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 
 from openmmpolymer.correlations import (
@@ -201,27 +203,40 @@ def test_the_frame_count_is_reported_alongside_the_answer() -> None:
 )
 @pytest.mark.parametrize("stride", [1, 2])
 @pytest.mark.parametrize("heavy_atoms_only", [False, True])
+@pytest.mark.parametrize("sheared", [False, True])
 def test_correlations_collect_coordinates_and_cells_in_one_pass(
     monkeypatch: pytest.MonkeyPatch,
     measure: Callable[..., Any],
     options: dict[str, float],
     stride: int,
     heavy_atoms_only: bool,
+    sheared: bool,
 ) -> None:
     """The chosen coordinates and changing cells must stay paired, without
     decoding the trajectory again to recover its box dimensions."""
     edges = np.linspace(2.8, 2.4, 6)
     frames = np.asarray([lattice(64, edge) for edge in edges])
     boxes = np.repeat(edges[:, None], 3, axis=1)
+    cells = np.asarray([np.diag(box) for box in boxes])
+    if sheared:
+        cells[:, 1, 0] = np.linspace(-0.9, 0.8, len(edges))
+        cells[:, 2, 0] = np.linspace(0.7, -0.5, len(edges))
+        cells[:, 2, 1] = np.linspace(-0.6, 0.9, len(edges))
+        frames = np.asarray([lattice(64, 1.0) @ cell for cell in cells])
     hydrogen = np.array([False, True])
     ensemble = synthetic_ensemble(
-        frames, n_chains=32, box_nm=boxes, is_hydrogen=hydrogen
+        frames,
+        n_chains=32,
+        is_hydrogen=hydrogen,
+        box_nm=boxes,
+        box_vectors_nm=cells if sheared else None,
     )
     selected = synthetic_ensemble(
         frames[::stride],
         n_chains=32,
-        box_nm=boxes[::stride],
         is_hydrogen=hydrogen,
+        box_nm=boxes[::stride],
+        box_vectors_nm=cells[::stride] if sheared else None,
     )
     expected = measure(
         selected, stride=1, heavy_atoms_only=heavy_atoms_only, n_bins=24, **options
@@ -242,6 +257,148 @@ def test_correlations_collect_coordinates_and_cells_in_one_pass(
         assert getattr(measured, field.name) == pytest.approx(
             getattr(expected, field.name)
         )
+
+
+def neighbouring_image_distances(
+    positions: npt.NDArray[np.float64], cell: npt.NDArray[np.float64]
+) -> npt.NDArray[np.float64]:
+    """A small explicit image search for dimers in a primary triclinic cell."""
+    images = np.asarray(list(product(range(-2, 3), repeat=3))) @ cell
+    return np.asarray(
+        [
+            np.linalg.norm(positions[j] - positions[i] + images, axis=1).min()
+            for i, j in combinations(range(len(positions)), 2)
+            if i // 2 != j // 2
+        ]
+    )
+
+
+@pytest.mark.parametrize("translated", [False, True])
+def test_sheared_pair_shells_match_explicit_periodic_images(translated: bool) -> None:
+    """Tilt changes distances and volume; moving atoms to other images does not."""
+    cell = np.array([[3.2, 0.0, 0.0], [1.15, 2.8, 0.0], [-0.65, 0.85, 3.4]])
+    generator = np.random.default_rng(35)
+    positions = generator.random((18, 3)) @ cell
+    expected_distances = neighbouring_image_distances(positions, cell)
+    if translated:
+        positions += generator.integers(-2, 3, size=positions.shape) @ cell
+    measured = radial_distribution(
+        synthetic_ensemble(positions, n_chains=9, box_vectors_nm=cell),
+        r_max_nm=1.1,
+        n_bins=17,
+        heavy_atoms_only=False,
+    )
+    edges = np.linspace(0.0, 1.1, 18)
+    counts = np.histogram(expected_distances, bins=edges)[0]
+    shells = 4 * math.pi / 3 * np.diff(edges**3)
+    volume = float(np.linalg.det(cell))
+    ideal_pairs = 18 * 16 / (2 * volume) * shells
+
+    assert counts.sum() > 0
+    assert measured.n_pairs == counts.sum()
+    assert measured.coordination_number == pytest.approx(2 * np.cumsum(counts) / 18)
+    assert measured.g_r == pytest.approx(counts / ideal_pairs)
+    assert measured.number_density_nm3 == pytest.approx(18 / volume)
+
+
+def test_a_sheared_cell_limits_shells_by_its_face_spacing() -> None:
+    """Half an edge can put part of a spherical shell beyond the nearest face."""
+    cell = np.array([[3.0, 0.0, 0.0], [1.4, 2.0, 0.0], [0.3, 0.7, 2.6]])
+    volume = float(np.linalg.det(cell))
+    heights = [
+        volume / np.linalg.norm(np.cross(cell[i], cell[j]))
+        for i, j in combinations(range(3), 2)
+    ]
+    limit = min(heights) / 2
+    ensemble = synthetic_ensemble(
+        lattice(64, 1.0) @ cell, n_chains=64, box_vectors_nm=cell
+    )
+    measured = radial_distribution(ensemble, heavy_atoms_only=False)
+    assert measured.r_max_nm == pytest.approx(limit)
+
+    unsafe = 0.5 * (limit + np.linalg.norm(cell, axis=1).min() / 2)
+    assert unsafe > limit
+    with pytest.raises(AnalysisError, match="more than half the smallest"):
+        radial_distribution(ensemble, r_max_nm=unsafe, heavy_atoms_only=False)
+
+
+def test_a_sheared_ideal_gas_normalises_to_one() -> None:
+    """Uniform fractional coordinates fill the parallelepiped, not its cuboid."""
+    cell = np.array([[6.0, 0.0, 0.0], [2.5, 5.5, 0.0], [-2.0, 2.0, 6.5]])
+    gas = np.random.default_rng(81).random((3000, 3)) @ cell
+    measured = radial_distribution(
+        synthetic_ensemble(gas, n_chains=len(gas), box_vectors_nm=cell),
+        n_bins=35,
+        heavy_atoms_only=False,
+    )
+    assert measured.g_r[measured.r_nm > 0.8] == pytest.approx(1.0, abs=0.06)
+
+
+def reciprocal_image_oracle(
+    cell: npt.NDArray[np.float64], q_max: float
+) -> npt.NDArray[np.float64]:
+    """Solve q.a_i = 2 pi n_i on an intentionally oversized integer cube."""
+    assert q_max * np.linalg.norm(cell, axis=1).max() / (2 * math.pi) < 8
+    vectors = []
+    for indices in product(range(-8, 9), repeat=3):
+        nonzero = [index for index in indices if index]
+        if nonzero and nonzero[0] > 0:
+            vector = np.linalg.solve(cell, 2 * math.pi * np.asarray(indices))
+            if np.linalg.norm(vector) < q_max:
+                vectors.append(vector)
+    return np.asarray(vectors)
+
+
+@pytest.mark.parametrize("translated", [False, True])
+@pytest.mark.parametrize(
+    "cell",
+    [
+        np.array([[3.2, 0.0, 0.0], [1.15, 2.8, 0.0], [-0.65, 0.85, 3.4]]),
+        # Here the shortest reciprocal vector combines two basis vectors.
+        np.array([[2.74, 0.0, 0.0], [-1.14, 1.71, 0.0], [1.32, 0.61, 1.47]]),
+    ],
+)
+def test_sheared_structure_factor_matches_commensurate_wavevectors(
+    cell: npt.NDArray[np.float64], translated: bool
+) -> None:
+    """Count and sum the true reciprocal lattice, including mixed-index modes."""
+    generator = np.random.default_rng(29)
+    positions = generator.random((12, 3)) @ cell
+    q_max, n_bins = 8.1, 37
+    wavevectors = reciprocal_image_oracle(cell, q_max)
+    phase = positions @ wavevectors.T
+    intensities = np.abs(np.exp(1j * phase).sum(axis=0)) ** 2 / len(positions)
+    magnitudes = np.linalg.norm(wavevectors, axis=1)
+    edges = np.linspace(0.0, q_max, n_bins + 1)
+    counts = np.histogram(magnitudes, bins=edges)[0]
+    total = np.histogram(magnitudes, bins=edges, weights=intensities)[0]
+    expected = np.divide(total, counts, out=np.zeros(n_bins), where=counts > 0)
+    if translated:
+        positions += generator.integers(-2, 3, size=positions.shape) @ cell
+    measured = structure_factor(
+        synthetic_ensemble(positions, n_chains=12, box_vectors_nm=cell),
+        q_max_per_nm=q_max,
+        n_bins=n_bins,
+        heavy_atoms_only=False,
+    )
+    assert measured.n_vectors == pytest.approx(counts)
+    assert measured.s_q == pytest.approx(expected, abs=1e-10)
+    assert measured.q_min_per_nm == pytest.approx(magnitudes.min())
+
+
+def test_sheared_resolution_floor_exists_above_the_requested_q_range() -> None:
+    """The shortest reciprocal mode is a property of the cell, not the query."""
+    cell = np.array([[2.74, 0.0, 0.0], [-1.14, 1.71, 0.0], [1.32, 0.61, 1.47]])
+    floor = float(np.linalg.norm(reciprocal_image_oracle(cell, 8.1), axis=1).min())
+    measured = structure_factor(
+        synthetic_ensemble(lattice(64, 1.0) @ cell, n_chains=64, box_vectors_nm=cell),
+        q_max_per_nm=0.9 * floor,
+        heavy_atoms_only=False,
+    )
+    assert measured.q_min_per_nm == pytest.approx(floor)
+    assert not measured.n_vectors.any()
+    assert not measured.s_q.any()
+    assert measured.first_peak_per_nm == 0.0
 
 
 def test_the_structure_factor_peaks_on_the_lattices_reciprocal_vector() -> None:
@@ -282,11 +439,14 @@ def test_every_bin_reports_how_many_wavevectors_fed_it() -> None:
     assert measured.s_q[measured.n_vectors == 0] == pytest.approx(0.0)
 
 
-def test_asking_for_more_wavevectors_than_will_be_summed_is_refused() -> None:
+@pytest.mark.parametrize("q_max", [1.0e6, 1.0e150, 1.0e308])
+def test_asking_for_more_wavevectors_than_will_be_summed_is_refused(
+    q_max: float,
+) -> None:
     """The answer to a cell too big for the q range is to ask for less, not to
     wait for a sum that will not finish."""
     with pytest.raises(AnalysisError, match="Lower q_max_per_nm"):
-        structure_factor(lattice_ensemble(), q_max_per_nm=1.0e6, heavy_atoms_only=False)
+        structure_factor(lattice_ensemble(), q_max_per_nm=q_max, heavy_atoms_only=False)
 
 
 @pytest.mark.parametrize("bad", [0, -1])

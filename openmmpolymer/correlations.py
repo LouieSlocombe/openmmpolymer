@@ -7,9 +7,8 @@ face and a split chain has a meaningless radius of gyration. Everything
 conformational wants that. A pair distribution does not - it needs each pair's
 shortest separation through the periodic boundaries - so it applies the
 convention itself, through MDAnalysis's distance kernels, which build a
-neighbour list rather than an N-by-N matrix. Both measurements take the cell to
-be rectangular, its three edges at right angles, so the tilt of a sheared cell
-is not accounted for.
+neighbour list rather than an N-by-N matrix. Both measurements retain the full
+periodic cell, including the tilt of a sheared cell.
 
 The pair distribution is deliberately **inter**molecular. A polymer's
 intramolecular g(r) is dominated by its own bonded geometry, which is a
@@ -18,14 +17,14 @@ question is whether chains interpenetrated, and only pairs on different
 molecules can answer it. That exclusion is one integer division, because a
 chain is a contiguous block of atoms.
 
-``r_max`` defaults to half the smallest cell edge and is refused above it. Past
-that distance the minimum image convention is simply wrong - and MDAnalysis
-applies it anyway on a cell of under a hundred atoms, with no warning - so a
-g(r) plotted out to the cell edge would show structure that is an artefact of
-the arithmetic.
+``r_max`` defaults to half the smallest perpendicular distance between opposing
+cell faces and is refused above it. This conservative bound keeps complete
+spherical shells inside the minimum-image region, so their usual volume is a
+valid normalisation. For a rectangular cell it is half the shortest edge.
 
 The structure factor is summed directly on the wavevectors the cell can
-actually hold, ``q = 2 pi n / L``. Fourier-transforming a g(r) truncated at
+actually hold, ``q = 2 pi n @ inverse(H).T`` for row cell vectors ``H``.
+Fourier-transforming a g(r) truncated at
 half the box would put ringing into the answer; summing on commensurate
 wavevectors has no truncation to ring, and gives every periodic image of an
 atom the same phase, so unwrapped coordinates need no folding. The cost is a
@@ -118,9 +117,9 @@ class StructureFactor:
             over the bins :func:`peak_bins` allows, which a peak the cell can
             resolve and an average worth the name have to be in. Zero when no
             bin qualifies.
-        q_min_per_nm: ``2 pi / L`` for the largest cell edge. Nothing below
-            this is measurable in a cell this size, whatever the curve does,
-            because the cell cannot hold a longer wave.
+        q_min_per_nm: Shortest nonzero reciprocal-cell wavevector magnitude
+            over the sampled frames. Nothing below this is measurable in the
+            cell, because it cannot hold a longer wave.
         n_frames: Frames averaged over.
         heavy_atoms_only: Whether hydrogens were dropped.
     """
@@ -147,7 +146,7 @@ def radial_distribution(
     Args:
         ensemble: A snapshot or a trajectory.
         r_max_nm: How far out to measure. None means half the smallest cell
-            edge, which is as far as the minimum image convention holds.
+            face spacing, a safe radius for complete spherical shells.
         n_bins: Bins between zero and *r_max_nm*.
         heavy_atoms_only: Drop hydrogens. On by default: a polymer melt's
             hydrogens trace the same structure as the carbons they hang off
@@ -160,7 +159,7 @@ def radial_distribution(
     Raises:
         AnalysisError: The cell has only one molecule, so there are no
             intermolecular pairs, or *r_max_nm* exceeds half the smallest cell
-            edge.
+            face spacing.
         ValueError: *n_bins* or *stride* is not a positive integer.
     """
     require_integer(n_bins, name="n_bins")
@@ -173,7 +172,7 @@ def radial_distribution(
         )
 
     positions, _, boxes = _load_chain_frames(
-        ensemble, stride=stride, heavy_atoms_only=heavy_atoms_only
+        ensemble, stride=stride, heavy_atoms_only=heavy_atoms_only, box_vectors=True
     )
     per_chain = positions.shape[2]
     limit = _pair_limit(boxes, r_max_nm)
@@ -181,13 +180,14 @@ def radial_distribution(
     edges = np.linspace(0.0, limit, n_bins + 1)
     counts = np.zeros(n_bins, dtype=np.float64)
     densities: list[float] = []
+    volumes = np.abs(np.linalg.det(boxes))
     n_atoms = positions.shape[1] * per_chain
-    for frame, box in zip(positions, boxes, strict=True):
+    for frame, box, volume in zip(positions, boxes, volumes, strict=True):
         distances = _intermolecular_distances(
             frame.reshape(n_atoms, 3), per_chain, box, limit
         )
         counts += np.histogram(distances, bins=edges)[0]
-        densities.append(n_atoms / float(box.prod()))
+        densities.append(n_atoms / float(volume))
 
     n_frames = positions.shape[0]
     centres = 0.5 * (edges[:-1] + edges[1:])
@@ -198,7 +198,7 @@ def radial_distribution(
     # molecule, which is what makes this an intermolecular g(r) rather than a
     # total one scaled wrongly.
     other = n_atoms - per_chain
-    ideal = 0.5 * n_atoms * other / float(np.mean([b.prod() for b in boxes])) * shells
+    ideal = 0.5 * n_atoms * other / float(np.mean(volumes)) * shells
     with np.errstate(divide="ignore", invalid="ignore"):
         g_r = np.where(ideal > TINY, counts / n_frames / np.maximum(ideal, TINY), 0.0)
 
@@ -257,7 +257,7 @@ def structure_factor(
     require_integer(stride, name="stride")
 
     positions, _, boxes = _load_chain_frames(
-        ensemble, stride=stride, heavy_atoms_only=heavy_atoms_only
+        ensemble, stride=stride, heavy_atoms_only=heavy_atoms_only, box_vectors=True
     )
     per_chain = positions.shape[2]
     n_atoms = positions.shape[1] * per_chain
@@ -265,10 +265,14 @@ def structure_factor(
     edges = np.linspace(0.0, q_max_per_nm, n_bins + 1)
     total = np.zeros(n_bins, dtype=np.float64)
     vectors = np.zeros(n_bins, dtype=np.int64)
+    floors: list[float] = []
     for frame, box in zip(positions, boxes, strict=True):
         wavevectors = _wavevectors(box, q_max_per_nm)
         intensity = _intensity(frame.reshape(n_atoms, 3), wavevectors)
         magnitudes = np.linalg.norm(wavevectors, axis=1)
+        floors.append(
+            float(magnitudes.min()) if magnitudes.size else _reciprocal_floor(box)
+        )
         index = np.digitize(magnitudes, edges) - 1
         inside = (index >= 0) & (index < n_bins)
         np.add.at(total, index[inside], intensity[inside])
@@ -278,7 +282,7 @@ def structure_factor(
     s_q = np.zeros(n_bins, dtype=np.float64)
     s_q[counted] = total[counted] / vectors[counted]
     centres = 0.5 * (edges[:-1] + edges[1:])
-    floor = 2.0 * math.pi / float(boxes.max())
+    floor = min(floors)
     n_frames = int(positions.shape[0])
     usable = peak_bins(centres, vectors, n_frames, floor, min_vectors_per_bin)
     return StructureFactor(
@@ -302,7 +306,7 @@ def peak_bins(
     """The bins of a structure factor that can carry its peak.
 
     Two exclusions, and the second is the one that matters. Below
-    *floor_per_nm*, ``2 pi / L``, the cell cannot hold a wave at all, so a
+    *floor_per_nm*, the cell cannot hold a wave at all, so a
     peak there contradicts the floor reported beside it. And a bin fed by
     fewer than *min_vectors_per_bin* wavevectors a frame is not an average;
     :data:`MIN_WAVEVECTORS_PER_BIN` says why.
@@ -328,20 +332,22 @@ def _peak_above(
 def _pair_limit(boxes: npt.NDArray[np.float64], r_max_nm: float | None) -> float:
     """Return the radius to measure to, refusing one the cell cannot support.
 
-    Half the smallest edge over the whole trajectory, because the cell
+    Half the smallest face spacing over the whole trajectory, because the cell
     shrinks under a barostat and a limit that was legal in the first frame
     need not be in the last.
     """
-    half = float(boxes.min()) / 2.0
+    # Column i of inverse(H) is normal to the faces opposite row vector i.
+    # Its reciprocal norm is the perpendicular spacing of those faces.
+    inverse = np.linalg.inv(boxes)
+    half = 0.5 / float(np.linalg.norm(inverse, axis=-2).max())
     if r_max_nm is None:
         return half
     limit = require_positive(r_max_nm, None, name="r_max_nm")
     if limit > half:
         raise AnalysisError(
-            f"r_max_nm={limit:.3f} is more than half the smallest cell edge "
-            f"({2 * half:.3f} nm, so {half:.3f} nm). Past that the minimum "
-            "image convention no longer counts every neighbour in a shell, so "
-            "the g(r) there would be an artefact of the arithmetic."
+            f"r_max_nm={limit:.3f} is more than half the smallest cell face spacing "
+            f"({2 * half:.3f} nm, so {half:.3f} nm). This conservative limit "
+            "keeps complete spherical shells within the minimum-image region."
         )
     return limit
 
@@ -360,16 +366,25 @@ def _intermolecular_distances(
     missing.
     """
     from MDAnalysis.lib.distances import self_capped_distance
+    from MDAnalysis.lib.mdamath import triclinic_box
 
     coordinates = np.ascontiguousarray(frame, dtype=np.float32)
-    box = np.array(
-        [box_nm[0], box_nm[1], box_nm[2], 90.0, 90.0, 90.0], dtype=np.float32
-    )
+    box = triclinic_box(*box_nm)
     # The kernel checks the cutoff against its float32 box, which can round
     # half an edge down past the float64 limit by one ulp and refuse it.
-    cutoff = min(float(r_max_nm), float(box[:3].min()) / 2.0)
+    tilted = not np.all(box[3:] == 90.0)
+    cutoff = (
+        float(r_max_nm) if tilted else min(float(r_max_nm), float(box[:3].min()) / 2.0)
+    )
+    # nsgrid imposes a smaller cutoff than the true face spacing for some
+    # tilted cells. The periodic tree handles the full safe radius without
+    # silently dropping the outer shells.
     found, measured = self_capped_distance(
-        coordinates, max_cutoff=cutoff, box=box, return_distances=True
+        coordinates,
+        max_cutoff=cutoff,
+        box=box,
+        method="pkdtree" if tilted else None,
+        return_distances=True,
     )
     pairs = np.asarray(found, dtype=np.int64)
     if pairs.size == 0:
@@ -395,12 +410,21 @@ def _wavevectors(
     Raises:
         AnalysisError: There are more than :data:`MAX_WAVEVECTORS` of them.
     """
-    spacing = 2.0 * math.pi / box_nm
-    limits = np.floor(q_max_per_nm / spacing).astype(int)
-    estimate = float(np.prod(2 * limits + 1))
+    reciprocal = 2.0 * math.pi * np.linalg.inv(box_nm).T
+    lengths = np.linalg.norm(box_nm, axis=1)
+    # n_i = q . a_i / (2 pi), so these bounds include even reciprocal
+    # combinations that are shorter than an individual basis vector.
+    bounds = [q_max_per_nm * (float(length) / (2.0 * math.pi)) for length in lengths]
+    if any(not math.isfinite(bound) or bound > MAX_WAVEVECTORS for bound in bounds):
+        raise AnalysisError(
+            f"The reciprocal grid exceeds {MAX_WAVEVECTORS:.3g} wavevectors. "
+            "Lower q_max_per_nm."
+        )
+    limits = [math.floor(bound) for bound in bounds]
+    estimate = math.prod(2 * limit + 1 for limit in limits)
     if estimate > 2 * MAX_WAVEVECTORS:
         raise AnalysisError(
-            f"A {box_nm.max():.1f} nm cell holds about {estimate / 2:.3g} "
+            f"A {lengths.max():.1f} nm cell holds about {estimate / 2:.3g} "
             f"wavevectors below {q_max_per_nm} /nm, over the "
             f"{MAX_WAVEVECTORS:.3g} this will sum. Lower q_max_per_nm."
         )
@@ -410,9 +434,19 @@ def _wavevectors(
     first = np.argmax(grid != 0, axis=1)
     leading = grid[np.arange(grid.shape[0]), first]
     grid = grid[(grid != 0).any(axis=1) & (leading > 0)]
-    wavevectors = grid * spacing
+    wavevectors = grid @ reciprocal
     magnitudes = np.linalg.norm(wavevectors, axis=1)
     return np.asarray(wavevectors[magnitudes <= q_max_per_nm], dtype=np.float64)
+
+
+def _reciprocal_floor(box_nm: npt.NDArray[np.float64]) -> float:
+    """Shortest reciprocal vector, including combinations of basis vectors."""
+    reciprocal = 2.0 * math.pi * np.linalg.inv(box_nm).T
+    upper = float(np.linalg.norm(reciprocal, axis=1).min())
+    # At least one basis vector fits; round upward so it is not lost to a
+    # last-bit difference in the norm or the integer enumeration bound.
+    candidates = _wavevectors(box_nm, float(np.nextafter(upper, math.inf)))
+    return float(np.linalg.norm(candidates, axis=1).min())
 
 
 def _intensity(

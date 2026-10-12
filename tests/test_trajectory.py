@@ -11,8 +11,10 @@ import pytest
 from openmmpolymer.structural_convergence import _block
 from openmmpolymer.trajectory import (
     AnalysisError,
+    Frame,
     _load_chain_frames,
     backbone_indices,
+    box_vectors_nm,
     boxes_nm,
     capped_stride,
     chain_positions,
@@ -278,6 +280,110 @@ def test_every_frame_reports_its_own_box(dimer_run_directory: Path) -> None:
     """Under a barostat the cell changes, and a density or a g(r) cut-off that
     used the first frame's box would drift out of date."""
     assert boxes_nm(open_run(dimer_run_directory, "02_nvt")).shape == (10, 3)
+
+
+def test_a_frame_without_angles_retains_orthorhombic_cell_semantics() -> None:
+    """Existing callers construct frames from three lengths alone."""
+    frame = Frame(0, 0.0, np.zeros((2, 3)), np.array([2.0, 3.0, 4.0]))
+    np.testing.assert_array_equal(frame.box_angles_deg, [90.0] * 3)
+    np.testing.assert_array_equal(frame.box_vectors_nm, np.diag([2.0, 3.0, 4.0]))
+
+
+@pytest.mark.parametrize("n_frames", [1, 5])
+@pytest.mark.parametrize("heavy_atoms_only", [False, True])
+def test_tilted_cells_follow_coordinates_in_one_pass(
+    n_frames: int, heavy_atoms_only: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shear angles, cell lengths and atom filtering share the same frame slice."""
+    from openmmpolymer.trajectory import Ensemble
+
+    coordinates = np.arange(n_frames * 6 * 3, dtype=np.float64).reshape(n_frames, 6, 3)
+    cells = np.repeat(np.diag([3.0, 4.0, 5.0])[None], n_frames, axis=0)
+    cells[:, 1, 0] = np.arange(n_frames) * 0.2 - 0.5
+    cells[:, 2, 0] = -0.3
+    cells[:, 2, 1] = np.arange(n_frames) * 0.1 + 0.4
+    ensemble = synthetic_ensemble(
+        coordinates,
+        n_chains=2,
+        box_vectors_nm=cells,
+        interval_ps=0.25,
+        is_hydrogen=np.array([False, True, False]),
+    )
+    original_frames = Ensemble.frames
+    passes = []
+
+    def frames(self: Ensemble, **options: Any) -> Any:
+        passes.append(options)
+        return original_frames(self, **options)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Ensemble, "frames", frames)
+        positions, times, vectors = _load_chain_frames(
+            ensemble, stride=2, heavy_atoms_only=heavy_atoms_only, box_vectors=True
+        )
+    assert passes == [{"stride": 2}]
+    expected_positions = coordinates[::2].reshape(-1, 2, 3, 3)
+    if heavy_atoms_only:
+        expected_positions = expected_positions[:, :, [0, 2]]
+    np.testing.assert_array_equal(positions, expected_positions)
+    np.testing.assert_array_equal(times, [0.0] if n_frames == 1 else [0.25, 0.75, 1.25])
+    np.testing.assert_allclose(vectors, cells[::2], atol=1e-14)
+    assert vectors.dtype == np.float64
+    np.testing.assert_allclose(
+        box_vectors_nm(ensemble, stride=2), cells[::2], atol=1e-14
+    )
+    np.testing.assert_allclose(
+        boxes_nm(ensemble, stride=2), np.linalg.norm(cells[::2], axis=2)
+    )
+
+
+@pytest.mark.parametrize("trajectory", [False, True], ids=["snapshot", "xtc"])
+def test_openmm_tilted_cells_survive_coordinate_file_round_trip(
+    tmp_path: Path, trajectory: bool
+) -> None:
+    """Read the angles OpenMM writes, including a changing XTC cell."""
+    from openmm import Vec3, app, unit
+
+    topology = app.Topology()
+    residue = topology.addResidue("AR", topology.addChain())
+    for index in range(2):
+        topology.addAtom(f"AR{index}", app.Element.getBySymbol("Ar"), residue)
+    positions = np.array([[0.2, 0.3, 0.4], [0.4, 0.3, 0.4]])
+    cells = np.array(
+        [
+            [[3.0, 0.0, 0.0], [0.8, 4.0, 0.0], [-0.4, 0.6, 5.0]],
+            [[3.1, 0.0, 0.0], [-0.5, 4.2, 0.0], [0.3, -0.7, 4.8]],
+        ]
+    )
+    pdb_path = tmp_path / ("shear_topology.pdb" if trajectory else "shear.pdb")
+    # The trajectory's cells must come from its frames, not from its topology.
+    topology.setPeriodicBoxVectors(
+        (np.diag([3.0, 4.0, 5.0]) if trajectory else cells[0]) * unit.nanometer
+    )
+    with pdb_path.open("w") as stream:
+        app.PDBFile.writeFile(topology, positions * unit.nanometer, stream)
+    if trajectory:
+        writer = app.XTCFile(
+            str(tmp_path / "shear.xtc"), topology, 0.5 * unit.picosecond
+        )
+        for cell in cells:
+            writer.writeModel(
+                positions * unit.nanometer,
+                periodicBoxVectors=tuple(Vec3(*vector) for vector in cell)
+                * unit.nanometer,
+            )
+    write_manifest(tmp_path, {"shear": {}})
+
+    ensemble = open_run(tmp_path, "shear")
+    expected_cells = cells if trajectory else cells[:1]
+    tolerance = 1e-6 if trajectory else 5e-4
+    np.testing.assert_allclose(box_vectors_nm(ensemble), expected_cells, atol=tolerance)
+    np.testing.assert_allclose(
+        boxes_nm(ensemble), np.linalg.norm(expected_cells, axis=2), atol=tolerance
+    )
+    for frame in ensemble.frames():
+        assert not np.allclose(frame.box_angles_deg, 90.0)
+        np.testing.assert_allclose(frame.positions_nm, positions, atol=1e-6)
 
 
 @pytest.mark.parametrize(

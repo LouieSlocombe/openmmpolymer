@@ -50,7 +50,7 @@ import logging
 import math
 import warnings
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -120,12 +120,25 @@ class Frame:
         time_ps: Time within the stage.
         positions_nm: ``(n_atoms, 3)``, unwrapped.
         box_nm: The three cell edge lengths.
+        box_angles_deg: Angles between the cell edges: alpha, beta and gamma.
+            Defaults to right angles for an orthorhombic cell.
     """
 
     index: int
     time_ps: float
     positions_nm: npt.NDArray[np.float64]
     box_nm: npt.NDArray[np.float64]
+    box_angles_deg: npt.NDArray[np.float64] = field(
+        default_factory=lambda: np.full(3, 90.0, dtype=np.float64)
+    )
+
+    @property
+    def box_vectors_nm(self) -> npt.NDArray[np.float64]:
+        """The three lattice vectors as rows of a ``(3, 3)`` matrix."""
+        from MDAnalysis.lib.mdamath import triclinic_vectors
+
+        dimensions = np.concatenate((self.box_nm, self.box_angles_deg))
+        return np.asarray(triclinic_vectors(dimensions, dtype=np.float64))
 
 
 @dataclass(frozen=True)
@@ -203,6 +216,7 @@ class Ensemble:
                 / ANGSTROM_PER_NM,
                 box_nm=np.asarray(step.dimensions[:3], dtype=np.float64)
                 / ANGSTROM_PER_NM,
+                box_angles_deg=np.array(step.dimensions[3:], dtype=np.float64),
             )
 
     def per_chain(
@@ -765,7 +779,11 @@ def chain_positions(
 
 
 def _load_chain_frames(
-    ensemble: Ensemble, *, stride: int = 1, heavy_atoms_only: bool = False
+    ensemble: Ensemble,
+    *,
+    stride: int = 1,
+    heavy_atoms_only: bool = False,
+    box_vectors: bool = False,
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """Read selected frames directly into their final arrays in one pass.
 
@@ -775,8 +793,9 @@ def _load_chain_frames(
     Returns:
         ``(n_frames, n_chains, atoms, 3)`` positions in nanometres,
         ``(n_frames,)`` times in picoseconds, and ``(n_frames, 3)`` cell edges
-        in nanometres, all sampled at the same stride. Only positions are
-        filtered by *heavy_atoms_only*.
+        in nanometres, or ``(n_frames, 3, 3)`` row lattice vectors when
+        *box_vectors* is true. All are sampled at the same stride. Only
+        positions are filtered by *heavy_atoms_only*.
     """
     require_integer(stride, name="stride")
     keep = ~ensemble.is_hydrogen if heavy_atoms_only else None
@@ -789,12 +808,14 @@ def _load_chain_frames(
     _check_size(ensemble.n_chains * n_atoms, n_frames)
     positions = np.empty((n_frames, ensemble.n_chains, n_atoms, 3), dtype=np.float64)
     times = np.empty(n_frames, dtype=np.float64)
-    boxes = np.empty((n_frames, 3), dtype=np.float64)
+    boxes = np.empty(
+        (n_frames, 3, 3) if box_vectors else (n_frames, 3), dtype=np.float64
+    )
     for index, frame in enumerate(ensemble.frames(stride=stride)):
         chains = ensemble.per_chain(frame.positions_nm)
         positions[index] = chains if keep is None else chains[:, keep]
         times[index] = frame.time_ps
-        boxes[index] = frame.box_nm
+        boxes[index] = frame.box_vectors_nm if box_vectors else frame.box_nm
     return positions, times, boxes
 
 
@@ -810,6 +831,17 @@ def boxes_nm(ensemble: Ensemble, *, stride: int = 1) -> npt.NDArray[np.float64]:
     """
     return np.asarray(
         [frame.box_nm for frame in ensemble.frames(stride=stride)], dtype=np.float64
+    )
+
+
+def box_vectors_nm(ensemble: Ensemble, *, stride: int = 1) -> npt.NDArray[np.float64]:
+    """Return every frame's row lattice vectors, ``(n_frames, 3, 3)`` in nm.
+
+    Unlike :func:`boxes_nm`, these retain the angles of a triclinic cell.
+    """
+    return np.asarray(
+        [frame.box_vectors_nm for frame in ensemble.frames(stride=stride)],
+        dtype=np.float64,
     )
 
 

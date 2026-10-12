@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 import numpy as np
@@ -96,6 +97,66 @@ def test_shrinking_box_uses_one_legal_radius_and_identical_grids() -> None:
         structural_window_convergence(
             ensemble, range(5), r_max_nm=2.1, **STRUCTURAL_OPTIONS
         )
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_changing_shear_sets_common_limits_from_even_unsampled_frames(
+    direction: int,
+) -> None:
+    """The strongest tilt is in the last frame, beyond every sampled prefix."""
+    rods = frozen_rods()
+    cells = np.tile(np.diag([4.0, 2.0, 3.0]), (72, 1, 1))
+    cells[:, 1, 0] = direction * np.linspace(0.0, 1.2, 72)
+    cells[:, 2, 1] = direction * np.linspace(0.0, 0.9, 72)
+    ensemble = synthetic_ensemble(
+        rods.universe.positions_angstrom / 10.0,
+        n_chains=4,
+        box_vectors_nm=cells,
+    )
+    options = {
+        **STRUCTURAL_OPTIONS,
+        "max_distribution_frames": 6,
+        "max_structure_factor_frames": 6,
+    }
+    report = structural_window_convergence(ensemble, range(5), **options)
+
+    # The b-face height is 2 / sqrt(1 + (0.9 / 3)^2). The shortest
+    # reciprocal vector is a* = 2 pi (1/4, -1.2/8, 1.2*0.9/24).
+    radius = 1.0 / math.sqrt(1.0 + 0.3**2)
+    floor = 2 * math.pi * math.sqrt(0.25**2 + 0.15**2 + 0.045**2)
+    assert report.settings["r_max_nm"] == pytest.approx(radius)
+    assert report.settings["common_q_floor_per_nm"] == pytest.approx(floor)
+    assert report.settings["pair_stride"] == 12
+    assert report.settings["factor_stride"] == 12
+    first = report.windows[0]
+    radial_grid = first.curves["radial_distribution"]["r_nm"]
+    reciprocal_grid = first.curves["structure_factor"]["q_per_nm"]
+    for window in (*report.windows, *report.blocks):
+        assert window.curves["radial_distribution"]["r_nm"] == radial_grid
+        assert window.curves["structure_factor"]["q_per_nm"] == reciprocal_grid
+    with pytest.raises(AnalysisError, match="smallest"):
+        structural_window_convergence(ensemble, range(5), r_max_nm=0.98, **options)
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [
+        np.zeros((3, 3)),
+        np.array([[4.0, 0, 0], [1.0, 4.0, 0], [2.0, 8.0, 0]]),
+        np.diag([4.0, 4.0, float("nan")]),
+        np.diag([4.0, 4.0, float("inf")]),
+    ],
+    ids=["zero", "singular", "nan", "infinite"],
+)
+def test_invalid_cell_vectors_are_refused_before_measuring(
+    monkeypatch: pytest.MonkeyPatch,
+    cell: np.ndarray,
+) -> None:
+    monkeypatch.setattr(convergence, "box_vectors_nm", lambda ensemble: cell[None])
+    with pytest.raises(
+        AnalysisError, match=r"finite cell vectors.*positive cell volumes"
+    ):
+        structural_window_convergence(frozen_rods(), range(5), **STRUCTURAL_OPTIONS)
 
 
 def test_distribution_caps_remain_fixed_across_prefixes_and_prevent_false_resolution() -> (

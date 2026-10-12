@@ -40,6 +40,7 @@ from .correlations import (
     MIN_WAVEVECTORS_PER_BIN,
     StructureFactor,
     _pair_limit,
+    _reciprocal_floor,
     peak_bins,
     radial_distribution,
     structure_factor,
@@ -49,7 +50,7 @@ from .trajectory import (
     AnalysisError,
     Ensemble,
     backbone_indices,
-    boxes_nm,
+    box_vectors_nm,
     capped_stride,
 )
 
@@ -527,9 +528,11 @@ def structural_window_convergence(
             int(index) for index in backbone_indices(backbone, ensemble.atoms_per_chain)
         )
     )
-    boxes = boxes_nm(ensemble)
-    if not np.all(np.isfinite(boxes)) or np.any(boxes <= 0):
-        raise AnalysisError("Structural convergence needs finite positive box edges.")
+    boxes = box_vectors_nm(ensemble)
+    if not np.all(np.isfinite(boxes)) or np.any(np.linalg.det(boxes) <= 0):
+        raise AnalysisError(
+            "Structural convergence needs finite cell vectors and positive cell volumes."
+        )
     options: dict[str, Any] = dict(
         stride=stride,
         pair_stride=capped_stride(ensemble.n_frames, stride, max_distribution_frames),
@@ -569,7 +572,7 @@ def structural_window_convergence(
     # reciprocal bins can win the peak simply because a prefix is longer.
     all_measured = measured + blocks
     mask = np.ones(q_bins, dtype=bool)
-    floor = 2 * math.pi / float(np.min(boxes))
+    floor = max(_reciprocal_floor(box) for box in boxes)
     for _, factor in all_measured:
         if factor is None:
             mask[:] = False
