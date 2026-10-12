@@ -140,9 +140,9 @@ def test_the_coarse_ladder_covers_the_range_at_the_step_asked_for() -> None:
     assert schedule.total_ps == pytest.approx(21_000.0)
 
 
-def test_the_size_of_the_fine_ladder_is_known_before_the_coarse_pass_runs() -> None:
-    """The window is the same width wherever it lands, so the cost is too."""
-    assert nominal_fine_schedule(TgSpec()).n_temperatures == 25
+def test_the_fine_estimate_reserves_the_extension_to_a_coarse_waypoint() -> None:
+    """A 120 K window can start up to 25 K higher, giving 30 fine holds."""
+    assert nominal_fine_schedule(TgSpec()).n_temperatures == 30
 
 
 def test_the_chunks_visit_every_temperature_once_and_in_order() -> None:
@@ -697,15 +697,15 @@ def test_the_equilibration_figure_is_drawn_when_the_melt_was_checked(
 @pytest.mark.parametrize(
     ("decimal_steps", "rates", "expected"),
     [
-        (False, None, 100110.0),
-        (False, (10.0, 5.0, 2.0), 125110.0),
-        (False, (0.3, 1.7, 9.0), 529194.9673202615),
-        (True, None, 44565.5),
-        (True, (10.0, 5.0, 2.0), 132070.0),
-        (True, (0.3, 1.7, 9.0), 580442.6797385621),
+        (False, None, 115110.0),
+        (False, (10.0, 5.0, 2.0), 145110.0),
+        (False, (0.3, 1.7, 9.0), 630011.9607843137),
+        (True, None, 49503.5),
+        (True, (10.0, 5.0, 2.0), 155430.0),
+        (True, (0.3, 1.7, 9.0), 698196.9281045751),
     ],
 )
-def test_scan_duration_keeps_the_original_cli_price(
+def test_scan_duration_prices_every_rate_with_a_waypoint_allowance(
     decimal_steps: bool, rates: tuple[float, ...] | None, expected: float
 ) -> None:
     from openmmpolymer.tg import tg_scan_duration_ps

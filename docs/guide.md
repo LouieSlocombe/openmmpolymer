@@ -60,7 +60,8 @@ Every measurement follows the same pattern:
 - It records what it was asked for before any dynamics. A rerun resumes only
   with the same request and intact states; `resume=False` reruns everything.
   Long ladders are split into stages, so an interrupted scan resumes mid-way.
-- `max_total_ns` prices the whole scan and refuses before anything is written.
+- `max_total_ns` prices the whole scan and refuses an over-budget initial
+  estimate before anything is written.
   The command line prints that price first, and `--dry-run` stops once the
   cell is built.
 - Every result carries `resolved` and `notes`. Unresolved means the data did
@@ -109,6 +110,14 @@ transition moves, as a straight line in log rate or in the
 Vogel-Fulcher-Tammann form (`wlf_constants` converts to WLF). Extrapolating to
 a calorimeter's 10 K/min is about ten decades, so it is always unresolved; the
 measured shift per decade of rate is the robust number.
+
+The initial Tg cost is an upper estimate with all coarse waypoints intact:
+it allows up to one coarse temperature step above the fine window. With
+default settings it quotes up to 115.11 ns; a coarse Tg of 420 K starts the
+fine pass at the 500 K waypoint and needs 112.11 ns. Before any fine pass runs,
+the scan checks the resolved total against `max_total_ns` again, including
+all requested cooling rates and any shared fallback pre-cool. Missing
+waypoints on resume can therefore cause a budget refusal before fine dynamics.
 
 ```bash
 openmmpolymer '[*]CC[*]' -n 30 -c 40 -r PE --protocol tg --check-melt -o run -v

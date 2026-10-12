@@ -535,9 +535,21 @@ def test_every_run_is_priced_in_full_before_anything_is_built(
         with pytest.raises(BuildReached):
             main(_argv(protocol, *flags))
     total_ns = _listed_ps(protocol, rates) / 1000.0
-    assert f"{protocol} run: {total_ns:.3g} ns of dynamics in total" in (
+    estimate = "up to " if protocol == "tg" else ""
+    assert f"{protocol} run: {estimate}{total_ns:.3g} ns of dynamics in total" in (
         capsys.readouterr().out
     )
+
+
+def test_tg_budget_includes_the_waypoint_extension_before_building(
+    no_build: list[Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI's shorter coarse holds still need the fine waypoint allowance."""
+    with pytest.raises(SystemExit, match="2"):
+        main(_argv("tg", "--max-total-ns", "90"))
+    assert "up to 95.3 ns" in capsys.readouterr().err
+    assert not no_build
+    assert not Path("run").exists()
 
 
 # --------------------------------------------------------------------------

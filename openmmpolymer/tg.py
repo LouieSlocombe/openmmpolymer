@@ -132,7 +132,9 @@ class TgSpec:
             anything about the chains, and off by default because it is frames
             of the whole cell.
         max_total_ns: Refuse to start if the whole scan - equilibration and
-            every pass - would exceed this.
+            every pass - would exceed this. The initial estimate reserves
+            up to one coarse step above the fine window; the resolved cost,
+            including any fallback pre-cool, is checked before the fine passes.
     """
 
     melt_temperature_k: float = 650.0
@@ -544,25 +546,37 @@ def pick_waypoint(
 
 
 def nominal_fine_schedule(spec: TgSpec, *, hold_ps: float | None = None) -> TgSchedule:
-    """How big the fine ladder will be, before it is known where it lands.
+    """An upper estimate of the fine ladder with all coarse waypoints intact.
 
-    The window is the same width wherever it ends up, so the point count - and
-    therefore the cost - is knowable before the coarse pass has run a step.
-    The temperatures here are offsets from the window's top rather than real
+    The fine pass starts at the coarse waypoint above the window, extending
+    the ladder by up to one coarse step. Reserve that extension, clamped to
+    the entire scanned range. Missing waypoints can require a hotter restart
+    or a pre-cool; that cost is checked once the actual start is known.
+    The temperatures here are offsets from the ladder's top rather than real
     ones, because only how many there are is being asked.
     """
+    span = min(
+        spec.melt_temperature_k - spec.t_floor_k,
+        2.0 * spec.window_k + spec.coarse_step_k,
+    )
     return TgSchedule(
-        temperatures_k=tuple(
-            quench_temperatures(2.0 * spec.window_k, 0.0, spec.fine_step_k)
-        ),
+        temperatures_k=tuple(quench_temperatures(span, 0.0, spec.fine_step_k)),
         hold_ps=spec.fine_hold_ps if hold_ps is None else hold_ps,
         step_k=spec.fine_step_k,
     )
 
 
-def _total_scan_ps(coarse: Protocol, fine_ladders: Sequence[TgSchedule]) -> float:
-    """Price the coarse preparation and each complete fine ladder."""
-    return coarse.total_duration_ps + sum(ladder.total_ps for ladder in fine_ladders)
+def _total_scan_ps(
+    coarse: Protocol,
+    fine_ladders: Sequence[TgSchedule],
+    precool: Stage | None = None,
+) -> float:
+    """Price preparation, every fine ladder, and the shared pre-cool once."""
+    return (
+        coarse.total_duration_ps
+        + sum(ladder.total_ps for ladder in fine_ladders)
+        + (0.0 if precool is None or not fine_ladders else precool.duration_ps)
+    )
 
 
 def tg_scan_duration_ps(
@@ -570,11 +584,13 @@ def tg_scan_duration_ps(
     *,
     rates_k_per_ns: Sequence[float] | None = None,
 ) -> float:
-    """Estimate coarse and fine dynamics before the fine window is located.
+    """Bound coarse and fine dynamics with all coarse waypoints intact.
 
     Each supplied rate sets its own fine hold; without rates the spec's fine
-    hold is used once. Uses the default coarse preparation; the ladder
-    arithmetic matches the runner.
+    hold is used once. Includes default coarse preparation and reserves the
+    fine ladder's extension to its starting waypoint. The runner checks the
+    resolved cost again before fine dynamics, including any fallback pre-cool
+    or hotter restart required by missing waypoints.
     """
     holds = (
         [spec.fine_hold_ps]
@@ -598,43 +614,53 @@ def _report_cost(
     fine_ladders: Sequence[TgSchedule],
     spec: TgSpec,
     manifest: RunManifest | None,
+    *,
+    precool: Stage | None = None,
+    estimated: bool = False,
 ) -> None:
-    """Say what the whole thing costs before any of it is spent.
+    """Report and check the whole scan's cost before its next pass starts.
 
     Two numbers: the total, and how much of it is still to run - in a queue
     the second is the only one anyone can act on. That counts the coarse
     stages the manifest does not already record and every fine pass in full,
-    because which fine stages there will be is not known until the coarse
-    pass has been fitted.
+    because fine stages may not be known yet. A fallback pre-cool is shared
+    by all rates and charged once, even when already completed on a resume.
 
     Raises:
         TgError: The total is over ``max_total_ns``.
     """
     fine_ps = sum(ladder.total_ps for ladder in fine_ladders)
-    total_ps = _total_scan_ps(coarse, fine_ladders)
+    total_ps = _total_scan_ps(coarse, fine_ladders, precool)
+    precool_stages = () if precool is None or not fine_ladders else (precool,)
+    precool_ps = sum(stage.duration_ps for stage in precool_stages)
     log.info(
         "Tg scan: %.1f ns equilibration, %.1f ns coarse (%d points at %.1f "
-        "K/ns), %.1f ns fine over %d pass(es) at %s K/ns, %d points each - "
-        "%.1f ns in total, %.1f ns of it still to run.",
+        "K/ns), %s%.1f ns fine over %d pass(es) at %s K/ns, %d points each, "
+        "%.1f ns pre-cool - %s%.1f ns in total, at most %.1f ns of it still to run.",
         (coarse.total_duration_ps - coarse_ladder.total_ps) / PS_PER_NS,
         coarse_ladder.total_ps / PS_PER_NS,
         coarse_ladder.n_temperatures,
         coarse_ladder.cooling_rate_k_per_ns,
+        "up to " if estimated else "",
         fine_ps / PS_PER_NS,
         len(fine_ladders),
         ", ".join(f"{ladder.cooling_rate_k_per_ns:.2f}" for ladder in fine_ladders),
         fine_ladders[0].n_temperatures if fine_ladders else 0,
+        precool_ps / PS_PER_NS,
+        "up to " if estimated else "",
         total_ps / PS_PER_NS,
-        (remaining_ps(coarse.stages, manifest) + fine_ps) / PS_PER_NS,
+        (remaining_ps((*coarse.stages, *precool_stages), manifest) + fine_ps)
+        / PS_PER_NS,
     )
     enforce_budget(
         total_ps / PS_PER_NS,
         spec.max_total_ns,
         error=TgError,
         message=lambda: (
-            f"This scan is {total_ps / PS_PER_NS:.1f} ns against a max_total_ns "
+            f"This scan {'is estimated at up to' if estimated else 'needs'} "
+            f"{total_ps / PS_PER_NS:.1f} ns against a max_total_ns "
             f"of {spec.max_total_ns:.1f}. Shorten the holds, widen the steps, "
-            "or raise the limit - but decide before it starts, not after."
+            "or raise the limit before continuing."
         ),
     )
 
@@ -702,6 +728,7 @@ def _approach(
         [nominal_fine_schedule(spec, hold_ps=hold) for hold in fine_holds],
         spec,
         RunManifest.load(directory) if resume else None,
+        estimated=True,
     )
 
     path = directory / WORKFLOW_NAME
@@ -727,6 +754,21 @@ def _approach(
 
     restart, start_state, start_temperature_k, precool = _restart_from(
         coarse, manifest, spec, window, record
+    )
+    # Missing waypoints can move the start beyond the initial allowance. Check
+    # every rate together before any fine pass (or its pre-cool) spends time.
+    # A resumed pre-cool still belongs to the whole scan's budget even when
+    # _restart_from no longer includes it in the stages to execute.
+    _report_cost(
+        coarse,
+        ladder,
+        [
+            fine_schedule(start_temperature_k, window[1], spec, hold_ps=hold)
+            for hold in fine_holds
+        ],
+        spec,
+        manifest,
+        precool=_precool_stage(window[0], spec) if restart == "precool" else None,
     )
     timestep_fs = safe_timestep_fs(start_temperature_k, run.spec)
     record.update(
@@ -876,7 +918,12 @@ def _restart_from(
     )
     if top >= spec.melt_temperature_k - 1.0e-9:
         return "melt", state, spec.melt_temperature_k, None
-    precool = Stage(
+    return "precool", state, top, _precool_stage(top, spec)
+
+
+def _precool_stage(top: float, spec: TgSpec) -> Stage:
+    """The shared fallback cooling stage, for both execution and budgeting."""
+    return Stage(
         PRECOOL_STEM,
         "quench",
         {
@@ -888,7 +935,6 @@ def _restart_from(
             "samples_per_segment": spec.samples_per_segment,
         },
     )
-    return "precool", state, top, precool
 
 
 def _fine_protocol(

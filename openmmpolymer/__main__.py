@@ -232,10 +232,10 @@ def _listed(
 
 
 def _tg_ps(spec: TgSpec, arguments: argparse.Namespace) -> float:
-    """The coarse pass, and each fine pass as long as its window will be.
+    """Price preparation and an upper estimate for each fine pass.
 
-    The window's place waits on the coarse fit, but not its size; each rate
-    of ``--cooling-rates`` holds each fine temperature for its own time.
+    Reserve the extension from the fine window to its coarse waypoint; each
+    rate of ``--cooling-rates`` holds each fine temperature for its own time.
     """
     if arguments.tg_approx is not None:
         fine_window(arguments.tg_approx, spec)
@@ -1499,11 +1499,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         spec = entry.settings(arguments)
         if rates is None:
             total_ns = entry.price(spec, arguments) / PS_PER_NS
-            cost = f"{arguments.protocol} run: {total_ns:.3g} ns of dynamics in total"
+            estimate = "up to " if arguments.protocol == "tg" else ""
+            cost = (
+                f"{arguments.protocol} run: {estimate}{total_ns:.3g} ns "
+                "of dynamics in total"
+            )
             budget = arguments.max_total_ns
             if budget is not None and total_ns > budget:
                 raise ValueError(
-                    f"The {arguments.protocol} run is {total_ns:.3g} ns, over the "
+                    f"The {arguments.protocol} run is {estimate}{total_ns:.3g} ns, over the "
                     f"{budget:g} ns budget. Shorten it or raise --max-total-ns."
                 )
         else:
