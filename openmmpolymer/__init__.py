@@ -16,7 +16,8 @@ A monomer SMILES becomes an equilibrated, measured melt::
 
 :func:`build_melt` is the four layers in turn - :func:`build_chain`,
 :func:`assign_charges`, :func:`build_polymer_forcefield` and :func:`pack_box` -
-each usable on its own. Their shape follows from one constraint: forcefill will
+each usable on its own; :func:`build_blend` does the same for a cell of several
+polymers. Their shape follows from one constraint: forcefill will
 not parameterise a residue bonded to its neighbours, and it is right not to, so
 a chain is one molecule and one residue, charged here rather than by the
 backend and packed by conformer. The measurement workflows (``run_*_scan``,
@@ -90,6 +91,7 @@ from .forcefield import (
     ForceFieldError,
     PolymerForceField,
     build_polymer_forcefield,
+    merge_polymer_forcefields,
 )
 from .mdsystem import (
     PackedBox,
@@ -115,7 +117,7 @@ from .mechanical import (
     run_modulus_scan,
     write_mechanical_report,
 )
-from .melt import build_melt
+from .melt import BlendComponent, build_blend, build_melt
 from .melt_check import MeltEquilibration, melt_equilibration
 from .packing import (
     DEFAULT_PACKING_DENSITY,
@@ -371,6 +373,7 @@ __all__ = [
     "TENSILE_RATE_PROPERTIES",
     "THERMAL_RATE_PROPERTIES",
     "AnalysisError",
+    "BlendComponent",
     "BreakingError",
     "BreakingReport",
     "BreakingSpec",
@@ -493,6 +496,7 @@ __all__ = [
     "box_edge_nm",
     "breaking_stages",
     "breaking_strength",
+    "build_blend",
     "build_chain",
     "build_melt",
     "build_polymer_forcefield",
@@ -534,6 +538,7 @@ __all__ = [
     "melt_quench",
     "melting_scan",
     "melting_temperature",
+    "merge_polymer_forcefields",
     "open_run",
     "pack_box",
     "persistence_length",

@@ -193,3 +193,28 @@ def test_the_cache_records_what_it_was_keyed_on(
     assert recorded["backend"] == "smirnoff"
     assert recorded["residue_name"] == "PE"
     assert entry.stem == cache_key(_molecule(charged_chain.sdf_paths[0]), recorded)
+
+
+@pytest.mark.parametrize(
+    ("changes", "match"),
+    [
+        ([{}], "at least two"),
+        ([{}, {"backend": "gaff", "residue_name": "PS"}], "Only smirnoff"),
+        ([{}, {"base_forcefield": ("other.xml",), "residue_name": "PS"}], "base"),
+        ([{}, {"residue_name": "pe"}], "its own residue name"),
+    ],
+)
+def test_force_fields_that_cannot_be_merged_safely_are_refused(
+    tmp_path: Path, changes: list[dict[str, Any]], match: str
+) -> None:
+    """Before forcefill is reached, so nothing is written."""
+    from dataclasses import replace
+
+    from openmmpolymer.forcefield import PolymerForceField, merge_polymer_forcefields
+
+    base = PolymerForceField("pe.xml", ("amber14-all.xml",), "PE", "smirnoff")
+    with pytest.raises(ValueError, match=match):
+        merge_polymer_forcefields(
+            [replace(base, **change) for change in changes], tmp_path / "merged.xml"
+        )
+    assert not (tmp_path / "merged.xml").exists()

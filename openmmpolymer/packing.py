@@ -425,6 +425,72 @@ def read_packed_pdb(packed_pdb: str | Path) -> tuple[Any, npt.NDArray[np.float64
     return pdb.topology, positions
 
 
+def blend_species(topology: Any, n_molecules: int) -> list[dict[str, Any]] | None:
+    """Tell a blend from a cell of identical molecules.
+
+    The per-chain analyses take molecule ``m`` to be atoms
+    ``m * atoms_per_chain`` onwards, which is right only when every molecule
+    is alike. So the cell is cut into *n_molecules* equal blocks, and each
+    block's residue names and sizes compared. Comparing blocks rather than
+    residues keeps a chain written as several residues - an end, a repeat, an
+    end - one molecule.
+
+    Args:
+        topology: The cell's topology.
+        n_molecules: The molecules it holds.
+
+    Returns:
+        None when every molecule is alike. Otherwise one entry per run of
+        alike chains - ``residue_name``, ``n_molecules`` and
+        ``atoms_per_chain`` - in topology order, or an empty list when the
+        residues do not map one to one onto the molecules.
+    """
+    n_atoms = topology.getNumAtoms()
+    if n_atoms % n_molecules == 0:
+        size = n_atoms // n_molecules
+        blocks: list[list[list[Any]]] = [[] for _ in range(n_molecules)]
+        for residue in topology.residues():
+            for atom in residue.atoms():
+                entries = blocks[atom.index // size]
+                if entries and entries[-1][0] == residue.index:
+                    entries[-1][2] += 1
+                else:
+                    entries.append([residue.index, residue.name, 1])
+        signatures = {
+            tuple((name, count) for _, name, count in entries) for entries in blocks
+        }
+        if len(signatures) == 1:
+            return None
+
+    residues = [
+        (residue.name, sum(1 for _ in residue.atoms()))
+        for residue in topology.residues()
+    ]
+    if len(residues) != n_molecules:
+        return []
+    species: list[dict[str, Any]] = []
+    for name, size in residues:
+        last = species[-1] if species else None
+        if last and (last["residue_name"], last["atoms_per_chain"]) == (name, size):
+            last["n_molecules"] += 1
+        else:
+            species.append(
+                {"residue_name": name, "n_molecules": 1, "atoms_per_chain": size}
+            )
+    return species
+
+
+def describe_species(species: Sequence[dict[str, Any]]) -> str:
+    """Name a blend's polymers, as :func:`blend_species` lists them."""
+    if not species:
+        return "molecules of different sizes"
+    return " and ".join(
+        f"{entry['n_molecules']} {entry['residue_name']} chains of "
+        f"{entry['atoms_per_chain']} atoms"
+        for entry in species
+    )
+
+
 def check_packing(topology: Any, positions_nm: npt.NDArray[np.float64]) -> None:
     """Check a packed cell for the three faults that survive minimisation.
 
@@ -546,28 +612,35 @@ def _find_rings(
 ) -> list[tuple[int, ...]]:
     """Return the rings in *topology* up to :data:`_MAX_RING_SIZE` atoms.
 
-    Every molecule in a packed cell is a copy of the same chain, so the rings
-    are found once on the first residue and shifted onto the rest. Falling back
-    to a per-residue search when the residues differ in size keeps this honest
-    for a cell mixing chains of different sizes; residues of one size are taken
-    to be copies of one chain, atom for atom.
+    Every chain of one polymer is a copy of the same molecule, so the rings
+    are found once on the first residue of each name and shifted onto the
+    rest. That keeps a blend honest, whose polymers can have the same number
+    of atoms and different rings. Falling back to a per-residue search when the
+    residues differ in size keeps this honest for a cell mixing chains of
+    different sizes; residues of one name and size are taken to be copies of
+    one chain, atom for atom.
     """
     residues = [
-        [atom.index for atom in residue.atoms()] for residue in topology.residues()
+        (residue.name, [atom.index for atom in residue.atoms()])
+        for residue in topology.residues()
     ]
-    counts = {len(indices) for indices in residues}
-    if len(counts) != 1:
+    if len({len(indices) for _, indices in residues}) != 1:
         return [
-            ring for indices in residues for ring in _rings_within(neighbours, indices)
+            ring
+            for _, indices in residues
+            for ring in _rings_within(neighbours, indices)
         ]
 
-    base = _rings_within(neighbours, residues[0])
-    stride = counts.pop()
-    return [
-        tuple(index + offset * stride for index in ring)
-        for offset in range(len(residues))
-        for ring in base
-    ]
+    templates: dict[str, tuple[int, list[tuple[int, ...]]]] = {}
+    rings: list[tuple[int, ...]] = []
+    for name, indices in residues:
+        if name not in templates:
+            templates[name] = (indices[0], _rings_within(neighbours, indices))
+        first, base = templates[name]
+        rings.extend(
+            tuple(index - first + indices[0] for index in ring) for ring in base
+        )
+    return rings
 
 
 def _rings_within(

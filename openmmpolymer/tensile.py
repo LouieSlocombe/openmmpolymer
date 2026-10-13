@@ -64,7 +64,7 @@ from ._workflow import (
 from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .elasticity import StressStrain, stress_strain
 from .plots import plot_breaking_strength, plot_elongation_at_break, plot_yield_strength
-from .protocols import Protocol, RunManifest
+from .protocols import Protocol, RunManifest, check_chain_options
 from .simulate import RunContext, safe_timestep_fs
 from .strength import (
     DEFAULT_CONFIRMATION_STEPS,
@@ -620,6 +620,7 @@ def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
     **equilibration: Any,
 ) -> R:
     """Budget, record and run a scan, then analyse what it recorded."""
+    check_chain_options(run, chain_backbone, atoms_per_chain)
     spec = measurement.spec() if spec is None else spec
     if type(spec) is not measurement.spec:
         raise TypeError(

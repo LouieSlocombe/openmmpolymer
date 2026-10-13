@@ -50,6 +50,7 @@ from .protocols import (
     RunManifest,
     RunSummary,
     Stage,
+    check_chain_options,
     run_protocol,
 )
 from .reporters import TrajectoryOptions
@@ -735,6 +736,7 @@ def run_tm_scan(
     glasses are not valid substitutes. The workflow records input fingerprints
     and settings so resume cannot silently mix different heating histories.
     """
+    check_chain_options(run, chain_backbone, atoms_per_chain)
     if not crystalline:
         raise TmError(
             "A melting scan requires a supplied crystalline or semicrystalline "

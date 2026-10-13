@@ -37,6 +37,7 @@ from ._files import file_sha256, write_json
 from ._state import positions_nm, read_state
 from ._validation import require_finite, require_nonnegative, require_positive
 from .chain import DEFAULT_CHARACTERISTIC_RATIO
+from .packing import blend_species, describe_species
 from .reporters import TrajectoryOptions
 from .simulate import (
     RunContext,
@@ -743,6 +744,53 @@ def validate_run_inputs(run: RunContext, run_dir: str | Path) -> None:
         _validate_identity(manifest, _run_identity(run))
 
 
+def _box_record(run: RunContext) -> dict[str, Any]:
+    """What a manifest records of the cell, for reading its trajectories back.
+
+    A blend records its polymers and no single chain size, so that nothing
+    reads its molecules as copies of one chain.
+    """
+    n_molecules = run.box.n_molecules
+    species = blend_species(run.box.topology, n_molecules)
+    if species is None:
+        return {
+            "n_molecules": n_molecules,
+            "atoms_per_chain": run.box.topology.getNumAtoms() // n_molecules,
+            "box_nm": list(run.box.box_nm),
+        }
+    return {
+        "n_molecules": n_molecules,
+        "atoms_per_chain": None,
+        "species": species,
+        "box_nm": list(run.box.box_nm),
+    }
+
+
+def check_chain_options(
+    run: RunContext,
+    chain_backbone: Sequence[int] | None,
+    atoms_per_chain: int | None,
+) -> None:
+    """Refuse to measure chains of a blend as copies of one chain.
+
+    Called before anything is written, so a refused call leaves no record.
+
+    Raises:
+        ProtocolError: A backbone or chain size was given for a cell whose
+            molecules are not all alike.
+    """
+    if chain_backbone is None and atoms_per_chain is None:
+        return
+    species = blend_species(run.box.topology, run.box.n_molecules)
+    if species is not None:
+        raise ProtocolError(
+            f"This cell is a blend ({describe_species(species)}), so its "
+            "chains cannot be measured as copies of one: pass no "
+            "chain_backbone or atoms_per_chain. Everything measured over the "
+            "whole cell is unaffected."
+        )
+
+
 def _prepare_manifest(
     protocol: Protocol,
     run: RunContext,
@@ -775,12 +823,7 @@ def _prepare_manifest(
             seed=run.seed,
             versions=_versions(),
             system=asdict(run.spec),
-            box={
-                "n_molecules": run.box.n_molecules,
-                "atoms_per_chain": run.box.topology.getNumAtoms()
-                // run.box.n_molecules,
-                "box_nm": list(run.box.box_nm),
-            },
+            box=_box_record(run),
             provenance={"version": 1, "run": identity, "stages": {}},
         )
     assert manifest.provenance is not None
@@ -950,6 +993,7 @@ def run_protocol(
         ProtocolError: A stage failed, inputs changed, or a legacy manifest
             lacks the provenance needed to resume safely.
     """
+    check_chain_options(run, chain_backbone, atoms_per_chain)
     directory = Path(run_dir)
     manifest = _prepare_manifest(
         protocol, run, directory, resume=resume, state_in=state_in

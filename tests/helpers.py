@@ -198,6 +198,24 @@ def argon_context(
     )
 
 
+def as_blend(run: Any, names: Sequence[str]) -> Any:
+    """*run* with its one-atom molecules split between residue names in turn.
+
+    A stand-in for a blend: the molecules are no longer all alike, which is
+    all the blend checks look at.
+    """
+    from openmm import app
+
+    topology = app.Topology()
+    chain = topology.addChain()
+    atoms = list(run.box.topology.atoms())
+    for index, atom in enumerate(atoms):
+        residue = topology.addResidue(names[index * len(names) // len(atoms)], chain)
+        topology.addAtom(atom.name, atom.element, residue)
+    topology.setPeriodicBoxVectors(run.box.topology.getPeriodicBoxVectors())
+    return replace(run, box=replace(run.box, topology=topology))
+
+
 def argon_cell(
     n_atoms: int = 64, box_nm: float = 2.4, *, atoms_per_molecule: int = 1
 ) -> tuple[Any, Any]:

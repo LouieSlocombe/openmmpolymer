@@ -46,7 +46,7 @@ from openmmpolymer.simulate import (
     run_heat,
 )
 
-from .helpers import argon_context, snapshot_files
+from .helpers import argon_context, as_blend, snapshot_files
 
 #: A protocol short enough to run in a test but shaped like a real one.
 QUICK = Protocol(
@@ -892,3 +892,69 @@ def test_stage_and_protocol_duration_count_every_hold(
 def test_a_mechanical_stage_takes_its_runners_defaults() -> None:
     """Priced from the runner's own signature, so the two cannot drift."""
     assert Stage("d", "deform", {}).duration_ps > 0.0
+
+
+# --------------------------------------------------------------------------
+# Blends
+# --------------------------------------------------------------------------
+
+
+def test_a_cell_of_alike_molecules_records_its_box_as_it_always_has(
+    argon_run: Any,
+) -> None:
+    """Runs already on disk read this record back."""
+    run_protocol(Protocol("p", (Stage("00_minimise", "minimise"),)), argon_run, "run")
+    manifest = json.loads(Path("run/manifest.json").read_text())
+    assert manifest["box"] == {
+        "n_molecules": 64,
+        "atoms_per_chain": 1,
+        "box_nm": [2.4, 2.4, 2.4],
+    }
+
+
+def test_a_blend_records_its_polymers_and_no_single_chain_size(
+    argon_run: Any,
+) -> None:
+    from openmmpolymer.trajectory import AnalysisError, open_run
+
+    blend = as_blend(argon_run, ["AR", "KR"])
+    run_protocol(Protocol("p", (Stage("00_minimise", "minimise"),)), blend, "run")
+    manifest = json.loads(Path("run/manifest.json").read_text())
+    assert manifest["box"] == {
+        "n_molecules": 64,
+        "atoms_per_chain": None,
+        "species": [
+            {"residue_name": "AR", "n_molecules": 32, "atoms_per_chain": 1},
+            {"residue_name": "KR", "n_molecules": 32, "atoms_per_chain": 1},
+        ],
+        "box_nm": [2.4, 2.4, 2.4],
+    }
+    with pytest.raises(AnalysisError, match=r"blend \(32 AR chains of 1 atoms"):
+        open_run("run")
+    # A declared block size is no way round it.
+    with pytest.raises(AnalysisError, match="does not support blends"):
+        open_run("run", atoms_per_chain=1)
+
+
+def test_a_blend_is_not_measured_as_copies_of_one_chain(argon_run: Any) -> None:
+    """Refused before the run directory is touched."""
+    blend = as_blend(argon_run, ["AR", "KR"])
+    protocol = Protocol("p", (Stage("00_minimise", "minimise"),))
+    with pytest.raises(ProtocolError, match="This cell is a blend"):
+        run_protocol(protocol, blend, "run", chain_backbone=(0,), atoms_per_chain=1)
+    assert not Path("run").exists()
+
+
+def test_a_scan_refuses_chain_options_on_a_blend_before_recording_anything(
+    argon_run: Any,
+) -> None:
+    from openmmpolymer.mechanical import run_modulus_scan
+
+    with pytest.raises(ProtocolError, match="This cell is a blend"):
+        run_modulus_scan(
+            as_blend(argon_run, ["AR", "KR"]),
+            "scan",
+            chain_backbone=(0,),
+            atoms_per_chain=1,
+        )
+    assert not Path("scan").exists()

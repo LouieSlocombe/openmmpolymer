@@ -473,9 +473,12 @@ def remaining_ps(stages: Iterable[Stage], manifest: RunManifest | None) -> float
 def chain_options(
     chain_backbone: Sequence[int] | None,
     atoms_per_chain: int | None,
-    expected_characteristic_ratio: float,
+    expected_characteristic_ratio: float | None,
 ) -> dict[str, Any]:
-    """The chain-measurement keywords a scan passes to every protocol it runs."""
+    """The chain-measurement keywords a scan passes to every protocol it runs.
+
+    A blend passes None for all three: its chains are not measured.
+    """
     return {
         "chain_backbone": chain_backbone,
         "atoms_per_chain": atoms_per_chain,

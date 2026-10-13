@@ -36,7 +36,7 @@ from ._workflow import (
 )
 from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .mdsystem import require_no_ensemble_controls
-from .protocols import Protocol, RunManifest, Stage, run_protocol
+from .protocols import Protocol, RunManifest, Stage, check_chain_options, run_protocol
 from .rate_dependence import (
     RateObservation,
     RateProperty,
@@ -270,6 +270,7 @@ def run_thermal_rate_scan(
     A common preparation does not itself prove equilibration or independent
     morphology. Replicas share coordinates and probe dynamical variability.
     """
+    check_chain_options(run, chain_backbone, atoms_per_chain)
     _property(property_name)
     if property_name == "melting_temperature" and not crystalline:
         raise ThermalRateError(

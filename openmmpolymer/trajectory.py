@@ -59,7 +59,7 @@ import numpy.typing as npt
 from openmm import unit
 
 from ._validation import require_integer
-from .packing import ANGSTROM_PER_NM, read_pdb
+from .packing import ANGSTROM_PER_NM, blend_species, describe_species, read_pdb
 from .protocols import RunManifest
 from .reporters import topology_path, trajectory_path
 
@@ -98,6 +98,9 @@ class StageFiles:
             for a manifest written before that was recorded.
         atoms_per_chain: Atoms in each one, likewise. Preferred over counting
             residues, because the run knows and the topology only implies.
+        blend: The polymers of a blend, described, when the run recorded the
+            cell as one. Its molecules are not copies of one chain, so it
+            cannot be opened for per-chain analysis.
     """
 
     stage: str
@@ -109,6 +112,7 @@ class StageFiles:
     topology: str | None
     n_molecules: int | None = None
     atoms_per_chain: int | None = None
+    blend: str | None = None
 
 
 @dataclass(frozen=True)
@@ -422,6 +426,7 @@ def stage_files(
         topology=topology,
         n_molecules=_recorded_int(recorded_box, "n_molecules"),
         atoms_per_chain=_recorded_int(recorded_box, "atoms_per_chain"),
+        blend=_recorded_blend(recorded_box),
     )
 
 
@@ -486,6 +491,16 @@ def _prefix_of(
     return directory / stage
 
 
+def _recorded_blend(box: dict[str, Any]) -> str | None:
+    """Describe the blend the manifest's box record lists, if it lists one."""
+    species = box.get("species")
+    if not isinstance(species, list):
+        return None
+    if not all(isinstance(entry, dict) for entry in species):
+        return describe_species([])
+    return describe_species(species)
+
+
 def _recorded_int(box: dict[str, Any], key: str) -> int | None:
     """Read one integer out of the manifest's box record, if it is there.
 
@@ -540,6 +555,8 @@ def _coordinate_paths(prefix: Path) -> tuple[str | None, str | None]:
 def _open_stage(files: StageFiles, *, atoms_per_chain: int | None = None) -> Ensemble:
     """Build an :class:`Ensemble` from resolved paths."""
     assert files.topology is not None  # open_stage checked this
+    if files.blend is not None:
+        raise AnalysisError(_blend_refusal(files.blend))
     structure = read_pdb(files.topology)
     topology = structure.topology
     declared = atoms_per_chain if atoms_per_chain is not None else files.atoms_per_chain
@@ -677,7 +694,20 @@ def _blocks(topology: Any, atoms_per_chain: int | None) -> tuple[int, int]:
                 f"Residue {index} has {count} atoms but residue 0 has "
                 f"{block}. Every molecule should be a copy of the same chain."
             )
+    if len({residue.name for residue in residues}) != 1:
+        species = blend_species(topology, len(residues))
+        raise AnalysisError(_blend_refusal(describe_species(species or [])))
     return len(residues), block
+
+
+def _blend_refusal(blend: str) -> str:
+    """Why a blend's coordinates cannot be read as copies of one chain."""
+    return (
+        f"This cell is a blend ({blend}). Per-chain analysis - chain "
+        "dimensions, correlations, displacements - reads every molecule as a "
+        "copy of one chain, so it does not support blends yet. Everything "
+        "measured over the whole cell is unaffected."
+    )
 
 
 def _chain_atoms(

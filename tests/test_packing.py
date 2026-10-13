@@ -312,3 +312,69 @@ def test_real_packmol_packs_a_cell_that_passes_the_checks(tmp_path: Path) -> Non
     box = assemble_box(components, packed.packed_pdb, packed.box_nm)
     check_packing(box.topology, box.positions_nm)
     assert box.n_molecules == 40
+
+
+def _residues(*residues: tuple[str, int, tuple[tuple[int, int], ...]]) -> Any:
+    """A topology of carbon residues, each with bonds given by local index."""
+    from openmm import app
+
+    topology = app.Topology()
+    chain = topology.addChain()
+    carbon = app.Element.getBySymbol("C")
+    for name, n_atoms, bonds in residues:
+        residue = topology.addResidue(name, chain)
+        atoms = [topology.addAtom(f"C{i}", carbon, residue) for i in range(n_atoms)]
+        for first, second in bonds:
+            topology.addBond(atoms[first], atoms[second])
+    return topology
+
+
+_SQUARE = ((0, 1), (1, 2), (2, 3), (3, 0))
+_ROD = ((0, 1), (1, 2), (2, 3))
+
+
+@pytest.mark.parametrize("ring_first", [True, False])
+def test_a_ring_is_found_only_in_the_polymer_that_has_one(ring_first: bool) -> None:
+    """Two polymers of one size need not share their rings.
+
+    Copying the first residue's rings onto every residue of its size would
+    put a ring in the rod, or none anywhere, depending on which came first.
+    """
+    from openmmpolymer.packing import _find_rings
+
+    ring, rod = ("RNG", 4, _SQUARE), ("ROD", 4, _ROD)
+    topology = _residues(*((ring, rod, ring) if ring_first else (rod, ring, rod)))
+    neighbours: dict[int, list[int]] = {}
+    for first, second in topology.bonds():
+        neighbours.setdefault(first.index, []).append(second.index)
+        neighbours.setdefault(second.index, []).append(first.index)
+    rings = [sorted(found) for found in _find_rings(topology, neighbours)]
+    assert rings == ([[0, 1, 2, 3], [8, 9, 10, 11]] if ring_first else [[4, 5, 6, 7]])
+
+
+def test_a_cell_of_one_chain_is_not_a_blend() -> None:
+    """Including a chain written as an end, a repeat and an end."""
+    from openmmpolymer.packing import blend_species
+
+    assert blend_species(_residues(*[("PE", 3, ())] * 4), 4) is None
+    one_chain = [("HED", 2, ()), ("MID", 3, ()), ("TAL", 2, ())]
+    assert blend_species(_residues(*one_chain * 3), 3) is None
+    assert blend_species(_residues(*[("AR", 1, ())] * 5), 5) is None
+
+
+def test_a_blend_is_told_apart_by_name_as_well_as_by_size() -> None:
+    from openmmpolymer.packing import blend_species, describe_species
+
+    same_size = blend_species(_residues(*[("PE", 3, ())] * 2, ("PS", 3, ())), 3)
+    assert same_size == [
+        {"residue_name": "PE", "n_molecules": 2, "atoms_per_chain": 3},
+        {"residue_name": "PS", "n_molecules": 1, "atoms_per_chain": 3},
+    ]
+    assert describe_species(same_size) == (
+        "2 PE chains of 3 atoms and 1 PS chains of 3 atoms"
+    )
+    # 2 x 2 + 2 x 6 atoms divides into four blocks of 4, which are not chains.
+    sizes = blend_species(_residues(*[("A", 2, ())] * 2, *[("B", 6, ())] * 2), 4)
+    assert [entry["atoms_per_chain"] for entry in sizes or []] == [2, 6]
+    # Residues that are not the molecules give no species, but still a blend.
+    assert blend_species(_residues(("A", 2, ()), ("B", 3, ()), ("C", 4, ())), 2) == []

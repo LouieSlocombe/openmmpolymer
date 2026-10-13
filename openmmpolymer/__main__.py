@@ -8,6 +8,8 @@ layers - chain, force field, packing, protocol - are separately callable.
 ``--analyse`` reads a finished run without rebuilding it. ``--protocol tm``
 heats an explicitly supplied crystal and serialised System: packing an
 amorphous melt from a monomer cannot provide a crystalline melting point.
+``--blend`` builds a cell of several polymers from a TOML file in place of the
+monomer SMILES and the flags describing its chain.
 
 The flags each protocol takes are a table, :data:`PROTOCOLS`, rather than a
 chain of conditionals, because the alternative failed quietly: a flag that no
@@ -26,6 +28,7 @@ import io
 import logging
 import math
 import sys
+import tomllib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -67,7 +70,7 @@ from .mechanical import (
     run_modulus_scan,
     write_mechanical_report,
 )
-from .melt import build_melt
+from .melt import BlendComponent, build_blend, build_melt, check_blend
 from .packing import DEFAULT_PACKING_DENSITY
 from .property_rates import (
     RATE_PROPERTIES,
@@ -79,6 +82,7 @@ from .property_rates import (
 from .protocols import (
     Protocol,
     ProtocolError,
+    RunManifest,
     melt_quench,
     record_build_request,
     run_protocol,
@@ -146,7 +150,7 @@ from .tm import (
     run_tm_scan,
     write_melting_report,
 )
-from .trajectory import AnalysisError
+from .trajectory import AnalysisError, _recorded_blend
 from .viscoelastic import (
     RelaxationSpec,
     analyse_relaxation,
@@ -596,6 +600,35 @@ _CHAIN = {
     "seed": "seed",
 }
 
+#: What one polymer of a ``--blend`` file may set: the chain flags, by dest,
+#: and how many chains of it. The cell-wide flags - seed, densities, charges,
+#: backend, conformers - apply to every polymer.
+_BLEND_KEYS = frozenset(
+    {
+        "monomer",
+        "degree_of_polymerization",
+        "chains",
+        "residue_name",
+        "head_cap",
+        "tail_cap",
+        "tacticity",
+        "characteristic_ratio",
+    }
+)
+
+#: Flags that describe a single chain, which a blend sets per polymer instead.
+_ONE_CHAIN_FLAGS = {
+    "degree_of_polymerization": "-n",
+    "chains": "-c",
+    "residue_name": "-r",
+    "head_cap": "--head-cap",
+    "tail_cap": "--tail-cap",
+    "tacticity": "--tacticity",
+    "characteristic_ratio": "--characteristic-ratio",
+    "backbone": "--backbone",
+    "rg": "--rg",
+}
+
 # --------------------------------------------------------------------------
 # The parser
 # --------------------------------------------------------------------------
@@ -718,6 +751,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_float,
         help="polymer C-infinity used for chain growth and dimension checks "
         "(default: 7.0 for building; recorded value for analysis)",
+    )
+    # SUPPRESS keeps the dest out of every namespace that does not use it, so
+    # the build requests of runs made without it still match theirs.
+    parser.add_argument(
+        "--blend",
+        default=argparse.SUPPRESS,
+        metavar="FILE",
+        help="build a blend: a TOML file with one [[species]] table per "
+        "polymer, each giving monomer, chains and residue_name, and optionally "
+        "degree_of_polymerization, head_cap, tail_cap, tacticity and "
+        "characteristic_ratio. Replaces the monomer SMILES and the chain flags",
     )
     parser.add_argument(
         "-t",
@@ -1433,6 +1477,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         # A long run's progress has to reach a redirected log as it happens.
         sys.stdout.reconfigure(line_buffering=True)
 
+    blend_file: str | None = getattr(arguments, "blend", None)
+    if blend_file is not None:
+        _check_blend_flags(parser, arguments)
+
     if arguments.convergence:
         if not arguments.analyse or len(arguments.analyse) != 1:
             parser.error("--convergence requires exactly one --analyse directory")
@@ -1499,12 +1547,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error(
                 "--crystal-pdb, --system-xml and --state-in require --protocol tm"
             )
-        if arguments.monomer is None:
-            parser.error("a monomer SMILES is required unless --analyse is given")
+        if arguments.monomer is None and blend_file is None:
+            parser.error(
+                "a monomer SMILES or --blend is required unless --analyse is given"
+            )
     entry = PROTOCOLS[arguments.protocol]
     # Everything is checked and priced before a file is read or written.
     with _refusals(parser):
-        chain = None if crystalline else ChainSpec(**_keywords(arguments, _CHAIN))
+        chain = None
+        blend: tuple[list[BlendComponent], list[dict[str, Any]]] | None = None
+        if blend_file is not None:
+            blend = _read_blend(blend_file, arguments)
+        elif not crystalline:
+            chain = ChainSpec(**_keywords(arguments, _CHAIN))
         spec = entry.settings(arguments)
         if rates is None:
             total_ns = entry.price(spec, arguments) / PS_PER_NS
@@ -1535,7 +1590,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(cost)
 
     output = Path(arguments.output_dir or "run")
-    if chain is None:
+    if crystalline:
         with _refusals(parser):
             run = load_crystal(
                 arguments.crystal_pdb,
@@ -1545,7 +1600,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 seed=arguments.seed,
             )
         options: dict[str, Any] = {"state_in": arguments.state_in, "crystalline": True}
+    elif blend is not None:
+        run = _build_blend(parser, arguments, *blend, output)
+        print(
+            "note: a blend's chains are not alike, so their dimensions are not "
+            "measured; everything measured over the whole cell is"
+        )
+        options = chain_options(None, None, None)
+        if entry.settles:
+            options.update(_settle(arguments))
     else:
+        assert chain is not None
         built, run = _build(parser, arguments, chain, output)
         options = chain_options(
             built.backbone, built.n_atoms, chain.characteristic_ratio
@@ -1578,6 +1643,141 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         _emit(arguments, report, _rate_lines, write_rate_report, output / "analysis")
     return 0
+
+
+def _check_blend_flags(
+    parser: argparse.ArgumentParser, arguments: argparse.Namespace
+) -> None:
+    """Refuse what cannot go with ``--blend``, before anything is read."""
+    if arguments.analyse:
+        parser.error(
+            "--blend builds a cell; a blend's run directory is analysed without it"
+        )
+    if arguments.protocol == "tm":
+        parser.error("tm starts from --crystal-pdb, not a blend")
+    if arguments.monomer is not None:
+        parser.error(
+            "--blend replaces the monomer SMILES: give each polymer's in the blend file"
+        )
+    single = [
+        flag
+        for dest, flag in _ONE_CHAIN_FLAGS.items()
+        if getattr(arguments, dest) != parser.get_default(dest)
+    ]
+    if single:
+        parser.error(
+            f"{', '.join(single)} {'describes' if len(single) == 1 else 'describe'} "
+            "one chain; with --blend, set it per polymer in the blend file"
+        )
+
+
+def _read_blend(
+    path: str, arguments: argparse.Namespace
+) -> tuple[list[BlendComponent], list[dict[str, Any]]]:
+    """Read a ``--blend`` file into its polymers and what the request records.
+
+    The record holds every polymer's settings with the defaults filled in,
+    rather than the file's name, so that editing the file between two runs
+    into one directory is caught like any other changed flag.
+
+    Raises:
+        ValueError: The file has no polymers, or one of them is missing a
+            required key, has an unknown one or is otherwise invalid.
+        OSError: The file cannot be read.
+    """
+    with open(path, "rb") as handle:
+        document = tomllib.load(handle)
+    entries = document.get("species")
+    unknown = set(document) - {"species"}
+    if unknown or not isinstance(entries, list) or not entries:
+        raise ValueError(
+            f"{path} must hold [[species]] tables, one per polymer, and nothing else."
+        )
+    components: list[BlendComponent] = []
+    record: list[dict[str, Any]] = []
+    for number, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            raise ValueError(f"Species {number} in {path} is not a table.")
+        extra = sorted(set(entry) - _BLEND_KEYS)
+        missing = sorted({"monomer", "chains", "residue_name"} - set(entry))
+        if extra or missing:
+            raise ValueError(
+                f"Species {number} in {path}: "
+                + "; ".join(
+                    part
+                    for part in (
+                        f"unknown {', '.join(extra)}" if extra else "",
+                        f"missing {', '.join(missing)}" if missing else "",
+                    )
+                    if part
+                )
+                + f". Each takes {', '.join(sorted(_BLEND_KEYS))}."
+            )
+        keywords = {
+            _CHAIN[key]: value
+            for key, value in entry.items()
+            if key not in {"chains", "characteristic_ratio"}
+        }
+        if "characteristic_ratio" in entry:
+            # 9 and 9.0 have to record alike, or a rerun stops matching.
+            keywords["characteristic_ratio"] = float(entry["characteristic_ratio"])
+        spec = ChainSpec(**keywords, seed=arguments.seed)
+        component = BlendComponent(spec, entry["chains"])
+        components.append(component)
+        record.append(
+            {
+                "monomer": spec.monomer_smiles,
+                "degree_of_polymerization": spec.degree_of_polymerization,
+                "chains": component.n_chains,
+                "residue_name": spec.residue_name,
+                "head_cap": spec.head_cap,
+                "tail_cap": spec.tail_cap,
+                "tacticity": spec.tacticity,
+                "characteristic_ratio": spec.characteristic_ratio,
+                "conformers": min(
+                    arguments.conformers or component.n_chains, component.n_chains
+                ),
+            }
+        )
+    check_blend(components, arguments.backend)
+    return components, record
+
+
+def _build_blend(
+    parser: argparse.ArgumentParser,
+    arguments: argparse.Namespace,
+    components: list[BlendComponent],
+    record: list[dict[str, Any]],
+    output: Path,
+) -> RunContext:
+    """Record what was asked for, then build the blend or check a rebuild.
+
+    The request is the melt's, with the polymers in place of the file name;
+    the chain flags it also holds are their defaults, which ``--blend``
+    requires.
+    """
+    request = {
+        key: value for key, value in vars(arguments).items() if key not in _UNRECORDED
+    }
+    request["blend"] = record
+    request["runtime_versions"] = {package: version(package) for package in _RUNTIME}
+    try:
+        record_build_request(output, request)
+        _, run = build_blend(
+            components,
+            output,
+            target_density_g_cm3=arguments.target_density,
+            n_conformers=arguments.conformers,
+            charge_method=arguments.charge_method,
+            backend=arguments.backend,
+            pack_density_g_cm3=arguments.pack_density,
+            platform=arguments.platform,
+            seed=arguments.seed,
+            progress=print,
+        )
+    except ProtocolError as error:
+        parser.error(str(error))
+    return run
 
 
 def _build(
@@ -1654,6 +1854,12 @@ def _has_stages(run_dir: Path, find: Any) -> bool:
         return False
 
 
+def _blend_of(run_dir: Path) -> str | None:
+    """The polymers of the blend *run_dir* holds, described, or None."""
+    manifest = RunManifest.load(run_dir)
+    return None if manifest is None else _recorded_blend(manifest.box or {})
+
+
 def _analyse(arguments: argparse.Namespace) -> int:
     """Report whatever a finished run directory holds, and write it out.
 
@@ -1689,7 +1895,28 @@ def _analyse(arguments: argparse.Namespace) -> int:
         _has_stages(first, find) for find in (deform_stages, load_stages, shear_stages)
     )
     relaxed = _has_stages(first, relax_stages)
-    structured = not arguments.no_structure and _has_stages(first, structure_stages)
+    blend = _blend_of(first)
+    if blend is not None and (arguments.backbone or arguments.rg):
+        raise ValueError(
+            f"{first} holds a blend ({blend}); --backbone and --rg describe one chain"
+        )
+    structured = (
+        blend is None
+        and not arguments.no_structure
+        and _has_stages(first, structure_stages)
+    )
+    if blend is not None:
+        skipped = (
+            f"{first} holds a blend ({blend}), and per-chain structure is not "
+            "analysed for blends yet"
+        )
+        if not (quenched or heated or tensile or deformed or relaxed):
+            print(
+                f"{skipped}; nothing else in it was a quench, a heating scan, "
+                "a deformation or a relaxation, so there is nothing to report"
+            )
+            return 1
+        print(f"note: {skipped}")
     if not (quenched or heated or tensile or deformed or relaxed or structured):
         print(
             f"nothing in {first} was a quench, a heating scan, a deformation or a relaxation, "

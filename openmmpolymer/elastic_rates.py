@@ -71,7 +71,7 @@ from .mechanical import (
     equilibration_protocol,
     extra_stages,
 )
-from .protocols import Protocol, RunManifest, Stage
+from .protocols import Protocol, RunManifest, Stage, check_chain_options
 from .rate_dependence import (
     _TEMPERATURE_TOLERANCE_K,
     RateObservation,
@@ -344,6 +344,7 @@ def run_elastic_rate_scan(
     Young's modulus keeps the record its original scan kept, and one written
     before scans fingerprinted their common state still resumes.
     """
+    check_chain_options(run, chain_backbone, atoms_per_chain)
     plan = validate_elastic_rate_scan(
         spec,
         hold_times_ps,

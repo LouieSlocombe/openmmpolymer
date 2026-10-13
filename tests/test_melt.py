@@ -17,7 +17,7 @@ import pytest
 
 from openmmpolymer import melt
 from openmmpolymer.chain import ChainSpec
-from openmmpolymer.melt import build_melt
+from openmmpolymer.melt import BlendComponent, build_blend, build_melt
 from openmmpolymer.protocols import Protocol, ProtocolError, Stage, run_protocol
 
 from .helpers import snapshot_files
@@ -257,3 +257,145 @@ def test_a_real_melt_builds_and_rebuilds_to_the_same_cell(tmp_path: Path) -> Non
     with pytest.raises(ProtocolError, match="changed"):
         build_melt(replace(spec, seed=12), 8, tmp_path, **settings)
     assert snapshot_files(tmp_path) == before
+
+
+# --------------------------------------------------------------------------
+# Blends
+# --------------------------------------------------------------------------
+
+PS = ChainSpec(
+    monomer_smiles="[*]CC([*])c1ccccc1", residue_name="PS", characteristic_ratio=9.5
+)
+BLEND = (BlendComponent(PE, 20), BlendComponent(PS, 10))
+
+
+def _build_blend(directory: Path = Path("run"), **options: Any) -> Any:
+    return build_blend(BLEND, directory, target_density_g_cm3=0.95, **options)
+
+
+def test_a_blend_records_each_polymer_and_its_files(
+    staged_blend: dict[str, Any],
+) -> None:
+    chains, run = _build_blend()
+    record = json.loads(Path("run/build/inputs.json").read_text())
+    assert set(record["inputs"]) == {"run", "blend"}
+    assert [
+        (entry["residue_name"], entry["n_chains"], entry["chain"]["n_atoms"])
+        for entry in record["inputs"]["blend"]
+    ] == [("PE", 20, 1), ("PS", 10, 1)]
+    assert "sdf_paths" not in record["inputs"]["blend"][0]["chain"]
+    assert set(record["artifacts"]) == {
+        "PE_0.sdf",
+        "PE_0.pdb",
+        "PS_0.sdf",
+        "PS_0.pdb",
+        "PE_ff.xml",
+        "PS_ff.xml",
+        "polymer_ff.xml",
+        "packed.pdb",
+    }
+    assert staged_blend["components"] == BLEND
+    assert [chain.sdf_paths for chain in chains] == [
+        (str(Path("run/build/PE_0.sdf")),),
+        (str(Path("run/build/PS_0.sdf")),),
+    ]
+    assert Path(run.forcefield.forcefield_xml) == Path("run/build/polymer_ff.xml")
+
+
+def test_a_blend_rebuild_is_checked_in_scratch_and_held_to_the_record(
+    staged_blend: dict[str, Any],
+) -> None:
+    _build_blend()
+    before = snapshot_files(Path("run"))
+    chains, _ = _build_blend()
+    assert snapshot_files(Path("run")) == before
+    assert staged_blend["builds"][1].parent.name.startswith(".build-check-")
+    assert chains[1].pdb_paths == (str(Path("run/build/PS_0.pdb")),)
+
+    staged_blend["system_suffix"] = "\n"
+    with pytest.raises(ProtocolError, match="changed"):
+        _build_blend()
+    assert snapshot_files(Path("run")) == before
+
+
+def test_a_melt_and_a_blend_never_share_a_build(
+    staged_melt: dict[str, Any], staged_blend: dict[str, Any]
+) -> None:
+    """Told apart from the record, before anything is rebuilt."""
+    _build(Path("melt"))
+    with pytest.raises(ProtocolError, match="holds a melt of one polymer, not a"):
+        _build_blend(Path("melt"))
+    _build_blend(Path("blend"))
+    with pytest.raises(ProtocolError, match="holds a blend of several polymers"):
+        _build(Path("blend"))
+    assert len(staged_melt["builds"]) == len(staged_blend["builds"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("components", "options", "match"),
+    [
+        ((BlendComponent(PE, 20),), {}, "at least two"),
+        (
+            (BlendComponent(PE, 20), BlendComponent(replace(PS, residue_name="pe"), 5)),
+            {},
+            "its own residue name",
+        ),
+        (BLEND, {"backend": "gaff"}, "smirnoff backend"),
+    ],
+)
+def test_a_blend_that_cannot_be_built_safely_is_refused_first(
+    staged_blend: dict[str, Any],
+    components: tuple[BlendComponent, ...],
+    options: dict[str, Any],
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        build_blend(components, "run", target_density_g_cm3=0.95, **options)
+    assert not Path("run").exists()
+    assert not staged_blend["builds"]
+
+
+def test_a_blend_component_holds_at_least_one_chain() -> None:
+    with pytest.raises(ValueError, match="n_chains"):
+        BlendComponent(PE, 0)
+
+
+@pytest.mark.forcefield
+@pytest.mark.packmol
+def test_a_real_blend_builds_and_rebuilds_to_the_same_cell(tmp_path: Path) -> None:
+    """Six ethylene tetramers and three styrene dimers, in two blocks."""
+    from openmm import XmlSerializer
+
+    pe = replace(PE, degree_of_polymerization=4, seed=11)
+    ps = replace(PS, degree_of_polymerization=2, seed=11)
+    components = (BlendComponent(pe, 6), BlendComponent(ps, 3))
+    settings: dict[str, Any] = {
+        "target_density_g_cm3": 0.05,
+        "charge_method": "gasteiger",
+        "pack_density_g_cm3": 0.03,
+        "platform": "CPU",
+        "n_conformers": 2,
+    }
+    lines: list[str] = []
+    chains, run = build_blend(components, tmp_path, progress=lines.append, **settings)
+    assert [line.split(":")[0] for line in lines] == [
+        "chain PE",
+        "chain PS",
+        "cell",
+        "force field",
+        "packed",
+    ]
+    assert [len(chain.sdf_paths) for chain in chains] == [2, 2]
+    names = [residue.name for residue in run.box.topology.residues()]
+    assert names == ["PE"] * 6 + ["PS"] * 3
+    n_atoms = 6 * chains[0].n_atoms + 3 * chains[1].n_atoms
+    assert run.box.topology.getNumAtoms() == n_atoms
+    assert XmlSerializer.deserialize(run.system_xml).getNumParticles() == n_atoms
+
+    before = snapshot_files(tmp_path)
+    again, rerun = build_blend(components, tmp_path, **settings)
+    assert snapshot_files(tmp_path) == before
+    assert again == chains
+    assert rerun.system_xml == run.system_xml
+    with pytest.raises(ProtocolError, match="holds a blend"):
+        build_melt(pe, 6, tmp_path, **settings)
