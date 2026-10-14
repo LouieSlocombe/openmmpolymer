@@ -91,6 +91,12 @@ def test_every_builder_and_workflow_request_keeps_its_recorded_digest() -> None:
     modulus = mechanical.ModulusSpec()
     relaxation = viscoelastic.RelaxationSpec()
     glass = tg.TgSpec()
+    # Freeze the original nominal offset ladder so this remains a resume guard.
+    # 86d6e5c (#33) widened nominal_fine_schedule's budget estimate from 25 to
+    # 30 holds (120..0 K to 145..0 K); real fine passes use fine_schedule instead.
+    # The same explicit ladder still has the recorded names and filled-in options,
+    # including after 67a736c (#34)'s short-stage and irregular-tail chunking fix.
+    fine_ladder = tg.fine_schedule(120.0, 0.0, glass)
     recorded = {
         "standard_melt_equilibration": _digest(_stages(standard_melt_equilibration())),
         "melt_quench": _digest(_stages(melt_quench())),
@@ -115,9 +121,7 @@ def test_every_builder_and_workflow_request_keeps_its_recorded_digest() -> None:
         ),
         "tg_coarse_scan": _digest(_stages(tg.tg_coarse_scan(glass))),
         "tg_fine_scan": _digest(
-            _stages(
-                tg.tg_fine_scan(tg.nominal_fine_schedule(glass), glass, timestep_fs=2.0)
-            )
+            _stages(tg.tg_fine_scan(fine_ladder, glass, timestep_fs=2.0))
         ),
         "tm.melting_scan": _digest(_stages(tm.melting_scan(tm.TmSpec()))),
     }
