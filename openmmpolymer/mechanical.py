@@ -80,7 +80,7 @@ from .elasticity import (
     youngs_modulus,
 )
 from .plots import plot_moduli, plot_stress_strain
-from .protocols import Protocol, RunManifest, Stage
+from .protocols import Protocol, RunManifest, Stage, check_chain_options
 from .simulate import RunContext
 from .trajectory import AnalysisError
 
@@ -526,6 +526,7 @@ def run_modulus_scan(
             run it cannot resume: another protocol's, one without a saved
             request, or one with different settings.
     """
+    check_chain_options(run, chain_backbone, atoms_per_chain)
     directory = Path(run_dir)
     settle = equilibration_protocol(spec, **equilibration)
     _report_cost(spec, settle, RunManifest.load(directory) if resume else None)

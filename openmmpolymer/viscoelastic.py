@@ -72,7 +72,7 @@ from ._workflow import (
 )
 from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .plots import plot_relaxation, plot_relaxation_spectrum
-from .protocols import Protocol, RunManifest, Stage
+from .protocols import Protocol, RunManifest, Stage, check_chain_options
 from .relaxation import (
     MIN_RELAXATION_POINTS,
     KWWFit,
@@ -589,6 +589,7 @@ def run_relaxation_scan(
             from the settings, so resuming under changed ones would merge
             incompatible grids into one curve.
     """
+    check_chain_options(run, chain_backbone, atoms_per_chain)
     directory = Path(run_dir)
     settle = equilibration_protocol(spec, **equilibration)
     _report_cost(spec, settle, RunManifest.load(directory) if resume else None)

@@ -142,13 +142,17 @@ def test_a_rerun_rebuilds_in_scratch_without_touching_the_replica(
     """Rebuilding in scratch must preserve the evidence even when the check fails.
 
     The force-field cache the replicas share is part of that evidence: the
-    rebuild works from a copy of it.
+    rebuild works from a copy of it. First builds also prepare in scratch,
+    publishing their verified assets before the benchmark starts a protocol.
     """
 
     class ReachedProtocol(Exception):
         pass
 
     def protocol(protocol: Any, run: Any, directory: Path, **kwargs: Any) -> None:
+        forcefield = Path(run.forcefield.forcefield_xml)
+        assert forcefield == directory / "build" / "polymer_ff.xml"
+        assert forcefield.is_file()
         raise ReachedProtocol(directory)
 
     monkeypatch.setattr(pe_melt, "run_protocol", protocol)
@@ -161,11 +165,16 @@ def test_a_rerun_rebuilds_in_scratch_without_touching_the_replica(
         run_benchmark(output, smoke=True, seeds=(11,), platform="CPU")
     assert snapshot_files(output) == original
     first, second = staged_melt["builds"]
-    assert first == output / "seed_11" / "build"
+    replica = output / "seed_11"
+    assert (replica / "build" / "inputs.json").is_file()
     assert second != first
-    assert not second.exists()
+    for working in (first, second):
+        assert working.name == "build"
+        assert working.parent.name.startswith(".build-check-")
+        assert working.parent.parent == replica
+        assert not working.parent.exists()
     if not changed_system:
-        assert raised.value.args == (output / "seed_11",)
+        assert raised.value.args == (replica,)
 
 
 @pytest.mark.slow

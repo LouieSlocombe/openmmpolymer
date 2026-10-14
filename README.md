@@ -1,6 +1,7 @@
 # openmmpolymer
 
-Build, pack, parameterise, equilibrate and measure all-atom polymer melts with
+Build, pack, parameterise, equilibrate and measure all-atom polymer melts and
+blends with
 [OpenMM](https://openmm.org), [packmol](https://m3g.github.io/packmol) and
 [forcefill](https://github.com/LouieSlocombe/forcefill).
 
@@ -91,6 +92,58 @@ side-chain or cap stereochemistry.
 `--characteristic-ratio` sets the C-infinity the chains are grown to and
 checked against; the default, 7.0, is polyethylene's.
 
+## A polymer blend
+
+`build_blend` builds a cell of several polymers. Each one is built, charged
+and parameterised exactly as `build_melt` does for one, and their force fields
+are merged:
+
+```python
+from openmmpolymer import (
+    BlendComponent,
+    ChainSpec,
+    build_blend,
+    run_protocol,
+    standard_melt_equilibration,
+)
+
+chains, run = build_blend(
+    [
+        BlendComponent(
+            ChainSpec(
+                monomer_smiles="[*]CC[*]",
+                degree_of_polymerization=30,
+                residue_name="PE",
+            ),
+            n_chains=32,
+        ),
+        BlendComponent(
+            ChainSpec(
+                monomer_smiles="[*]CC([*])c1ccccc1",
+                degree_of_polymerization=20,
+                residue_name="PS",
+                characteristic_ratio=9.5,
+            ),
+            n_chains=16,
+        ),
+    ],
+    directory="blend",
+    target_density_g_cm3=0.95,
+)
+run_protocol(standard_melt_equilibration(target_temperature_k=450.0), run, "blend")
+```
+
+From the command line, list the polymers in a TOML file, with one
+`[[species]]` table for each:
+
+```bash
+openmmpolymer --blend pe_ps.toml --target-density 0.95 -t 450 -o blend
+```
+
+Every measurement over the whole cell works on a blend. Measurements that
+treat every chain as a copy of one chain refuse a blend. The
+[guide](docs/guide.md#blends) says which those are.
+
 ## Measurements and analysis
 
 Each measurement prepares the cell, records its request and resumes from intact
@@ -120,7 +173,7 @@ molecular-dynamics rates are far faster than experimental ones.
 
 | Layer | Modules |
 |---|---|
-| Building a cell | `chain` (monomer SMILES to grown chains), `charges`, `forcefield` (forcefill to an ffxml, cached), `packing` (packmol and the checks that catch a bad cell), `mdsystem` (topology, System, barostats, platforms), `melt` (all of it in one call) |
+| Building a cell | `chain` (monomer SMILES to grown chains), `charges`, `forcefield` (forcefill to an ffxml, cached), `packing` (packmol and the checks that catch a bad cell), `mdsystem` (topology, System, barostats, platforms), `melt` (all of it in one call: `build_melt` for one polymer, `build_blend` for several) |
 | Running it | `simulate` (the stages), `protocols` (named stage sequences, the manifest and resume), `reporters`, `stress` |
 | Reading it back | `trajectory`, `timeseries`, `conformation`, `correlations`, `elasticity`, `strength`, `relaxation`, `melt_check`, `plots` |
 | Workflows | `tg`, `tm`, `mechanical`, `tensile`, `viscoelastic`, `structure` |

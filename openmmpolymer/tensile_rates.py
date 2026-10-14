@@ -37,6 +37,7 @@ from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .protocols import (
     Protocol,
     RunManifest,
+    check_chain_options,
     standard_melt_equilibration,
 )
 from .rate_dependence import (
@@ -194,6 +195,7 @@ def run_tensile_rate_scan(
     rerun (``resume=False``) replaces the saved request instead of comparing
     it.
     """
+    check_chain_options(run, chain_backbone, atoms_per_chain)
     measurement = _event(property_name)[0]
     selected: TensileSpec = measurement.spec() if spec is None else spec
     plan = validate_tensile_rate_scan(
@@ -387,7 +389,7 @@ def analyse_tensile_rates(
         if manifest.box is not None:
             conditions["composition"] = {
                 key: manifest.box[key]
-                for key in ("n_molecules", "atoms_per_chain")
+                for key in ("n_molecules", "atoms_per_chain", "species")
                 if key in manifest.box
             }
         conditions.update({key: getattr(report, key) for key in measurement.criterion})

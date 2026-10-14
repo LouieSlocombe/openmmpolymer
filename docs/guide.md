@@ -49,6 +49,76 @@ manifest; analysis uses a backbone you give it, then the recorded one, and
 otherwise infers the longest shortest path through one chain's heavy atoms and
 says so in `backbone_source`.
 
+## Blends
+
+`build_blend` and `openmmpolymer --blend` build a cell of several polymers.
+- Each polymer is built, charged and parameterised on its own, exactly as for a
+  melt, and cached on its own.
+- The force fields are then merged.
+- The chains are packed together, one polymer after another, so each polymer's
+  chains form one contiguous block of the topology.
+- A rebuild is checked against the record of the first build, as for a melt.
+
+The blend file gives each polymer a `[[species]]` table:
+
+```toml
+[[species]]
+monomer = "[*]CC[*]"
+degree_of_polymerization = 30
+chains = 32
+residue_name = "PE"
+
+[[species]]
+monomer = "[*]CC([*])c1ccccc1"
+degree_of_polymerization = 20
+chains = 16
+residue_name = "PS"
+characteristic_ratio = 9.5
+```
+
+```bash
+openmmpolymer --blend pe_ps.toml --target-density 0.95 -t 450 -o blend
+```
+
+- **Required keys:** `monomer`, `chains` and `residue_name`.
+- **Optional keys:** `degree_of_polymerization`, `head_cap`, `tail_cap`,
+  `tacticity` and `characteristic_ratio`.
+- **Flags that conflict with `--blend`:** the flags that describe a single
+  chain (`-n`, `-c`, `-r`, the caps, `--tacticity` and
+  `--characteristic-ratio`). Set these per polymer in the file instead.
+- **Flags that apply to the whole cell:** `--seed`, the densities,
+  `--charge-method` and `--conformers`.
+- **What the request records:** every polymer's settings, not the file name. A
+  rerun with an edited file is therefore a different request.
+
+**Every polymer needs its own residue name.** The residue name names the
+polymer's files (`PE_0.sdf`, `PE_ff.xml`), its force-field template and its
+chains in the topology. Two names that differ only in case would overwrite
+each other's files on some filesystems, so they are refused too.
+
+**Blends use the smirnoff backend only.** SMIRNOFF atom types are named after
+a hash of the whole molecule, so two polymers cannot share one. GAFF types are
+shared classes such as `c3`. If two polymers each had an estimate for the same
+bonded class, both would be kept, and OpenMM would silently use whichever came
+first.
+
+**Cell-wide measurements work on a blend.** Density, enthalpy, the glass
+transition, the elastic constants, tensile strength and stress relaxation are
+all measured over the whole cell.
+
+**Per-chain measurements refuse a blend.** Chain dimensions, `g(r)`, `S(q)`,
+centre-of-mass displacement and end-to-end relaxation all read every molecule
+as a copy of one chain. A blend would mix the polymers up, so these refuse it
+rather than average over the wrong atoms.
+- The manifest records the polymers under `box.species`.
+- `--analyse` skips the structure report and says why.
+- The displacement half of the melt-equilibration verdict needs these
+  measurements too, so on a blend it becomes a note.
+
+**The chains start well mixed and stay mixed.** packmol places them at
+random, and polymers demix over times far beyond molecular dynamics. A blend
+here is a mixed cell, not a phase-separated morphology.
+
 ## Measuring properties
 
 Every measurement follows the same pattern:

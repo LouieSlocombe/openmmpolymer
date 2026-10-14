@@ -62,6 +62,7 @@ from .protocols import (
     RunManifest,
     RunSummary,
     Stage,
+    check_chain_options,
     run_protocol,
     standard_melt_equilibration,
 )
@@ -1059,6 +1060,7 @@ def run_tg_scan(
         AnalysisError: The fine pass recorded too few temperatures to give
             both branches ``spec.min_points_per_branch`` points.
     """
+    check_chain_options(run, chain_backbone, atoms_per_chain)
     directory = Path(run_dir)
     chains = chain_options(
         chain_backbone, atoms_per_chain, expected_characteristic_ratio
@@ -1154,6 +1156,7 @@ def cooling_rate_series(
             number. Every rate is checked before anything runs.
         AnalysisError: As :func:`run_tg_scan`, for any of the fine passes.
     """
+    check_chain_options(run, chain_backbone, atoms_per_chain)
     holds = _fine_holds(rates_k_per_ns, spec)
     directory = Path(run_dir)
     chains = chain_options(

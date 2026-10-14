@@ -48,6 +48,7 @@ from openmmpolymer.viscoelastic import (
 
 from .helpers import (
     BuildReached,
+    as_blend,
     snapshot_files,
     transition_at,
     two_line_curve,
@@ -65,9 +66,10 @@ from .helpers import (
 #: defaults are filled in. The request is ``vars(arguments)``, compared whole
 #: when a run resumes, so renaming, removing or re-defaulting a flag - or
 #: changing what a protocol fills in - makes every run already on disk refuse
-#: to resume. Change one of these only knowing that.
+#: to resume. Change one of these only knowing that. ``--blend`` defaults to
+#: ``argparse.SUPPRESS``, so adding it moved ``defaults`` and no namespace.
 RECORDED_REQUEST_SHA256 = {
-    "defaults": "7dee2dafb06a7a3f98caac0787aae9d6fc956ab72f71c646bf11eab9405cdce2",
+    "defaults": "df481884887c691a2fbe3815c2385c6acda89ad9d2e85e7e7155c406732b22be",
     "analyse": "de0816302b550e30bbd6bab0569f077527562e7294cbecfac7bfb72a469930e9",
     "breaking": "1c0733748e93a35670c4f69ff0579045da4a0f640cb4386adfdf9bb4826d1a6f",
     "elongation": "2be7461048f580a378bef14b4a703814d77baa0768e0ff8b425f4aa1ca8a86de",
@@ -83,7 +85,7 @@ RECORDED_REQUEST_SHA256 = {
 # The action schema also pins parsing and user-visible help, which need not
 # affect the shortest command lines above to change the CLI contract.
 RECORDED_PARSER_SHA256 = (
-    "37b929f66932aa135a27f88ce8a92fc9c97d30e4ab68655b74d260766120325b"
+    "2abc8e87aa48d2ac838ab0eb54d05267e7f410b6de43d4efce165afda68b5850"
 )
 
 #: What the build request leaves out: where things go, which device runs
@@ -1495,3 +1497,167 @@ def test_finite_consistency_gaps_are_shared_by_console_figure_and_log(
     assert "G 10%" in _consistency_line(check)
     assert "G 10%" in _moduli_title(report)
     assert replace(check, shear_gap=float("inf")).gaps == ()
+
+
+# --------------------------------------------------------------------------
+# Blends
+# --------------------------------------------------------------------------
+
+BLEND_TOML = """
+[[species]]
+monomer = "[*]CC[*]"
+degree_of_polymerization = 30
+chains = 32
+residue_name = "PE"
+
+[[species]]
+monomer = "[*]CC([*])c1ccccc1"
+degree_of_polymerization = 20
+chains = 16
+residue_name = "PS"
+characteristic_ratio = 9
+"""
+
+
+def test_a_blend_file_is_built_and_recorded_polymer_by_polymer(
+    staged_blend: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    Path("pe_ps.toml").write_text(BLEND_TOML)
+    assert main(["--blend", "pe_ps.toml", "--seed", "7", "--dry-run"]) == 0
+    pe, ps = (component.spec for component in staged_blend["components"])
+    assert (pe.residue_name, pe.degree_of_polymerization, pe.seed) == ("PE", 30, 7)
+    assert (ps.monomer_smiles, ps.characteristic_ratio) == ("[*]CC([*])c1ccccc1", 9.0)
+    assert [c.n_chains for c in staged_blend["components"]] == [32, 16]
+    assert "dimensions are not measured" in capsys.readouterr().out
+
+    recorded = json.loads(Path("run/build_request.json").read_text())
+    assert recorded["blend"][1] == {
+        "monomer": "[*]CC([*])c1ccccc1",
+        "degree_of_polymerization": 20,
+        "chains": 16,
+        "residue_name": "PS",
+        "head_cap": None,
+        "tail_cap": None,
+        "tacticity": "atactic",
+        "characteristic_ratio": 9.0,
+        "conformers": 16,
+    }
+    assert (recorded["conformers"], recorded["characteristic_ratio"]) == (None, None)
+
+    # The same file resumes; an edited one is a different request.
+    before = snapshot_files(Path("run"))
+    assert main(["--blend", "pe_ps.toml", "--seed", "7", "--dry-run"]) == 0
+    Path("pe_ps.toml").write_text(BLEND_TOML.replace("chains = 16", "chains = 17"))
+    with pytest.raises(SystemExit, match="2"):
+        main(["--blend", "pe_ps.toml", "--seed", "7", "--dry-run"])
+    assert snapshot_files(Path("run")) == before
+
+
+def test_a_run_without_a_blend_records_no_blend(no_build: list[Any]) -> None:
+    """So the requests of runs made before ``--blend`` existed still match."""
+    assert "blend" not in vars(build_parser().parse_args(["[*]CC[*]"]))
+    with pytest.raises(BuildReached):
+        main(["[*]CC[*]", "--dry-run"])
+    assert "blend" not in json.loads(Path("run/build_request.json").read_text())
+
+
+def test_a_blend_goes_on_to_dynamics_without_chain_measurements(
+    staged_blend: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ran: list[dict[str, Any]] = []
+
+    def dynamics(protocol: Any, run: Any, output: Path, **options: Any) -> Any:
+        ran.append(options)
+        return SimpleNamespace(
+            protocol=protocol.name,
+            results=(),
+            wall_seconds=1.0,
+            manifest_path="run/manifest.json",
+            chains=None,
+        )
+
+    monkeypatch.setattr(cli, "run_protocol", dynamics)
+    Path("pe_ps.toml").write_text(BLEND_TOML)
+    assert main(["--blend", "pe_ps.toml"]) == 0
+    assert ran == [
+        {
+            "chain_backbone": None,
+            "atoms_per_chain": None,
+            "expected_characteristic_ratio": None,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (["[*]CC[*]"], "replaces the monomer SMILES"),
+        (["-c", "40", "-r", "PE"], "-c, -r describe one chain"),
+        (["--rg", "1.0"], "--rg describes one chain"),
+        (["--protocol", "tm"], "tm starts from --crystal-pdb"),
+        (["--analyse", "run"], "analysed without it"),
+        (["--backend", "gaff"], "needs the smirnoff backend"),
+    ],
+)
+def test_a_blend_refuses_flags_that_describe_one_chain(
+    no_build: list[Any],
+    capsys: pytest.CaptureFixture[str],
+    extra: list[str],
+    message: str,
+) -> None:
+    Path("pe_ps.toml").write_text(BLEND_TOML)
+    with pytest.raises(SystemExit, match="2"):
+        main(["--blend", "pe_ps.toml", *extra])
+    assert message in capsys.readouterr().err
+    assert not no_build
+    assert not Path("run").exists()
+
+
+@pytest.mark.parametrize(
+    ("contents", "message"),
+    [
+        ("", "must hold [[species]] tables"),
+        ('title = "x"\n' + BLEND_TOML, "must hold [[species]] tables"),
+        (BLEND_TOML.replace('residue_name = "PS"', ""), "missing residue_name"),
+        (BLEND_TOML.replace("chains = 16", "chain = 16"), "unknown chain"),
+        (BLEND_TOML.replace("[[species]]", "[[species", 1), "line 2"),
+        (BLEND_TOML.replace('"PS"', '"PE"'), "its own residue name"),
+    ],
+)
+def test_a_blend_file_that_cannot_be_built_is_refused_before_anything(
+    no_build: list[Any],
+    capsys: pytest.CaptureFixture[str],
+    contents: str,
+    message: str,
+) -> None:
+    Path("pe_ps.toml").write_text(contents)
+    with pytest.raises(SystemExit, match="2"):
+        main(["--blend", "pe_ps.toml", "--dry-run"])
+    assert message in capsys.readouterr().err
+    assert not no_build
+    assert not Path("run").exists()
+
+
+def test_a_missing_blend_file_is_a_usage_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        main(["--blend", "absent.toml", "--dry-run"])
+    assert "absent.toml" in capsys.readouterr().err
+
+
+def test_a_blend_run_is_analysed_for_what_it_holds(
+    argon_run: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Its per-chain structure is skipped, and said to be."""
+    from openmmpolymer.protocols import Stage, run_protocol
+
+    blend = as_blend(argon_run, ["AR", "KR"])
+    run_protocol(Protocol("p", (Stage("00_minimise", "minimise"),)), blend, "run")
+    assert main(["--analyse", "run"]) == 1
+    printed = capsys.readouterr().out
+    assert "holds a blend (32 AR chains of 1 atoms and 32 KR chains" in printed
+    assert "nothing to report" in printed
+    with pytest.raises(SystemExit, match="2"):
+        main(["--analyse", "run", "--rg", "1.0"])
+    assert "describe one chain" in capsys.readouterr().err

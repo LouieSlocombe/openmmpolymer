@@ -31,7 +31,7 @@ import hashlib
 import json
 import logging
 import shutil
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -244,4 +244,74 @@ def build_polymer_forcefield(
             forcefill.residue_templates_with_virtual_sites(str(written))
         ),
         cached=cached,
+    )
+
+
+def merge_polymer_forcefields(
+    forcefields: Sequence[PolymerForceField], output_xml: str | Path
+) -> PolymerForceField:
+    """Merge the force fields of several polymers into one, for a blend.
+
+    Each chain is parameterised on its own by :func:`build_polymer_forcefield`
+    and cached on its own; this folds the results into the single file a
+    System is built from. It is safe for the smirnoff backend only. SMIRNOFF
+    atom types are named after a hash of the whole molecule, so two different
+    chains cannot share one, whereas GAFF types are shared classes such as
+    ``c3`` and ``hc``: two chains' estimates for the same bonded class would
+    both be kept, and OpenMM would silently use whichever came first.
+
+    Args:
+        forcefields: One per polymer, each with its own residue name.
+        output_xml: Where the merged force field is written.
+
+    Returns:
+        A force field whose ``residue_name`` joins its polymers' names with
+        ``+``; it covers every one of their templates.
+
+    Raises:
+        ValueError: Fewer than two force fields, a GAFF one, ones built with
+            different backends or base force fields, or a repeated residue.
+        ForceFieldError: forcefill could not merge them.
+    """
+    if len(forcefields) < 2:
+        raise ValueError("A merge needs at least two force fields.")
+    backends = {forcefield.backend for forcefield in forcefields}
+    if backends != {"smirnoff"}:
+        raise ValueError(
+            f"Only smirnoff force fields can be merged, not {sorted(backends)}: "
+            "GAFF atom types are shared classes, so two chains' bonded "
+            "parameters for the same class would collide silently."
+        )
+    bases = {forcefield.base_forcefield for forcefield in forcefields}
+    if len(bases) != 1:
+        raise ValueError(
+            "The force fields were built beside different base force fields: "
+            f"{sorted(bases)}."
+        )
+    names = [forcefield.residue_name for forcefield in forcefields]
+    if len({name.upper() for name in names}) != len(names):
+        raise ValueError(f"Each force field needs its own residue name, not {names}.")
+
+    import forcefill
+
+    try:
+        written = forcefill.merge_ffxml(
+            [forcefield.forcefield_xml for forcefield in forcefields], output_xml
+        )
+    except Exception as error:
+        raise ForceFieldError(
+            f"forcefill could not merge the force fields for {'+'.join(names)}: {error}"
+        ) from error
+    log.info("Merged the force fields for %s into %s.", "+".join(names), written)
+    return PolymerForceField(
+        forcefield_xml=written,
+        base_forcefield=forcefields[0].base_forcefield,
+        residue_name="+".join(names),
+        backend="smirnoff",
+        virtual_site_residues=tuple(
+            name
+            for forcefield in forcefields
+            for name in forcefield.virtual_site_residues
+        ),
+        cached=all(forcefield.cached for forcefield in forcefields),
     )

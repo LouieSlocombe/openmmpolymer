@@ -214,6 +214,73 @@ def staged_melt(monkeypatch: pytest.MonkeyPatch, argon_run: Any) -> dict[str, An
 
 
 @pytest.fixture
+def staged_blend(monkeypatch: pytest.MonkeyPatch, argon_run: Any) -> dict[str, Any]:
+    """Stand in for the chemistry behind ``build_blend``, as ``staged_melt`` does.
+
+    Each preparation writes, for every polymer, a conformer and a force field
+    named after its residue, then the merged force field and the packed cell.
+    ``components`` holds the polymers the last preparation was given; the
+    other controls are ``staged_melt``'s.
+    """
+    from dataclasses import replace
+
+    from openmmpolymer import melt
+    from openmmpolymer.chain import ChainResult
+
+    control: dict[str, Any] = {
+        "system_suffix": "",
+        "fail": False,
+        "builds": [],
+        "options": {},
+        "components": (),
+    }
+
+    def prepare(
+        components: Any, build_dir: Path, cache_dir: Path, **options: Any
+    ) -> Any:
+        control["builds"].append(build_dir)
+        control["options"] = options
+        control["components"] = components
+        number = len(control["builds"])
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / f"entry_{number}.xml").write_text("parameters")
+        build_dir.mkdir(parents=True, exist_ok=True)
+        names = [component.spec.residue_name for component in components]
+        files = [
+            *(f"{name}_0.{suffix}" for name in names for suffix in ("sdf", "pdb")),
+            *(f"{name}_ff.xml" for name in names),
+            "polymer_ff.xml",
+            "packed.pdb",
+        ]
+        for name in files:
+            (build_dir / name).write_text(f"prepared artifact {number}")
+        if control["fail"]:
+            raise RuntimeError("preparation failed")
+        chains = tuple(
+            ChainResult(
+                sdf_paths=(str(build_dir / f"{name}_0.sdf"),),
+                pdb_paths=(str(build_dir / f"{name}_0.pdb"),),
+                smiles="[Ar]",
+                n_atoms=1,
+                molar_mass_g_mol=39.948,
+            )
+            for name in names
+        )
+        run = replace(
+            argon_run,
+            system_xml=argon_run.system_xml + control["system_suffix"],
+            forcefield=replace(
+                argon_run.forcefield,
+                forcefield_xml=str(build_dir / "polymer_ff.xml"),
+            ),
+        )
+        return chains, run
+
+    monkeypatch.setattr(melt, "_prepare_blend", prepare)
+    return control
+
+
+@pytest.fixture
 def no_build(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
     """Stop any melt build where it would begin, with :class:`BuildReached`.
 
