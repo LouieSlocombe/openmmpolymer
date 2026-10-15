@@ -95,6 +95,30 @@ def _tg_lines(report: Any) -> Iterator[str]:
             yield _extrapolation_line(extrapolation)
 
 
+def _tg_run_lines(result: Any) -> Iterator[str]:
+    """What a two-pass glass-transition scan found, as it finishes."""
+    found = (
+        "no clear transition"
+        if result.temperature_k is None
+        else f"Tg = {result.temperature_k:.0f} K"
+    )
+    coarse = (
+        "nothing"
+        if result.approximate is None
+        else f"{result.approximate.temperature_k:.0f} K"
+    )
+    yield (
+        f"tg: {found} at {result.fine_schedule.cooling_rate_k_per_ns:.2f} "
+        f"K/ns (coarse said {coarse}), started from the {result.restart} state"
+    )
+
+
+def _tg_rate_lines(rates: Iterable[float], transitions: Iterable[Any]) -> Iterator[str]:
+    """One line per cooling rate of a rate series, as it finishes."""
+    for rate, fit in zip(rates, transitions, strict=True):
+        yield f"tg: {fit.temperature_k:.0f} K at {rate:g} K/ns{_unresolved(fit.resolved)}"
+
+
 def _transition_line(label: str, fit: Any) -> str:
     """One line for a fitted transition, with both expansivities."""
     rate = _cooling_rate(fit.cooling_rate_k_per_ns)
@@ -174,7 +198,7 @@ def _consistency_line(check: Any) -> str:
         f"E and nu imply K = {check.bulk_implied_mpa:.0f}, "
         f"G = {check.shear_implied_mpa:.0f} MPa"
     )
-    gaps = ", ".join(f"{name} {100.0 * gap:.0f}%" for name, gap in check.gaps)
+    gaps = check.gap_summary
     if not gaps:
         return f"{implied} - nothing measured to check them against"
     return (

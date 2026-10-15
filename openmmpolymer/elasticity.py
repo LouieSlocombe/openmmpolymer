@@ -328,6 +328,11 @@ class ElasticConsistency:
             if math.isfinite(gap)
         )
 
+    @property
+    def gap_summary(self) -> str:
+        """The finite gaps as ``K 12%, G 3%``, or empty when nothing was measured."""
+        return ", ".join(f"{name} {100.0 * gap:.0f}%" for name, gap in self.gaps)
+
 
 # --------------------------------------------------------------------------
 # Reading a run directory

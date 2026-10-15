@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from ._cli_reports import _modulus_lines
 from ._files import ReportFiles, figure_stem
 from ._fitting import MAX_REPLICA_SPREAD as MAX_REPLICA_SPREAD
 from ._fitting import NEGLIGIBLE, PS_PER_NS
@@ -521,46 +522,10 @@ def run_modulus_scan(
     )
 
 
-def _log_result(report: ModulusReport, schedule: ModulusSchedule) -> None:
-    """One line per measured constant, each with what qualifies it."""
-    if report.youngs is None:
-        log.info("Mechanical scan: no extension to fit.")
-        return
-    log.info(
-        "Mechanical scan: E = %.0f MPa%s at %.3g strain/ns, %.0f K%s.",
-        report.youngs.modulus_mpa,
-        ""
-        if report.replica_spread_mpa is None
-        else f" +/- {report.replica_spread_mpa:.0f} over "
-        f"{len(report.replicas)} replicas",
-        schedule.strain_rate_per_ns,
-        report.youngs.temperature_k,
-        "" if report.resolved else " (not resolved)",
-    )
-    if report.poisson is not None:
-        log.info(
-            "  nu = %.3f%s.",
-            report.poisson.ratio,
-            "" if report.poisson.resolved else " (not resolved)",
-        )
-    for label, fit in (("K", report.bulk), ("G", report.shear)):
-        if fit is not None:
-            log.info(
-                "  %s = %.0f MPa%s.",
-                label,
-                fit.modulus_mpa,
-                "" if fit.resolved else " (not resolved)",
-            )
-    if report.consistency is not None:
-        check = report.consistency
-        gaps = ", ".join(f"{name} {100.0 * gap:.0f}%" for name, gap in check.gaps)
-        log.info(
-            "  E and nu imply K = %.0f, G = %.0f MPa; %s%s.",
-            check.bulk_implied_mpa,
-            check.shear_implied_mpa,
-            f"gaps {gaps}" if gaps else "nothing measured to check them against",
-            "" if check.consistent or not gaps else " - not consistent",
-        )
+def _log_result(report: ModulusReport) -> None:
+    """Log what the scan found, in the lines the command line prints."""
+    for line in _modulus_lines(report):
+        log.info("Mechanical scan: %s", line)
     if math.isfinite(report.method_gap):
         log.info(
             "  the constant-stress cross-check differs by %.0f%%.",
@@ -583,7 +548,7 @@ SCAN: MeasurementScan[ModulusReport] = MeasurementScan(
     analyse=lambda directory, spec: analyse_mechanics(
         directory, strain_limit=spec.elastic_strain_limit
     ),
-    log_result=lambda report, spec: _log_result(report, deform_schedule(spec)),
+    log_result=lambda report, spec: _log_result(report),
 )
 
 

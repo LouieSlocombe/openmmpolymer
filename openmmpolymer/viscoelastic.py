@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from ._cli_reports import _relaxation_lines
 from ._files import ReportFiles
 from ._fitting import MAX_REPLICA_SPREAD as MAX_REPLICA_SPREAD
 from ._fitting import NEGLIGIBLE, PS_PER_NS
@@ -586,36 +587,9 @@ def run_relaxation_scan(
 
 
 def _log_result(report: RelaxationReport) -> None:
-    """One line per measured quantity, each with what qualifies it."""
-    if report.mean is None:
-        log.info("Relaxation scan: nothing was strained.")
-        return
-    log.info(
-        "Relaxation scan: G(0) = %.1f MPa over %.1f decades from %d replicas, "
-        "at %+.3f strain, %.0f K%s.",
-        report.mean.initial_modulus_mpa,
-        report.mean.decades,
-        report.mean.n_replicas,
-        report.mean.step_strain,
-        report.mean.temperature_k,
-        "" if report.resolved else " (not resolved)",
-    )
-    if report.kww is not None:
-        log.info(
-            "  KWW: beta = %.3f, tau = %.4g ps, <tau> = %.4g ps%s.",
-            report.kww.beta,
-            report.kww.tau_ps,
-            report.kww.mean_tau_ps,
-            "" if report.kww.resolved else " (not resolved)",
-        )
-    if report.prony is not None:
-        log.info(
-            "  Prony: G_inf = %.2f MPa over %d of %d terms%s.",
-            report.prony.equilibrium_mpa,
-            report.prony.n_active,
-            report.prony.n_terms,
-            "" if report.prony.plateau_reached else " - the decay had not finished",
-        )
+    """Log what the scan found, in the lines the command line prints."""
+    for line in _relaxation_lines(report):
+        log.info("Relaxation scan: %s", line)
     if report.plateau_conflict:
         log.warning(
             "  The spectrum finds an equilibrium modulus but the stretched "

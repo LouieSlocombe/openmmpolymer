@@ -50,13 +50,14 @@ from ._cli_reports import (
     _say,
     _structure_lines,
     _tg_lines,
-    _unresolved,
+    _tg_rate_lines,
+    _tg_run_lines,
     _yield_lines,
 )
 from ._files import ReportFiles
 from ._fitting import MAX_EXTRAPOLATION_DECADES, PS_PER_NS
 from ._seeds import DEFAULT_SEED
-from ._workflow import chain_options
+from ._workflow import chain_options, enforce_budget
 from .chain import ChainResult, ChainSpec
 from .charges import CHARGE_METHODS, DEFAULT_CHARGE_METHOD
 from .convergence import DEFAULT_WINDOW_FRACTIONS
@@ -291,36 +292,14 @@ def _run_tg(job: _Job) -> None:
     rates = arguments.cooling_rates
     if rates is None:
         result = job.scan(run_tg_scan, tg_approx_k=arguments.tg_approx)
-        found = (
-            "no clear transition"
-            if result.temperature_k is None
-            else f"Tg = {result.temperature_k:.0f} K"
-        )
-        coarse = (
-            "nothing"
-            if result.approximate is None
-            else f"{result.approximate.temperature_k:.0f} K"
-        )
-        print(
-            f"tg: {found} at {result.fine_schedule.cooling_rate_k_per_ns:.2f} "
-            f"K/ns (coarse said {coarse}), started from the {result.restart} state"
-        )
+        _say(_tg_run_lines(result))
         _print_chains(result.fine_summary.chains)
     else:
         transitions = job.scan(
             cooling_rate_series, rates_k_per_ns=rates, tg_approx_k=arguments.tg_approx
         )
-        for rate, fit in zip(rates, transitions, strict=True):
-            print(
-                f"tg: {fit.temperature_k:.0f} K at {rate:g} K/ns{_unresolved(fit.resolved)}"
-            )
-    report = analyse_tg(
-        job.output,
-        melt_stage=None if arguments.no_melt_check else arguments.melt_stage,
-        min_points_per_branch=arguments.min_points_per_branch,
-        target_rate_k_per_ns=arguments.target_rate,
-        radius_of_gyration_nm=arguments.rg,
-    )
+        _say(_tg_rate_lines(rates, transitions))
+    report = _tg_report(arguments, job.output)
     if rates is not None:
         extrapolation = getattr(report, arguments.rate_form)
         if extrapolation is not None:
@@ -328,6 +307,18 @@ def _run_tg(job: _Job) -> None:
     # The scan summaries above already supply the console headline. Save the
     # same full report as --analyse, including every available rate fit.
     job.report(report, None, write_tg_report)
+
+
+def _tg_report(arguments: argparse.Namespace, directory: Path, *extra: Path) -> Any:
+    """Read a glass-transition report the way the flags ask for it."""
+    return analyse_tg(
+        directory,
+        extra_run_dirs=extra,
+        melt_stage=None if arguments.no_melt_check else arguments.melt_stage,
+        min_points_per_branch=arguments.min_points_per_branch,
+        target_rate_k_per_ns=arguments.target_rate,
+        radius_of_gyration_nm=arguments.rg,
+    )
 
 
 def _run_tm(job: _Job) -> None:
@@ -1482,29 +1473,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _check_blend_flags(parser, arguments)
 
     if arguments.convergence:
-        if not arguments.analyse or len(arguments.analyse) != 1:
-            parser.error("--convergence requires exactly one --analyse directory")
-        if _property_rates_requested(arguments):
-            parser.error("run --convergence separately from imposed-rate analysis")
-        with _refusals(parser):
-            windows = analyse_convergence(
-                arguments.analyse[0],
-                stage=arguments.convergence_stage or arguments.structure_stage,
-                backbone=arguments.backbone,
-                stride=arguments.stride,
-                window_fractions=arguments.window_fractions,
-                relative_tolerance=arguments.convergence_tolerance,
-                min_effective_samples=arguments.min_effective_samples,
-                discard_fraction=arguments.convergence_discard_fraction,
-            )
-            _emit(
-                arguments,
-                windows,
-                _convergence_lines,
-                write_convergence_report,
-                arguments.output_dir,
-            )
-        return 0
+        return _convergence(parser, arguments)
 
     rates = None
     if _property_rates_requested(arguments):
@@ -1535,22 +1504,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _analyse(arguments)
 
     crystalline = arguments.protocol == "tm"
-    if crystalline:
-        if arguments.monomer is not None:
-            parser.error("tm starts from --crystal-pdb, not a monomer SMILES")
-        if arguments.crystal_pdb is None or arguments.system_xml is None:
-            parser.error("tm requires both --crystal-pdb and --system-xml")
-        if arguments.check_melt is not None:
-            parser.error("--check-melt watches a melt settle; tm heats a crystal")
-    else:
-        if any((arguments.crystal_pdb, arguments.system_xml, arguments.state_in)):
-            parser.error(
-                "--crystal-pdb, --system-xml and --state-in require --protocol tm"
-            )
-        if arguments.monomer is None and blend_file is None:
-            parser.error(
-                "a monomer SMILES or --blend is required unless --analyse is given"
-            )
+    _check_inputs(parser, arguments, blend_file=blend_file, crystalline=crystalline)
     entry = PROTOCOLS[arguments.protocol]
     # Everything is checked and priced before a file is read or written.
     with _refusals(parser):
@@ -1568,12 +1522,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{arguments.protocol} run: {estimate}{total_ns:.3g} ns "
                 "of dynamics in total"
             )
-            budget = arguments.max_total_ns
-            if budget is not None and total_ns > budget:
-                raise ValueError(
-                    f"The {arguments.protocol} run is {estimate}{total_ns:.3g} ns, over the "
-                    f"{budget:g} ns budget. Shorten it or raise --max-total-ns."
-                )
+            enforce_budget(
+                total_ns,
+                arguments.max_total_ns,
+                error=ValueError,
+                message=lambda: (
+                    f"The {arguments.protocol} run is {estimate}{total_ns:.3g} ns, "
+                    f"over the {arguments.max_total_ns:g} ns budget. Shorten it or "
+                    "raise --max-total-ns."
+                ),
+            )
         else:
             total_ns = validate_property_rate_scan(
                 spec,
@@ -1590,33 +1548,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(cost)
 
     output = Path(arguments.output_dir or "run")
-    if crystalline:
-        with _refusals(parser):
-            run = load_crystal(
-                arguments.crystal_pdb,
-                arguments.system_xml,
-                state_in=arguments.state_in,
-                platform=arguments.platform,
-                seed=arguments.seed,
-            )
-        options: dict[str, Any] = {"state_in": arguments.state_in, "crystalline": True}
-    elif blend is not None:
-        run = _build_blend(parser, arguments, *blend, output)
-        print(
-            "note: a blend's chains are not alike, so their dimensions are not "
-            "measured; everything measured over the whole cell is"
-        )
-        options = chain_options(None, None, None)
-        if entry.settles:
-            options.update(_settle(arguments))
-    else:
-        assert chain is not None
-        built, run = _build(parser, arguments, chain, output)
-        options = chain_options(
-            built.backbone, built.n_atoms, chain.characteristic_ratio
-        )
-        if entry.settles:
-            options.update(_settle(arguments))
+    run, options = _prepare_cell(
+        parser,
+        arguments,
+        entry,
+        output,
+        crystalline=crystalline,
+        chain=chain,
+        blend=blend,
+    )
     if arguments.dry_run:
         print(
             "dry run: crystal and heating schedule validated; no dynamics"
@@ -1643,6 +1583,98 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         _emit(arguments, report, _rate_lines, write_rate_report, output / "analysis")
     return 0
+
+
+def _convergence(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
+    """Report how a finished run's estimates settled as its window grew."""
+    if not arguments.analyse or len(arguments.analyse) != 1:
+        parser.error("--convergence requires exactly one --analyse directory")
+    if _property_rates_requested(arguments):
+        parser.error("run --convergence separately from imposed-rate analysis")
+    with _refusals(parser):
+        windows = analyse_convergence(
+            arguments.analyse[0],
+            stage=arguments.convergence_stage or arguments.structure_stage,
+            backbone=arguments.backbone,
+            stride=arguments.stride,
+            window_fractions=arguments.window_fractions,
+            relative_tolerance=arguments.convergence_tolerance,
+            min_effective_samples=arguments.min_effective_samples,
+            discard_fraction=arguments.convergence_discard_fraction,
+        )
+        _emit(
+            arguments,
+            windows,
+            _convergence_lines,
+            write_convergence_report,
+            arguments.output_dir,
+        )
+    return 0
+
+
+def _check_inputs(
+    parser: argparse.ArgumentParser,
+    arguments: argparse.Namespace,
+    *,
+    blend_file: str | None,
+    crystalline: bool,
+) -> None:
+    """Refuse the flags a protocol cannot start from, before anything is read."""
+    if crystalline:
+        if arguments.monomer is not None:
+            parser.error("tm starts from --crystal-pdb, not a monomer SMILES")
+        if arguments.crystal_pdb is None or arguments.system_xml is None:
+            parser.error("tm requires both --crystal-pdb and --system-xml")
+        if arguments.check_melt is not None:
+            parser.error("--check-melt watches a melt settle; tm heats a crystal")
+    else:
+        if any((arguments.crystal_pdb, arguments.system_xml, arguments.state_in)):
+            parser.error(
+                "--crystal-pdb, --system-xml and --state-in require --protocol tm"
+            )
+        if arguments.monomer is None and blend_file is None:
+            parser.error(
+                "a monomer SMILES or --blend is required unless --analyse is given"
+            )
+
+
+def _prepare_cell(
+    parser: argparse.ArgumentParser,
+    arguments: argparse.Namespace,
+    entry: ProtocolEntry,
+    output: Path,
+    *,
+    crystalline: bool,
+    chain: ChainSpec | None,
+    blend: tuple[list[BlendComponent], list[dict[str, Any]]] | None,
+) -> tuple[RunContext, dict[str, Any]]:
+    """Load the crystal or build the cell; return it with the run's chain options."""
+    if crystalline:
+        with _refusals(parser):
+            run = load_crystal(
+                arguments.crystal_pdb,
+                arguments.system_xml,
+                state_in=arguments.state_in,
+                platform=arguments.platform,
+                seed=arguments.seed,
+            )
+        return run, {"state_in": arguments.state_in, "crystalline": True}
+    if blend is not None:
+        run = _build_blend(parser, arguments, *blend, output)
+        print(
+            "note: a blend's chains are not alike, so their dimensions are not "
+            "measured; everything measured over the whole cell is"
+        )
+        options = chain_options(None, None, None)
+    else:
+        assert chain is not None
+        built, run = _build(parser, arguments, chain, output)
+        options = chain_options(
+            built.backbone, built.n_atoms, chain.characteristic_ratio
+        )
+    if entry.settles:
+        options.update(_settle(arguments))
+    return run, options
 
 
 def _check_blend_flags(
@@ -1743,6 +1775,22 @@ def _read_blend(
     return components, record
 
 
+def _record_build_request(
+    output: Path, arguments: argparse.Namespace, **settled: Any
+) -> None:
+    """Record what was asked for, with the settings the flags left to be filled in.
+
+    Recorded before building: a rebuild into a finished run could otherwise
+    overwrite its chemistry before anything refused to resume it.
+    """
+    request = {
+        key: value for key, value in vars(arguments).items() if key not in _UNRECORDED
+    }
+    request.update(settled)
+    request["runtime_versions"] = {package: version(package) for package in _RUNTIME}
+    record_build_request(output, request)
+
+
 def _build_blend(
     parser: argparse.ArgumentParser,
     arguments: argparse.Namespace,
@@ -1756,13 +1804,8 @@ def _build_blend(
     the chain flags it also holds are their defaults, which ``--blend``
     requires.
     """
-    request = {
-        key: value for key, value in vars(arguments).items() if key not in _UNRECORDED
-    }
-    request["blend"] = record
-    request["runtime_versions"] = {package: version(package) for package in _RUNTIME}
     try:
-        record_build_request(output, request)
+        _record_build_request(output, arguments, blend=record)
         _, run = build_blend(
             components,
             output,
@@ -1791,16 +1834,13 @@ def _build(
     The request is recorded first: a rebuild into a finished run could
     otherwise overwrite its chemistry before anything refused to resume it.
     """
-    request = {
-        key: value for key, value in vars(arguments).items() if key not in _UNRECORDED
-    }
-    request["conformers"] = min(
-        arguments.conformers or arguments.chains, arguments.chains
-    )
-    request["characteristic_ratio"] = chain.characteristic_ratio
-    request["runtime_versions"] = {package: version(package) for package in _RUNTIME}
     try:
-        record_build_request(output, request)
+        _record_build_request(
+            output,
+            arguments,
+            conformers=min(arguments.conformers or arguments.chains, arguments.chains),
+            characteristic_ratio=chain.characteristic_ratio,
+        )
         return build_melt(
             chain,
             arguments.chains,
@@ -1929,15 +1969,7 @@ def _analyse(arguments: argparse.Namespace) -> int:
         _emit(arguments, report, lines, write, arguments.output_dir)
 
     if quenched:
-        tg = analyse_tg(
-            first,
-            extra_run_dirs=directories[1:],
-            melt_stage=None if arguments.no_melt_check else arguments.melt_stage,
-            min_points_per_branch=arguments.min_points_per_branch,
-            target_rate_k_per_ns=arguments.target_rate,
-            radius_of_gyration_nm=arguments.rg,
-        )
-        emit(tg, _tg_lines, write_tg_report)
+        emit(_tg_report(arguments, first, *directories[1:]), _tg_lines, write_tg_report)
     if heated:
         melting = analyse_melting(
             first, min_points_per_branch=arguments.min_points_per_branch

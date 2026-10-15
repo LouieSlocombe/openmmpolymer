@@ -1482,7 +1482,7 @@ def test_finite_consistency_gaps_are_shared_by_console_figure_and_log(
     from dataclasses import replace
 
     from openmmpolymer._cli_reports import _consistency_line
-    from openmmpolymer.mechanical import _log_result, analyse_mechanics, deform_schedule
+    from openmmpolymer.mechanical import _log_result, analyse_mechanics
     from openmmpolymer.plots import _moduli_title
 
     write_deformation(tmp_path)
@@ -1491,8 +1491,8 @@ def test_finite_consistency_gaps_are_shared_by_console_figure_and_log(
     assert check.gaps == (("G", 0.1),)
     report = replace(report, consistency=check)
     with caplog.at_level(logging.INFO, logger="openmmpolymer.mechanical"):
-        _log_result(report, deform_schedule(ModulusSpec()))
-    assert "gaps G 10%" in caplog.text
+        _log_result(report)
+    assert "measured differ by G 10%" in caplog.text
     assert "nan%" not in caplog.text
     assert "G 10%" in _consistency_line(check)
     assert "G 10%" in _moduli_title(report)

@@ -948,11 +948,11 @@ def _moduli_title(report: ModulusReport) -> str:
     check = report.consistency
     if check is None:
         return "Elastic constants"
-    gaps = [f"{name} {100.0 * gap:.0f}%" for name, gap in check.gaps]
+    gaps = check.gap_summary
     if not gaps:
         return "Elastic constants - nothing to check them against"
     verdict = "consistent" if check.consistent else "not consistent"
-    return f"Elastic constants - {verdict} ({', '.join(gaps)} from E and nu)"
+    return f"Elastic constants - {verdict} ({gaps} from E and nu)"
 
 
 # --------------------------------------------------------------------------
