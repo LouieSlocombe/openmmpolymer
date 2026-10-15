@@ -45,6 +45,7 @@ from .protocols import (
     RunManifest,
     RunSummary,
     Stage,
+    check_chain_options,
     run_protocol,
     standard_melt_equilibration,
     validate_run_inputs,
@@ -594,38 +595,93 @@ def enforce_budget(
         raise error(message())
 
 
-def run_measurement_scan[T](
+@dataclass(frozen=True)
+class MeasurementScan[R]:
+    """A branched measurement: what names it, what it runs and what it reads.
+
+    Args:
+        protocol: The protocol name every stage of the scan runs under.
+        workflow: The record written beside the manifest.
+        error: What a refused scan raises.
+        verb: What a branch does to the equilibrated cell, for messages.
+        budget_advice: The scan-specific way out of an over-budget refusal.
+        equilibration: Builds the settle from a spec and the equilibration
+            keywords.
+        branches: The protocols that start from the equilibrated cell, given
+            the spec, a timestep and that cell - or None, for a listing.
+        log_cost: Says what the scan costs, given the spec, the settle, the
+            whole listing and how much of it is still to run.
+        analyse: Reads the finished run directory under the spec.
+        log_result: Says what was found.
+    """
+
+    protocol: str
+    workflow: str
+    error: type[Exception]
+    verb: str
+    budget_advice: str
+    equilibration: Callable[..., Protocol]
+    branches: Callable[[Any, float, Sequence[float] | None], list[Protocol]]
+    log_cost: Callable[[Any, Protocol, Protocol, float], None]
+    analyse: Callable[[Path, Any], R]
+    log_result: Callable[[R, Any], None]
+
+
+def run_measurement[R](
+    scan: MeasurementScan[R],
     run: RunContext,
-    workflow: Path,
+    run_dir: str | Path,
     spec: Any,
-    settle: Protocol,
-    branches: Callable[[float, Sequence[float]], Iterable[Protocol]],
-    analyse: Callable[[Path], T],
-    log_result: Callable[[T], None],
     *,
     resume: bool,
-    error: type[Exception],
-    verb: str,
-    **chains: Any,
-) -> T:
-    """Run and read a mechanical measurement with its recorded chain options."""
+    chain_backbone: Sequence[int] | None,
+    atoms_per_chain: int | None,
+    expected_characteristic_ratio: float,
+    **equilibration: Any,
+) -> R:
+    """Budget, record, equilibrate and branch a measurement, then read it back.
+
+    Nothing is written before the budget and a resumed directory's settings
+    have been checked. The request is saved before equilibration, and the
+    reference cell before the measurement branches run.
+    """
     from .simulate import safe_timestep_fs
 
+    check_chain_options(run, chain_backbone, atoms_per_chain)
+    directory = Path(run_dir)
+    settle = scan.equilibration(spec, **equilibration)
+    listing = scan_listing(scan.protocol, [settle, *scan.branches(spec, 2.0, None)])
+    manifest = RunManifest.load(directory) if resume else None
+    scan.log_cost(spec, settle, listing, remaining_ps(listing.stages, manifest))
+    total_ns = listing.total_duration_ps / PS_PER_NS
+    enforce_budget(
+        total_ns,
+        spec.max_total_ns,
+        error=scan.error,
+        message=lambda: (
+            f"The scan is {total_ns:.1f} ns, over the {spec.max_total_ns:.1f} ns "
+            f"budget. Shorten relax_ps, drop a replica, {scan.budget_advice}, or "
+            "raise max_total_ns."
+        ),
+    )
+    chains = chain_options(
+        chain_backbone, atoms_per_chain, expected_characteristic_ratio
+    )
     timestep_fs = safe_timestep_fs(spec.temperature_k, run.spec)
     run_branched_scan(
         run,
-        workflow,
+        directory / scan.workflow,
         scan_request(run, spec, settle, **chains),
         settle,
-        lambda origin: branches(timestep_fs, origin),
+        lambda origin: scan.branches(spec, timestep_fs, origin),
         resume=resume,
-        error=error,
-        verb=verb,
+        error=scan.error,
+        verb=scan.verb,
         metadata={"timestep_fs": timestep_fs, "n_replicas": spec.n_replicas},
         **chains,
     )
-    report = analyse(workflow.parent)
-    log_result(report)
+    report = scan.analyse(directory, spec)
+    scan.log_result(report, spec)
     return report
 
 

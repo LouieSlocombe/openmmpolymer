@@ -57,14 +57,12 @@ from ._validation import (
     require_positive,
 )
 from ._workflow import (
-    chain_options,
-    enforce_budget,
+    MeasurementScan,
     equilibration_at,
     group_by_stem,
     optional,
-    remaining_ps,
     require_positive_fields,
-    run_measurement_scan,
+    run_measurement,
     sample_spread,
     scan_listing,
     with_reference_box,
@@ -72,7 +70,7 @@ from ._workflow import (
 )
 from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .plots import plot_relaxation, plot_relaxation_spectrum
-from .protocols import Protocol, RunManifest, Stage, check_chain_options
+from .protocols import Protocol, RunManifest, Stage
 from .relaxation import (
     MIN_RELAXATION_POINTS,
     KWWFit,
@@ -507,16 +505,11 @@ def relaxation_scan(
 # --------------------------------------------------------------------------
 
 
-def _report_cost(
-    spec: RelaxationSpec, settle: Protocol, manifest: RunManifest | None
+def _log_cost(
+    spec: RelaxationSpec, settle: Protocol, listing: Protocol, remaining_ps: float
 ) -> None:
-    """Say what the whole scan costs before any of it runs.
-
-    Raises:
-        ViscoelasticError: The total is over ``max_total_ns``.
-    """
+    """Say what the whole scan costs before any of it runs."""
     schedule = relax_schedule(spec)
-    listing = scan_listing(PROTOCOL_NAME, [settle, *_branches(spec, timestep_fs=2.0)])
     total_ps = listing.total_duration_ps
     relax_ps = total_ps - settle.total_duration_ps
     passes = len(_strains(spec))
@@ -534,17 +527,7 @@ def _report_cost(
         schedule.n_bins,
         schedule.decades,
         total_ps / PS_PER_NS,
-        remaining_ps(listing.stages, manifest) / PS_PER_NS,
-    )
-    enforce_budget(
-        total_ps / PS_PER_NS,
-        spec.max_total_ns,
-        error=ViscoelasticError,
-        message=lambda: (
-            f"The scan is {total_ps / PS_PER_NS:.1f} ns, over the "
-            f"{spec.max_total_ns:.1f} ns budget. Shorten relax_ps, drop a "
-            "replica, skip the linearity pass, or raise max_total_ns."
-        ),
+        remaining_ps / PS_PER_NS,
     )
 
 
@@ -589,25 +572,16 @@ def run_relaxation_scan(
             from the settings, so resuming under changed ones would merge
             incompatible grids into one curve.
     """
-    check_chain_options(run, chain_backbone, atoms_per_chain)
-    directory = Path(run_dir)
-    settle = equilibration_protocol(spec, **equilibration)
-    _report_cost(spec, settle, RunManifest.load(directory) if resume else None)
-
-    return run_measurement_scan(
+    return run_measurement(
+        SCAN,
         run,
-        directory / WORKFLOW_NAME,
+        run_dir,
         spec,
-        settle,
-        lambda timestep_fs, origin: _branches(
-            spec, timestep_fs=timestep_fs, reference_box_nm=origin
-        ),
-        analyse_relaxation,
-        _log_result,
         resume=resume,
-        error=ViscoelasticError,
-        verb="strain",
-        **chain_options(chain_backbone, atoms_per_chain, expected_characteristic_ratio),
+        chain_backbone=chain_backbone,
+        atoms_per_chain=atoms_per_chain,
+        expected_characteristic_ratio=expected_characteristic_ratio,
+        **equilibration,
     )
 
 
@@ -660,6 +634,23 @@ def _log_result(report: RelaxationReport) -> None:
             "  the cell started at %.0f%% of the initial response.",
             100.0 * report.baseline_fraction,
         )
+
+
+#: The relaxation scan, as :func:`~openmmpolymer._workflow.run_measurement` runs it.
+SCAN: MeasurementScan[RelaxationReport] = MeasurementScan(
+    protocol=PROTOCOL_NAME,
+    workflow=WORKFLOW_NAME,
+    error=ViscoelasticError,
+    verb="strain",
+    budget_advice="skip the linearity pass",
+    equilibration=equilibration_protocol,
+    branches=lambda spec, timestep_fs, origin: _branches(
+        spec, timestep_fs=timestep_fs, reference_box_nm=origin
+    ),
+    log_cost=_log_cost,
+    analyse=lambda directory, spec: analyse_relaxation(directory),
+    log_result=lambda report, spec: _log_result(report),
+)
 
 
 # --------------------------------------------------------------------------

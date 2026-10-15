@@ -46,16 +46,14 @@ from ._fitting import MAX_REPLICA_SPREAD as MAX_REPLICA_SPREAD
 from ._fitting import NEGLIGIBLE, PS_PER_NS
 from ._validation import require_axis, require_integer
 from ._workflow import (
+    MeasurementScan,
     StrainSchedule,
-    chain_options,
     deformation_stages,
-    enforce_budget,
     equilibration_at,
     group_by_stem,
     optional,
-    remaining_ps,
     require_positive_fields,
-    run_measurement_scan,
+    run_measurement,
     sample_spread,
     scan_listing,
     with_reference_box,
@@ -80,7 +78,7 @@ from .elasticity import (
     youngs_modulus,
 )
 from .plots import plot_moduli, plot_stress_strain
-from .protocols import Protocol, RunManifest, Stage, check_chain_options
+from .protocols import Protocol, RunManifest, Stage
 from .simulate import RunContext
 from .trajectory import AnalysisError
 
@@ -450,17 +448,11 @@ def mechanical_scan(spec: ModulusSpec = DEFAULT_SPEC, **equilibration: Any) -> P
 # --------------------------------------------------------------------------
 
 
-def _report_cost(
-    spec: ModulusSpec, settle: Protocol, manifest: RunManifest | None
+def _log_cost(
+    spec: ModulusSpec, settle: Protocol, listing: Protocol, remaining_ps: float
 ) -> None:
-    """Say what the whole scan costs before any of it runs.
-
-    Raises:
-        MechanicalError: The total is over ``max_total_ns``.
-    """
+    """Say what the whole scan costs before any of it runs."""
     schedule = deform_schedule(spec)
-    listing = scan_listing(PROTOCOL_NAME, [settle, *_branches(spec, timestep_fs=2.0)])
-    total_ps = listing.total_duration_ps
     log.info(
         "Mechanical scan: %.1f ns equilibration, %.1f ns of extension (%d "
         "replicas of %d steps to %.1f%% strain at %.3g /ns), %.1f ns of "
@@ -473,18 +465,8 @@ def _report_cost(
         schedule.strain_rate_per_ns,
         sum(stage.duration_ps for stage in extra_stages(spec, timestep_fs=2.0))
         / PS_PER_NS,
-        total_ps / PS_PER_NS,
-        remaining_ps(listing.stages, manifest) / PS_PER_NS,
-    )
-    enforce_budget(
-        total_ps / PS_PER_NS,
-        spec.max_total_ns,
-        error=MechanicalError,
-        message=lambda: (
-            f"The scan is {total_ps / PS_PER_NS:.1f} ns, over the "
-            f"{spec.max_total_ns:.1f} ns budget. Shorten relax_ps, drop a "
-            "replica, skip a pass, or raise max_total_ns."
-        ),
+        listing.total_duration_ps / PS_PER_NS,
+        remaining_ps / PS_PER_NS,
     )
 
 
@@ -526,27 +508,16 @@ def run_modulus_scan(
             run it cannot resume: another protocol's, one without a saved
             request, or one with different settings.
     """
-    check_chain_options(run, chain_backbone, atoms_per_chain)
-    directory = Path(run_dir)
-    settle = equilibration_protocol(spec, **equilibration)
-    _report_cost(spec, settle, RunManifest.load(directory) if resume else None)
-
-    return run_measurement_scan(
+    return run_measurement(
+        SCAN,
         run,
-        directory / WORKFLOW_NAME,
+        run_dir,
         spec,
-        settle,
-        lambda timestep_fs, origin: _branches(
-            spec, timestep_fs=timestep_fs, reference_box_nm=origin
-        ),
-        lambda directory: analyse_mechanics(
-            directory, strain_limit=spec.elastic_strain_limit
-        ),
-        lambda report: _log_result(report, deform_schedule(spec)),
         resume=resume,
-        error=MechanicalError,
-        verb="deform",
-        **chain_options(chain_backbone, atoms_per_chain, expected_characteristic_ratio),
+        chain_backbone=chain_backbone,
+        atoms_per_chain=atoms_per_chain,
+        expected_characteristic_ratio=expected_characteristic_ratio,
+        **equilibration,
     )
 
 
@@ -595,6 +566,25 @@ def _log_result(report: ModulusReport, schedule: ModulusSchedule) -> None:
             "  the constant-stress cross-check differs by %.0f%%.",
             100.0 * report.method_gap,
         )
+
+
+#: The mechanical scan, as :func:`~openmmpolymer._workflow.run_measurement` runs it.
+SCAN: MeasurementScan[ModulusReport] = MeasurementScan(
+    protocol=PROTOCOL_NAME,
+    workflow=WORKFLOW_NAME,
+    error=MechanicalError,
+    verb="deform",
+    budget_advice="skip a pass",
+    equilibration=equilibration_protocol,
+    branches=lambda spec, timestep_fs, origin: _branches(
+        spec, timestep_fs=timestep_fs, reference_box_nm=origin
+    ),
+    log_cost=_log_cost,
+    analyse=lambda directory, spec: analyse_mechanics(
+        directory, strain_limit=spec.elastic_strain_limit
+    ),
+    log_result=lambda report, spec: _log_result(report, deform_schedule(spec)),
+)
 
 
 # --------------------------------------------------------------------------
