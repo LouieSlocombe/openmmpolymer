@@ -22,6 +22,7 @@ from ._fitting import finite_or_none
 from ._validation import require_in_range, require_integer, require_positive
 from ._workflow import optional
 from .conformation import (
+    ConformationSeries,
     centre_of_mass_msd,
     chain_conformation,
     end_to_end_relaxation,
@@ -212,12 +213,14 @@ def _measure(
     q_bins: int,
     heavy_atoms_only: bool,
     max_lag_fraction: float,
+    conformation: ConformationSeries | None = None,
 ) -> tuple[StructuralWindow, StructureFactor | None]:
     """Measure every parameter over one interval, noting what could not be.
 
     The structure factor's peak is left for the caller, which picks it from
     the bins every interval can resolve; the factor itself is returned for
-    that.
+    that. A *conformation* already measured over exactly this interval is
+    used instead of measuring it again.
     """
     values: dict[str, float | None] = {name: None for name in _PARAMETERS}
     valid = {name: False for name in _PARAMETERS}
@@ -226,11 +229,12 @@ def _measure(
     notes: list[str] = []
 
     if backbone is not None:
-        conformation = optional(
-            lambda: chain_conformation(ensemble, backbone, stride=stride),
-            notes,
-            "chain dimensions",
-        )
+        if conformation is None:
+            conformation = optional(
+                lambda: chain_conformation(ensemble, backbone, stride=stride),
+                notes,
+                "chain dimensions",
+            )
         if conformation is not None:
             for name in ("characteristic_ratio", "ratio_of_squares"):
                 value = finite_or_none(getattr(conformation.mean, name))
@@ -469,8 +473,13 @@ def structural_window_convergence(
     heavy_atoms_only: bool = True,
     max_lag_fraction: float = 0.5,
     min_vectors_per_bin: int = MIN_WAVEVECTORS_PER_BIN,
+    conformation: ConformationSeries | None = None,
 ) -> StructuralWindowConvergence:
     """Refit trajectory prefixes using fixed bins, lags policy and sampling.
+
+    *conformation* is the chain-conformation series of the whole trajectory
+    at this *stride*, when the caller has already measured it; the
+    full-length prefix reuses it rather than measuring the trajectory twice.
 
     Pair/S(q) strides are chosen once from the entire trajectory. Their
     default caps match ordinary structural reports (50/8 frames), which
@@ -543,16 +552,19 @@ def structural_window_convergence(
         heavy_atoms_only=heavy_atoms_only,
         max_lag_fraction=max_lag_fraction,
     )
-    measured = [
-        _measure(
-            replace(ensemble, n_frames=max(1, int(ensemble.n_frames * fraction))),
-            path,
-            fraction=fraction,
-            first_frame=0,
-            **options,
+    measured = []
+    for fraction in fractions:
+        n_frames = max(1, int(ensemble.n_frames * fraction))
+        measured.append(
+            _measure(
+                replace(ensemble, n_frames=n_frames),
+                path,
+                fraction=fraction,
+                first_frame=0,
+                conformation=conformation if n_frames == ensemble.n_frames else None,
+                **options,
+            )
         )
-        for fraction in fractions
-    ]
     boundaries = np.linspace(ensemble.n_frames // 2, ensemble.n_frames, 4, dtype=int)
     blocks = [
         _measure(

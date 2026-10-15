@@ -157,6 +157,7 @@ def analyse_convergence(
         )
         if ensemble.is_snapshot:
             notes.append(SNAPSHOT_REFUSAL)
+        series = None
         if path is not None:
             series = chain_conformation(ensemble, path, stride=stride)
             measure(
@@ -177,6 +178,7 @@ def analyse_convergence(
             window_fractions=fractions,
             relative_tolerance=relative_tolerance,
             stride=stride,
+            conformation=series,
         )
 
     structural = optional(read_structure, notes, "Structural convergence unavailable")
