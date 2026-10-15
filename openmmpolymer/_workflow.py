@@ -21,7 +21,7 @@ import hashlib
 import json
 import logging
 import math
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -647,7 +647,9 @@ def run_measurement[R](
     """
     from .simulate import safe_timestep_fs
 
-    check_chain_options(run, chain_backbone, atoms_per_chain)
+    chains = checked_chain_options(
+        run, chain_backbone, atoms_per_chain, expected_characteristic_ratio
+    )
     directory = Path(run_dir)
     settle = scan.equilibration(spec, **equilibration)
     listing = scan_listing(scan.protocol, [settle, *scan.branches(spec, 2.0, None)])
@@ -663,9 +665,6 @@ def run_measurement[R](
             f"budget. Shorten relax_ps, drop a replica, {scan.budget_advice}, or "
             "raise max_total_ns."
         ),
-    )
-    chains = chain_options(
-        chain_backbone, atoms_per_chain, expected_characteristic_ratio
     )
     timestep_fs = safe_timestep_fs(spec.temperature_k, run.spec)
     run_branched_scan(
@@ -911,6 +910,41 @@ def strain_ladder(
         (1.0 + strain_start) * (1.0 + strain_increment) ** steps - 1.0,
         dtype=np.float64,
     )
+
+
+def require_samples(
+    samples: Mapping[str, Any],
+    key: str,
+    expected: Any,
+    *,
+    message: str,
+    rtol: float = 1.0e-8,
+    atol: float = 0.0,
+) -> npt.NDArray[np.float64]:
+    """The recorded ``samples[key]``, refusing one missing, short or different.
+
+    A resumed or hand-edited run can carry a stage whose samples no longer
+    match what the workflow asked for; the shape and the values are compared
+    together, and *message* names what differed.
+    """
+    recorded = np.asarray(samples.get(key, []), dtype=float)
+    wanted = np.asarray(expected, dtype=float)
+    if recorded.shape != wanted.shape or not np.allclose(
+        recorded, wanted, rtol=rtol, atol=atol
+    ):
+        raise AnalysisError(message)
+    return recorded
+
+
+def checked_chain_options(
+    run: RunContext,
+    chain_backbone: Sequence[int] | None,
+    atoms_per_chain: int | None,
+    expected_characteristic_ratio: float | None,
+) -> dict[str, Any]:
+    """The chain-measurement keywords, checked against the cell they describe."""
+    check_chain_options(run, chain_backbone, atoms_per_chain)
+    return chain_options(chain_backbone, atoms_per_chain, expected_characteristic_ratio)
 
 
 def require_distinct(directories: Sequence[Path], *, what: str) -> None:

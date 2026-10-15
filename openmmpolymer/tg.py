@@ -59,6 +59,7 @@ from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .melt_check import MeltEquilibration, melt_equilibration
 from .plots import plot_cooling_rate, plot_quench_curve, plot_state_data
 from .protocols import (
+    MANIFEST_NAME,
     Protocol,
     RunManifest,
     RunSummary,
@@ -608,10 +609,7 @@ def tg_scan_duration_ps(
     holds = (
         [spec.fine_hold_ps]
         if rates_k_per_ns is None
-        else [
-            spec.fine_step_k / require_positive(rate, name="rates_k_per_ns") * PS_PER_NS
-            for rate in rates_k_per_ns
-        ]
+        else [_hold_for_rate(spec, rate) for rate in rates_k_per_ns]
     )
     return _total_scan_ps(
         tg_coarse_scan(spec),
@@ -1092,7 +1090,7 @@ def run_tg_scan(
     )
     return TgResult(
         run_dir=str(directory),
-        manifest_path=str(directory / "manifest.json"),
+        manifest_path=str(directory / MANIFEST_NAME),
         temperature_k=temperature,
         approximate=approach.approximate,
         transition=transition,
@@ -1190,15 +1188,13 @@ def _fine_holds(rates_k_per_ns: Sequence[float], spec: TgSpec) -> tuple[float, .
             f"The rates {tuple(rates_k_per_ns)} are not distinct, so two "
             "passes would be the same measurement under two names."
         )
-    holds: list[float] = []
-    for rate in rates_k_per_ns:
-        rate_k_per_ns = require_positive(rate, name="rates_k_per_ns")
-        holds.append(
-            require_positive(
-                spec.fine_step_k / rate_k_per_ns * PS_PER_NS, name="hold_ps"
-            )
-        )
-    return tuple(holds)
+    return tuple(_hold_for_rate(spec, rate) for rate in rates_k_per_ns)
+
+
+def _hold_for_rate(spec: TgSpec, rate_k_per_ns: float) -> float:
+    """The fine hold that cools one step of the ladder at *rate_k_per_ns*."""
+    rate = require_positive(rate_k_per_ns, name="rates_k_per_ns")
+    return require_positive(spec.fine_step_k / rate * PS_PER_NS, name="hold_ps")
 
 
 # --------------------------------------------------------------------------

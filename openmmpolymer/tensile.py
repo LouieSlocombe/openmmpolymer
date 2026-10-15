@@ -49,7 +49,7 @@ from ._fitting import PS_PER_NS
 from ._validation import require_axis, require_integer, require_positive
 from ._workflow import (
     StrainSchedule,
-    chain_options,
+    checked_chain_options,
     deformation_stages,
     enforce_budget,
     equilibration_at,
@@ -65,7 +65,7 @@ from ._workflow import (
 from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .elasticity import StressStrain, stress_strain
 from .plots import plot_breaking_strength, plot_elongation_at_break, plot_yield_strength
-from .protocols import Protocol, RunManifest, check_chain_options
+from .protocols import MANIFEST_NAME, Protocol, RunManifest
 from .simulate import RunContext, safe_timestep_fs
 from .strength import (
     DEFAULT_CONFIRMATION_STEPS,
@@ -626,7 +626,9 @@ def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
     **equilibration: Any,
 ) -> R:
     """Budget, record and run a scan, then analyse what it recorded."""
-    check_chain_options(run, chain_backbone, atoms_per_chain)
+    chains = checked_chain_options(
+        run, chain_backbone, atoms_per_chain, expected_characteristic_ratio
+    )
     spec = measurement.spec() if spec is None else spec
     if type(spec) is not measurement.spec:
         raise TypeError(
@@ -669,9 +671,6 @@ def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
         spec.n_replicas,
         total_ns,
         schedule.strain_rate_per_ns,
-    )
-    chains = chain_options(
-        chain_backbone, atoms_per_chain, expected_characteristic_ratio
     )
     run_branched_scan(
         run,
@@ -971,7 +970,7 @@ def _analyse[R: BreakingReport | ElongationReport | YieldReport](
     values = [getattr(fit, measurement.value) for fit in fits]
     return measurement.report(
         run_dir=str(directory),
-        manifest_path=str(directory / "manifest.json"),
+        manifest_path=str(directory / MANIFEST_NAME),
         curves=tuple(curves),
         replicas=tuple(fits),
         replica_indices=tuple(chunks),

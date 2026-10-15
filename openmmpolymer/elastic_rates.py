@@ -34,7 +34,7 @@ from ._fitting import (
 from ._validation import require_choice, require_positive
 from ._workflow import (
     branch_runs,
-    chain_options,
+    checked_chain_options,
     enforce_budget,
     equilibrate,
     group_by_stem,
@@ -42,6 +42,7 @@ from ._workflow import (
     record_scan_request,
     record_start,
     require_distinct,
+    require_samples,
     resumable_record,
     run_branches,
     run_fingerprint,
@@ -71,7 +72,7 @@ from .mechanical import (
     equilibration_protocol,
     extra_stages,
 )
-from .protocols import Protocol, RunManifest, Stage, check_chain_options
+from .protocols import MANIFEST_NAME, Protocol, RunManifest, Stage
 from .rate_dependence import (
     _TEMPERATURE_TOLERANCE_K,
     RateObservation,
@@ -116,17 +117,32 @@ ELASTIC_RATE_PROPERTIES = {
 
 @dataclass(frozen=True)
 class _ElasticPath:
-    """The builder settings and recorded samples for one loading path."""
+    """The builder settings and recorded samples for one loading path.
+
+    Args:
+        kind: The stage kind that runs it.
+        hold_field: The spec field a rate scan varies.
+        sample_key: What the stage records the path under.
+        path_option: The stage option holding the ladder, for the kinds that
+            take one explicitly.
+        axis_key: What the stage records its loading axis under, for the
+            kinds that have one.
+    """
 
     kind: str
     hold_field: str
     sample_key: str
     path_option: str | None = None
+    axis_key: str | None = None
 
 
 _PATHS = {
-    "youngs_modulus": _ElasticPath("deform", "relax_ps", "segment_strain"),
-    "poisson_ratio": _ElasticPath("deform", "relax_ps", "segment_strain"),
+    "youngs_modulus": _ElasticPath(
+        "deform", "relax_ps", "segment_strain", axis_key="deform_axis"
+    ),
+    "poisson_ratio": _ElasticPath(
+        "deform", "relax_ps", "segment_strain", axis_key="deform_axis"
+    ),
     "shear_modulus": _ElasticPath(
         "shear", "shear_ps_each", "segment_shear_strain", "strains"
     ),
@@ -134,7 +150,11 @@ _PATHS = {
         "compress", "bulk_ps_each", "segment_pressure_bar", "pressures_bar"
     ),
     "load_modulus": _ElasticPath(
-        "load", "load_ps_each", "segment_applied_stress_bar", "stresses_bar"
+        "load",
+        "load_ps_each",
+        "segment_applied_stress_bar",
+        "stresses_bar",
+        "load_axis",
     ),
 }
 _PATHS_BY_KIND = {path.kind: path for path in _PATHS.values()}
@@ -344,7 +364,9 @@ def run_elastic_rate_scan(
     Young's modulus keeps the record its original scan kept, and one written
     before scans fingerprinted their common state still resumes.
     """
-    check_chain_options(run, chain_backbone, atoms_per_chain)
+    chains = checked_chain_options(
+        run, chain_backbone, atoms_per_chain, expected_characteristic_ratio
+    )
     plan = validate_elastic_rate_scan(
         spec,
         hold_times_ps,
@@ -374,9 +396,6 @@ def run_elastic_rate_scan(
         branch_runs(directory, names),
         resume=resume,
         run_dirs=names,
-    )
-    chains = chain_options(
-        chain_backbone, atoms_per_chain, expected_characteristic_ratio
     )
     start, origin = equilibrate(
         plan.equilibration,
@@ -425,7 +444,7 @@ def run_elastic_rate_scan(
 
 
 def _read_rate_manifest(directory: Path) -> dict[str, Any]:
-    path = directory / "manifest.json"
+    path = directory / MANIFEST_NAME
     if not path.is_file():
         raise AnalysisError(f"No completed rate manifest in {directory}.")
     record: dict[str, Any] = json.loads(path.read_text())
@@ -464,13 +483,14 @@ def _check_recorded_scan(
                     ("segment_duration_ps", [expected_hold] * len(path)),
                     ("segment_temperature_k", [spec.temperature_k] * len(path)),
                 ):
-                    recorded = np.asarray(samples.get(field, []), dtype=float)
-                    if recorded.shape != (len(path),) or not np.allclose(
-                        recorded, expected, rtol=1e-8, atol=1e-9
-                    ):
-                        raise AnalysisError(
-                            f"{directory / name}/{stage.name} is incomplete or has different {field}."
-                        )
+                    require_samples(
+                        samples,
+                        field,
+                        expected,
+                        rtol=1e-8,
+                        atol=1e-9,
+                        message=f"{directory / name}/{stage.name} is incomplete or has different {field}.",
+                    )
                 if stage.kind == "shear" and samples.get("shear_plane", [0, 2]) != [
                     0,
                     2,
@@ -483,23 +503,21 @@ def _check_recorded_scan(
                     raise AnalysisError(
                         "Recorded lateral pressure differs from the workflow."
                     )
-                axis_key = {"deform": "deform_axis", "load": "load_axis"}.get(
-                    stage.kind
-                )
+                loaded = _PATHS_BY_KIND.get(stage.kind)
+                axis_key = None if loaded is None else loaded.axis_key
                 if axis_key and samples.get(axis_key) != [spec.axis]:
                     raise AnalysisError(
                         "Recorded loading axis differs from the workflow."
                     )
                 if stage.kind == "deform" and "reference_box_nm" in record:
-                    reference = np.asarray(
-                        samples.get("reference_box_nm", []), dtype=float
+                    require_samples(
+                        samples,
+                        "reference_box_nm",
+                        record["reference_box_nm"],
+                        rtol=1e-8,
+                        atol=1e-9,
+                        message="Recorded reference box differs from the workflow.",
                     )
-                    if reference.shape != (3,) or not np.allclose(
-                        reference, record["reference_box_nm"], rtol=1e-8, atol=1e-9
-                    ):
-                        raise AnalysisError(
-                            "Recorded reference box differs from the workflow."
-                        )
 
     return manifests
 
@@ -591,10 +609,9 @@ def _observations(
     """
     stages = raw_manifest.get("stages", {})
     key = _PATHS[name].sample_key
+    manifest = RunManifest(**raw_manifest)
     if name == "poisson_ratio":
-        groups = group_by_stem(
-            deform_stages(directory, manifest=RunManifest(**raw_manifest))
-        )
+        groups = group_by_stem(deform_stages(directory, manifest=manifest))
     else:
         # A preparation's compression ladder records pressures as well; only
         # the bulk pass measures a modulus.
@@ -702,50 +719,16 @@ def _observations(
                 )
         axis = None
         if name in ("poisson_ratio", "load_modulus"):
-            axis_key = "deform_axis" if name == "poisson_ratio" else "load_axis"
-            axes = samples.get(axis_key, [])
+            axes = samples.get(_PATHS[name].axis_key or "", [])
             if not axes or len(set(axes)) != 1 or axes[0] not in (0, 1, 2):
                 raise AnalysisError(
                     "Every tensile measurement must record one valid loading axis."
                 )
             axis = int(axes[0])
         try:
-            manifest = RunManifest(**raw_manifest)
-            if name == "poisson_ratio":
-                fit = poisson_ratio(
-                    stress_strain(directory, group, manifest=manifest),
-                    strain_limit=strain_limit,
-                )
-                value, error, resolved = fit.ratio, fit.standard_error, fit.resolved
-            elif name == "shear_modulus":
-                shear = shear_modulus(directory, group, manifest=manifest)
-                value, error, resolved = (
-                    shear.modulus_mpa,
-                    shear.standard_error_mpa,
-                    shear.resolved,
-                )
-            elif name == "bulk_modulus":
-                bulk = bulk_modulus(directory, group, manifest=manifest)
-                value, error, resolved = (
-                    bulk.modulus_mpa,
-                    bulk.standard_error_mpa,
-                    bulk.resolved,
-                )
-                notes.append(
-                    "Bulk standard error propagates the log-volume slope fit; "
-                    "independent replicas are needed to assess preparation variability."
-                )
-            else:
-                load = youngs_modulus(
-                    load_curve(directory, group, manifest=manifest),
-                    strain_limit=strain_limit,
-                    min_points=2,
-                )
-                value, error, resolved = (
-                    load.modulus_mpa,
-                    load.standard_error_mpa,
-                    load.resolved,
-                )
+            value, error, resolved = _fit_path(
+                name, directory, group, manifest, strain_limit, notes
+            )
         except (AnalysisError, KeyError, ValueError) as exc:
             value, error, resolved = math.nan, None, False
             notes.append(f"Measurement cannot be fitted: {exc}")
@@ -787,6 +770,39 @@ def _observations(
             )
         )
     return observations
+
+
+def _fit_path(
+    name: str,
+    directory: Path,
+    group: Sequence[str],
+    manifest: RunManifest,
+    strain_limit: float,
+    notes: list[str],
+) -> tuple[float, float | None, bool]:
+    """Fit one loading path with its property's own reader: value, error, resolved."""
+    if name == "poisson_ratio":
+        fit = poisson_ratio(
+            stress_strain(directory, group, manifest=manifest),
+            strain_limit=strain_limit,
+        )
+        return fit.ratio, fit.standard_error, fit.resolved
+    if name == "shear_modulus":
+        shear = shear_modulus(directory, group, manifest=manifest)
+        return shear.modulus_mpa, shear.standard_error_mpa, shear.resolved
+    if name == "bulk_modulus":
+        bulk = bulk_modulus(directory, group, manifest=manifest)
+        notes.append(
+            "Bulk standard error propagates the log-volume slope fit; "
+            "independent replicas are needed to assess preparation variability."
+        )
+        return bulk.modulus_mpa, bulk.standard_error_mpa, bulk.resolved
+    load = youngs_modulus(
+        load_curve(directory, group, manifest=manifest),
+        strain_limit=strain_limit,
+        min_points=2,
+    )
+    return load.modulus_mpa, load.standard_error_mpa, load.resolved
 
 
 # --------------------------------------------------------------------------
@@ -857,31 +873,29 @@ def _check_youngs_scan(
                         f"{directory} is incomplete: expected replica stage {stage.name}."
                     )
                 samples = entry.get("samples", {})
-                recorded = np.asarray(samples.get("segment_strain", []), dtype=float)
                 expected = strain_ladder(
                     float(stage.options["strain_start"]),
                     spec.strain_increment,
                     int(stage.options["n_steps"]),
                 )
-                if recorded.shape != expected.shape or not np.allclose(
-                    recorded, expected, rtol=1.0e-6, atol=1.0e-9
-                ):
-                    raise AnalysisError(
-                        f"{directory}/{stage.name} is incomplete or has a different strain ladder."
-                    )
+                require_samples(
+                    samples,
+                    "segment_strain",
+                    expected,
+                    rtol=1.0e-6,
+                    atol=1.0e-9,
+                    message=f"{directory}/{stage.name} is incomplete or has a different strain ladder.",
+                )
                 if samples.get("deform_axis", [None])[0] != spec.axis:
                     raise AnalysisError(
                         f"{directory}/{stage.name} has a different deformation axis."
                     )
-                durations = np.asarray(
-                    samples.get("segment_duration_ps", []), dtype=float
+                require_samples(
+                    samples,
+                    "segment_duration_ps",
+                    np.full(expected.shape, hold),
+                    message=f"{directory}/{stage.name} has missing or different rate holds.",
                 )
-                if durations.shape != expected.shape or not np.allclose(
-                    durations, hold, rtol=1.0e-8, atol=0.0
-                ):
-                    raise AnalysisError(
-                        f"{directory}/{stage.name} has missing or different rate holds."
-                    )
                 target_temperatures = samples.get("segment_temperature_k", [])
                 if target_temperatures and not np.allclose(
                     target_temperatures, spec.temperature_k, rtol=0.0, atol=1.0e-8
