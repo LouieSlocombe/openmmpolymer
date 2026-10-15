@@ -474,17 +474,31 @@ def _characteristic_ratio(
     return float(ends @ ends) / (n_bonds * bond_length_nm**2)
 
 
+def _anchor_units(mol: Chem.Mol, which: str) -> dict[int, int]:
+    """Each unit's head or tail backbone anchor atom index, found in one pass."""
+    prop = f"_omp_{which}_anchor"
+    found: dict[int, int] = {}
+    for atom in _atoms(mol):
+        if atom.HasProp(prop) and atom.HasProp("_omp_unit"):
+            found.setdefault(atom.GetIntProp("_omp_unit"), int(atom.GetIdx()))
+    return found
+
+
 def _anchor(mol: Chem.Mol, unit: int, which: str) -> int:
     """Return the index of unit *unit*'s head or tail backbone anchor atom."""
-    prop = f"_omp_{which}_anchor"
-    for atom in _atoms(mol):
-        if (
-            atom.HasProp(prop)
-            and atom.HasProp("_omp_unit")
-            and atom.GetIntProp("_omp_unit") == unit
-        ):
-            return int(atom.GetIdx())
-    raise ChainError(f"Unit {unit} has no {which} anchor.")
+    try:
+        return _anchor_units(mol, which)[unit]
+    except KeyError:
+        raise ChainError(f"Unit {unit} has no {which} anchor.") from None
+
+
+def _anchors(mol: Chem.Mol, n_units: int, which: str) -> list[int]:
+    """Every unit's head or tail anchor atom index, in unit order."""
+    found = _anchor_units(mol, which)
+    for unit in range(n_units):
+        if unit not in found:
+            raise ChainError(f"Unit {unit} has no {which} anchor.")
+    return [found[unit] for unit in range(n_units)]
 
 
 def backbone_path(mol: Chem.Mol, n_units: int) -> tuple[int, ...]:
@@ -668,8 +682,8 @@ def _build_template(spec: ChainSpec, seed: int) -> _Template:
 
     positions = _positions(template_mol)
     groups = _unit_atoms(template_mol, 4)
-    heads = [positions[_anchor(template_mol, i, "head")] for i in range(4)]
-    tails = [positions[_anchor(template_mol, i, "tail")] for i in range(4)]
+    heads = [positions[index] for index in _anchors(template_mol, 4, "head")]
+    tails = [positions[index] for index in _anchors(template_mol, 4, "tail")]
 
     # The reference is the previous unit's *tail* anchor, which is the backbone
     # atom bonded to this unit's head. Using its head instead would make the
@@ -773,8 +787,8 @@ def _grow_conformer(
         np.asarray(group)[local]
         for group, local in zip(groups, heavy_local, strict=True)
     ]
-    heads = [_anchor(mol, i, "head") for i in range(n_units)]
-    tails = [_anchor(mol, i, "tail") for i in range(n_units)]
+    heads = _anchors(mol, n_units, "head")
+    tails = _anchors(mol, n_units, "tail")
 
     for unit, block in ((1, template.second), (n_units - 1, template.last)):
         if len(groups[unit]) != len(block):

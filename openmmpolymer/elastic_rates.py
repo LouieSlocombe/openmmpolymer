@@ -564,8 +564,8 @@ def _expand(
                     )
                     spec_data = _recorded_spec(record)
             candidates = [(directory, spec_data)]
-        for candidate, spec_data in candidates:
-            candidate = candidate.resolve()
+        for unresolved, spec_data in candidates:
+            candidate = unresolved.resolve()
             raw = (
                 manifests[candidate]
                 if candidate in manifests

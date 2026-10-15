@@ -403,11 +403,11 @@ def analyse_tensile_rates(
                 )
             notes = list(fit.notes)
             notes.extend(report.notes)
-            for key in ("preparation", "system_sha256", "composition"):
-                if key not in conditions:
-                    notes.append(
-                        f"Recorded {key} is unavailable; cross-rate comparability is not fully verified."
-                    )
+            notes.extend(
+                f"Recorded {key} is unavailable; cross-rate comparability is not fully verified."
+                for key in ("preparation", "system_sha256", "composition")
+                if key not in conditions
+            )
             bracket = next(
                 (
                     getattr(fit, name)

@@ -1384,20 +1384,19 @@ def _rate_fits(
     ]
     if len(family) < 2:
         return None, None
-    fits: list[CoolingRateExtrapolation | None] = []
-    for form in ("log_linear", "vft"):
-        fits.append(
-            optional(
-                partial(
-                    cooling_rate_extrapolation,
-                    family,
-                    target_rate_k_per_ns=target_rate_k_per_ns,
-                    form=form,
-                ),
-                notes,
-                f"{form} rate fit",
-            )
+    fits: list[CoolingRateExtrapolation | None] = [
+        optional(
+            partial(
+                cooling_rate_extrapolation,
+                family,
+                target_rate_k_per_ns=target_rate_k_per_ns,
+                form=form,
+            ),
+            notes,
+            f"{form} rate fit",
         )
+        for form in ("log_linear", "vft")
+    ]
     return fits[0], fits[1]
 
 

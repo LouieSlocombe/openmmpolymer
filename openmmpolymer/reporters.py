@@ -138,13 +138,6 @@ class AtomicStateReporter:
         """Return the path of state file *slot*."""
         return self._prefix.with_suffix(f".state.{slot}.xml")
 
-    def current_state(self) -> Path | None:
-        """Return the last state fully written, or None if there is none."""
-        if not self.pointer_path.is_file():
-            return None
-        candidate = self.state_path(self.pointer_path.read_text().strip())
-        return candidate if candidate.is_file() else None
-
     def describeNextReport(self, simulation: Any) -> dict[str, Any]:
         """Tell OpenMM when this reporter next wants to be called."""
         steps = self._interval - simulation.currentStep % self._interval

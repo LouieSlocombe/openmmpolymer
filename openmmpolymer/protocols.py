@@ -1053,6 +1053,7 @@ def run_protocol(
         # to survive whatever stops the run.
         manifest.save(directory)
 
+    assert state is not None  # a protocol has a stage, so a state was written
     dimensions = _measure_chains(
         run,
         state,
@@ -1082,13 +1083,13 @@ def run_protocol(
 
 def _measure_chains(
     run: RunContext,
-    state_path: str | Path | None,
+    state_path: str | Path,
     backbone: Sequence[int] | None,
     atoms_per_chain: int | None,
     expected_ratio: float,
 ) -> ChainDimensions | None:
     """Measure the final chain dimensions, when there is enough to do it with."""
-    if backbone is None or atoms_per_chain is None or state_path is None:
+    if backbone is None or atoms_per_chain is None:
         return None
 
     positions = positions_nm(read_state(state_path))

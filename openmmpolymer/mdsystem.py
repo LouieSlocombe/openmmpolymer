@@ -212,7 +212,7 @@ class PackedBox:
         return self.positions_nm * unit.nanometer
 
 
-def replicate_topology(components: Sequence[PackedComponent]) -> tuple[Any, Any]:
+def replicate_topology(components: Sequence[PackedComponent]) -> Any:
     """Build a box topology by replicating each component's own topology.
 
     Args:
@@ -221,8 +221,7 @@ def replicate_topology(components: Sequence[PackedComponent]) -> tuple[Any, Any]
             coordinates line up.
 
     Returns:
-        A ``(topology, positions)`` pair. The positions are the input
-        conformers' own, and are replaced by packmol's.
+        The topology. Its coordinates are packmol's, read separately.
     """
     from openmm import app
 
@@ -231,7 +230,7 @@ def replicate_topology(components: Sequence[PackedComponent]) -> tuple[Any, Any]
         source = read_pdb(component.pdb_path)
         for _ in range(component.count):
             modeller.add(source.topology, source.positions)
-    return modeller.topology, modeller.positions
+    return modeller.topology
 
 
 def assemble_box(
@@ -253,7 +252,7 @@ def assemble_box(
         SystemAssemblyError: The packed file and the replicated topology disagree, so
             the coordinates cannot be trusted to belong to these atoms.
     """
-    topology, _ = replicate_topology(components)
+    topology = replicate_topology(components)
     packed_topology, positions = read_packed_pdb(packed_pdb)
 
     if positions.shape[0] != topology.getNumAtoms():
@@ -546,7 +545,6 @@ def make_barostat(
     seed: int,
     *,
     scale_molecules_as_rigid: bool = True,
-    pressures_bar: Sequence[float] | None = None,
     scale_axes: Sequence[bool] = (True, True, True),
 ) -> Any:
     """Build a barostat.
@@ -556,8 +554,9 @@ def make_barostat(
         temperature_k: The temperature its Metropolis test uses. It has to
             agree with the integrator's, and nothing here can check that - see
             :func:`openmmpolymer.simulate.set_temperature`.
-        pressure_bar: The pressure, on every axis that has no entry in
-            *pressures_bar*.
+        pressure_bar: The pressure, on every axis. A per-axis pressure is
+            set on the running Context by
+            :func:`openmmpolymer.simulate.set_pressures`.
         frequency: Steps between volume moves. Zero means never, and is how a
             stage that holds its box still reads a pressure at all: OpenMM
             reports one only through a barostat's ``computeCurrentPressure``
@@ -571,10 +570,6 @@ def make_barostat(
             default and why turning it off needs ``constraints="none"``. It
             also decides whether the pressure it reports is the molecular or
             the atomic virial.
-        pressures_bar: Per-axis pressures, for the anisotropic barostat only.
-            None applies *pressure_bar* to all three. This is what makes a
-            uniaxial load: a different pressure along one axis from the other
-            two.
         scale_axes: Which axes an anisotropic barostat may move. Setting the
             driven axis False is what holds an applied strain in place while
             the other two relax to their target pressure.
@@ -583,8 +578,8 @@ def make_barostat(
         The barostat force, not yet added to a System.
 
     Raises:
-        ValueError: *kind* is not one of :data:`BAROSTATS`, a per-axis setting
-            does not have three entries or was given for a barostat that has no
+        ValueError: *kind* is not one of :data:`BAROSTATS`, *scale_axes* does
+            not have three entries or was given for a barostat that has no
             axes, no axis may move, or *seed* is zero.
     """
     require_choice(kind, tuple(BAROSTATS), name="kind")
@@ -593,27 +588,15 @@ def make_barostat(
         raise ValueError(f"scale_axes={scale_axes!r} must have three entries.")
 
     if kind != "anisotropic":
-        # Silently ignoring these would produce a run that looks like the one
+        # Silently ignoring this would produce a run that looks like the one
         # that was asked for and is not - the whole reason this package builds
         # a Simulation per stage rather than mutating one.
-        if pressures_bar is not None:
-            raise ValueError(
-                f"pressures_bar is only meaningful for an anisotropic "
-                f"barostat, not a {kind} one, which holds one pressure on "
-                "every axis."
-            )
         if axes != (True, True, True):
             raise ValueError(
                 f"scale_axes is only meaningful for an anisotropic barostat, "
                 f"not a {kind} one, which scales every axis together."
             )
-
-    if kind == "isotropic":
-        barostat = mm.MonteCarloBarostat(
-            pressure_bar * unit.bar, temperature_k * unit.kelvin, frequency
-        )
-    elif kind == "flexible":
-        barostat = mm.MonteCarloFlexibleBarostat(
+        barostat = BAROSTATS[kind].force(
             pressure_bar * unit.bar, temperature_k * unit.kelvin, frequency
         )
     else:
@@ -623,18 +606,8 @@ def make_barostat(
                 "move anything. For a pressure reading without a moving box, "
                 "attach one at frequency=0 instead."
             )
-        three = (
-            (pressure_bar, pressure_bar, pressure_bar)
-            if pressures_bar is None
-            else tuple(float(value) for value in pressures_bar)
-        )
-        if len(three) != 3:
-            raise ValueError(
-                f"pressures_bar={pressures_bar!r} must have three entries, "
-                "one per axis."
-            )
         barostat = mm.MonteCarloAnisotropicBarostat(
-            mm.Vec3(*three) * unit.bar,
+            mm.Vec3(pressure_bar, pressure_bar, pressure_bar) * unit.bar,
             temperature_k * unit.kelvin,
             axes[0],
             axes[1],

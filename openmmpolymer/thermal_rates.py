@@ -642,11 +642,11 @@ def analyse_thermal_rates(
             )
         elif present:
             common[key] = present[0]
-    for key in ("pressure_bar", "preparation_state_sha256", "system_sha256"):
-        if key not in common:
-            notes.append(
-                f"Recorded {key} is unavailable for all histories; comparability is not fully verified."
-            )
+    notes.extend(
+        f"Recorded {key} is unavailable for all histories; comparability is not fully verified."
+        for key in ("pressure_bar", "preparation_state_sha256", "system_sha256")
+        if key not in common
+    )
     observations = [replace(item, conditions=common) for item in observations]
     report = analyse_rate_observations(
         observations,

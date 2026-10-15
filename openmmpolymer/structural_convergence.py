@@ -585,22 +585,22 @@ def structural_window_convergence(
                 min_vectors_per_bin,
             )
     updated = []
-    for window, factor in all_measured:
+    for measured_window, factor in all_measured:
         if factor is not None and mask.any():
             index = int(np.argmax(np.where(mask, factor.s_q, -np.inf)))
-            values, valid = dict(window.values), dict(window.valid)
+            values, valid = dict(measured_window.values), dict(measured_window.valid)
             for name, value in (
                 ("structure_factor_peak_per_nm", factor.q_per_nm[index]),
                 ("structure_factor_peak_height", factor.s_q[index]),
             ):
                 values[name] = finite_or_none(float(value))
                 valid[name] = values[name] is not None and float(value) > 0
-            window = replace(window, values=values, valid=valid)
+            window = replace(measured_window, values=values, valid=valid)
         else:
             window = replace(
-                window,
+                measured_window,
                 notes=(
-                    *window.notes,
+                    *measured_window.notes,
                     "No common adequately populated S(q) peak bins across all windows.",
                 ),
             )

@@ -622,7 +622,7 @@ def plot_moduli(report: ModulusReport) -> Figure:
     values: list[float] = []
     resolved: list[bool] = []
     errors: list[float] = []
-    for label, fit, error in (
+    for label, fit, spread in (
         ("E", report.youngs, report.replica_spread_mpa),
         ("K", report.bulk, None),
         ("G", report.shear, None),
@@ -632,6 +632,7 @@ def plot_moduli(report: ModulusReport) -> Figure:
         labels.append(label)
         values.append(float(fit.modulus_mpa))
         resolved.append(bool(fit.resolved))
+        error = spread
         if label == "K" and math.isfinite(fit.standard_error_mpa):
             error = fit.standard_error_mpa
         errors.append(0.0 if error is None else float(error))

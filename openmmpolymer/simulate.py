@@ -1107,6 +1107,18 @@ def run_pushoff(
     )
 
 
+def _segment_stage(
+    run: RunContext,
+    output_prefix: str | Path,
+    segments: Sequence[Segment],
+    **kwargs: Any,
+) -> StageResult:
+    """Run *segments* as the stage *output_prefix* names, forwarding *kwargs*."""
+    return run_segments(
+        run, Path(output_prefix).name, segments, output_prefix, **kwargs
+    )
+
+
 def run_nvt(
     run: RunContext,
     output_prefix: str | Path = "02_nvt",
@@ -1131,11 +1143,10 @@ def run_nvt(
     Returns:
         What the stage did.
     """
-    return run_segments(
+    return _segment_stage(
         run,
-        Path(output_prefix).name,
-        [Segment(temperature_k, duration_ps)],
         output_prefix,
+        [Segment(temperature_k, duration_ps)],
         barostat=None,
         **kwargs,
     )
@@ -1165,11 +1176,10 @@ def run_npt(
     Returns:
         What the stage did.
     """
-    return run_segments(
+    return _segment_stage(
         run,
-        Path(output_prefix).name,
-        [Segment(temperature_k, duration_ps, pressure_bar)],
         output_prefix,
+        [Segment(temperature_k, duration_ps, pressure_bar)],
         barostat=barostat,
         **kwargs,
     )
@@ -1233,14 +1243,7 @@ def run_compress(
         pressures_bar=pressures_bar,
         duration_ps_each=duration_ps_each,
     )
-    result = run_segments(
-        run,
-        Path(output_prefix).name,
-        segments,
-        output_prefix,
-        barostat=barostat,
-        **kwargs,
-    )
+    result = _segment_stage(run, output_prefix, segments, barostat=barostat, **kwargs)
     result.samples["segment_pressure_bar"] = list(pressures_bar)
     return result
 
@@ -1329,14 +1332,7 @@ def run_anneal(
         hold_ps=hold_ps,
         pressure_bar=pressure_bar,
     )
-    return run_segments(
-        run,
-        Path(output_prefix).name,
-        segments,
-        output_prefix,
-        barostat=barostat,
-        **kwargs,
-    )
+    return _segment_stage(run, output_prefix, segments, barostat=barostat, **kwargs)
 
 
 def quench_temperatures(t_start: float, t_end: float, step_k: float) -> list[float]:
@@ -1484,14 +1480,7 @@ def run_quench(
         pressure_bar=pressure_bar,
         temperatures_k=temperatures_k,
     )
-    return run_segments(
-        run,
-        Path(output_prefix).name,
-        segments,
-        output_prefix,
-        barostat=barostat,
-        **kwargs,
-    )
+    return _segment_stage(run, output_prefix, segments, barostat=barostat, **kwargs)
 
 
 def heating_temperatures(t_start: float, t_end: float, step_k: float) -> list[float]:
@@ -1594,14 +1583,7 @@ def run_heat(
     )
     require_choice(barostat, tuple(BAROSTATS), name="barostat")
     kwargs["measure_enthalpy"] = True
-    return run_segments(
-        run,
-        Path(output_prefix).name,
-        segments,
-        output_prefix,
-        barostat=barostat,
-        **kwargs,
-    )
+    return _segment_stage(run, output_prefix, segments, barostat=barostat, **kwargs)
 
 
 def run_production(
@@ -1628,9 +1610,9 @@ def run_production(
     Returns:
         What the stage did.
     """
-    return run_segments(
+    return _segment_stage(
         run,
-        Path(output_prefix).name,
+        output_prefix,
         [
             Segment(
                 temperature_k,
@@ -1638,7 +1620,6 @@ def run_production(
                 1.0 if pressure_bar is None else pressure_bar,
             )
         ],
-        output_prefix,
         barostat=None if pressure_bar is None else "isotropic",
         trajectory=trajectory,
         **kwargs,
@@ -1742,6 +1723,30 @@ def _reference_box_nm(
             f"reference_box_nm={reference.tolist()} is not three positive cell edges."
         )
     return reference
+
+
+def _box_samples() -> dict[str, list[float]]:
+    """Empty per-axis cell-edge samples, in the order a stage records them."""
+    return {f"segment_box_{name}_nm": [] for name in "xyz"}
+
+
+def _record_box(
+    samples: dict[str, list[float]], edges: npt.NDArray[np.float64]
+) -> None:
+    """Append one set of cell edges to the per-axis samples."""
+    for which, name in enumerate("xyz"):
+        samples[f"segment_box_{name}_nm"].append(float(edges[which]))
+
+
+def _measured_cell(
+    live: _Live, run: RunContext, reference_box_nm: Sequence[float] | None
+) -> tuple[float, npt.NDArray[np.float64]]:
+    """Check the cell is still whole; return its cutoff and the strain origin."""
+    simulation = live.simulation
+    _check_molecules(live.name, simulation, run.box.n_molecules)
+    return nonbonded_cutoff_nm(simulation.system), _reference_box_nm(
+        simulation, reference_box_nm
+    )
 
 
 def run_deform(
@@ -1859,9 +1864,7 @@ def run_deform(
     )
     simulation = live.simulation
 
-    _check_molecules(live.name, simulation, run.box.n_molecules)
-    cutoff_nm = nonbonded_cutoff_nm(simulation.system)
-    reference = _reference_box_nm(simulation, reference_box_nm)
+    cutoff_nm, reference = _measured_cell(live, run, reference_box_nm)
 
     total_steps = live.steps(relax_ps) * n_steps
     samples: dict[str, list[float]] = {
@@ -1870,9 +1873,7 @@ def run_deform(
         "segment_stress_xx_bar": [],
         "segment_stress_yy_bar": [],
         "segment_stress_zz_bar": [],
-        "segment_box_x_nm": [],
-        "segment_box_y_nm": [],
-        "segment_box_z_nm": [],
+        **_box_samples(),
     }
     waypoint_paths: list[str] = []
     log.info(
@@ -1922,7 +1923,7 @@ def run_deform(
                 samples[f"segment_stress_{name}{name}_bar"].append(
                     float(stress[which, which])
                 )
-                samples[f"segment_box_{name}_nm"].append(float(edges[which]))
+            _record_box(samples, edges)
             if waypoints:
                 waypoint_paths.append(
                     _save_waypoint(simulation, live.prefix, index, temperature_k)
@@ -2169,9 +2170,7 @@ def run_load(
     samples: dict[str, list[float]] = {
         "segment_applied_stress_bar": [],
         "lateral_pressure_bar": [pressure_bar],
-        "segment_box_x_nm": [],
-        "segment_box_y_nm": [],
-        "segment_box_z_nm": [],
+        **_box_samples(),
     }
     log.info(
         "%s: %d applied stresses on axis %d, %.1f ps each at %.2f fs (%d steps).",
@@ -2206,8 +2205,7 @@ def run_load(
             # saying it several steps later about a box nobody set.
             _check_deformed_box(live.name, simulation, cutoff_nm, applied)
             samples["segment_applied_stress_bar"].append(applied)
-            for which, name in enumerate("xyz"):
-                samples[f"segment_box_{name}_nm"].append(float(edges[which]))
+            _record_box(samples, edges)
             log.info(
                 "  %g bar: box %s nm, %.4f g/cm3, ran at %.0f K.",
                 applied,
@@ -2749,9 +2747,7 @@ def run_relax(
         barostat_frequency=0,
     )
     simulation = live.simulation
-    _check_molecules(live.name, simulation, run.box.n_molecules)
-    cutoff_nm = nonbonded_cutoff_nm(simulation.system)
-    reference = _reference_box_nm(simulation, reference_box_nm)
+    cutoff_nm, reference = _measured_cell(live, run, reference_box_nm)
 
     # Guarded rather than left to steps_for, which floors at one step: a
     # baseline of zero or an instantaneous strain would otherwise each run a

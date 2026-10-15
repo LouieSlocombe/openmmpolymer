@@ -88,7 +88,7 @@ def settled_state(
     through, and every branch has to start from the *equilibrated* cell.
     """
     state = summary.final_state
-    if state and state != "None" and Path(state).is_file():
+    if state and Path(state).is_file():
         return str(state)
     raise error(
         f"{directory} has no finished equilibration stage to {verb} from. Run "
