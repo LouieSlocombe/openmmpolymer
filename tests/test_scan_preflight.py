@@ -11,7 +11,13 @@ from typing import Any
 import pytest
 
 from openmmpolymer import _workflow, mechanical, tensile, tg, tm, viscoelastic
-from openmmpolymer.protocols import Protocol, ProtocolError, RunManifest, run_protocol
+from openmmpolymer.protocols import (
+    MANIFEST_NAME,
+    Protocol,
+    ProtocolError,
+    RunManifest,
+    run_protocol,
+)
 from openmmpolymer.simulate import RunContext
 
 from .helpers import QUICK_EQUILIBRATION, snapshot_files
@@ -225,3 +231,23 @@ def test_tensile_refuses_malformed_nested_request_without_writes(
     with pytest.raises(scan.error, match="different settings"):
         scan.run(argon_run, directory, **scan.options)
     assert snapshot_files(directory, mtimes=True) == before
+
+
+@pytest.mark.parametrize("name", list(SCANS))
+def test_a_forced_rerun_clears_the_old_manifest_before_any_dynamics(
+    name: str, argon_run: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new request must never sit beside stages that ran under the old one."""
+    scan = SCANS[name]
+    directory, _ = _begin_scan(scan, argon_run, monkeypatch)
+    assert (directory / MANIFEST_NAME).is_file()
+
+    def refuse(*args: Any, **options: Any) -> None:
+        raise DynamicsReached
+
+    _patch_dynamics(monkeypatch, refuse)
+    with pytest.raises(DynamicsReached):
+        scan.run(argon_run, directory, resume=False, **scan.options)
+    assert not (directory / MANIFEST_NAME).is_file()
+    record = json.loads((directory / scan.record_name).read_text())
+    assert record["request"]

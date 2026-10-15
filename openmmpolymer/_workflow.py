@@ -25,7 +25,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, NoReturn, Self
 
 import numpy as np
 import numpy.typing as npt
@@ -321,20 +321,21 @@ def rate_request(fields: dict[str, Any]) -> dict[str, Any]:
 
 
 def spec_request(
-    spec: Any, *, drop: Iterable[str] = (), **extra: Any
+    spec: Any, *, drop: Iterable[str] = (), strict: bool = False, **extra: Any
 ) -> dict[str, Any]:
     """What a scan was asked for, in the form its workflow record stores it.
 
     Round-tripped through JSON before it is compared with anything, because a
     tuple comes back from a file as a list, and comparing the two directly
     would make every resume look like a change of settings. *drop* leaves out
-    settings that do not change the dynamics, such as a budget.
+    settings that do not change the dynamics, such as a budget. A *strict*
+    request refuses a value JSON cannot encode; the others stringify it.
     """
     dropped = set(drop)
     settings = {key: value for key, value in asdict(spec).items() if key not in dropped}
-    stored: dict[str, Any] = json.loads(
-        json.dumps({"spec": settings, **extra}, default=str)
-    )
+    record = {"spec": settings, **extra}
+    text = json.dumps(record) if strict else json.dumps(record, default=str)
+    stored: dict[str, Any] = json.loads(text)
     return stored
 
 
@@ -390,6 +391,17 @@ def require_scan_protocol(
         )
 
 
+def _refuse_unrecorded_runs(
+    directory: Path, workflow: Path, *, error: type[Exception]
+) -> NoReturn:
+    """Refuse runs whose request was never recorded, so cannot be checked."""
+    raise error(
+        f"{directory} already holds runs without a request in {workflow.name}; "
+        "the workflow record is missing or incomplete, so their settings cannot "
+        "be verified. Use a fresh directory or rerun with resume=False."
+    )
+
+
 def check_scan_resume(
     run: RunContext,
     workflow: Path,
@@ -427,11 +439,7 @@ def check_scan_resume(
         and (manifest.stages or require_record_for_empty_manifest)
         and record.get("request") is None
     ):
-        raise error(
-            f"{directory} already holds runs without a request in {workflow.name}; "
-            "the workflow record is missing or incomplete, so their settings cannot "
-            "be verified. Use a fresh directory or rerun with resume=False."
-        )
+        _refuse_unrecorded_runs(directory, workflow, error=error)
     validate_run_inputs(run, directory)
     return record
 
@@ -634,8 +642,6 @@ def run_branched_scan(
     metadata: dict[str, Any],
     read_record: Callable[[], dict[str, Any]] | None = None,
     precheck: Callable[[dict[str, Any], RunManifest | None], None] | None = None,
-    record_builder: Callable[[str | None, list[float] | None], dict[str, Any]]
-    | None = None,
     require_record_for_empty_manifest: bool = True,
     **chains: Any,
 ) -> None:
@@ -646,16 +652,14 @@ def run_branched_scan(
     branch, so interruptions during dynamics or analysis cannot leave stages
     without their settings. A forced rerun discards the old manifest before
     replacing its request; only equilibration resets it, and the branches
-    preserve each other's results.
+    preserve each other's results. The record is rebuilt on every run, so a
+    resume carries nothing over from the previous record but what it checks.
 
     A custom reader retains a workflow's corrupt-record diagnostics, and
     *precheck* verifies domain-specific stage relationships before input checks.
-    *record_builder* rebuilds records that historically reset their metadata;
-    it receives no state for the first write and the equilibrated state for
-    the second, retaining the caller's field order.
     """
     directory = workflow.parent
-    record = check_scan_resume(
+    check_scan_resume(
         run,
         workflow,
         request,
@@ -666,18 +670,14 @@ def run_branched_scan(
         precheck=precheck,
         require_record_for_empty_manifest=require_record_for_empty_manifest,
     )
-    if record_builder is not None:
-        record = record_builder(None, None)
+    record: dict[str, Any] = {}
     record_scan_request(
         workflow, record, request, [directory], resume=resume, **metadata
     )
     start, origin = equilibrate(
         settle, run, directory, resume=resume, error=error, verb=verb, **chains
     )
-    if record_builder is None:
-        record.update(start_state=start, reference_box_nm=origin)
-    else:
-        record = record_builder(start, origin)
+    record.update(reference_box_nm=origin, start_state=start)
     write_json(workflow, record, strict=False)
     run_branches(branches(origin), run, directory, start, **chains)
 
@@ -767,10 +767,7 @@ def resumable_record(
         and directory.is_dir()
         and any(directory.rglob(MANIFEST_NAME))
     ):
-        raise error(
-            f"{directory} already holds runs without a request in {workflow.name}, "
-            "so their settings cannot be verified. Use a fresh directory."
-        )
+        _refuse_unrecorded_runs(directory, workflow, error=error)
     runs = [directory / "equilibration", *(directory / name for name in branches)]
     for path in runs:
         manifest = path / MANIFEST_NAME

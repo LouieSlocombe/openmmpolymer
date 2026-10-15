@@ -48,6 +48,7 @@ from ._workflow import (
     check_scan_resume,
     enforce_budget,
     optional,
+    record_scan_request,
     remaining_ps,
     require_positive_fields,
     resume_chunks,
@@ -746,9 +747,7 @@ def _approach(
     record = check_scan_resume(
         run, path, request, coarse.name, resume=resume, error=TgError
     )
-    record["request"] = request
-    directory.mkdir(parents=True, exist_ok=True)
-    write_json(path, record, strict=False)
+    record_scan_request(path, record, request, [directory], resume=resume)
 
     summary = run_protocol(coarse, run, directory, resume=resume, **chains)
     manifest = RunManifest.load(directory)
