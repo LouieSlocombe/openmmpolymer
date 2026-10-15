@@ -19,7 +19,7 @@ import itertools
 import logging
 import math
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import AbstractContextManager, ExitStack
 from copy import copy
 from dataclasses import dataclass, field, replace
@@ -1042,6 +1042,20 @@ def _timestep_fs(
     return timestep_fs
 
 
+def _pushoff_segments(
+    temperature_k: float, duration_ps: float, timesteps_fs: Sequence[float]
+) -> list[Segment]:
+    """One hold per timestep on the ladder, sharing *duration_ps* equally."""
+    require_positive(duration_ps, name="duration_ps")
+    if not timesteps_fs:
+        raise ValueError("timesteps_fs is empty, so there is no ladder to climb.")
+    share = duration_ps / len(timesteps_fs)
+    return [
+        Segment(temperature_k, share, label=f"{timestep:g} fs")
+        for timestep in timesteps_fs
+    ]
+
+
 def run_pushoff(
     run: RunContext,
     output_prefix: str | Path = "01_pushoff",
@@ -1073,19 +1087,20 @@ def run_pushoff(
     Returns:
         What the stage did.
     """
-    require_positive(duration_ps, name="duration_ps")
+    segments = _pushoff_segments(temperature_k, duration_ps, timesteps_fs)
     prefix = Path(output_prefix)
     started = time.monotonic()
     state: str | Path | None = state_in
     steps = 0
     results: list[StageResult] = []
-    share = duration_ps / len(timesteps_fs)
 
-    for index, timestep in enumerate(timesteps_fs):
+    for index, (timestep, segment) in enumerate(
+        zip(timesteps_fs, segments, strict=True)
+    ):
         result = run_segments(
             run,
             f"{prefix.name}[{timestep:g} fs]",
-            [Segment(temperature_k, share, label=f"{timestep:g} fs")],
+            [segment],
             prefix.with_name(f"{prefix.name}_{index}"),
             barostat=None,
             timestep_fs=timestep,
@@ -1725,6 +1740,56 @@ def _reference_box_nm(
     return reference
 
 
+def _deform_duration_ps(n_steps: int, relax_ps: float) -> float:
+    """Validate and price a strain ladder: *n_steps* holds of *relax_ps* each."""
+    return require_integer(n_steps, minimum=1, name="n_steps") * require_positive(
+        relax_ps, name="relax_ps"
+    )
+
+
+def _rungs(values: Sequence[float], *, name: str, verb: str) -> list[float]:
+    """A ladder's rungs as finite floats, refusing an empty ladder."""
+    rungs = [require_finite(value, name=name) for value in values]
+    if not rungs:
+        raise ValueError(f"{name} is empty, so there is nothing to {verb}.")
+    return rungs
+
+
+def _ladder_duration_ps(
+    values: Sequence[float], duration_ps_each: float, *, name: str, verb: str
+) -> float:
+    """Validate and price a ladder: one hold of *duration_ps_each* per rung."""
+    return len(_rungs(values, name=name, verb=verb)) * require_positive(
+        duration_ps_each, name="duration_ps_each"
+    )
+
+
+def _relax_duration_ps(
+    duration_ps: float,
+    baseline_ps: float,
+    ramp_ps: float,
+    time_offset_ps: float,
+    *,
+    strain_applied: bool,
+) -> float:
+    """Validate and price a relaxation: its baseline, ramp and hold.
+
+    A chunk that opens an already-strained cell repeats neither the baseline
+    nor the ramp, so counting them would price a resumed ladder as several
+    first chunks.
+    """
+    duration = require_positive(duration_ps, name="duration_ps")
+    for name, value in (
+        ("baseline_ps", baseline_ps),
+        ("ramp_ps", ramp_ps),
+        ("time_offset_ps", time_offset_ps),
+    ):
+        require_nonnegative(value, name=name)
+    if strain_applied:
+        return duration
+    return float(baseline_ps) + float(ramp_ps) + duration
+
+
 def _box_samples() -> dict[str, list[float]]:
     """Empty per-axis cell-edge samples, in the order a stage records them."""
     return {f"segment_box_{name}_nm": [] for name in "xyz"}
@@ -1842,9 +1907,9 @@ def run_deform(
         ValueError: The axis or the increment is not usable.
     """
     require_axis(axis)
-    require_integer(n_steps, minimum=1, name="n_steps")
+    # Validated by what prices it, so a budget and a run cannot disagree.
+    _deform_duration_ps(n_steps, relax_ps)
     require_integer(samples_per_step, minimum=1, name="samples_per_step")
-    require_positive(relax_ps, name="relax_ps")
     require_positive(abs(strain_increment), name="strain_increment")
 
     scale_flags = [True, True, True]
@@ -2146,9 +2211,7 @@ def run_load(
         ValueError: The axis is not 0, 1 or 2, or no stresses were given.
     """
     require_axis(axis)
-    rungs = [require_finite(value, name="stresses_bar") for value in stresses_bar]
-    if not rungs:
-        raise ValueError("stresses_bar is empty, so there is nothing to pull with.")
+    rungs = _rungs(stresses_bar, name="stresses_bar", verb="pull with")
     require_integer(samples_per_step, minimum=1, name="samples_per_step")
     require_positive(duration_ps_each, name="duration_ps_each")
 
@@ -2274,9 +2337,7 @@ def run_shear(
         ValueError: The plane or the strain ladder is not usable.
     """
     driven, gradient = require_plane(plane)
-    ladder = [require_finite(value, name="strains") for value in strains]
-    if not ladder:
-        raise ValueError("strains is empty, so there is nothing to shear.")
+    ladder = _rungs(strains, name="strains", verb="shear")
     require_integer(samples_per_step, minimum=1, name="samples_per_step")
     require_positive(duration_ps_each, name="duration_ps_each")
 
@@ -2709,16 +2770,13 @@ def run_relax(
     require_choice(mode, RELAX_MODES, name="mode")
     require_axis(axis)
     driven, gradient = require_plane(plane)
-    require_positive(duration_ps, name="duration_ps")
+    # Validated by what prices it, so a budget and a run cannot disagree.
+    _relax_duration_ps(
+        duration_ps, baseline_ps, ramp_ps, time_offset_ps, strain_applied=strain_applied
+    )
     require_positive(sample_every_ps, name="sample_every_ps")
     require_positive(late_sample_every_ps, name="late_sample_every_ps")
     require_positive(abs(step_strain), name="step_strain")
-    for name, value in (
-        ("baseline_ps", baseline_ps),
-        ("ramp_ps", ramp_ps),
-        ("time_offset_ps", time_offset_ps),
-    ):
-        require_nonnegative(value, name=name)
     timestep_fs = _timestep_fs(timestep_fs, temperature_k, run.spec)
 
     # A shear step measures G directly: sigma_xz = G gamma. A tensile step
@@ -2971,3 +3029,108 @@ def run_relax(
             mean_temperature_k=realised,
             mean_density_g_cm3=density,
         )
+
+
+# --------------------------------------------------------------------------
+# Pricing a stage before it runs
+# --------------------------------------------------------------------------
+
+
+def _hold_segment(options: dict[str, Any]) -> Segment:
+    """The one hold an nvt, npt or production stage runs, as its runner builds it."""
+    pressure = options.get("pressure_bar")
+    return Segment(
+        options["temperature_k"],
+        options["duration_ps"],
+        1.0 if pressure is None else pressure,
+    )
+
+
+def _total_ps(segments: Iterable[Segment]) -> float:
+    return sum((segment.duration_ps for segment in segments), 0.0)
+
+
+def _pushoff_duration_ps(options: dict[str, Any]) -> float:
+    _pushoff_segments(
+        options["temperature_k"], options["duration_ps"], options["timesteps_fs"]
+    )
+    return float(options["duration_ps"])
+
+
+def _ramp_duration_ps(
+    build: Callable[..., list[Segment]], options: dict[str, Any]
+) -> float:
+    return _total_ps(
+        build(
+            t_start=options["t_start"],
+            t_end=options["t_end"],
+            step_k=options["step_k"],
+            hold_ps=options["hold_ps"],
+            pressure_bar=options["pressure_bar"],
+            temperatures_k=options["temperatures_k"],
+        )
+    )
+
+
+#: How much dynamics each kind of stage asks for, given its filled-in options.
+#: Every entry validates with the very code its runner validates with, so a
+#: budget refuses exactly what a run would refuse, with the same message.
+_STAGE_DURATIONS: dict[str, Callable[[dict[str, Any]], float]] = {
+    "minimise": lambda options: 0.0,
+    "pushoff": _pushoff_duration_ps,
+    "nvt": lambda options: _hold_segment(options).duration_ps,
+    "npt": lambda options: _hold_segment(options).duration_ps,
+    "production": lambda options: _hold_segment(options).duration_ps,
+    "compress": lambda options: _total_ps(
+        _compress_segments(
+            temperature_k=options["temperature_k"],
+            pressures_bar=options["pressures_bar"],
+            duration_ps_each=options["duration_ps_each"],
+        )
+    ),
+    "anneal": lambda options: _total_ps(
+        _anneal_segments(
+            t_low=options["t_low"],
+            t_high=options["t_high"],
+            n_cycles=options["n_cycles"],
+            ramp_windows=options["ramp_windows"],
+            window_ps=options["window_ps"],
+            hold_ps=options["hold_ps"],
+            pressure_bar=options["pressure_bar"],
+        )
+    ),
+    "quench": lambda options: _ramp_duration_ps(_quench_segments, options),
+    "heat": lambda options: _ramp_duration_ps(_heat_segments, options),
+    "deform": lambda options: _deform_duration_ps(
+        options["n_steps"], options["relax_ps"]
+    ),
+    "load": lambda options: _ladder_duration_ps(
+        options["stresses_bar"],
+        options["duration_ps_each"],
+        name="stresses_bar",
+        verb="pull with",
+    ),
+    "shear": lambda options: _ladder_duration_ps(
+        options["strains"], options["duration_ps_each"], name="strains", verb="shear"
+    ),
+    "relax": lambda options: _relax_duration_ps(
+        options["duration_ps"],
+        options["baseline_ps"],
+        options["ramp_ps"],
+        options["time_offset_ps"],
+        strain_applied=options["strain_applied"],
+    ),
+}
+
+
+def stage_duration_ps(kind: str, options: dict[str, Any]) -> float:
+    """How much dynamics a stage of *kind* asks for, from its filled-in options.
+
+    *options* are the stage's options with its runner's defaults filled in, as
+    :func:`openmmpolymer.protocols._stage_options` records them.
+
+    Raises:
+        ValueError: The schedule is one the runner would refuse, with the
+            runner's own message.
+    """
+    return _STAGE_DURATIONS[kind](options)
