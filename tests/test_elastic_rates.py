@@ -35,6 +35,7 @@ from .helpers import (
     deformation_rate_per_ns,
     fake_run_context,
     fake_scan_dynamics,
+    first_stage_samples,
     planted_extension_runner,
     planted_modulus_mpa,
     snapshot_files,
@@ -173,7 +174,7 @@ def test_bulk_rate_observations_carry_fit_uncertainty_and_reject_noise(
     for directory in directories:
         path = directory / "manifest.json"
         record = json.loads(path.read_text())
-        samples = next(iter(record["stages"].values()))["samples"]
+        samples = first_stage_samples(record)
         density = np.asarray(samples["segment_density_g_cm3"])
         samples["segment_density_g_cm3"] = (
             density * np.exp([0.0, -0.4, 0.4, 0.0, 0.4, -0.4, 0.0])
@@ -196,7 +197,7 @@ def test_nominal_rate_counts_both_branches_and_every_hold(
     for directory in directories:
         file = directory / "manifest.json"
         record = json.loads(file.read_text())
-        samples = next(iter(record["stages"].values()))["samples"]
+        samples = first_stage_samples(record)
         key = PATH_KEYS[name]
         if name == "shear_modulus":
             samples[key] = [0.01, 0.02, 0.01, 0.0]
@@ -228,7 +229,7 @@ def test_incompatible_measurements_refuse_rate_fit(
     directories = _series(tmp_path, "shear_modulus")
     file = directories[1] / "manifest.json"
     record = json.loads(file.read_text())
-    next(iter(record["stages"].values()))["samples"][field] = replacement
+    first_stage_samples(record)[field] = replacement
     file.write_text(json.dumps(record))
     report = analyse_elastic_rates(
         directories, property_name="shear_modulus", target_rate=0.001
@@ -246,7 +247,7 @@ def test_unknown_conditions_stay_unresolved(tmp_path: Path, field: str) -> None:
     for directory in directories:
         file = directory / "manifest.json"
         record = json.loads(file.read_text())
-        next(iter(record["stages"].values()))["samples"].pop(field)
+        first_stage_samples(record).pop(field)
         file.write_text(json.dumps(record))
     report = analyse_elastic_rates(
         directories, property_name="shear_modulus", target_rate=0.001
@@ -262,7 +263,7 @@ def test_missing_measurement_stays_present_and_blocks_extrapolation(
     directories = _series(tmp_path, "shear_modulus")
     file = directories[1] / "manifest.json"
     record = json.loads(file.read_text())
-    next(iter(record["stages"].values()))["samples"].pop("segment_shear_stress_bar")
+    first_stage_samples(record).pop("segment_shear_stress_bar")
     file.write_text(json.dumps(record))
     report = analyse_elastic_rates(
         directories, property_name="shear_modulus", target_rate=0.001
@@ -486,7 +487,7 @@ def test_workflow_refuses_changed_recorded_settings(
     directories = _workflow(tmp_path, "shear_modulus")
     path = directories[0] / "manifest.json"
     record = json.loads(path.read_text())
-    next(iter(record["stages"].values()))["samples"][field] = values
+    first_stage_samples(record)[field] = values
     path.write_text(json.dumps(record))
     with pytest.raises(AnalysisError, match=r"different|differs"):
         analyse_elastic_rates(
@@ -515,7 +516,7 @@ def test_missing_duration_or_duplicate_directory_never_guesses_rate(
         analyse_elastic_rates([], property_name=name, target_rate=0.001)
     file = directories[0] / "manifest.json"
     record = json.loads(file.read_text())
-    next(iter(record["stages"].values()))["samples"].pop("segment_duration_ps")
+    first_stage_samples(record).pop("segment_duration_ps")
     file.write_text(json.dumps(record))
     with pytest.raises(AnalysisError, match=message):
         analyse_elastic_rates(directories, property_name=name, target_rate=0.001)

@@ -77,6 +77,8 @@ from openmmpolymer.tm import analyse_melting
 from .helpers import (
     STRUCTURAL_OPTIONS,
     dimer_cell,
+    drifting_dimers,
+    exponential_relaxation,
     failure_curve,
     freely_rotating_chain,
     frozen_rods,
@@ -89,6 +91,7 @@ from .helpers import (
     rod_positions,
     rotating_dimer,
     state_data_csv,
+    state_rows,
     stationary_trace,
     synthetic_ensemble,
     two_line_curve,
@@ -101,19 +104,17 @@ from .helpers import (
 
 def settling_state_data(directory: Path) -> StateData:
     """A short state-data series with a settling density."""
-    rows = [
-        [
-            index * 100,
-            index * 0.2,
-            -100.0 - index,
-            10.0,
-            -90.0,
-            300.0 + 0.1 * index,
-            13.8,
-            0.85 - 0.05 * np.exp(-index / 5.0),
-        ]
-        for index in range(60)
-    ]
+    index = np.arange(60, dtype=np.float64)
+    rows = state_rows(
+        index * 0.2,
+        step=index * 100,
+        potential_kj_mol=-100.0 - index,
+        kinetic_kj_mol=10.0,
+        total_kj_mol=-90.0,
+        temperature_k=300.0 + 0.1 * index,
+        volume_nm3=13.8,
+        density_g_cm3=0.85 - 0.05 * np.exp(-index / 5.0),
+    )
     path = directory / "05_npt.csv"
     path.write_text(state_data_csv(rows))
     return read_state_data(path, stage="05_npt")
@@ -252,12 +253,7 @@ FIGURES: dict[str, Callable[[Path], Any]] = {
         )
     ),
     "relaxation_convergence": lambda d: plot_relaxation_convergence(
-        relaxation_window_convergence(
-            planted_relaxation(
-                np.geomspace(0.1, 1.0e4, 140),
-                1000.0 * np.exp(-np.geomspace(0.1, 1.0e4, 140) / 50.0),
-            )
-        )
+        relaxation_window_convergence(exponential_relaxation())
     ),
     "structural_convergence": lambda d: plot_structural_convergence(
         structural_window_convergence(frozen_rods(), range(5), **STRUCTURAL_OPTIONS)
@@ -472,14 +468,8 @@ def test_the_dynamics_figure_is_logarithmic_with_a_slope_one_guide(
 def test_a_measurement_with_no_diffusion_coefficient_says_so_in_its_title() -> None:
     """Leaving the title blank would read as a rendering failure rather than as
     the deliberate refusal it is."""
-    ballistic = np.zeros((40, 40, 3), dtype=np.float64)
-    generator = np.random.default_rng(2)
-    velocities = generator.normal(0.0, 0.05, size=(20, 3))
-    for index in range(40):
-        ballistic[index, 0::2, :] = velocities * index
-        ballistic[index, 1::2, :] = velocities * index + np.array([0.0, 0.0, 0.6])
     measured = centre_of_mass_msd(
-        synthetic_ensemble(ballistic, n_chains=20, interval_ps=1.0),
+        drifting_dimers(20, 40, 1.0, seed=2),
         remove_box_scaling=False,
     )
     assert "no diffusion" in plot_dynamics(measured).axes[0].get_title()
@@ -733,10 +723,7 @@ def test_constant_snapshot_plot_labels_unknown_uncertainty() -> None:
 
 
 def test_relaxation_parameter_plot_keeps_unobserved_tails_unresolved() -> None:
-    times = np.geomspace(0.1, 10000.0, 140)
-    result = relaxation_window_convergence(
-        planted_relaxation(times, 1000.0 * np.exp(-times / 10000.0))
-    )
+    result = relaxation_window_convergence(exponential_relaxation(10000.0))
     figure = plot_relaxation_convergence(result)
     assert len(figure.axes) == 4
     assert all("not resolved" in axis.get_title() for axis in figure.axes)

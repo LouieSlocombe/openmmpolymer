@@ -241,6 +241,23 @@ def fake_run_context(*, seed: int = 17) -> Any:
     )
 
 
+def _periodic_cell(box_nm: float, cutoff_nm: float) -> tuple[Any, Any]:
+    """An empty System in a cubic cell, and a periodic NonbondedForce for it."""
+    import openmm as mm
+    from openmm import unit
+
+    system = mm.System()
+    system.setDefaultPeriodicBoxVectors(
+        mm.Vec3(box_nm, 0, 0) * unit.nanometer,
+        mm.Vec3(0, box_nm, 0) * unit.nanometer,
+        mm.Vec3(0, 0, box_nm) * unit.nanometer,
+    )
+    nonbonded = mm.NonbondedForce()
+    nonbonded.setNonbondedMethod(mm.NonbondedForce.CutoffPeriodic)
+    nonbonded.setCutoffDistance(cutoff_nm * unit.nanometer)
+    return system, nonbonded
+
+
 def argon_system(
     n_atoms: int,
     box_nm: float,
@@ -258,15 +275,7 @@ def argon_system(
     import openmm as mm
     from openmm import app, unit
 
-    system = mm.System()
-    system.setDefaultPeriodicBoxVectors(
-        mm.Vec3(box_nm, 0, 0) * unit.nanometer,
-        mm.Vec3(0, box_nm, 0) * unit.nanometer,
-        mm.Vec3(0, 0, box_nm) * unit.nanometer,
-    )
-    nonbonded = mm.NonbondedForce()
-    nonbonded.setNonbondedMethod(mm.NonbondedForce.CutoffPeriodic)
-    nonbonded.setCutoffDistance(cutoff_nm * unit.nanometer)
+    system, nonbonded = _periodic_cell(box_nm, cutoff_nm)
     nonbonded.setUseDispersionCorrection(True)
     bonds = mm.HarmonicBondForce()
     spacing_nm = box_nm / math.ceil(n_atoms ** (1 / 3))
@@ -336,6 +345,39 @@ def rod_positions(n_beads: int, spacing_nm: float, *, axis: int = 0) -> np.ndarr
     return positions
 
 
+def state_rows(
+    time_ps: Any,
+    *,
+    step: Any = None,
+    potential_kj_mol: Any = -1000.0,
+    kinetic_kj_mol: Any = 500.0,
+    total_kj_mol: Any = -500.0,
+    temperature_k: Any = 300.0,
+    volume_nm3: Any = 100.0,
+    density_g_cm3: Any = 1.0,
+) -> list[list[float]]:
+    """Rows of a stage's state CSV, in OpenMM's column order.
+
+    Each column is broadcast against *time_ps*; *step* defaults to the time.
+    """
+    times = np.asarray(time_ps, dtype=np.float64)
+    columns = [
+        times if step is None else step,
+        times,
+        potential_kj_mol,
+        kinetic_kj_mol,
+        total_kj_mol,
+        temperature_k,
+        volume_nm3,
+        density_g_cm3,
+    ]
+    table = np.broadcast_arrays(
+        *(np.asarray(column, dtype=np.float64) for column in columns)
+    )
+    rows: list[list[float]] = np.column_stack(table).tolist()
+    return rows
+
+
 def state_data_csv(rows: Sequence[Sequence[float]]) -> str:
     """The numeric CSV a stage writes, header and all.
 
@@ -383,19 +425,16 @@ def write_quenches(
         csv: str | None = None
         if total_ps is not None:
             csv = str(directory / f"{stage}.csv")
-            rows = [
-                [
-                    index * 1000,
-                    index * total_ps / 100.0,
-                    -1.0,
-                    1.0,
-                    0.0,
-                    300.0,
-                    13.8,
-                    0.9,
-                ]
-                for index in range(1, 101)
-            ]
+            index = np.arange(1, 101, dtype=np.float64)
+            rows = state_rows(
+                index * total_ps / 100.0,
+                step=index * 1000,
+                potential_kj_mol=-1.0,
+                kinetic_kj_mol=1.0,
+                total_kj_mol=0.0,
+                volume_nm3=13.8,
+                density_g_cm3=0.9,
+            )
             Path(csv).write_text(state_data_csv(rows))
         samples: dict[str, list[float]] = {
             "segment_temperature_k": temperature,
@@ -468,6 +507,33 @@ def two_line_curve(
         1.0 + melt_slope * (temperature - transition_k),
     )
     return temperature, 1.0 / volume
+
+
+def descending_quench(
+    transition_k: float, hold_ps: float, *, n_points: int = 21, **extra: Any
+) -> dict[str, Any]:
+    """A quench stage's samples: a two-line curve cooled from the top."""
+    temperature, density = two_line_curve(transition_k=transition_k, n_points=n_points)
+    return quench_entry(
+        temperature[::-1],
+        density[::-1],
+        segment_duration_ps=[hold_ps] * n_points,
+        **extra,
+    )
+
+
+def first_stage_samples(record: dict[str, Any]) -> dict[str, Any]:
+    """The samples of a manifest record's first stage."""
+    samples: dict[str, Any] = next(iter(record["stages"].values()))["samples"]
+    return samples
+
+
+def read_strict_report(path: str | Path) -> dict[str, Any]:
+    """A written report, checked to be JSON every reader accepts."""
+    raw = Path(path).read_text()
+    assert "NaN" not in raw and "Infinity" not in raw
+    record: dict[str, Any] = json.loads(raw)
+    return record
 
 
 def transition_at(
@@ -752,18 +818,9 @@ def ideal_gas_system(
     No ``CMMotionRemover``, so the answer is over all ``n_atoms`` rather than
     ``n_atoms - 1``.
     """
-    import openmm as mm
     from openmm import app, unit
 
-    system = mm.System()
-    system.setDefaultPeriodicBoxVectors(
-        mm.Vec3(box_nm, 0, 0) * unit.nanometer,
-        mm.Vec3(0, box_nm, 0) * unit.nanometer,
-        mm.Vec3(0, 0, box_nm) * unit.nanometer,
-    )
-    nonbonded = mm.NonbondedForce()
-    nonbonded.setNonbondedMethod(mm.NonbondedForce.CutoffPeriodic)
-    nonbonded.setCutoffDistance(min(1.0, box_nm / 2.5) * unit.nanometer)
+    system, nonbonded = _periodic_cell(box_nm, min(1.0, box_nm / 2.5))
 
     topology = app.Topology()
     chain = topology.addChain()
@@ -790,18 +847,9 @@ def rigid_rotor_system(
     counts it and comes out 5/3 too high, which is what makes this the test
     that pins the convention.
     """
-    import openmm as mm
     from openmm import app, unit
 
-    system = mm.System()
-    system.setDefaultPeriodicBoxVectors(
-        mm.Vec3(box_nm, 0, 0) * unit.nanometer,
-        mm.Vec3(0, box_nm, 0) * unit.nanometer,
-        mm.Vec3(0, 0, box_nm) * unit.nanometer,
-    )
-    nonbonded = mm.NonbondedForce()
-    nonbonded.setNonbondedMethod(mm.NonbondedForce.CutoffPeriodic)
-    nonbonded.setCutoffDistance(min(1.0, box_nm / 2.5) * unit.nanometer)
+    system, nonbonded = _periodic_cell(box_nm, min(1.0, box_nm / 2.5))
 
     topology = app.Topology()
     chain = topology.addChain()
@@ -1020,7 +1068,6 @@ def write_relaxation(
     that many stages, which is what a resumed relaxation looks like on disk
     and the only way to exercise the merge.
     """
-    from openmmpolymer.elasticity import MPA_PER_BAR
     from openmmpolymer.simulate import relax_bin_edges_ps
     from openmmpolymer.stress import STRESS_ESTIMATOR_VERSION, deviatoric_strain
 
@@ -1035,7 +1082,7 @@ def write_relaxation(
     moduli = equilibrium_mpa + modulus_mpa * np.exp(-((centres / tau_ps) ** beta))
     # The reader subtracts the baseline, scales to MPa and divides by the
     # strain, so plant the stress that comes back out as exactly `moduli`.
-    stresses = moduli * strain_measure / MPA_PER_BAR + baseline_bar
+    stresses = moduli * strain_measure / 0.1 + baseline_bar
 
     stages: dict[str, Any] = {}
     groups = np.array_split(np.arange(centres.size), max(1, chunks))
@@ -1060,7 +1107,7 @@ def write_relaxation(
             samples["baseline_stress_sq_bar2"] = [float(baseline_bar) ** 2]
             samples["baseline_samples"] = [samples_per_bin]
             samples["instant_stress_bar"] = [
-                float((equilibrium_mpa + modulus_mpa) * strain_measure / MPA_PER_BAR)
+                float((equilibrium_mpa + modulus_mpa) * strain_measure / 0.1)
                 + baseline_bar
             ]
         stages[f"{stem}_{index:02d}"] = {
@@ -1378,6 +1425,21 @@ def planted_relaxation(
     )
 
 
+def exponential_relaxation(
+    tau_ps: float = 50.0,
+    *,
+    plateau_mpa: float = 0.0,
+    modulus_mpa: float = 1000.0,
+    n_points: int = 140,
+    **options: Any,
+) -> RelaxationCurve:
+    """A planted single-exponential decay on a log-spaced grid of times."""
+    time = np.geomspace(0.1, 10000.0, n_points)
+    return planted_relaxation(
+        time, plateau_mpa + modulus_mpa * np.exp(-time / tau_ps), **options
+    )
+
+
 def stationary_trace(n_samples: int = 6000) -> npt.NDArray[np.float64]:
     """Uncorrelated noise about ten, the trace every window test starts from."""
     return 10.0 + np.random.default_rng(7).normal(0.0, 0.5, n_samples)
@@ -1440,6 +1502,23 @@ def dimer_cell(
     positions[0::2, :] = origins
     positions[1::2, :] = origins + np.array([0.0, 0.0, separation_nm])
     return positions
+
+
+def drifting_dimers(
+    n_chains: int = 40, n_frames: int = 60, interval_ps: float = 0.5, *, seed: int = 4
+) -> Any:
+    """Dimers each drifting at its own constant velocity: ballistic, not diffusive.
+
+    ``MSD = |v|^2 tau^2`` exactly, so the log-log slope is two.
+    """
+    generator = np.random.default_rng(seed)
+    velocities = generator.normal(0.0, 0.05, size=(n_chains, 3))
+    times = np.arange(n_frames, dtype=np.float64) * interval_ps
+    frames = np.zeros((n_frames, n_chains * 2, 3), dtype=np.float64)
+    for index, time in enumerate(times):
+        frames[index, 0::2, :] = velocities * time
+        frames[index, 1::2, :] = velocities * time + np.array([0.0, 0.0, 0.6])
+    return synthetic_ensemble(frames, n_chains=n_chains, interval_ps=interval_ps)
 
 
 def rotating_dimer(

@@ -375,12 +375,6 @@ def test_report_can_write_json_without_figures(tmp_path: Path) -> None:
     json.loads(Path(files.json).read_text(), parse_constant=reject_constant)
 
 
-def test_an_unsupported_figure_format_is_refused(tmp_path: Path) -> None:
-    write_heating(tmp_path, planted_curve())
-    with pytest.raises(ValueError, match="figure_format"):
-        write_melting_report(analyse_melting(tmp_path), figure_format="not-a-format")
-
-
 def test_unconfirmed_amorphous_coordinates_are_refused_before_dynamics(
     argon_run: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

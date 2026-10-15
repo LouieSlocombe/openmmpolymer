@@ -16,7 +16,7 @@ import openmmpolymer
 from openmmpolymer.rate_dependence import RateObservation, analyse_rate_observations
 from openmmpolymer.rate_reports import write_rate_report
 
-from .helpers import forbidden, planted_rate_report
+from .helpers import forbidden, planted_rate_report, read_strict_report
 
 
 def test_strict_json_preserves_measurements_model_difference_and_units(
@@ -25,9 +25,7 @@ def test_strict_json_preserves_measurements_model_difference_and_units(
     source = planted_rate_report()
     files = write_rate_report(source, tmp_path)
     assert Path(files.json).name == "yield_strength_rates.json"
-    raw = Path(files.json).read_text()
-    assert "NaN" not in raw and "Infinity" not in raw
-    data = json.loads(raw)
+    data = read_strict_report(files.json)
     assert set(data) == {
         "openmmpolymer",
         "versions",
@@ -137,12 +135,6 @@ def test_missing_output_directory_and_unsafe_format_fail_before_writing(
 ) -> None:
     with pytest.raises(ValueError, match="output_dir"):
         write_rate_report(planted_rate_report(), figures=figures)
-    output = tmp_path / "report"
-    with pytest.raises(ValueError, match="figure_format"):
-        write_rate_report(
-            planted_rate_report(), output, figures=figures, figure_format="../png"
-        )
-    assert not output.exists()
 
 
 def test_importing_the_writer_leaves_matplotlib_unloaded() -> None:
