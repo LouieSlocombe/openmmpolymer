@@ -163,11 +163,11 @@ class SystemSpec:
             "ewald_error_tolerance",
             "minimum_box_factor",
         ):
-            require_positive(getattr(self, name), None, name=name)
+            require_positive(getattr(self, name), name=name)
         if self.hydrogen_mass_amu is not None:
-            require_positive(self.hydrogen_mass_amu, None, name="hydrogen_mass_amu")
+            require_positive(self.hydrogen_mass_amu, name="hydrogen_mass_amu")
         if self.switch_distance_nm is not None:
-            require_finite(self.switch_distance_nm, None, name="switch_distance_nm")
+            require_finite(self.switch_distance_nm, name="switch_distance_nm")
             if not 0.0 <= self.switch_distance_nm < self.nonbonded_cutoff_nm:
                 raise ValueError(
                     f"switch_distance_nm={self.switch_distance_nm} must be below "

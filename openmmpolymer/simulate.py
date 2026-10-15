@@ -639,9 +639,9 @@ class Segment:
 
     def __post_init__(self) -> None:
         """Reject invalid holds before either budget estimation or execution."""
-        require_positive(self.temperature_k, None, name="temperature_k")
-        require_positive(self.duration_ps, None, name="duration_ps")
-        require_finite(self.pressure_bar, None, name="pressure_bar")
+        require_positive(self.temperature_k, name="temperature_k")
+        require_positive(self.duration_ps, name="duration_ps")
+        require_finite(self.pressure_bar, name="pressure_bar")
 
 
 #: Readings taken per segment unless a stage asks for more.
@@ -1037,7 +1037,7 @@ def _timestep_fs(
     """
     if timestep_fs is None:
         timestep_fs = safe_timestep_fs(temperature_k, spec)
-    require_positive(timestep_fs, None, name="timestep_fs")
+    require_positive(timestep_fs, name="timestep_fs")
     check_timestep(timestep_fs, temperature_k, spec)
     return timestep_fs
 
@@ -1073,7 +1073,7 @@ def run_pushoff(
     Returns:
         What the stage did.
     """
-    require_positive(duration_ps, None, name="duration_ps")
+    require_positive(duration_ps, name="duration_ps")
     prefix = Path(output_prefix)
     started = time.monotonic()
     state: str | Path | None = state_in
@@ -1358,9 +1358,9 @@ def quench_temperatures(t_start: float, t_end: float, step_k: float) -> list[flo
         ValueError: Endpoints are not finite, the step is not finite and
             positive, the ramp does not descend, or the step cannot advance it.
     """
-    t_start = require_finite(t_start, None, name="t_start")
-    t_end = require_finite(t_end, None, name="t_end")
-    step_k = require_positive(step_k, None, name="step_k")
+    t_start = require_finite(t_start, name="t_start")
+    t_end = require_finite(t_end, name="t_end")
+    step_k = require_positive(step_k, name="step_k")
     if t_end >= t_start:
         raise ValueError(
             f"t_end={t_end} must be below t_start={t_start}: a quench cools."
@@ -1385,7 +1385,7 @@ def _temperature_ladder(
 ) -> list[float]:
     """Validate an explicit thermal ladder, including a one-window chunk."""
     ladder = [
-        require_positive(value, None, name="temperatures_k") for value in temperatures_k
+        require_positive(value, name="temperatures_k") for value in temperatures_k
     ]
     if not ladder:
         raise ValueError("temperatures_k is empty, so there is nothing to hold.")
@@ -1413,8 +1413,8 @@ def _quench_segments(
     """Build a physical cooling ladder, including explicit resumable chunks."""
     temperatures = (
         quench_temperatures(
-            require_positive(t_start, None, name="t_start"),
-            require_positive(t_end, None, name="t_end"),
+            require_positive(t_start, name="t_start"),
+            require_positive(t_end, name="t_end"),
             step_k,
         )
         if temperatures_k is None
@@ -1489,9 +1489,9 @@ def heating_temperatures(t_start: float, t_end: float, step_k: float) -> list[fl
     All arguments must be finite and positive, and ``t_end`` must exceed
     ``t_start``. The final interval may be shorter than ``step_k``.
     """
-    t_start = require_positive(t_start, None, name="t_start")
-    t_end = require_positive(t_end, None, name="t_end")
-    step_k = require_positive(step_k, None, name="step_k")
+    t_start = require_positive(t_start, name="t_start")
+    t_end = require_positive(t_end, name="t_end")
+    step_k = require_positive(step_k, name="step_k")
     if t_end <= t_start:
         raise ValueError(
             f"t_end={t_end} must exceed t_start={t_start}: a heating scan warms."
@@ -1525,8 +1525,8 @@ def _heat_segments(
         if temperatures_k is None
         else _temperature_ladder(temperatures_k, ascending=True)
     )
-    hold_ps = require_positive(hold_ps, None, name="hold_ps")
-    pressure_bar = require_positive(pressure_bar, None, name="pressure_bar")
+    hold_ps = require_positive(hold_ps, name="hold_ps")
+    pressure_bar = require_positive(pressure_bar, name="pressure_bar")
     return [
         Segment(value, hold_ps, pressure_bar, label=f"{value:.0f} K")
         for value in temperatures
@@ -1844,8 +1844,8 @@ def run_deform(
     require_axis(axis)
     require_integer(n_steps, minimum=1, name="n_steps")
     require_integer(samples_per_step, minimum=1, name="samples_per_step")
-    require_positive(relax_ps, None, name="relax_ps")
-    require_positive(abs(strain_increment), None, name="strain_increment")
+    require_positive(relax_ps, name="relax_ps")
+    require_positive(abs(strain_increment), name="strain_increment")
 
     scale_flags = [True, True, True]
     scale_flags[axis] = False
@@ -2146,11 +2146,11 @@ def run_load(
         ValueError: The axis is not 0, 1 or 2, or no stresses were given.
     """
     require_axis(axis)
-    rungs = [require_finite(value, None, name="stresses_bar") for value in stresses_bar]
+    rungs = [require_finite(value, name="stresses_bar") for value in stresses_bar]
     if not rungs:
         raise ValueError("stresses_bar is empty, so there is nothing to pull with.")
     require_integer(samples_per_step, minimum=1, name="samples_per_step")
-    require_positive(duration_ps_each, None, name="duration_ps_each")
+    require_positive(duration_ps_each, name="duration_ps_each")
 
     live = _open(
         run,
@@ -2274,11 +2274,11 @@ def run_shear(
         ValueError: The plane or the strain ladder is not usable.
     """
     driven, gradient = require_plane(plane)
-    ladder = [require_finite(value, None, name="strains") for value in strains]
+    ladder = [require_finite(value, name="strains") for value in strains]
     if not ladder:
         raise ValueError("strains is empty, so there is nothing to shear.")
     require_integer(samples_per_step, minimum=1, name="samples_per_step")
-    require_positive(duration_ps_each, None, name="duration_ps_each")
+    require_positive(duration_ps_each, name="duration_ps_each")
 
     live = _open(
         run,
@@ -2408,7 +2408,7 @@ def relax_bin_edges_ps(
     Raises:
         ValueError: The span is not positive, or *bins_per_decade* is not.
     """
-    require_positive(first_sample_ps, None, name="first_sample_ps")
+    require_positive(first_sample_ps, name="first_sample_ps")
     require_integer(bins_per_decade, minimum=1, name="bins_per_decade")
     if total_ps <= first_sample_ps:
         raise ValueError(
@@ -2709,16 +2709,16 @@ def run_relax(
     require_choice(mode, RELAX_MODES, name="mode")
     require_axis(axis)
     driven, gradient = require_plane(plane)
-    require_positive(duration_ps, None, name="duration_ps")
-    require_positive(sample_every_ps, None, name="sample_every_ps")
-    require_positive(late_sample_every_ps, None, name="late_sample_every_ps")
-    require_positive(abs(step_strain), None, name="step_strain")
+    require_positive(duration_ps, name="duration_ps")
+    require_positive(sample_every_ps, name="sample_every_ps")
+    require_positive(late_sample_every_ps, name="late_sample_every_ps")
+    require_positive(abs(step_strain), name="step_strain")
     for name, value in (
         ("baseline_ps", baseline_ps),
         ("ramp_ps", ramp_ps),
         ("time_offset_ps", time_offset_ps),
     ):
-        require_nonnegative(value, None, name=name)
+        require_nonnegative(value, name=name)
     timestep_fs = _timestep_fs(timestep_fs, temperature_k, run.spec)
 
     # A shear step measures G directly: sigma_xz = G gamma. A tensile step

@@ -490,7 +490,7 @@ def analyse_structure(
             "expected_characteristic_ratio", DEFAULT_CHARACTERISTIC_RATIO
         )
     expected_characteristic_ratio = require_positive(
-        expected_characteristic_ratio, None, name="expected_characteristic_ratio"
+        expected_characteristic_ratio, name="expected_characteristic_ratio"
     )
 
     if ensemble.is_snapshot:

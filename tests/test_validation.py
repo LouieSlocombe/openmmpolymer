@@ -8,6 +8,7 @@ hundred picoseconds into a run.
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import numpy as np
 import pytest
@@ -72,60 +73,45 @@ def test_a_plane_requires_two_distinct_plain_axes(plane: tuple[int, ...]) -> Non
         require_plane(plane, name="shear_plane")
 
 
-def test_a_bare_number_is_taken_to_be_in_the_expected_unit() -> None:
+def test_a_bare_number_is_taken_in_the_unit_the_name_gives() -> None:
     """Public signatures take floats; the unit is in the parameter name."""
-    assert require_positive(300.0, unit.kelvin, name="temperature_k") == 300.0
+    assert require_positive(300.0, name="temperature_k") == 300.0
 
 
-def test_a_quantity_is_converted_rather_than_refused() -> None:
-    """Given the unit to work in, a quantity is converted into it."""
-    assert require_positive(
-        2.0 * unit.picosecond, unit.femtosecond, name="timestep_fs"
-    ) == pytest.approx(2000.0)
-
-
-def test_without_a_unit_only_a_plain_number_is_taken() -> None:
-    """How every caller in the package validates, so the message asks for one."""
+@pytest.mark.parametrize(
+    "value", [300.0 * unit.kelvin, 2.0 * unit.picosecond, 1.0 * unit.nanometer]
+)
+def test_a_quantity_is_refused_rather_than_read_in_the_wrong_unit(
+    value: Any,
+) -> None:
+    """A quantity in the right unit is refused too: the message asks for a float."""
     with pytest.raises(TypeError, match="Pass a plain number"):
-        require_positive(300.0 * unit.kelvin, None, name="temperature_k")
+        require_positive(value, name="temperature_k")
 
 
 def test_something_that_is_not_a_number_says_what_was_wanted() -> None:
-    """The message names the parameter and the unit."""
+    """The message names the parameter."""
     with pytest.raises(TypeError, match="temperature_k"):
-        require_positive("warm", unit.kelvin, name="temperature_k")
-
-
-def test_a_quantity_in_the_wrong_dimension_is_refused() -> None:
-    """Nanometres are not kelvin, however willing the arithmetic."""
-    with pytest.raises(TypeError, match="not a number or a quantity"):
-        require_positive(1.0 * unit.nanometer, unit.kelvin, name="temperature_k")
-
-
-def test_a_quantity_is_converted_between_compatible_units() -> None:
-    """Whatever it arrives as, the package works in the unit it named."""
-    assert require_finite(
-        1.0 * unit.nanometer, unit.angstrom, name="cutoff_nm"
-    ) == pytest.approx(10.0)
+        require_positive("warm", name="temperature_k")
 
 
 @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
 def test_nan_and_infinity_are_refused(value: float) -> None:
     """Either would propagate silently into a System."""
     with pytest.raises(ValueError, match="must be finite"):
-        require_finite(value, unit.kelvin, name="temperature_k")
+        require_finite(value, name="temperature_k")
 
 
 @pytest.mark.parametrize("value", [0.0, -1.0])
 def test_a_non_positive_value_is_refused_where_one_is_needed(value: float) -> None:
     """A timestep or a density of zero is not a setting."""
     with pytest.raises(ValueError, match="greater than zero"):
-        require_positive(value, unit.kelvin, name="temperature_k")
+        require_positive(value, name="temperature_k")
 
 
 @pytest.mark.parametrize("value", [0.0, 0.5])
 def test_nonnegative_allows_zero(value: float) -> None:
-    assert require_nonnegative(value, None, name="baseline_ps") == value
+    assert require_nonnegative(value, name="baseline_ps") == value
 
 
 @pytest.mark.parametrize("value", [-1.0, math.nan, math.inf, -math.inf])
@@ -133,7 +119,7 @@ def test_nonnegative_rejects_negative_and_nonfinite_values(value: float) -> None
     with pytest.raises(
         ValueError, match=r"baseline_ps=.*nonnegative.*finite and zero or more"
     ):
-        require_nonnegative(value, None, name="baseline_ps")
+        require_nonnegative(value, name="baseline_ps")
 
 
 @pytest.mark.parametrize("include_minimum", [False, True])
@@ -155,36 +141,28 @@ def test_range_endpoints_can_be_open_or_closed(
         if accepted:
             assert (
                 require_in_range(
-                    value, None, name="fraction", minimum=0.0, maximum=1.0, **options
+                    value, name="fraction", minimum=0.0, maximum=1.0, **options
                 )
                 == value
             )
         else:
             with pytest.raises(ValueError, match=r"fraction=.*must be in"):
                 require_in_range(
-                    value, None, name="fraction", minimum=0.0, maximum=1.0, **options
+                    value, name="fraction", minimum=0.0, maximum=1.0, **options
                 )
 
 
 @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
 def test_an_unbounded_range_still_requires_finite_values(value: float) -> None:
     with pytest.raises(ValueError, match=r"count=.*finite"):
-        require_in_range(value, None, name="count", minimum=1.0)
+        require_in_range(value, name="count", minimum=1.0)
 
 
-def test_ranges_and_nonnegative_values_follow_the_shared_unit_rules() -> None:
-    assert (
-        require_nonnegative(0.5 * unit.picosecond, unit.femtosecond, name="time")
-        == 500.0
-    )
-    assert (
-        require_in_range(
-            0.5 * unit.picosecond, unit.femtosecond, name="time", maximum=1000.0
-        )
-        == 500.0
-    )
-    assert require_in_range(2.0, None, name="count", minimum=1.0) == 2.0
-    assert require_in_range(-2.0, None, name="offset", maximum=-1.0) == -2.0
+def test_ranges_follow_the_shared_number_rules() -> None:
+    with pytest.raises(TypeError, match="Pass a plain number"):
+        require_nonnegative(0.5 * unit.picosecond, name="time")
+    assert require_in_range(2.0, name="count", minimum=1.0) == 2.0
+    assert require_in_range(-2.0, name="offset", maximum=-1.0) == -2.0
 
 
 def test_an_integer_is_required_where_one_is_meant() -> None:

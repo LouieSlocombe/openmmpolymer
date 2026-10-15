@@ -496,18 +496,15 @@ def structural_window_convergence(
             fit.
     """
     fractions = require_fractions(window_fractions)
-    relative_tolerance = require_positive(
-        relative_tolerance, None, name="relative_tolerance"
-    )
+    relative_tolerance = require_positive(relative_tolerance, name="relative_tolerance")
     min_frames = require_integer(min_frames, minimum=3, name="min_frames")
     stride = require_integer(stride, name="stride")
     require_integer(rdf_bins, name="rdf_bins")
     require_integer(q_bins, name="q_bins")
     require_integer(min_vectors_per_bin, name="min_vectors_per_bin")
-    require_positive(q_max_per_nm, None, name="q_max_per_nm")
+    require_positive(q_max_per_nm, name="q_max_per_nm")
     require_in_range(
         max_lag_fraction,
-        None,
         name="max_lag_fraction",
         minimum=0.0,
         maximum=0.5,

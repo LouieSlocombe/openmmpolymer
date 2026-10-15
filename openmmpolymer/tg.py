@@ -477,7 +477,7 @@ def fine_window(transition_k: float, spec: TgSpec) -> tuple[float, float]:
         ValueError: The transition temperature is not finite and positive.
         TgError: Clamping left nothing between them.
     """
-    transition_k = require_positive(transition_k, None, name="transition_k")
+    transition_k = require_positive(transition_k, name="transition_k")
     top = min(transition_k + spec.window_k, spec.melt_temperature_k)
     bottom = max(transition_k - spec.window_k, spec.t_floor_k)
     if top < transition_k + spec.window_k:
@@ -608,9 +608,7 @@ def tg_scan_duration_ps(
         [spec.fine_hold_ps]
         if rates_k_per_ns is None
         else [
-            spec.fine_step_k
-            / require_positive(rate, None, name="rates_k_per_ns")
-            * PS_PER_NS
+            spec.fine_step_k / require_positive(rate, name="rates_k_per_ns") * PS_PER_NS
             for rate in rates_k_per_ns
         ]
     )
@@ -1195,10 +1193,10 @@ def _fine_holds(rates_k_per_ns: Sequence[float], spec: TgSpec) -> tuple[float, .
         )
     holds: list[float] = []
     for rate in rates_k_per_ns:
-        rate_k_per_ns = require_positive(rate, None, name="rates_k_per_ns")
+        rate_k_per_ns = require_positive(rate, name="rates_k_per_ns")
         holds.append(
             require_positive(
-                spec.fine_step_k / rate_k_per_ns * PS_PER_NS, None, name="hold_ps"
+                spec.fine_step_k / rate_k_per_ns * PS_PER_NS, name="hold_ps"
             )
         )
     return tuple(holds)

@@ -138,7 +138,7 @@ def validate_hold_times(
     values: Sequence[float], *, name: str = "hold_times_ps"
 ) -> tuple[float, ...]:
     """Require at least three distinct positive holds, in their requested order."""
-    holds = tuple(require_positive(value, None, name=name) for value in values)
+    holds = tuple(require_positive(value, name=name) for value in values)
     if len(holds) < 3 or any(
         math.isclose(first, second, rel_tol=1e-8)
         for first, second in pairwise(sorted(holds))
@@ -156,11 +156,11 @@ def require_positive_fields(
     this" or "no limit".
     """
     for name in names:
-        require_positive(getattr(spec, name), None, name=name)
+        require_positive(getattr(spec, name), name=name)
     for name in optional:
         value = getattr(spec, name)
         if value is not None:
-            require_positive(value, None, name=name)
+            require_positive(value, name=name)
 
 
 def equilibration_at(

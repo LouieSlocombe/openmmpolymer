@@ -612,7 +612,7 @@ def _window(
     Raises:
         ValueError: The window is not a strain.
     """
-    require_positive(strain_limit, None, name="strain_limit")
+    require_positive(strain_limit, name="strain_limit")
     return np.asarray(np.abs(strain) <= strain_limit + NEGLIGIBLE, dtype=np.bool_)
 
 

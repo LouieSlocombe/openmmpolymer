@@ -468,7 +468,7 @@ def tensile_protocol(
     """
     measurement = _measurement(spec)
     require_integer(replica, minimum=0, name="replica")
-    require_positive(timestep_fs, None, name="timestep_fs")
+    require_positive(timestep_fs, name="timestep_fs")
     stages = deformation_stages(
         tensile_schedule(spec),
         stem=f"{measurement.stem}_r{replica}",

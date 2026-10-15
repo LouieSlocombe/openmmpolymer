@@ -204,13 +204,13 @@ class RelaxationSpec:
             ),
             optional=("max_total_ns",),
         )
-        require_positive(abs(self.step_strain), None, name="step_strain")
+        require_positive(abs(self.step_strain), name="step_strain")
         require_integer(self.n_replicas, minimum=1, name="n_replicas")
         require_integer(self.bins_per_decade, minimum=1, name="bins_per_decade")
         require_choice(self.mode, RELAX_MODES, name="mode")
         require_axis(self.axis)
         require_plane(self.plane)
-        require_nonnegative(self.ramp_ps, None, name="ramp_ps")
+        require_nonnegative(self.ramp_ps, name="ramp_ps")
         if self.sample_every_ps >= self.relax_ps:
             raise ValueError(
                 f"sample_every_ps={self.sample_every_ps} is not below "

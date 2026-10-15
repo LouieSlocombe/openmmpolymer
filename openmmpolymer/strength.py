@@ -38,7 +38,6 @@ def require_breaking_criterion(failure_fraction: float, confirmation_steps: int)
     """Validate the same terminal stress-loss criterion for scans and analysis."""
     require_in_range(
         failure_fraction,
-        None,
         name="failure_fraction",
         minimum=0.0,
         maximum=1.0,
@@ -52,12 +51,11 @@ def require_yield_criterion(
     offset_strain: float, fit_min_strain: float, fit_max_strain: float
 ) -> None:
     """Validate the offset and elastic fitting interval shared with tensile scans."""
-    require_positive(offset_strain, None, name="offset_strain")
-    require_positive(fit_max_strain, None, name="fit_max_strain")
-    require_nonnegative(fit_min_strain, None, name="fit_min_strain")
+    require_positive(offset_strain, name="offset_strain")
+    require_positive(fit_max_strain, name="fit_max_strain")
+    require_nonnegative(fit_min_strain, name="fit_min_strain")
     require_in_range(
         fit_min_strain,
-        None,
         name="fit_min_strain",
         maximum=fit_max_strain,
         include_maximum=False,
@@ -136,9 +134,9 @@ def _nominal_tensile_stress(
         raise ValueError(
             "lateral_strain must give strictly positive lateral stretches."
         )
-    require_positive(curve.temperature_k, None, name="temperature_k")
+    require_positive(curve.temperature_k, name="temperature_k")
     if curve.strain_rate_per_ns is not None:
-        require_nonnegative(curve.strain_rate_per_ns, None, name="strain_rate_per_ns")
+        require_nonnegative(curve.strain_rate_per_ns, name="strain_rate_per_ns")
 
     # Finite inputs can still overflow while forming area or stress. Reject
     # that explicitly rather than finding a peak in an infinite curve.

@@ -261,13 +261,10 @@ def require_window_options(
         ValueError: One of them is out of range.
     """
     fractions = require_fractions(window_fractions)
-    require_positive(relative_tolerance, None, name="relative_tolerance")
-    require_in_range(
-        min_effective_samples, None, name="min_effective_samples", minimum=1.0
-    )
+    require_positive(relative_tolerance, name="relative_tolerance")
+    require_in_range(min_effective_samples, name="min_effective_samples", minimum=1.0)
     require_in_range(
         discard_fraction,
-        None,
         name="discard_fraction",
         minimum=0.0,
         maximum=1.0,
@@ -503,7 +500,7 @@ def relaxation_window_convergence(
         AnalysisError: The curve's arrays cannot be refitted honestly.
     """
     fractions = require_fractions(window_fractions)
-    require_positive(relative_tolerance, None, name="relative_tolerance")
+    require_positive(relative_tolerance, name="relative_tolerance")
     times, values = _series(curve.time_ps, curve.modulus_mpa)
     if np.any(times <= 0.0):
         raise AnalysisError("Relaxation bins must have positive times.")

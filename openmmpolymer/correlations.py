@@ -252,7 +252,7 @@ def structure_factor(
             :data:`MAX_WAVEVECTORS`.
         ValueError: A numeric argument is out of range.
     """
-    require_positive(q_max_per_nm, None, name="q_max_per_nm")
+    require_positive(q_max_per_nm, name="q_max_per_nm")
     require_integer(n_bins, name="n_bins")
     require_integer(stride, name="stride")
 
@@ -342,7 +342,7 @@ def _pair_limit(boxes: npt.NDArray[np.float64], r_max_nm: float | None) -> float
     half = 0.5 / float(np.linalg.norm(inverse, axis=-2).max())
     if r_max_nm is None:
         return half
-    limit = require_positive(r_max_nm, None, name="r_max_nm")
+    limit = require_positive(r_max_nm, name="r_max_nm")
     if limit > half:
         raise AnalysisError(
             f"r_max_nm={limit:.3f} is more than half the smallest cell face spacing "

@@ -163,33 +163,29 @@ class Stage:
         if segments is not None:
             return sum((segment.duration_ps for segment in segments), 0.0)
         if self.kind == "deform":
-            return require_positive(options["relax_ps"], None, name="relax_ps") * int(
+            return require_positive(options["relax_ps"], name="relax_ps") * int(
                 options["n_steps"]
             )
         if self.kind in {"load", "shear"}:
             key = "stresses_bar" if self.kind == "load" else "strains"
             for value in options[key]:
-                require_finite(value, None, name=key)
+                require_finite(value, name=key)
             return require_positive(
-                options["duration_ps_each"], None, name="duration_ps_each"
+                options["duration_ps_each"], name="duration_ps_each"
             ) * len(options[key])
         if self.kind == "relax":
             # A chunk that opens an already-strained cell repeats neither the
             # baseline nor the ramp, so counting them would price a resumed
             # ladder as several first chunks.
-            duration_ps = require_positive(
-                options["duration_ps"], None, name="duration_ps"
-            )
+            duration_ps = require_positive(options["duration_ps"], name="duration_ps")
             for key in ("baseline_ps", "ramp_ps", "time_offset_ps"):
-                require_nonnegative(options[key], None, name=key)
+                require_nonnegative(options[key], name=key)
             held = 0.0 if options["strain_applied"] else float(options["baseline_ps"])
             ramp = 0.0 if options["strain_applied"] else float(options["ramp_ps"])
             return held + ramp + duration_ps
         duration = options.get("duration_ps")
         return (
-            0.0
-            if duration is None
-            else require_positive(duration, None, name="duration_ps")
+            0.0 if duration is None else require_positive(duration, name="duration_ps")
         )
 
 

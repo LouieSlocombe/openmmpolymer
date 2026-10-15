@@ -809,7 +809,7 @@ def cooling_rate_extrapolation(
             recorded cooling rate, or two were measured at the same rate.
     """
     n_parameters = minimum_cooling_rates(form)
-    target = require_positive(target_rate_k_per_ns, None, name="target_rate_k_per_ns")
+    target = require_positive(target_rate_k_per_ns, name="target_rate_k_per_ns")
 
     if len(transitions) < 2:
         raise AnalysisError(

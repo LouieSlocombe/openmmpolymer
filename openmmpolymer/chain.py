@@ -137,7 +137,7 @@ class ChainSpec:
         """Reject a malformed spec at construction, not mid-build."""
         require_integer(self.degree_of_polymerization, name="degree_of_polymerization")
         require_choice(self.tacticity, TACTICITIES, name="tacticity")
-        require_positive(self.characteristic_ratio, None, name="characteristic_ratio")
+        require_positive(self.characteristic_ratio, name="characteristic_ratio")
         if not 1 <= len(self.residue_name) <= 3:
             raise ValueError(
                 f"residue_name={self.residue_name!r} must be one to three "

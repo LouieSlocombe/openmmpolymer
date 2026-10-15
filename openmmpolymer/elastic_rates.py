@@ -241,7 +241,7 @@ def validate_elastic_rate_scan(
     """Validate a selected property and price all rates before any output exists."""
     _property(property_name)
     validate_rate_request(target_rate, max_extrapolation_decades)
-    require_positive(spec.elastic_strain_limit, None, name="strain_limit")
+    require_positive(spec.elastic_strain_limit, name="strain_limit")
     holds = validate_hold_times(hold_times_ps)
     groups = tuple(
         tuple(
@@ -1002,7 +1002,7 @@ def analyse_elastic_rates(
     """
     prop = _property(property_name)
     validate_rate_request(target_rate, max_extrapolation_decades)
-    require_positive(strain_limit, None, name="strain_limit")
+    require_positive(strain_limit, name="strain_limit")
     if property_name == "youngs_modulus":
         loaded = _youngs_directories(run_dirs)
         directories = [directory for directory, _ in loaded]
