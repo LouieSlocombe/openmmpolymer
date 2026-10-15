@@ -65,8 +65,8 @@ def _rate_lines(report: Any) -> Iterator[str]:
             f"{fit.extrapolation_decades:.2f} decades{_unresolved(fit.resolved)}"
         )
         yield from (f"note ({form}): {note}" for note in fit.notes)
-    if report.log_linear is not None and report.power_law is not None:
-        difference = abs(report.log_linear.value - report.power_law.value)
+    difference = report.model_difference()
+    if difference is not None:
         yield f"model difference at target: {difference:.4g} {quantity.value_unit}"
 
 

@@ -769,17 +769,28 @@ def write_report_files(
     written as null, as every report writes it. Each ``(stem, figure)`` pair is saved as
     ``<stem>.<figure_format>``, in the order *figures* yields them.
     """
+    directory = analysis_directory(run_dir, output_dir)
+    record = {**report_header(run_dir), **fields}
+    return write_report(directory, name, record, figures, figure_format)
+
+
+def report_header(
+    run_dir: str | None, *, record_run_dir: bool = True
+) -> dict[str, Any]:
+    """What every report opens with: the version that wrote it, the run, the versions that produced it.
+
+    *run_dir* None is a report with no run behind it, which records no
+    versions; *record_run_dir* False keeps the versions but not the path, for
+    a report that lists its runs some other way.
+    """
     from . import __version__
 
-    directory = analysis_directory(run_dir, output_dir)
-    manifest = RunManifest.load(run_dir)
-    record = {
-        "openmmpolymer": __version__,
-        "run_dir": run_dir,
-        "versions": {} if manifest is None else manifest.versions,
-        **fields,
-    }
-    return write_report(directory, name, record, figures, figure_format)
+    header: dict[str, Any] = {"openmmpolymer": __version__}
+    if run_dir is not None and record_run_dir:
+        header["run_dir"] = run_dir
+    manifest = None if run_dir is None else RunManifest.load(run_dir)
+    header["versions"] = {} if manifest is None else manifest.versions
+    return header
 
 
 # --------------------------------------------------------------------------

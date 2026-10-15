@@ -18,7 +18,7 @@ import numpy.typing as npt
 
 from ._files import ReportFiles, analysis_directory, figure_stem, write_report
 from ._validation import require_integer
-from ._workflow import optional
+from ._workflow import optional, report_header
 from .conformation import chain_conformation
 from .convergence import (
     DEFAULT_MIN_SAMPLES,
@@ -251,7 +251,7 @@ def write_convergence_report(
         ValueError: *figure_format* is not a plain filename extension.
     """
     directory = analysis_directory(report.run_dir, output_dir)
-    record = asdict(report)
+    record = {**report_header(report.run_dir), **asdict(report)}
     record["interpretation"] = (
         "Window stability is conditional on recorded observables and sampled times. "
         "Overlapping prefixes are not independent replicas; stationary traces also "

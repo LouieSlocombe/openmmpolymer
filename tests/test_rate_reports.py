@@ -29,6 +29,8 @@ def test_strict_json_preserves_measurements_model_difference_and_units(
     assert "NaN" not in raw and "Infinity" not in raw
     data = json.loads(raw)
     assert set(data) == {
+        "openmmpolymer",
+        "versions",
         "property",
         "observations",
         "log_linear",

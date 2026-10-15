@@ -150,7 +150,9 @@ def test_strict_json_retains_unknown_error_and_qualifications(tmp_path: Path) ->
     assert "NaN" not in raw and "Infinity" not in raw
     data = json.loads(raw)
     assert set(data) == {
+        "openmmpolymer",
         "run_dir",
+        "versions",
         "stage",
         "results",
         "relaxation",

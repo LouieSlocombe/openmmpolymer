@@ -187,6 +187,15 @@ class RateReport:
     target_rate: float | None = None
     max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES
 
+    def model_difference(self) -> float | None:
+        """How far the two models disagree at the target, or None without both.
+
+        Sensitivity to the choice of model, not a confidence interval.
+        """
+        if self.log_linear is None or self.power_law is None:
+            return None
+        return abs(self.log_linear.value - self.power_law.value)
+
 
 def validate_rate_request(
     target_rate: float, max_extrapolation_decades: float

@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -856,45 +856,6 @@ def _curve_record(curve: RelaxationCurve) -> dict[str, Any]:
     }
 
 
-def _kww_record(fit: KWWFit) -> dict[str, Any]:
-    """A stretched exponential as plain JSON types."""
-    return {
-        "modulus_mpa": fit.modulus_mpa,
-        "tau_ps": fit.tau_ps,
-        "beta": fit.beta,
-        "mean_tau_ps": fit.mean_tau_ps,
-        "residual": fit.residual,
-        "half_disagreement": fit.half_disagreement,
-        "n_points": fit.n_points,
-        "window_ps": list(fit.window_ps),
-        "extrapolation_decades": fit.extrapolation_decades,
-        "at_bound": fit.at_bound,
-        "temperature_k": fit.temperature_k,
-        "step_strain": fit.step_strain,
-        "resolved": fit.resolved,
-    }
-
-
-def _prony_record(fit: PronyFit) -> dict[str, Any]:
-    """A relaxation spectrum as plain JSON types."""
-    return {
-        "tau_ps": fit.tau_ps.tolist(),
-        "weights_mpa": fit.weights_mpa.tolist(),
-        "equilibrium_mpa": fit.equilibrium_mpa,
-        "unrelaxed_mpa": fit.unrelaxed_mpa,
-        "residual_mpa": fit.residual_mpa,
-        "n_points": fit.n_points,
-        "n_terms": fit.n_terms,
-        "n_active": fit.n_active,
-        "edge_weight": fit.edge_weight,
-        "window_ps": list(fit.window_ps),
-        "plateau_reached": fit.plateau_reached,
-        "temperature_k": fit.temperature_k,
-        "step_strain": fit.step_strain,
-        "resolved": fit.resolved,
-    }
-
-
 def write_relaxation_report(
     report: RelaxationReport,
     output_dir: str | Path | None = None,
@@ -909,20 +870,11 @@ def write_relaxation_report(
     fields: dict[str, Any] = {
         "stages": [curve.stage for curve in report.curves],
         "mean": None if report.mean is None else _curve_record(report.mean),
-        "kww": None if report.kww is None else _kww_record(report.kww),
-        "prony": None if report.prony is None else _prony_record(report.prony),
+        "kww": None if report.kww is None else asdict(report.kww),
+        "prony": None if report.prony is None else asdict(report.prony),
         "replicas": [_curve_record(curve) for curve in report.curves],
         "replica_spread_mpa": report.replica_spread_mpa,
-        "linearity": (
-            None
-            if report.linearity is None
-            else {
-                "strains": list(report.linearity.strains),
-                "initial_mpa": list(report.linearity.initial_mpa),
-                "gap": report.linearity.gap,
-                "linear": report.linearity.linear,
-            }
-        ),
+        "linearity": None if report.linearity is None else asdict(report.linearity),
         "plateau_conflict": report.plateau_conflict,
         "baseline_fraction": report.baseline_fraction,
         "resolved": report.resolved,

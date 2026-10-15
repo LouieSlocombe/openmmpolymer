@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -782,17 +782,6 @@ def _modulus_record(fit: ElasticModulus) -> dict[str, Any]:
     }
 
 
-def _poisson_record(fit: PoissonRatio) -> dict[str, Any]:
-    """Poisson's ratio as plain JSON types."""
-    return {
-        "ratio": fit.ratio,
-        "standard_error": fit.standard_error,
-        "n_points": fit.n_points,
-        "strain_limit": fit.strain_limit,
-        "resolved": fit.resolved,
-    }
-
-
 def _bulk_record(fit: BulkModulus) -> dict[str, Any]:
     """The bulk modulus as plain JSON types."""
     return {
@@ -823,19 +812,6 @@ def _shear_record(fit: ShearModulus) -> dict[str, Any]:
     }
 
 
-def _consistency_record(check: ElasticConsistency) -> dict[str, Any]:
-    """The over-determination check as plain JSON types."""
-    return {
-        "bulk_implied_mpa": check.bulk_implied_mpa,
-        "shear_implied_mpa": check.shear_implied_mpa,
-        "bulk_measured_mpa": check.bulk_measured_mpa,
-        "shear_measured_mpa": check.shear_measured_mpa,
-        "bulk_gap": check.bulk_gap,
-        "shear_gap": check.shear_gap,
-        "consistent": check.consistent,
-    }
-
-
 def write_mechanical_report(
     report: ModulusReport,
     output_dir: str | Path | None = None,
@@ -850,7 +826,7 @@ def write_mechanical_report(
     fields: dict[str, Any] = {
         "stages": [curve.stage for curve in report.curves],
         "youngs": None if report.youngs is None else _modulus_record(report.youngs),
-        "poisson": None if report.poisson is None else _poisson_record(report.poisson),
+        "poisson": None if report.poisson is None else asdict(report.poisson),
         "bulk": None if report.bulk is None else _bulk_record(report.bulk),
         "shear": None if report.shear is None else _shear_record(report.shear),
         "load_modulus": (
@@ -862,9 +838,7 @@ def write_mechanical_report(
         "replica_spread_mpa": report.replica_spread_mpa,
         "method_gap": report.method_gap,
         "consistency": (
-            None
-            if report.consistency is None
-            else _consistency_record(report.consistency)
+            None if report.consistency is None else asdict(report.consistency)
         ),
         "resolved": report.resolved,
         "notes": list(report.notes),
