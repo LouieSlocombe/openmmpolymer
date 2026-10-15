@@ -766,15 +766,20 @@ def test_duration_counts_the_segments_handed_to_execution(
             ("deform", {"relax_ps": value}, "relax_ps")
             for value in (0.0, -1.0, math.nan, math.inf)
         ],
+        ("deform", {"n_steps": 0}, "n_steps"),
+        ("deform", {"n_steps": 2.5}, "n_steps"),
+        ("load", {"stresses_bar": []}, "stresses_bar is empty"),
+        ("shear", {"strains": []}, "strains is empty"),
+        ("pushoff", {"timesteps_fs": ()}, "timesteps_fs is empty"),
     ],
 )
 def test_invalid_schedules_fail_identically_in_budgets_and_execution(
     kind: str, options: dict[str, Any], match: str | None
 ) -> None:
-    """An empty explicit schedule cannot fall back to the default or cost zero."""
-    with pytest.raises(ValueError, match=match) as estimate_error:
+    """An empty or degenerate schedule cannot fall back to the default or cost zero."""
+    with pytest.raises((TypeError, ValueError), match=match) as estimate_error:
         _ = Stage("test", kind, options).duration_ps
-    with pytest.raises(ValueError, match=match) as execution_error:
+    with pytest.raises((TypeError, ValueError), match=match) as execution_error:
         STAGE_RUNNERS[kind](None, **options)
     assert str(estimate_error.value) == str(execution_error.value)
 

@@ -25,7 +25,7 @@ from copy import copy
 from dataclasses import dataclass, field, replace
 from functools import cached_property, partial
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import numpy as np
 import numpy.typing as npt
@@ -2643,6 +2643,137 @@ def _check_baseline(name: str, mean_bar: float, error_bar: float, samples: int) 
         )
 
 
+@dataclass
+class _Moments:
+    """A running count, sum and sum of squares of one scalar reading."""
+
+    n: int = 0
+    total: float = 0.0
+    total_sq: float = 0.0
+
+    def add(self, value: float) -> None:
+        """Take one reading."""
+        self.n += 1
+        self.total += value
+        self.total_sq += value * value
+
+    @property
+    def mean(self) -> float:
+        """The mean reading, or zero before the first."""
+        return self.total / self.n if self.n else 0.0
+
+    @property
+    def mean_sq(self) -> float:
+        """The mean square, which merges across chunks where an error does not."""
+        return self.total_sq / self.n if self.n else 0.0
+
+    @property
+    def standard_error(self) -> float:
+        """The standard error of the mean, or zero below two readings."""
+        if self.n < 2:
+            return 0.0
+        return standard_error_from_moments(self.mean, self.mean_sq, self.n)
+
+
+def _apply_step_strain(
+    simulation: Any,
+    *,
+    mode: str,
+    axis: int,
+    plane: tuple[int, int],
+    step_strain: float,
+    poisson: float,
+    ramp_ps: float,
+    sample_every_ps: float,
+    ramp_steps: int,
+) -> int:
+    """Apply a step strain at once, or ramp it in; return the steps run.
+
+    Composed from increments so that a ramp and a step are the same code
+    path. Engineering strain compounds, so a tensile increment is the root of
+    one plus the total; a shear tilt simply adds.
+    """
+    increments = max(1, round(ramp_ps / sample_every_ps)) if ramp_ps > 0 else 1
+    each = (
+        step_strain / increments
+        if mode == "shear"
+        else (1.0 + step_strain) ** (1.0 / increments) - 1.0
+    )
+    per_increment = ramp_steps // increments
+    ran_steps = 0
+    for _ in range(increments):
+        _strain_increment(
+            simulation,
+            mode=mode,
+            axis=axis,
+            plane=plane,
+            increment=each,
+            poisson=poisson,
+        )
+        if per_increment:
+            simulation.step(per_increment)
+            ran_steps += per_increment
+    return ran_steps
+
+
+def _sample_decay(
+    live: _Live,
+    bins: _LogBins,
+    read: Callable[[], tuple[npt.NDArray[np.float64], float]],
+    raw: TextIO | None,
+    *,
+    production_steps: int,
+    elapsed_ps: float,
+    sample_every_ps: float,
+    late_after_ps: float,
+    late_sample_every_ps: float,
+) -> tuple[float, int, list[float]]:
+    """Hold the locked cell for *production_steps*, binning every reading.
+
+    Returns the relaxation clock at the end, the steps run, and the
+    temperatures read along the way - at least one.
+    """
+    simulation = live.simulation
+    temperatures: list[float] = []
+    ran_steps = 0
+    remaining = production_steps
+    since_temperature = 0
+    rows = 0
+    while remaining > 0:
+        cadence = (
+            sample_every_ps if elapsed_ps < late_after_ps else late_sample_every_ps
+        )
+        taken = min(live.steps(cadence), remaining)
+        simulation.step(taken)
+        remaining -= taken
+        ran_steps += taken
+        elapsed_ps += taken * live.timestep_fs / 1000.0
+        diagonal, measure = read()
+        bins.add(elapsed_ps, measure, diagonal)
+        if raw is not None:
+            raw.write(
+                f"{elapsed_ps:.8g},{diagonal[0]:.8g},{diagonal[1]:.8g},"
+                f"{diagonal[2]:.8g},{measure:.8g}\n"
+            )
+            rows += 1
+            if rows % 1000 == 0:
+                # Flushed as it goes: the run this matters for is the one
+                # that gets killed, and a buffer is lost with the process.
+                raw.flush()
+        since_temperature += 1
+        if since_temperature >= 50:
+            temperatures.append(
+                temperature_k_of(simulation, degrees_of_freedom=live.degrees_of_freedom)
+            )
+            since_temperature = 0
+
+    if not temperatures:
+        temperatures.append(
+            temperature_k_of(simulation, degrees_of_freedom=live.degrees_of_freedom)
+        )
+    return elapsed_ps, ran_steps, temperatures
+
+
 def run_relax(
     run: RunContext,
     output_prefix: str | Path = "06_relax",
@@ -2859,10 +2990,7 @@ def run_relax(
         return diagonal, measure
 
     raw_path = live.prefix.parent / f"{live.name}_stress.csv"
-    baseline_n = 0
-    baseline_sum = 0.0
-    baseline_sum_sq = 0.0
-    temperatures: list[float] = []
+    baseline = _Moments()
     elapsed_ps = float(time_offset_ps)
     ran_steps = 0
 
@@ -2884,41 +3012,22 @@ def run_relax(
             remaining -= taken
             ran_steps += taken
             _, measure = read()
-            baseline_n += 1
-            baseline_sum += measure
-            baseline_sum_sq += measure * measure
+            baseline.add(measure)
 
-        baseline_mean = baseline_sum / baseline_n if baseline_n else 0.0
-        baseline_error = 0.0
-        if baseline_n > 1:
-            baseline_error = standard_error_from_moments(
-                baseline_mean, baseline_sum_sq / baseline_n, baseline_n
-            )
-        _check_baseline(live.name, baseline_mean, baseline_error, baseline_n)
+        _check_baseline(live.name, baseline.mean, baseline.standard_error, baseline.n)
 
         if not strain_applied:
-            # Composed from increments so that a ramp and a step are the same
-            # code path. Engineering strain compounds, so a tensile increment
-            # is the root of one plus the total; a shear tilt simply adds.
-            increments = max(1, round(ramp_ps / sample_every_ps)) if ramp_ps > 0 else 1
-            each = (
-                step_strain / increments
-                if mode == "shear"
-                else (1.0 + step_strain) ** (1.0 / increments) - 1.0
+            ran_steps += _apply_step_strain(
+                simulation,
+                mode=mode,
+                axis=axis,
+                plane=plane,
+                step_strain=step_strain,
+                poisson=poisson,
+                ramp_ps=ramp_ps,
+                sample_every_ps=sample_every_ps,
+                ramp_steps=ramp_steps,
             )
-            per_increment = ramp_steps // increments
-            for _ in range(increments):
-                _strain_increment(
-                    simulation,
-                    mode=mode,
-                    axis=axis,
-                    plane=plane,
-                    increment=each,
-                    poisson=poisson,
-                )
-                if per_increment:
-                    simulation.step(per_increment)
-                    ran_steps += per_increment
             _check_deformed_box(live.name, simulation, cutoff_nm, step_strain)
             # The response the moment the strain is complete - for a step,
             # before anything has moved: the affine part of the modulus, and
@@ -2933,43 +3042,18 @@ def run_relax(
         density = _density_g_cm3(simulation, run.total_mass_g_mol)
         locked = _box_lengths_nm(simulation)
 
-        remaining = production_steps
-        since_temperature = 0
-        rows = 0
-        while remaining > 0:
-            cadence = (
-                sample_every_ps if elapsed_ps < late_after_ps else late_sample_every_ps
-            )
-            taken = min(live.steps(cadence), remaining)
-            simulation.step(taken)
-            remaining -= taken
-            ran_steps += taken
-            elapsed_ps += taken * live.timestep_fs / 1000.0
-            diagonal, measure = read()
-            bins.add(elapsed_ps, measure, diagonal)
-            if raw is not None:
-                raw.write(
-                    f"{elapsed_ps:.8g},{diagonal[0]:.8g},{diagonal[1]:.8g},"
-                    f"{diagonal[2]:.8g},{measure:.8g}\n"
-                )
-                rows += 1
-                if rows % 1000 == 0:
-                    # Flushed as it goes: the run this matters for is the one
-                    # that gets killed, and a buffer is lost with the process.
-                    raw.flush()
-            since_temperature += 1
-            if since_temperature >= 50:
-                temperatures.append(
-                    temperature_k_of(
-                        simulation, degrees_of_freedom=live.degrees_of_freedom
-                    )
-                )
-                since_temperature = 0
-
-        if not temperatures:
-            temperatures.append(
-                temperature_k_of(simulation, degrees_of_freedom=live.degrees_of_freedom)
-            )
+        elapsed_ps, held_steps, temperatures = _sample_decay(
+            live,
+            bins,
+            read,
+            raw,
+            production_steps=production_steps,
+            elapsed_ps=elapsed_ps,
+            sample_every_ps=sample_every_ps,
+            late_after_ps=late_after_ps,
+            late_sample_every_ps=late_sample_every_ps,
+        )
+        ran_steps += held_steps
         moved = _box_lengths_nm(simulation)
         if not np.allclose(moved, locked, rtol=0.0, atol=1.0e-9):
             raise SimulationError(
@@ -3003,10 +3087,10 @@ def run_relax(
             samples["relax_poisson"] = [float(poisson)]
         if instant_bar is not None:
             samples["instant_stress_bar"] = [instant_bar]
-        if baseline_n:
-            samples["baseline_stress_bar"] = [baseline_mean]
-            samples["baseline_stress_sq_bar2"] = [baseline_sum_sq / baseline_n]
-            samples["baseline_samples"] = [float(baseline_n)]
+        if baseline.n:
+            samples["baseline_stress_bar"] = [baseline.mean]
+            samples["baseline_stress_sq_bar2"] = [baseline.mean_sq]
+            samples["baseline_samples"] = [float(baseline.n)]
 
         realised = float(np.mean(temperatures))
         log.info(
@@ -3017,8 +3101,8 @@ def run_relax(
             float(edges[-1]),
             realised,
             density,
-            f", baseline {baseline_mean:+.1f} +/- {baseline_error:.1f} bar"
-            if baseline_n
+            f", baseline {baseline.mean:+.1f} +/- {baseline.standard_error:.1f} bar"
+            if baseline.n
             else "",
         )
         return live.finish(
