@@ -609,8 +609,11 @@ def _observations(
     """
     stages = raw_manifest.get("stages", {})
     key = _PATHS[name].sample_key
-    manifest = RunManifest(**raw_manifest)
+    # Built only once a path is selected: a legacy manifest with fields the
+    # schema does not know can still say it holds no measurement.
+    manifest: RunManifest | None = None
     if name == "poisson_ratio":
+        manifest = RunManifest(**raw_manifest)
         groups = group_by_stem(deform_stages(directory, manifest=manifest))
     else:
         # A preparation's compression ladder records pressures as well; only
@@ -726,6 +729,8 @@ def _observations(
                 )
             axis = int(axes[0])
         try:
+            if manifest is None:
+                manifest = RunManifest(**raw_manifest)
             value, error, resolved = _fit_path(
                 name, directory, group, manifest, strain_limit, notes
             )
