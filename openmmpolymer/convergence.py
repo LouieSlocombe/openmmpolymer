@@ -30,6 +30,7 @@ from ._fitting import (
     ROUNDING,
     relative_span,
     rms,
+    series_scale,
     standard_error,
     statistical_inefficiency,
 )
@@ -362,7 +363,7 @@ def time_window_convergence(
         window_fractions, relative_tolerance, min_effective_samples, discard_fraction
     )
     times, data = _series(time_ps, values)
-    scale = max(abs(float(np.mean(data))), float(np.std(data)))
+    scale = series_scale(data)
     windows: list[WindowEstimate] = []
     for fraction in fractions:
         stop = _prefix_stop(times, fraction, float(times[0]))

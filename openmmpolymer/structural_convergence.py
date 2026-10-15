@@ -42,6 +42,7 @@ from .correlations import (
     StructureFactor,
     _pair_limit,
     _reciprocal_floor,
+    masked_argmax,
     peak_bins,
     radial_distribution,
     structure_factor,
@@ -166,11 +167,7 @@ _PARAMETERS = {
 
 def _block(ensemble: Ensemble, start: int, stop: int) -> Ensemble:
     """Frames *start* to *stop* of *ensemble*, as an ensemble of their own."""
-    return replace(
-        ensemble,
-        n_frames=stop - start,
-        first_frame=ensemble.first_frame + start,
-    )
+    return ensemble.window(start, stop)
 
 
 def _curve(**columns: Any) -> dict[str, tuple[float, ...]]:
@@ -228,6 +225,11 @@ def _measure(
     curves: dict[str, dict[str, tuple[float, ...]]] = {}
     notes: list[str] = []
 
+    def record(name: str, value: float | None, count: int) -> None:
+        """Keep a parameter's value, whether it counts, and what it was read from."""
+        values[name], valid[name] = value, value is not None and value > 0
+        counts[name] = count
+
     if backbone is not None:
         if conformation is None:
             conformation = optional(
@@ -237,23 +239,24 @@ def _measure(
             )
         if conformation is not None:
             for name in ("characteristic_ratio", "ratio_of_squares"):
-                value = finite_or_none(getattr(conformation.mean, name))
-                values[name], valid[name] = value, value is not None and value > 0
-                counts[name] = conformation.n_frames
+                record(
+                    name,
+                    finite_or_none(getattr(conformation.mean, name)),
+                    conformation.n_frames,
+                )
         persistence = optional(
             lambda: persistence_length(ensemble, backbone, stride=stride),
             notes,
             "persistence length",
         )
         if persistence is not None:
-            name = "persistence_length_nm"
-            value = (
+            record(
+                "persistence_length_nm",
                 finite_or_none(persistence.persistence_length_nm)
                 if persistence.decayed
-                else None
+                else None,
+                len(range(0, ensemble.n_frames, stride)),
             )
-            values[name], valid[name] = value, value is not None and value > 0
-            counts[name] = len(range(0, ensemble.n_frames, stride))
             curves["bond_correlation"] = _curve(
                 separation_bonds=persistence.separation,
                 correlation=persistence.correlation,
@@ -271,14 +274,13 @@ def _measure(
             "end-to-end relaxation",
         )
         if relaxation is not None:
-            name = "end_to_end_relaxation_time_ps"
-            value = (
+            record(
+                "end_to_end_relaxation_time_ps",
                 finite_or_none(relaxation.relaxation_time_ps)
                 if relaxation.decorrelated
-                else None
+                else None,
+                relaxation.n_origins,
             )
-            values[name], valid[name] = value, value is not None and value > 0
-            counts[name] = relaxation.n_origins
             curves["end_to_end_correlation"] = _curve(
                 lag_ps=relaxation.lag_ps, correlation=relaxation.correlation
             )
@@ -300,14 +302,13 @@ def _measure(
         "COM diffusion",
     )
     if displacement is not None:
-        name = "diffusion_coefficient_cm2_s"
-        value = (
+        record(
+            "diffusion_coefficient_cm2_s",
             finite_or_none(displacement.diffusion_coefficient_cm2_s)
             if displacement.diffusive
-            else None
+            else None,
+            displacement.n_origins,
         )
-        values[name], valid[name] = value, value is not None and value > 0
-        counts[name] = displacement.n_origins
         curves["centre_of_mass_msd"] = _curve(
             lag_ps=displacement.lag_ps, msd_nm2=displacement.msd_nm2
         )
@@ -557,7 +558,7 @@ def structural_window_convergence(
         n_frames = max(1, int(ensemble.n_frames * fraction))
         measured.append(
             _measure(
-                replace(ensemble, n_frames=n_frames),
+                ensemble.window(0, n_frames),
                 path,
                 fraction=fraction,
                 first_frame=0,
@@ -596,7 +597,7 @@ def structural_window_convergence(
     updated = []
     for measured_window, factor in all_measured:
         if factor is not None and mask.any():
-            index = int(np.argmax(np.where(mask, factor.s_q, -np.inf)))
+            index = masked_argmax(factor.s_q, mask)
             values, valid = dict(measured_window.values), dict(measured_window.valid)
             for name, value in (
                 ("structure_factor_peak_per_nm", factor.q_per_nm[index]),

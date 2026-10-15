@@ -40,6 +40,7 @@ from openmmpolymer.plots import (
     plot_correlations,
     plot_dynamics,
     plot_elongation_at_break,
+    plot_melting,
     plot_moduli,
     plot_persistence,
     plot_quench_curve,
@@ -71,6 +72,7 @@ from openmmpolymer.timeseries import (
     quench_curve,
     read_state_data,
 )
+from openmmpolymer.tm import analyse_melting
 
 from .helpers import (
     STRUCTURAL_OPTIONS,
@@ -80,6 +82,7 @@ from .helpers import (
     frozen_rods,
     lattice,
     log_linear_transitions,
+    planted_curve,
     planted_rate_report,
     planted_relaxation,
     random_walk_frames,
@@ -90,6 +93,7 @@ from .helpers import (
     synthetic_ensemble,
     two_line_curve,
     write_deformation,
+    write_heating,
     write_quench,
     yield_curve,
 )
@@ -189,8 +193,15 @@ FAILED = failure_curve(stage="06_tensile_r0_00")
 YIELDED = yield_curve(stage="06_tensile_r0_00")
 
 
+def _heated(directory: Path) -> Path:
+    """A run directory holding a planted heating scan."""
+    write_heating(directory, planted_curve())
+    return directory
+
+
 FIGURES: dict[str, Callable[[Path], Any]] = {
     "state_data": lambda d: plot_state_data(settling_state_data(d)),
+    "melting": lambda d: plot_melting(analyse_melting(_heated(d))),
     "quench_curve": lambda d: plot_quench_curve(
         quench(d), transition=glass_transition(quench(d))
     ),

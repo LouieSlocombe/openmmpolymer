@@ -152,9 +152,7 @@ def analyse_convergence(
 
     def read_structure() -> StructuralWindowConvergence:
         ensemble = open_stage(files)
-        path, _, _ = resolve_backbone(
-            directory, manifest, ensemble, backbone, True, notes
-        )
+        path, _, _ = resolve_backbone(manifest, ensemble, backbone, True, notes)
         if ensemble.is_snapshot:
             notes.append(SNAPSHOT_REFUSAL)
         series = None

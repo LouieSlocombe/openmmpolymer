@@ -29,6 +29,7 @@ import math
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -557,12 +558,19 @@ def _log_slope(lag_ps: npt.NDArray[np.float64], msd: npt.NDArray[np.float64]) ->
     window = x >= x[-1] - _SLOPE_DECADES
     if window.sum() < 2:
         window = np.ones_like(x, dtype=bool)
-    if float(np.ptp(x[window])) == 0.0:
-        warnings.warn(
-            "Polyfit may be poorly conditioned", np.exceptions.RankWarning, stacklevel=2
-        )
-    (slope, _), _ = fit_line(x[window], y[window])
+    (slope, _), _ = _checked_fit_line(x[window], y[window])
     return slope
+
+
+def _checked_fit_line(
+    x: npt.NDArray[np.float64], y: npt.NDArray[np.float64]
+) -> tuple[tuple[float, float], Any]:
+    """Fit a line, warning first when every abscissa is the same."""
+    if float(np.ptp(x)) == 0.0:
+        warnings.warn(
+            "Polyfit may be poorly conditioned", np.exceptions.RankWarning, stacklevel=3
+        )
+    return fit_line(x, y)
 
 
 def _diffusion_cm2_s(
@@ -578,11 +586,7 @@ def _diffusion_cm2_s(
     y = msd[start:]
     if x.size < 2:
         return None
-    if float(np.ptp(x)) == 0.0:
-        warnings.warn(
-            "Polyfit may be poorly conditioned", np.exceptions.RankWarning, stacklevel=2
-        )
-    (slope, _), _ = fit_line(x, y)
+    (slope, _), _ = _checked_fit_line(x, y)
     if slope <= 0.0:
         return None
     return slope / 6.0 * NM2_PS_TO_CM2_S

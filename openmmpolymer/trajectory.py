@@ -50,7 +50,7 @@ import logging
 import math
 import warnings
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -188,6 +188,12 @@ class Ensemble:
     def n_atoms(self) -> int:
         """Atoms in the whole cell."""
         return self.n_chains * self.atoms_per_chain
+
+    def window(self, start: int, stop: int) -> Ensemble:
+        """Frames *start* to *stop* of this view, as an ensemble of their own."""
+        return replace(
+            self, n_frames=stop - start, first_frame=self.first_frame + start
+        )
 
     def frames(
         self, *, start: int = 0, stop: int | None = None, stride: int = 1

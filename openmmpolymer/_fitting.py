@@ -300,3 +300,13 @@ def standard_error(values: npt.NDArray[np.float64], n_independent: float) -> flo
     """
     scale = float(np.max(np.abs(values))) or 1.0
     return float(np.std(values / scale, ddof=1)) * scale / math.sqrt(n_independent)
+
+
+def series_scale(values: npt.NDArray[np.float64], *, floor: float = 0.0) -> float:
+    """A scale to make a drift or an error relative to.
+
+    The mean, unless the series straddles zero - a total energy can - in which
+    case its spread is the only meaningful scale. *floor* keeps the scale away
+    from zero where a later division cannot tolerate it.
+    """
+    return max(abs(float(np.mean(values))), float(np.std(values)), floor)

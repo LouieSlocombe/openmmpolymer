@@ -317,7 +317,6 @@ def _is_index_list(value: object) -> bool:
 
 
 def resolve_backbone(
-    directory: Path,
     manifest: RunManifest | None,
     ensemble: Ensemble,
     explicit: Sequence[int] | None,
@@ -511,7 +510,7 @@ def analyse_structure(
             )
 
     path, backbone_source, backbone_file = resolve_backbone(
-        directory, manifest, ensemble, backbone, infer_backbone, notes
+        manifest, ensemble, backbone, infer_backbone, notes
     )
 
     pair_stride = capped_stride(ensemble.n_frames, stride, MAX_DISTRIBUTION_FRAMES)

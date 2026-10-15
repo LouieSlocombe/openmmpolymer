@@ -45,14 +45,15 @@ from typing import Any, overload
 import numpy as np
 import numpy.typing as npt
 
-from ._fitting import MAX_EXTRAPOLATION_DECADES as MAX_EXTRAPOLATION_DECADES
 from ._fitting import (
+    MAX_EXTRAPOLATION_DECADES,
     PS_PER_NS,
     TINY,
     extrapolation_decades,
     fit_line,
     median_spacing,
     separable_fit,
+    series_scale,
     standard_error,
     statistical_inefficiency,
 )
@@ -541,7 +542,7 @@ def equilibration(
             best_inefficiency = inefficiency
 
     window = series[best_start:]
-    scale = _scale_of(window)
+    scale = series_scale(window, floor=TINY)
     drift = _relative_drift(times[best_start:], window, scale)
     error = standard_error(window, best_effective) / scale
     return Equilibration(
@@ -550,7 +551,7 @@ def equilibration(
         n_samples=int(window.size),
         n_independent_samples=float(best_effective),
         correlation_time_ps=(
-            max(0.0, (best_inefficiency - 1.0) / 2.0) * _spacing_ps(times)
+            max(0.0, (best_inefficiency - 1.0) / 2.0) * median_spacing(times)
         ),
         relative_standard_error=error,
         relative_drift=drift,
@@ -959,20 +960,6 @@ def _is_transition(
     lower = float(temperature_k[break_index - 1]) - spacing
     upper = float(temperature_k[min(break_index, temperature_k.size - 1)]) + spacing
     return lower <= crossing_k <= upper
-
-
-def _scale_of(values: npt.NDArray[np.float64]) -> float:
-    """A scale to make a drift or an error relative to.
-
-    The mean, unless the series straddles zero - a total energy can - in which
-    case its spread is the only meaningful scale.
-    """
-    return max(abs(float(values.mean())), float(np.std(values)), TINY)
-
-
-def _spacing_ps(times: npt.NDArray[np.float64]) -> float:
-    """Time between rows, from the series rather than assumed."""
-    return median_spacing(times)
 
 
 def _relative_drift(

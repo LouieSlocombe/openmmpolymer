@@ -91,22 +91,19 @@ def plot_melting(report: MeltingReport) -> Figure:
 
     Returns a figure without writing files or selecting a pyplot backend.
     """
-    from matplotlib.figure import Figure
-
-    figure = Figure(figsize=(7, 7), layout="constrained")
-    axes = figure.subplots(2, 1, sharex=True)
+    figure, (volume, enthalpy) = _figure(2, 1, height_per_row=3.5, sharex=True)
     curve = report.curve
-    axes[0].plot(curve.temperature_k, curve.specific_volume_cm3_g, "o-")
-    axes[1].plot(curve.temperature_k, curve.enthalpy_kj_mol, "o-")
-    axes[0].set_ylabel("Specific volume (cm³/g)")
-    axes[1].set_ylabel("Enthalpy (kJ/mol of cells)")
-    axes[1].set_xlabel("Temperature (K)")
-    for axis in axes:
-        if report.transition.bracket_k is not None:
-            axis.axvspan(*report.transition.bracket_k, alpha=0.2, color="tab:red")
+    _measured(volume, curve.temperature_k, curve.specific_volume_cm3_g)
+    _measured(enthalpy, curve.temperature_k, curve.enthalpy_kj_mol)
+    volume.set_ylabel("Specific volume (cm³/g)")
+    enthalpy.set_ylabel("Enthalpy (kJ/mol of cells)")
+    enthalpy.set_xlabel("Temperature (K)")
+    if report.transition.bracket_k is not None:
+        for axis in (volume, enthalpy):
+            _span(axis, *report.transition.bracket_k, _GUIDE_COLOUR)
     rate = curve.heating_rate_k_per_ns
     label = "irregular heating schedule" if rate is None else f"{rate:g} K/ns"
-    figure.suptitle(f"Apparent melting scan - {label}, {curve.pressure_bar[0]:g} bar")
+    _suptitle(figure, f"Apparent melting scan - {label}, {curve.pressure_bar[0]:g} bar")
     return figure
 
 
@@ -177,10 +174,12 @@ def plot_quench_curve(
             float(curve.specific_volume_cm3_g.min()) * 0.995,
             float(curve.specific_volume_cm3_g.max()) * 1.005,
         )
-    axis.set_xlabel("Temperature (K)")
-    axis.set_ylabel("Specific volume (cm3/g)")
-    _title(axis, _quench_title(curve, transition))
-    _legend(axis)
+    _finish(
+        axis,
+        "Temperature (K)",
+        "Specific volume (cm3/g)",
+        _quench_title(curve, transition),
+    )
     return figure
 
 
@@ -230,10 +229,12 @@ def plot_cooling_rate(extrapolation: CoolingRateExtrapolation) -> Figure:
         label=f"{extrapolation.temperature_k:.0f} K at {target:.3g} K/ns",
     )
     axis.set_xscale("log")
-    axis.set_xlabel("Cooling rate (K/ns)")
-    axis.set_ylabel("Transition temperature (K)")
-    _title(axis, _cooling_rate_title(extrapolation))
-    _legend(axis)
+    _finish(
+        axis,
+        "Cooling rate (K/ns)",
+        "Transition temperature (K)",
+        _cooling_rate_title(extrapolation),
+    )
     return figure
 
 
@@ -472,10 +473,7 @@ def plot_persistence(length: PersistenceLength) -> Figure:
     if not length.decayed:
         _span(axis, last, x_max, _REFERENCE_COLOUR, label="past the end of the chain")
         axis.set_xlim(0.0, x_max)
-    axis.set_xlabel("Separation (bonds)")
-    axis.set_ylabel("<cos theta(s)>")
-    _title(axis, _persistence_title(length))
-    _legend(axis)
+    _finish(axis, "Separation (bonds)", "<cos theta(s)>", _persistence_title(length))
     return figure
 
 
@@ -829,16 +827,18 @@ def plot_yield_strength(curve: StressStrain, result: YieldStrength) -> Figure:
     high = max(0.0, float(result.nominal_stress_mpa.max()))
     margin = max(high - low, 1.0) * 0.05
     axis.set_ylim(low - margin, high + margin)
-    _zero_line(axis)
-    axis.set_xlabel(_strain_axis(curve))
-    axis.set_ylabel("Nominal tensile stress (MPa)")
     verdict = (
         f"{offset_label} yield strength = {result.strength_mpa:.1f} MPa"
         if result.resolved and result.strength_mpa is not None
         else f"{offset_label} yield strength not resolved"
     )
-    _title(axis, _strength_title(curve, result, verdict))
-    _legend(axis)
+    _zero_line(axis)
+    _finish(
+        axis,
+        _strain_axis(curve),
+        "Nominal tensile stress (MPa)",
+        _strength_title(curve, result, verdict),
+    )
     return figure
 
 
@@ -887,12 +887,12 @@ def _failure_figure(
         if strain is not None and stress is not None:
             _point(axis, strain, stress, "D", 5, label=failure_label)
     _zero_line(axis)
-    axis.set_xlabel(
-        _strain_axis(curve, "elongation", " (%)") if percent else _strain_axis(curve)
+    _finish(
+        axis,
+        _strain_axis(curve, "elongation", " (%)") if percent else _strain_axis(curve),
+        "Nominal tensile stress (MPa)",
+        _strength_title(curve, result, verdict),
     )
-    axis.set_ylabel("Nominal tensile stress (MPa)")
-    _title(axis, _strength_title(curve, result, verdict))
-    _legend(axis)
     return figure
 
 
@@ -1115,14 +1115,13 @@ def plot_relaxation_spectrum(prony: PronyFit) -> Figure:
             label="past the end of the run",
         )
     spectrum.set_xscale("log")
-    spectrum.set_xlabel("Relaxation time (ps)")
-    spectrum.set_ylabel("Weight (MPa)")
-    _title(
+    _finish(
         spectrum,
+        "Relaxation time (ps)",
+        "Weight (MPa)",
         f"{prony.n_active} of {prony.n_terms} terms carry weight"
         f"{_unresolved(prony.resolved)}",
     )
-    _legend(spectrum)
     return figure
 
 
@@ -1219,16 +1218,13 @@ def plot_rate_dependence(fit: RateExtrapolation) -> Figure:
             label=f"target estimate not finite at {target:.3g} {prop.rate_unit}",
         )
     axis.set_xscale("log")
-    axis.set_xlabel(f"Rate ({prop.rate_unit})")
-    axis.set_ylabel(
-        f"{prop.label} ({prop.value_unit})" if prop.value_unit else prop.label
-    )
-    _title(
+    _finish(
         axis,
+        f"Rate ({prop.rate_unit})",
+        f"{prop.label} ({prop.value_unit})" if prop.value_unit else prop.label,
         f"{prop.label}: {fit.form}\n{fit.extrapolation_decades:.1f} decades "
         f"extrapolated, {'resolved' if fit.resolved else 'not resolved'}",
     )
-    _legend(axis)
     return figure
 
 
@@ -1238,7 +1234,11 @@ def plot_rate_dependence(fit: RateExtrapolation) -> Figure:
 
 
 def _figure(
-    n_rows: int = 1, n_columns: int = 1, *, height_per_row: float | None = None
+    n_rows: int = 1,
+    n_columns: int = 1,
+    *,
+    height_per_row: float | None = None,
+    sharex: bool = False,
 ) -> tuple[Figure, list[Axes]]:
     """Build a figure and return it with its axes flattened.
 
@@ -1256,7 +1256,7 @@ def _figure(
     figure = Figure(
         figsize=(FIGURE_SIZE_IN[0], height), dpi=FIGURE_DPI, layout="constrained"
     )
-    grid = figure.subplots(n_rows, n_columns, squeeze=False)
+    grid = figure.subplots(n_rows, n_columns, squeeze=False, sharex=sharex)
     return figure, [axis for row in grid for axis in row]
 
 
@@ -1271,6 +1271,29 @@ def _title(axis: Axes, text: str) -> None:
     axis.set_title(text, fontsize=9)
 
 
+def _suptitle(figure: Figure, text: str) -> None:
+    """Title a whole figure, in the size every figure is titled in."""
+    figure.suptitle(text, fontsize=10)
+
+
+def _finish(axis: Axes, xlabel: str, ylabel: str, title: str) -> None:
+    """Label, title and add the legend to a panel, in that order."""
+    axis.set_xlabel(xlabel)
+    axis.set_ylabel(ylabel)
+    _title(axis, title)
+    _legend(axis)
+
+
+def _duration_axes(axis: Axes, metric: Any, *, label_size: float | None = None) -> None:
+    """Label a window-convergence panel: observation time against the metric."""
+    axis.set_xlabel("Observation duration (ps)")
+    label = f"{metric.property_name} ({metric.value_unit})"
+    if label_size is None:
+        axis.set_ylabel(label)
+    else:
+        axis.set_ylabel(label, fontsize=label_size)
+
+
 def _legend(axis: Axes) -> None:
     """Add a panel's legend, small and unframed."""
     axis.legend(fontsize=7, frameon=False)
@@ -1282,6 +1305,23 @@ def _measured(
     """Draw what was measured, with a marker at each point unless told not to."""
     marker = {} if markersize is None else {"marker": "o", "markersize": markersize}
     axis.plot(x, y, **{"color": _DATA_COLOUR, "linewidth": 0.9, **marker, **style})
+
+
+def _markers(
+    axis: Axes, x: Any, y: Any, marker: str, *, colour: str = _DATA_COLOUR, **style: Any
+) -> None:
+    """Draw points alone, with no line between them."""
+    _measured(
+        axis,
+        x,
+        y,
+        marker=marker,
+        markersize=None,
+        linewidth=None,
+        linestyle="none",
+        color=colour,
+        **style,
+    )
 
 
 def _guide(
@@ -1417,15 +1457,12 @@ def plot_window_convergence(result: WindowConvergence) -> Figure:
             )
         unknown = finite & ~known
         if np.any(unknown):
-            _measured(
+            _markers(
                 axis,
                 x[unknown],
                 y[unknown],
-                marker="x",
-                markersize=None,
-                linewidth=None,
-                linestyle="none",
-                color=_GUIDE_COLOUR,
+                "x",
+                colour=_GUIDE_COLOUR,
                 label="SE unavailable",
             )
         _title(axis, label)
@@ -1436,9 +1473,9 @@ def plot_window_convergence(result: WindowConvergence) -> Figure:
     blocks.set_xlabel("Late-time block")
     blocks.set_xticks([1, 2, 3])
     verdict = "resolved" if result.resolved else "not resolved"
-    figure.suptitle(
+    _suptitle(
+        figure,
         f"Window stability: {verdict}; tolerance {result.relative_tolerance:.0%}",
-        fontsize=10,
     )
     return figure
 
@@ -1474,8 +1511,7 @@ def plot_relaxation_convergence(result: RelaxationWindowConvergence) -> Figure:
                 centre = float(np.mean(metric.values[finite]))
                 axis.set_ylim(centre - 0.05 * scale, centre + 0.05 * scale)
         axis.ticklabel_format(axis="y", useOffset=False)
-        axis.set_xlabel("Observation duration (ps)")
-        axis.set_ylabel(f"{metric.property_name} ({metric.value_unit})")
+        _duration_axes(axis, metric)
         verdict = "resolved" if metric.resolved else "not resolved"
         difference = (
             f"{metric.relative_change:.1%}"
@@ -1483,9 +1519,8 @@ def plot_relaxation_convergence(result: RelaxationWindowConvergence) -> Figure:
             else "unavailable"
         )
         _title(axis, f"{verdict}; change {difference}")
-    figure.suptitle(
-        "Relaxation window sensitivity; overlapping refits are not error bars",
-        fontsize=10,
+    _suptitle(
+        figure, "Relaxation window sensitivity; overlapping refits are not error bars"
     )
     return figure
 
@@ -1517,36 +1552,22 @@ def plot_structural_convergence(result: StructuralWindowConvergence) -> Figure:
             values[finite],
             linewidth=0.7,
         )
-        _measured(
-            axis,
-            durations[valid],
-            values[valid],
-            marker="o",
-            markersize=None,
-            linewidth=None,
-            linestyle="none",
-            label="valid window",
-        )
+        _markers(axis, durations[valid], values[valid], "o", label="valid window")
         if np.any(finite & ~valid):
-            _measured(
+            _markers(
                 axis,
                 durations[finite & ~valid],
                 values[finite & ~valid],
-                marker="x",
-                markersize=None,
-                linewidth=None,
-                linestyle="none",
-                color=_GUIDE_COLOUR,
+                "x",
+                colour=_GUIDE_COLOUR,
                 label="unresolved window",
             )
-        axis.set_xlabel("Observation duration (ps)")
-        axis.set_ylabel(f"{metric.property_name} ({metric.value_unit})", fontsize=8)
+        _duration_axes(axis, metric, label_size=8)
         _title(axis, "resolved" if metric.resolved else "not resolved")
         _legend(axis)
     for axis in axes[len(result.parameters) :]:
         axis.set_visible(False)
-    figure.suptitle(
-        "Structural window sensitivity; curves and tail blocks retained in JSON",
-        fontsize=10,
+    _suptitle(
+        figure, "Structural window sensitivity; curves and tail blocks retained in JSON"
     )
     return figure

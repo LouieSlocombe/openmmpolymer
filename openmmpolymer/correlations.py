@@ -325,8 +325,12 @@ def _peak_above(
     """Where ``S(q)`` peaks over the *usable* bins, or zero if there are none."""
     if not usable.any():
         return 0.0
-    within = np.where(usable, s_q, -np.inf)
-    return float(q_per_nm[int(np.argmax(within))])
+    return float(q_per_nm[masked_argmax(s_q, usable)])
+
+
+def masked_argmax(values: npt.NDArray[np.float64], mask: npt.NDArray[np.bool_]) -> int:
+    """The index of the largest value among those the mask lets in."""
+    return int(np.argmax(np.where(mask, values, -np.inf)))
 
 
 def _pair_limit(boxes: npt.NDArray[np.float64], r_max_nm: float | None) -> float:
