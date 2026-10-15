@@ -17,20 +17,21 @@ from typing import Any
 
 import numpy as np
 
-from ._files import file_sha256, write_json
+from ._files import file_sha256
 from ._fitting import MAX_EXTRAPOLATION_DECADES, PS_PER_NS
 from ._validation import require_choice, require_integer
 from ._workflow import (
+    branch_runs,
     chain_options,
     enforce_budget,
     rate_request,
     record_scan_request,
+    record_start,
     require_distinct,
     resumable_record,
     resume_chunks,
     run_fingerprint,
     settled_state,
-    start_fingerprint,
     validate_hold_times,
     with_timestep,
 )
@@ -290,13 +291,16 @@ def run_thermal_rate_scan(
     n_replicas = plan.n_replicas
     _check_system(run)
     timestep = safe_timestep_fs(max(plan.temperatures_k), run.spec)
+    replicas: list[tuple[Protocol, str]] = []
     entries: list[dict[str, Any]] = []
     for rate_index, protocol in enumerate(plan.protocols):
         for replica in range(n_replicas):
             actual = _replica_protocol(protocol, rate_index, replica, timestep)
+            name = f"rate_{rate_index:02d}/replica_{replica:02d}"
+            replicas.append((actual, name))
             entries.append(
                 {
-                    "directory": f"rate_{rate_index:02d}/replica_{replica:02d}",
+                    "directory": name,
                     "hold_ps": plan.hold_times_ps[rate_index],
                     "stages": [stage.name for stage in actual.stages],
                     "protocol": asdict(actual),
@@ -336,10 +340,7 @@ def run_thermal_rate_scan(
         workflow,
         record,
         request,
-        [
-            directory / "equilibration",
-            *(directory / item["directory"] for item in entries),
-        ],
+        branch_runs(directory, [item["directory"] for item in entries]),
         resume=resume,
         entries=entries,
         temperatures_k=plan.temperatures_k,
@@ -356,21 +357,11 @@ def run_thermal_rate_scan(
     start = settled_state(
         settled, directory / "equilibration", error=ThermalRateError, verb="branch"
     )
-    record.update(
-        start_state=start,
-        start_state_sha256=start_fingerprint(start, record, error=ThermalRateError),
-    )
-    write_json(workflow, record)
-    for rate_index, protocol in enumerate(plan.protocols):
-        for replica in range(n_replicas):
-            run_protocol(
-                _replica_protocol(protocol, rate_index, replica, timestep),
-                run,
-                directory / f"rate_{rate_index:02d}/replica_{replica:02d}",
-                resume=resume,
-                state_in=start,
-                **chains,
-            )
+    record_start(workflow, record, start, error=ThermalRateError)
+    for actual, name in replicas:
+        run_protocol(
+            actual, run, directory / name, resume=resume, state_in=start, **chains
+        )
     return analyse_thermal_rates(
         [directory],
         property_name=property_name,

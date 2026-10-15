@@ -20,16 +20,17 @@ from ._fitting import MAX_EXTRAPOLATION_DECADES
 from ._seeds import derive_seed
 from ._validation import require_choice
 from ._workflow import (
+    branch_runs,
     chain_options,
     enforce_budget,
     equilibrate,
     rate_request,
     record_scan_request,
+    record_start,
     require_distinct,
     resumable_record,
     run_branches,
     run_fingerprint,
-    start_fingerprint,
     strain_ladder,
     validate_hold_times,
 )
@@ -224,7 +225,7 @@ def run_tensile_rate_scan(
         workflow,
         record,
         request,
-        [directory / "equilibration", *(directory / name for name in names)],
+        branch_runs(directory, names),
         resume=resume,
         run_dirs=names,
     )
@@ -240,11 +241,8 @@ def run_tensile_rate_scan(
         verb="strain",
         **chains,
     )
-    fingerprint = start_fingerprint(start, record, error=ValueError)
-    record.update(
-        start_state=start, start_state_sha256=fingerprint, reference_box_nm=origin
-    )
-    write_json(workflow, record)
+    record_start(workflow, record, start, error=ValueError, reference_box_nm=origin)
+    fingerprint = record["start_state_sha256"]
     timestep = safe_timestep_fs(selected.temperature_k, run.spec)
     for index, (name, rate_spec) in enumerate(zip(names, plan.specs, strict=True)):
         rate_dir = directory / name

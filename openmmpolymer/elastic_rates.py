@@ -24,7 +24,6 @@ from typing import Any
 
 import numpy as np
 
-from ._files import write_json
 from ._fitting import (
     MAX_EXTRAPOLATION_DECADES,
     MAX_REPLICA_SPREAD,
@@ -34,18 +33,19 @@ from ._fitting import (
 )
 from ._validation import require_choice, require_positive
 from ._workflow import (
+    branch_runs,
     chain_options,
     enforce_budget,
     equilibrate,
     group_by_stem,
     rate_request,
     record_scan_request,
+    record_start,
     require_distinct,
     resumable_record,
     run_branches,
     run_fingerprint,
     sample_spread,
-    start_fingerprint,
     strain_ladder,
     validate_hold_times,
 )
@@ -371,7 +371,7 @@ def run_elastic_rate_scan(
         workflow,
         record,
         request,
-        [directory / "equilibration", *(directory / name for name in names)],
+        branch_runs(directory, names),
         resume=resume,
         run_dirs=names,
     )
@@ -388,13 +388,14 @@ def run_elastic_rate_scan(
         **chains,
     )
     timestep = safe_timestep_fs(spec.temperature_k, run.spec)
-    record.update(
-        start_state=start,
-        start_state_sha256=start_fingerprint(start, record, error=MechanicalError),
+    record_start(
+        workflow,
+        record,
+        start,
+        error=MechanicalError,
         reference_box_nm=origin,
         timestep_fs=timestep,
     )
-    write_json(workflow, record)
     for i, (name, hold) in enumerate(zip(names, plan.hold_times_ps, strict=True)):
         rate_spec = _rate_spec(spec, property_name, hold)
         run_branches(

@@ -732,6 +732,11 @@ def write_report_files(
 # --------------------------------------------------------------------------
 
 
+def branch_runs(directory: Path, branches: Sequence[str]) -> list[Path]:
+    """The run directories a rate scan writes: its equilibration, then each branch."""
+    return [directory / "equilibration", *(directory / name for name in branches)]
+
+
 def resumable_record(
     run: RunContext,
     workflow: Path,
@@ -768,7 +773,7 @@ def resumable_record(
         and any(directory.rglob(MANIFEST_NAME))
     ):
         _refuse_unrecorded_runs(directory, workflow, error=error)
-    runs = [directory / "equilibration", *(directory / name for name in branches)]
+    runs = branch_runs(directory, branches)
     for path in runs:
         manifest = path / MANIFEST_NAME
         if (
@@ -815,6 +820,26 @@ def start_fingerprint(
             "resume=False."
         )
     return digest
+
+
+def record_start(
+    workflow: Path,
+    record: dict[str, Any],
+    start: str,
+    *,
+    error: type[Exception],
+    **extra: Any,
+) -> None:
+    """Save the state every branch starts from, fingerprinted, and *extra* beside it.
+
+    The fingerprint refuses a start that changed since the record was written.
+    """
+    record.update(
+        start_state=start,
+        start_state_sha256=start_fingerprint(start, record, error=error),
+        **extra,
+    )
+    write_json(workflow, record)
 
 
 def strain_ladder(
