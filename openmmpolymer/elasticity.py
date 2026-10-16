@@ -328,6 +328,11 @@ class ElasticConsistency:
             if math.isfinite(gap)
         )
 
+    @property
+    def gap_summary(self) -> str:
+        """The finite gaps as ``K 12%, G 3%``, or empty when nothing was measured."""
+        return ", ".join(f"{name} {100.0 * gap:.0f}%" for name, gap in self.gaps)
+
 
 # --------------------------------------------------------------------------
 # Reading a run directory
@@ -612,7 +617,7 @@ def _window(
     Raises:
         ValueError: The window is not a strain.
     """
-    require_positive(strain_limit, None, name="strain_limit")
+    require_positive(strain_limit, name="strain_limit")
     return np.asarray(np.abs(strain) <= strain_limit + NEGLIGIBLE, dtype=np.bool_)
 
 

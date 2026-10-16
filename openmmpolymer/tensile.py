@@ -49,7 +49,7 @@ from ._fitting import PS_PER_NS
 from ._validation import require_axis, require_integer, require_positive
 from ._workflow import (
     StrainSchedule,
-    chain_options,
+    checked_chain_options,
     deformation_stages,
     enforce_budget,
     equilibration_at,
@@ -59,12 +59,13 @@ from ._workflow import (
     run_fingerprint,
     sample_spread,
     scan_listing,
+    spec_request,
     write_report_files,
 )
 from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .elasticity import StressStrain, stress_strain
 from .plots import plot_breaking_strength, plot_elongation_at_break, plot_yield_strength
-from .protocols import Protocol, RunManifest, check_chain_options
+from .protocols import MANIFEST_NAME, Protocol, RunManifest
 from .simulate import RunContext, safe_timestep_fs
 from .strength import (
     DEFAULT_CONFIRMATION_STEPS,
@@ -468,7 +469,7 @@ def tensile_protocol(
     """
     measurement = _measurement(spec)
     require_integer(replica, minimum=0, name="replica")
-    require_positive(timestep_fs, None, name="timestep_fs")
+    require_positive(timestep_fs, name="timestep_fs")
     stages = deformation_stages(
         tensile_schedule(spec),
         stem=f"{measurement.stem}_r{replica}",
@@ -583,6 +584,19 @@ def _check_resume(
         )
 
 
+def tensile_metadata(
+    spec: TensileSpec, ladders: Sequence[Protocol], timestep_fs: float
+) -> dict[str, Any]:
+    """What a tensile workflow records beside its request: the ladders it runs."""
+    return {
+        "replica_stages": [
+            [stage.name for stage in ladder.stages] for ladder in ladders
+        ],
+        "steps_per_replica": tensile_schedule(spec).n_steps,
+        "timestep_fs": timestep_fs,
+    }
+
+
 def workflow_record(
     request: dict[str, Any],
     spec: TensileSpec,
@@ -591,18 +605,10 @@ def workflow_record(
     *,
     state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """The tensile record shared by standalone and rate scans.
-
-    Optional state fields retain their caller's insertion order and omitted
-    fields remain absent, preserving the existing workflow JSON layouts.
-    """
+    """The tensile record a rate scan writes into each of its rate directories."""
     return {
         "request": request,
-        "replica_stages": [
-            [stage.name for stage in ladder.stages] for ladder in ladders
-        ],
-        "steps_per_replica": tensile_schedule(spec).n_steps,
-        "timestep_fs": timestep_fs,
+        **tensile_metadata(spec, ladders, timestep_fs),
         **({} if state is None else state),
     }
 
@@ -620,7 +626,9 @@ def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
     **equilibration: Any,
 ) -> R:
     """Budget, record and run a scan, then analyse what it recorded."""
-    check_chain_options(run, chain_backbone, atoms_per_chain)
+    chains = checked_chain_options(
+        run, chain_backbone, atoms_per_chain, expected_characteristic_ratio
+    )
     spec = measurement.spec() if spec is None else spec
     if type(spec) is not measurement.spec:
         raise TypeError(
@@ -647,18 +655,14 @@ def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
             "budget."
         ),
     )
-    settings = asdict(spec)
-    settings.pop("max_total_ns")
-    # Preserve the standalone tensile request's refusal of unsupported JSON
-    # scalars; other spec requests historically stringify those values.
-    request = json.loads(
-        json.dumps(
-            {
-                "spec": settings,
-                "equilibration": [asdict(stage) for stage in settle.stages],
-                **run_fingerprint(run),
-            }
-        )
+    # Strict: a value JSON cannot encode is refused here, where the other
+    # scans' requests stringify it.
+    request = spec_request(
+        spec,
+        drop=("max_total_ns",),
+        strict=True,
+        equilibration=[asdict(stage) for stage in settle.stages],
+        **run_fingerprint(run),
     )
     schedule = tensile_schedule(spec)
     log.info(
@@ -667,9 +671,6 @@ def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
         spec.n_replicas,
         total_ns,
         schedule.strain_rate_per_ns,
-    )
-    chains = chain_options(
-        chain_backbone, atoms_per_chain, expected_characteristic_ratio
     )
     run_branched_scan(
         run,
@@ -685,19 +686,10 @@ def _run_scan[R: BreakingReport | ElongationReport | YieldReport](
         resume=resume,
         error=measurement.error,
         verb="stretch",
-        metadata={},
+        metadata=tensile_metadata(spec, ladders, timestep),
         read_record=lambda: _read_record(measurement, directory),
         precheck=lambda previous, manifest: _check_resume(
             measurement, directory, previous, manifest, settle, ladders
-        ),
-        record_builder=lambda start, origin: workflow_record(
-            request,
-            spec,
-            ladders,
-            timestep,
-            state=None
-            if start is None
-            else {"reference_box_nm": origin, "start_state": start},
         ),
         require_record_for_empty_manifest=False,
         **chains,
@@ -978,7 +970,7 @@ def _analyse[R: BreakingReport | ElongationReport | YieldReport](
     values = [getattr(fit, measurement.value) for fit in fits]
     return measurement.report(
         run_dir=str(directory),
-        manifest_path=str(directory / "manifest.json"),
+        manifest_path=str(directory / MANIFEST_NAME),
         curves=tuple(curves),
         replicas=tuple(fits),
         replica_indices=tuple(chunks),

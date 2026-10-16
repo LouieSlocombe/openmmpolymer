@@ -252,7 +252,7 @@ def structure_factor(
             :data:`MAX_WAVEVECTORS`.
         ValueError: A numeric argument is out of range.
     """
-    require_positive(q_max_per_nm, None, name="q_max_per_nm")
+    require_positive(q_max_per_nm, name="q_max_per_nm")
     require_integer(n_bins, name="n_bins")
     require_integer(stride, name="stride")
 
@@ -325,8 +325,12 @@ def _peak_above(
     """Where ``S(q)`` peaks over the *usable* bins, or zero if there are none."""
     if not usable.any():
         return 0.0
-    within = np.where(usable, s_q, -np.inf)
-    return float(q_per_nm[int(np.argmax(within))])
+    return float(q_per_nm[masked_argmax(s_q, usable)])
+
+
+def masked_argmax(values: npt.NDArray[np.float64], mask: npt.NDArray[np.bool_]) -> int:
+    """The index of the largest value among those the mask lets in."""
+    return int(np.argmax(np.where(mask, values, -np.inf)))
 
 
 def _pair_limit(boxes: npt.NDArray[np.float64], r_max_nm: float | None) -> float:
@@ -342,7 +346,7 @@ def _pair_limit(boxes: npt.NDArray[np.float64], r_max_nm: float | None) -> float
     half = 0.5 / float(np.linalg.norm(inverse, axis=-2).max())
     if r_max_nm is None:
         return half
-    limit = require_positive(r_max_nm, None, name="r_max_nm")
+    limit = require_positive(r_max_nm, name="r_max_nm")
     if limit > half:
         raise AnalysisError(
             f"r_max_nm={limit:.3f} is more than half the smallest cell face spacing "

@@ -65,13 +65,10 @@ def _add_snapshot_stage(run_directory: Path, name: str) -> None:
     source = Path(str(manifest["stages"]["02_nvt"]["final_pdb"]))
     copy = run_directory / f"{name}.pdb"
     shutil.copy(source, copy)
-    manifest["stages"][name] = {
-        "name": name,
-        "final_pdb": str(copy),
-        "csv": None,
-        "samples": {},
-    }
-    (run_directory / "manifest.json").write_text(json.dumps(manifest))
+    write_manifest(
+        run_directory,
+        {name: {"name": name, "final_pdb": str(copy), "csv": None, "samples": {}}},
+    )
 
 
 # --------------------------------------------------------------------------
@@ -172,10 +169,7 @@ def test_analysis_uses_saved_polymer_dimensions_unless_overridden(
     tmp_path: Path, override: float | None
 ) -> None:
     write_polymer_snapshot(tmp_path)
-    path = tmp_path / "manifest.json"
-    manifest = json.loads(path.read_text())
-    manifest["chains"] = {"expected_characteristic_ratio": 5.5}
-    path.write_text(json.dumps(manifest))
+    write_manifest(tmp_path, {}, chains={"expected_characteristic_ratio": 5.5})
     report = analyse_structure(tmp_path, expected_characteristic_ratio=override)
     assert report.conformation is not None
     expected = 5.5 if override is None else override
@@ -187,18 +181,19 @@ def test_the_manifest_supplies_the_backbone_when_it_records_one(
 ) -> None:
     """And the dimensions recorded beside it come back for cross-reference."""
     write_polymer_snapshot(tmp_path)
-    path = tmp_path / "manifest.json"
-    manifest = json.loads(path.read_text())
-    manifest["chains"] = {
-        "mean_squared_end_to_end_nm2": 0.37,
-        "mean_radius_of_gyration_nm": 0.2,
-        "ratio_of_squares": 6.0,
-        "characteristic_ratio": 6.5,
-        "expected_characteristic_ratio": 7.0,
-        "consistent": True,
-        "backbone": [0, 1, 2, 3],
-    }
-    path.write_text(json.dumps(manifest))
+    write_manifest(
+        tmp_path,
+        {},
+        chains={
+            "mean_squared_end_to_end_nm2": 0.37,
+            "mean_radius_of_gyration_nm": 0.2,
+            "ratio_of_squares": 6.0,
+            "characteristic_ratio": 6.5,
+            "expected_characteristic_ratio": 7.0,
+            "consistent": True,
+            "backbone": [0, 1, 2, 3],
+        },
+    )
     report = analyse_structure(tmp_path)
     assert report.backbone == (0, 1, 2, 3)
     assert report.backbone_source == "manifest"
@@ -252,10 +247,7 @@ def test_a_bad_recorded_backbone_is_noted_and_inference_carries_on(
 ) -> None:
     """A recorded path that does not fit is not a reason to stop reading."""
     write_polymer_snapshot(tmp_path)
-    path = tmp_path / "manifest.json"
-    manifest = json.loads(path.read_text())
-    manifest["chains"] = {"backbone": recorded}
-    path.write_text(json.dumps(manifest))
+    write_manifest(tmp_path, {}, chains={"backbone": recorded})
     report = analyse_structure(tmp_path)
     assert report.backbone_source == "inferred"
     assert any(note in text for text in report.notes)

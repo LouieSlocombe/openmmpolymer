@@ -42,6 +42,7 @@ from openmmpolymer.trajectory import AnalysisError
 from .helpers import (
     QUICK_EQUILIBRATION,
     argon_context,
+    descending_quench,
     forbidden,
     quench_entry,
     two_line_curve,
@@ -419,14 +420,11 @@ def two_pass_directory(directory: Path) -> Path:
     The coarse pass steps 40 K and the fine one 20 K, both around the same
     340 K knot, so which is which is a question the data answers.
     """
-    coarse_t, coarse_d = two_line_curve(transition_k=340.0, n_points=11)
     fine_t, fine_d = two_line_curve(transition_k=340.0, n_points=21)
     return write_quenches(
         directory,
         {
-            "06_coarse_quench_00": quench_entry(
-                coarse_t[::-1], coarse_d[::-1], segment_duration_ps=[1000.0] * 11
-            ),
+            "06_coarse_quench_00": descending_quench(340.0, 1000.0, n_points=11),
             "08_fine_quench_00": quench_entry(
                 fine_t[::-1][:11], fine_d[::-1][:11], segment_duration_ps=[4000.0] * 11
             ),
@@ -600,17 +598,11 @@ def test_only_the_finest_scans_are_weighed_against_each_other(
     Two fine passes here and one coarse, so the rate fit has exactly two
     points rather than three.
     """
-    coarse_t, coarse_d = two_line_curve(transition_k=340.0, n_points=11)
     stages: dict[str, Any] = {
-        "06_coarse": quench_entry(
-            coarse_t[::-1], coarse_d[::-1], segment_duration_ps=[1000.0] * 11
-        )
+        "06_coarse": descending_quench(340.0, 1000.0, n_points=11)
     }
     for transition_k, hold_ps in ((340.0, 4000.0), (360.0, 8000.0)):
-        temperature, density = two_line_curve(transition_k=transition_k)
-        stages[f"08_fine_{hold_ps:.0f}"] = quench_entry(
-            temperature[::-1], density[::-1], segment_duration_ps=[hold_ps] * 21
-        )
+        stages[f"08_fine_{hold_ps:.0f}"] = descending_quench(transition_k, hold_ps)
     write_quenches(tmp_path, stages)
 
     report = analyse_tg(tmp_path, melt_stage=None)
@@ -644,21 +636,12 @@ def test_a_curve_too_short_to_fit_drops_out_without_shifting_the_others(
     back together after one has lost an entry silently pairs every later
     curve with the fit belonging to the one before it.
     """
-    long_t, long_d = two_line_curve(transition_k=340.0)
-    short_t, short_d = two_line_curve(transition_k=340.0, n_points=4)
-    fine_t, fine_d = two_line_curve(transition_k=340.0, n_points=41)
     write_quenches(
         tmp_path,
         {
-            "06_coarse": quench_entry(
-                long_t[::-1], long_d[::-1], segment_duration_ps=[1000.0] * 21
-            ),
-            "07_stub": quench_entry(
-                short_t[::-1], short_d[::-1], segment_duration_ps=[1000.0] * 4
-            ),
-            "08_fine": quench_entry(
-                fine_t[::-1], fine_d[::-1], segment_duration_ps=[4000.0] * 41
-            ),
+            "06_coarse": descending_quench(340.0, 1000.0),
+            "07_stub": descending_quench(340.0, 1000.0, n_points=4),
+            "08_fine": descending_quench(340.0, 4000.0, n_points=41),
         },
     )
     report = analyse_tg(tmp_path, melt_stage=None)

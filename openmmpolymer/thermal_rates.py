@@ -17,26 +17,28 @@ from typing import Any
 
 import numpy as np
 
-from ._files import file_sha256, write_json
+from ._files import file_sha256
 from ._fitting import MAX_EXTRAPOLATION_DECADES, PS_PER_NS
 from ._validation import require_choice, require_integer
 from ._workflow import (
-    chain_options,
+    branch_runs,
+    checked_chain_options,
     enforce_budget,
     rate_request,
     record_scan_request,
+    record_start,
     require_distinct,
+    require_samples,
     resumable_record,
     resume_chunks,
     run_fingerprint,
     settled_state,
-    start_fingerprint,
     validate_hold_times,
     with_timestep,
 )
 from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .mdsystem import require_no_ensemble_controls
-from .protocols import Protocol, RunManifest, Stage, check_chain_options, run_protocol
+from .protocols import Protocol, RunManifest, Stage, run_protocol
 from .rate_dependence import (
     RateObservation,
     RateProperty,
@@ -46,6 +48,7 @@ from .rate_dependence import (
 )
 from .reporters import TrajectoryOptions
 from .simulate import RunContext, safe_timestep_fs
+from .tg import WORKFLOW_NAME as TG_WORKFLOW_NAME
 from .tg import (
     TgSchedule,
     TgSpec,
@@ -55,6 +58,7 @@ from .tg import (
     tg_coarse_scan,
 )
 from .timeseries import glass_transition, quench_curve, quench_stages
+from .tm import WORKFLOW_NAME as TM_WORKFLOW_NAME
 from .tm import TmSpec, heating_curve, melting_scan, melting_temperature
 from .trajectory import AnalysisError
 
@@ -270,7 +274,9 @@ def run_thermal_rate_scan(
     A common preparation does not itself prove equilibration or independent
     morphology. Replicas share coordinates and probe dynamical variability.
     """
-    check_chain_options(run, chain_backbone, atoms_per_chain)
+    chains = checked_chain_options(
+        run, chain_backbone, atoms_per_chain, expected_characteristic_ratio
+    )
     _property(property_name)
     if property_name == "melting_temperature" and not crystalline:
         raise ThermalRateError(
@@ -290,21 +296,21 @@ def run_thermal_rate_scan(
     n_replicas = plan.n_replicas
     _check_system(run)
     timestep = safe_timestep_fs(max(plan.temperatures_k), run.spec)
+    replicas: list[tuple[Protocol, str]] = []
     entries: list[dict[str, Any]] = []
     for rate_index, protocol in enumerate(plan.protocols):
         for replica in range(n_replicas):
             actual = _replica_protocol(protocol, rate_index, replica, timestep)
+            name = f"rate_{rate_index:02d}/replica_{replica:02d}"
+            replicas.append((actual, name))
             entries.append(
                 {
-                    "directory": f"rate_{rate_index:02d}/replica_{replica:02d}",
+                    "directory": name,
                     "hold_ps": plan.hold_times_ps[rate_index],
                     "stages": [stage.name for stage in actual.stages],
                     "protocol": asdict(actual),
                 }
             )
-    chains = chain_options(
-        chain_backbone, atoms_per_chain, expected_characteristic_ratio
-    )
     request = rate_request(
         {
             "property_name": property_name,
@@ -336,10 +342,7 @@ def run_thermal_rate_scan(
         workflow,
         record,
         request,
-        [
-            directory / "equilibration",
-            *(directory / item["directory"] for item in entries),
-        ],
+        branch_runs(directory, [item["directory"] for item in entries]),
         resume=resume,
         entries=entries,
         temperatures_k=plan.temperatures_k,
@@ -356,21 +359,11 @@ def run_thermal_rate_scan(
     start = settled_state(
         settled, directory / "equilibration", error=ThermalRateError, verb="branch"
     )
-    record.update(
-        start_state=start,
-        start_state_sha256=start_fingerprint(start, record, error=ThermalRateError),
-    )
-    write_json(workflow, record)
-    for rate_index, protocol in enumerate(plan.protocols):
-        for replica in range(n_replicas):
-            run_protocol(
-                _replica_protocol(protocol, rate_index, replica, timestep),
-                run,
-                directory / f"rate_{rate_index:02d}/replica_{replica:02d}",
-                resume=resume,
-                state_in=start,
-                **chains,
-            )
+    record_start(workflow, record, start, error=ThermalRateError)
+    for actual, name in replicas:
+        run_protocol(
+            actual, run, directory / name, resume=resume, state_in=start, **chains
+        )
     return analyse_thermal_rates(
         [directory],
         property_name=property_name,
@@ -406,21 +399,20 @@ def _check_completed(directory: Path, entry: dict[str, Any]) -> RunManifest:
             ("segment_temperature_k", temperatures),
             ("segment_duration_ps", np.full(len(temperatures), entry["hold_ps"])),
         ):
-            values = np.asarray(samples.get(name, []), dtype=float)
-            if values.shape != expected.shape or not np.allclose(
-                values, expected, rtol=1e-8, atol=0
-            ):
-                raise AnalysisError(
-                    f"{directory}/{stage['name']} has incomplete or changed thermal ladder/holds."
-                )
+            require_samples(
+                samples,
+                name,
+                expected,
+                message=f"{directory}/{stage['name']} has incomplete or changed thermal ladder/holds.",
+            )
         if "segment_pressure_bar" in samples:
-            pressures = np.asarray(samples["segment_pressure_bar"], dtype=float)
-            if pressures.shape != temperatures.shape or not np.allclose(
-                pressures, stage["options"]["pressure_bar"], rtol=1e-8
-            ):
-                raise AnalysisError(
-                    f"{directory}/{stage['name']} has a changed pressure."
-                )
+            require_samples(
+                samples,
+                "segment_pressure_bar",
+                np.full(temperatures.shape, stage["options"]["pressure_bar"]),
+                atol=1e-8,
+                message=f"{directory}/{stage['name']} has a changed pressure.",
+            )
 
     return manifest
 
@@ -479,7 +471,7 @@ def _metadata(
             crystalline_supplied=request.get("crystalline_supplied"),
         )
     else:
-        for name in ("tg_workflow.json", "tm_workflow.json"):
+        for name in (TG_WORKFLOW_NAME, TM_WORKFLOW_NAME):
             path = directory / name
             if path.is_file():
                 request = json.loads(path.read_text()).get("request", {})
@@ -549,7 +541,7 @@ def analyse_thermal_rates(
                         f"Unknown or irregular cooling rate in {directory}/{curve.stage}."
                     )
                 minimum = (
-                    4
+                    TgSpec.min_points_per_branch
                     if record is None
                     else record["request"]["spec"]["min_points_per_branch"]
                 )
@@ -592,7 +584,7 @@ def analyse_thermal_rates(
                     f"Unknown or irregular heating rate in {directory}."
                 )
             minimum = (
-                3
+                TmSpec.min_points_per_branch
                 if record is None
                 else record["request"]["spec"]["min_points_per_branch"]
             )
@@ -642,11 +634,11 @@ def analyse_thermal_rates(
             )
         elif present:
             common[key] = present[0]
-    for key in ("pressure_bar", "preparation_state_sha256", "system_sha256"):
-        if key not in common:
-            notes.append(
-                f"Recorded {key} is unavailable for all histories; comparability is not fully verified."
-            )
+    notes.extend(
+        f"Recorded {key} is unavailable for all histories; comparability is not fully verified."
+        for key in ("pressure_bar", "preparation_state_sha256", "system_sha256")
+        if key not in common
+    )
     observations = [replace(item, conditions=common) for item in observations]
     report = analyse_rate_observations(
         observations,

@@ -20,6 +20,7 @@ import pytest
 
 from openmmpolymer import __main__ as cli
 from openmmpolymer.__main__ import PROTOCOLS, build_parser, main
+from openmmpolymer._files import ReportFiles
 from openmmpolymer.conformation import PersistenceLength
 from openmmpolymer.elasticity import ElasticConsistency
 from openmmpolymer.mechanical import (
@@ -49,8 +50,9 @@ from openmmpolymer.viscoelastic import (
 from .helpers import (
     BuildReached,
     as_blend,
+    descending_quench,
+    log_linear_transitions,
     snapshot_files,
-    transition_at,
     two_line_curve,
     write_crystal,
     write_deformation,
@@ -744,23 +746,11 @@ def test_a_dry_run_builds_packs_and_stops(
 
 def _write_tg_scan(directory: Path, rates: tuple[float, ...] = (1.0,)) -> None:
     """A coarse pass and one fine pass per rate, with exact planted transitions."""
-    temperature, density = two_line_curve(transition_k=400.0, n_points=11)
-    stages: dict[str, Any] = {
-        "06_coarse": {
-            "temperature_k": list(temperature[::-1]),
-            "density_g_cm3": list(density[::-1]),
-            "segment_duration_ps": [200.0] * 11,
-        }
-    }
+    stages: dict[str, Any] = {"06_coarse": descending_quench(400.0, 200.0, n_points=11)}
     for rate in rates:
-        temperature, density = two_line_curve(
-            transition_k=340.0 + 20.0 * np.log10(rate)
+        stages[f"08_fine_{rate:g}"] = descending_quench(
+            340.0 + 20.0 * np.log10(rate), 20_000.0 / rate
         )
-        stages[f"08_fine_{rate:g}"] = {
-            "temperature_k": list(temperature[::-1]),
-            "density_g_cm3": list(density[::-1]),
-            "segment_duration_ps": [20_000.0 / rate] * 21,
-        }
     write_quenches(directory, stages)
 
 
@@ -807,10 +797,7 @@ def test_a_tg_run_at_several_rates_reports_each_and_then_the_fit(
 
     def series(run: Any, run_dir: Any, **kwargs: Any) -> Any:
         _write_tg_scan(run_dir, tuple(kwargs["rates_k_per_ns"]))
-        return tuple(
-            transition_at(rate, 340.0 + 20.0 * np.log10(rate))
-            for rate in kwargs["rates_k_per_ns"]
-        )
+        return tuple(log_linear_transitions(kwargs["rates_k_per_ns"]))
 
     monkeypatch.setattr(cli, "cooling_rate_series", series)
     assert main(_argv("tg", "--cooling-rates", "100,10,1", "--rate-form", "vft")) == 0
@@ -932,9 +919,7 @@ def test_a_finished_scan_writes_its_analysis_and_requested_figures(
         _write_tg_scan(output, rates or (1.0,))
         if rates is not None:
             assert tuple(options["rates_k_per_ns"]) == rates
-            return tuple(
-                transition_at(rate, 340.0 + 20.0 * np.log10(rate)) for rate in rates
-            )
+            return tuple(log_linear_transitions(rates))
         return SimpleNamespace(
             temperature_k=340.0,
             resolved=True,
@@ -1048,7 +1033,7 @@ def test_melting_cli_dispatches_the_prepared_cell_and_explicit_schedule(
         assert actual is report
         assert output_dir is None
         assert kwargs["figures"] is False
-        return SimpleNamespace(json="output/analysis/tm.json", figures=())
+        return ReportFiles(json="output/analysis/tm.json", figures=())
 
     monkeypatch.setattr(cli, "run_tm_scan", scan)
     monkeypatch.setattr(cli, "write_melting_report", write)
@@ -1101,7 +1086,7 @@ def test_analyse_dispatches_melting_and_reports_unresolved_results(
         assert actual is report
         assert output == str(tmp_path / "reports")
         assert kwargs["figures"] is False
-        return SimpleNamespace(json=tmp_path / "reports/tm.json", figures=())
+        return ReportFiles(json=str(tmp_path / "reports/tm.json"), figures=())
 
     monkeypatch.setattr(cli, "analyse_melting", analyse)
     monkeypatch.setattr(cli, "write_melting_report", write)
@@ -1142,21 +1127,11 @@ def test_the_rate_form_leaves_every_extrapolation_in_an_analysis(
     form: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """--rate-form picks the one a --cooling-rates run headlines, nothing more."""
-    coarse_t, coarse_d = two_line_curve(transition_k=340.0, n_points=11)
     stages: dict[str, Any] = {
-        "06_coarse": {
-            "temperature_k": list(coarse_t[::-1]),
-            "density_g_cm3": list(coarse_d[::-1]),
-            "segment_duration_ps": [1000.0] * 11,
-        }
+        "06_coarse": descending_quench(340.0, 1000.0, n_points=11)
     }
     for transition_k, hold_ps in ((360.0, 1000.0), (340.0, 4000.0), (320.0, 16000.0)):
-        temperature, density = two_line_curve(transition_k=transition_k)
-        stages[f"08_fine_{hold_ps:.0f}"] = {
-            "temperature_k": list(temperature[::-1]),
-            "density_g_cm3": list(density[::-1]),
-            "segment_duration_ps": [hold_ps] * 21,
-        }
+        stages[f"08_fine_{hold_ps:.0f}"] = descending_quench(transition_k, hold_ps)
     write_quenches(tmp_path, stages)
     argv = ["--analyse", str(tmp_path), "--no-melt-check", "--no-figures"]
     assert main([*argv, "--rate-form", form]) == 0
@@ -1482,7 +1457,7 @@ def test_finite_consistency_gaps_are_shared_by_console_figure_and_log(
     from dataclasses import replace
 
     from openmmpolymer._cli_reports import _consistency_line
-    from openmmpolymer.mechanical import _log_result, analyse_mechanics, deform_schedule
+    from openmmpolymer.mechanical import _log_result, analyse_mechanics
     from openmmpolymer.plots import _moduli_title
 
     write_deformation(tmp_path)
@@ -1491,8 +1466,8 @@ def test_finite_consistency_gaps_are_shared_by_console_figure_and_log(
     assert check.gaps == (("G", 0.1),)
     report = replace(report, consistency=check)
     with caplog.at_level(logging.INFO, logger="openmmpolymer.mechanical"):
-        _log_result(report, deform_schedule(ModulusSpec()))
-    assert "gaps G 10%" in caplog.text
+        _log_result(report)
+    assert "measured differ by G 10%" in caplog.text
     assert "nan%" not in caplog.text
     assert "G 10%" in _consistency_line(check)
     assert "G 10%" in _moduli_title(report)

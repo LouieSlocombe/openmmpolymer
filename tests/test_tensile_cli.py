@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from openmmpolymer import __main__ as cli
+from openmmpolymer._files import ReportFiles
 from openmmpolymer.tensile import BreakingSpec, ElongationSpec, YieldSpec
 
 from .helpers import forbidden
@@ -155,7 +156,7 @@ def test_analyse_detects_a_tensile_scan_and_writes_its_report(
         result: Any, output_dir: Any, *, figures: bool, figure_format: str
     ) -> Any:
         written.append((result, output_dir, figures, figure_format))
-        return SimpleNamespace(json=f"reports/{name}.json", figures=())
+        return ReportFiles(json=f"reports/{name}.json", figures=())
 
     unexpected_mechanics = forbidden(
         "a finite tensile ladder was dispatched to the modulus report"
@@ -194,7 +195,7 @@ def test_the_scan_settles_the_melt_and_writes_into_its_analysis_directory(
 
     def write(result: Any, directory: Any, *, figures: bool, figure_format: str) -> Any:
         calls.append((result, directory, figures, figure_format))
-        return SimpleNamespace(json=f"tensile/analysis/{name}.json", figures=("a.svg",))
+        return ReportFiles(json=f"tensile/analysis/{name}.json", figures=("a.svg",))
 
     monkeypatch.setattr(cli, f"run_{name}_scan", run_scan)
     monkeypatch.setattr(cli, f"write_{name}_report", write)

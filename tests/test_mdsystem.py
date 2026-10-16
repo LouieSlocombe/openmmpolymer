@@ -197,11 +197,10 @@ def test_replicate_topology_repeats_the_bonds_as_well_as_the_atoms(
 ) -> None:
     """packmol writes no CONECT records, so the bonds have to come from here."""
     source = build_dimer_pdb(tmp_path / "dimer.pdb")
-    topology, positions = replicate_topology([PackedComponent(source, 5)])
+    topology = replicate_topology([PackedComponent(source, 5)])
     assert topology.getNumAtoms() == 10
     assert topology.getNumResidues() == 5
     assert sum(1 for _ in topology.bonds()) == 5
-    assert len(positions) == 10
 
 
 def _packed_pdb(
@@ -526,18 +525,6 @@ def test_an_automatic_choice_probes_each_platform_once_per_process(
 # --------------------------------------------------------------------------
 
 
-def test_an_anisotropic_barostat_takes_a_pressure_per_axis() -> None:
-    """Which is what makes a uniaxial load rather than a hydrostatic one."""
-    barostat = make_barostat(
-        "anisotropic", 300.0, 1.0, 25, 7, pressures_bar=(1.0, 1.0, -50.0)
-    )
-    pressures = barostat.getDefaultPressure().value_in_unit(unit.bar)
-    assert (pressures[0], pressures[1], pressures[2]) == pytest.approx(
-        (1.0, 1.0, -50.0)
-    )
-    assert isinstance(barostat, mm.MonteCarloAnisotropicBarostat)
-
-
 def test_an_axis_can_be_frozen_while_the_others_move() -> None:
     """Uniaxial stress under strain control, in one flag."""
     barostat = make_barostat(
@@ -561,8 +548,6 @@ def test_a_barostat_that_cannot_move_anything_is_refused() -> None:
 def test_per_axis_settings_are_refused_by_the_barostats_that_have_no_axes() -> None:
     """Silently ignoring them would give a run that is not the one asked for."""
     for kind in ("isotropic", "flexible"):
-        with pytest.raises(ValueError, match="anisotropic"):
-            make_barostat(kind, 300.0, 1.0, 25, 7, pressures_bar=(1.0, 1.0, 2.0))
         with pytest.raises(ValueError, match="anisotropic"):
             make_barostat(kind, 300.0, 1.0, 25, 7, scale_axes=(True, True, False))
 

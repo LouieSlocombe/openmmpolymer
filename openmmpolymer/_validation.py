@@ -5,10 +5,8 @@ these first, so a typo or a negative temperature fails at the call site rather
 than a hundred picoseconds into a run.
 
 Public signatures in this package take plain floats with the unit in the name
-(``temperature_k``, ``duration_ps``). Given an *expected_unit*, the numeric
-helpers also convert an ``openmm.unit.Quantity`` into it. Every caller in the
-package passes None, which takes a bare number only, so a quantity handed to a
-public function is refused rather than read in the wrong unit.
+(``temperature_k``, ``duration_ps``), so an ``openmm.unit.Quantity`` is refused
+rather than read in the wrong unit.
 """
 
 from __future__ import annotations
@@ -18,90 +16,72 @@ from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 
-def _as_float(value: object, expected_unit: Any, *, name: str) -> float:
-    """Convert a quantity or a bare number to a scalar in *expected_unit*.
+def _as_float(value: object, *, name: str) -> float:
+    """Convert a bare number to a float.
 
     Args:
-        value: An ``openmm.unit.Quantity`` or anything ``float()`` accepts.
-        expected_unit: The unit a quantity is converted into. Ignored for a
-            bare number, which is taken to already be in that unit. None
-            accepts a bare number only.
+        value: Anything ``float()`` accepts. An ``openmm.unit.Quantity`` is
+            not: it is refused rather than read in the wrong unit.
         name: Parameter name, used in the error message.
 
     Returns:
-        The value as a float in *expected_unit*.
+        The value as a float.
 
     Raises:
-        TypeError: The value is neither a compatible quantity nor a number.
+        TypeError: The value is not a number.
     """
-    # Imported lazily so this module stays usable in the pure-arithmetic tests
-    # that do not want an OpenMM import.
-    from openmm import unit
-
     try:
-        if unit.is_quantity(value):
-            return float(cast(Any, value).value_in_unit(expected_unit))
         return float(cast(Any, value))
     except (AttributeError, TypeError, ValueError) as error:
-        if expected_unit is None:
-            raise TypeError(
-                f"{name}={value!r} is not a number. Pass a plain number, in the "
-                "unit the name gives."
-            ) from error
         raise TypeError(
-            f"{name}={value!r} is not a number or a quantity in "
-            f"{expected_unit}. Pass a plain float in {expected_unit}, or an "
-            "openmm.unit.Quantity that converts to it."
+            f"{name}={value!r} is not a number. Pass a plain number, in the "
+            "unit the name gives."
         ) from error
 
 
-def require_finite(value: object, expected_unit: Any, *, name: str) -> float:
+def require_finite(value: object, *, name: str) -> float:
     """Return *value* as a float, rejecting NaN and infinity.
 
     Args:
-        value: An ``openmm.unit.Quantity`` or a bare number.
-        expected_unit: The unit the result is expressed in, or None to accept
-            a bare number only.
+        value: A bare number, in the unit the parameter name gives.
         name: Parameter name, used in the error message.
 
     Returns:
         The finite value as a float.
 
     Raises:
-        TypeError: The value is neither a compatible quantity nor a number.
+        TypeError: The value is not a number.
         ValueError: The value is NaN or infinite.
     """
-    number = _as_float(value, expected_unit, name=name)
+    number = _as_float(value, name=name)
     if not math.isfinite(number):
         raise ValueError(f"{name}={value!r} must be finite.")
     return number
 
 
-def require_positive(value: object, expected_unit: Any, *, name: str) -> float:
+def require_positive(value: object, *, name: str) -> float:
     """Return *value* as a strictly positive float.
 
     Args:
-        value: An ``openmm.unit.Quantity`` or a bare number.
-        expected_unit: The unit the result is expressed in, or None to accept
-            a bare number only.
+        value: A bare number, in the unit the parameter name gives.
         name: Parameter name, used in the error message.
 
     Returns:
         The positive value as a float.
 
     Raises:
-        TypeError: The value is neither a compatible quantity nor a number.
+        TypeError: The value is not a number.
         ValueError: The value is not strictly positive, NaN or infinite.
     """
-    number = require_finite(value, expected_unit, name=name)
+    number = require_finite(value, name=name)
     if number <= 0.0:
         raise ValueError(f"{name}={value!r} must be greater than zero.")
     return number
 
 
-def require_nonnegative(value: object, expected_unit: Any, *, name: str) -> float:
+def require_nonnegative(value: object, *, name: str) -> float:
     """Return a finite float at least zero, retaining zero where it is meaningful."""
-    number = _as_float(value, expected_unit, name=name)
+    number = _as_float(value, name=name)
     if not math.isfinite(number) or number < 0.0:
         raise ValueError(
             f"{name}={value!r} must be nonnegative (finite and zero or more)."
@@ -111,7 +91,6 @@ def require_nonnegative(value: object, expected_unit: Any, *, name: str) -> floa
 
 def require_in_range(
     value: object,
-    expected_unit: Any,
     *,
     name: str,
     minimum: float | None = None,
@@ -120,7 +99,7 @@ def require_in_range(
     include_maximum: bool = True,
 ) -> float:
     """Return a finite float within the requested open or closed bounds."""
-    number = require_finite(value, expected_unit, name=name)
+    number = require_finite(value, name=name)
     below = minimum is not None and (
         number < minimum if include_minimum else number <= minimum
     )

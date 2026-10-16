@@ -139,7 +139,7 @@ def box_edge_nm(
     Raises:
         ValueError: The density is not positive, or there is nothing to pack.
     """
-    require_positive(density_g_cm3, None, name="density_g_cm3")
+    require_positive(density_g_cm3, name="density_g_cm3")
     total_mass = sum(
         count * mass for count, mass in zip(counts, molar_masses_g_mol, strict=True)
     )
@@ -290,10 +290,10 @@ def pack_box(
         PackmolError: packmol is missing, failed, or did not converge.
         ValueError: The tolerance or a box edge is not positive.
     """
-    require_positive(tolerance_nm, None, name="tolerance_nm")
+    require_positive(tolerance_nm, name="tolerance_nm")
     edges = (box_nm, box_nm, box_nm) if isinstance(box_nm, int | float) else box_nm
     for edge in edges:
-        require_positive(edge, None, name="box_nm")
+        require_positive(edge, name="box_nm")
     inset = tolerance_nm / 2.0
 
     destination = Path(output_pdb)

@@ -22,6 +22,7 @@ from ._fitting import finite_or_none
 from ._validation import require_in_range, require_integer, require_positive
 from ._workflow import optional
 from .conformation import (
+    ConformationSeries,
     centre_of_mass_msd,
     chain_conformation,
     end_to_end_relaxation,
@@ -41,6 +42,7 @@ from .correlations import (
     StructureFactor,
     _pair_limit,
     _reciprocal_floor,
+    masked_argmax,
     peak_bins,
     radial_distribution,
     structure_factor,
@@ -165,11 +167,7 @@ _PARAMETERS = {
 
 def _block(ensemble: Ensemble, start: int, stop: int) -> Ensemble:
     """Frames *start* to *stop* of *ensemble*, as an ensemble of their own."""
-    return replace(
-        ensemble,
-        n_frames=stop - start,
-        first_frame=ensemble.first_frame + start,
-    )
+    return ensemble.window(start, stop)
 
 
 def _curve(**columns: Any) -> dict[str, tuple[float, ...]]:
@@ -212,12 +210,14 @@ def _measure(
     q_bins: int,
     heavy_atoms_only: bool,
     max_lag_fraction: float,
+    conformation: ConformationSeries | None = None,
 ) -> tuple[StructuralWindow, StructureFactor | None]:
     """Measure every parameter over one interval, noting what could not be.
 
     The structure factor's peak is left for the caller, which picks it from
     the bins every interval can resolve; the factor itself is returned for
-    that.
+    that. A *conformation* already measured over exactly this interval is
+    used instead of measuring it again.
     """
     values: dict[str, float | None] = {name: None for name in _PARAMETERS}
     valid = {name: False for name in _PARAMETERS}
@@ -225,31 +225,38 @@ def _measure(
     curves: dict[str, dict[str, tuple[float, ...]]] = {}
     notes: list[str] = []
 
+    def record(name: str, value: float | None, count: int) -> None:
+        """Keep a parameter's value, whether it counts, and what it was read from."""
+        values[name], valid[name] = value, value is not None and value > 0
+        counts[name] = count
+
     if backbone is not None:
-        conformation = optional(
-            lambda: chain_conformation(ensemble, backbone, stride=stride),
-            notes,
-            "chain dimensions",
-        )
+        if conformation is None:
+            conformation = optional(
+                lambda: chain_conformation(ensemble, backbone, stride=stride),
+                notes,
+                "chain dimensions",
+            )
         if conformation is not None:
             for name in ("characteristic_ratio", "ratio_of_squares"):
-                value = finite_or_none(getattr(conformation.mean, name))
-                values[name], valid[name] = value, value is not None and value > 0
-                counts[name] = conformation.n_frames
+                record(
+                    name,
+                    finite_or_none(getattr(conformation.mean, name)),
+                    conformation.n_frames,
+                )
         persistence = optional(
             lambda: persistence_length(ensemble, backbone, stride=stride),
             notes,
             "persistence length",
         )
         if persistence is not None:
-            name = "persistence_length_nm"
-            value = (
+            record(
+                "persistence_length_nm",
                 finite_or_none(persistence.persistence_length_nm)
                 if persistence.decayed
-                else None
+                else None,
+                len(range(0, ensemble.n_frames, stride)),
             )
-            values[name], valid[name] = value, value is not None and value > 0
-            counts[name] = len(range(0, ensemble.n_frames, stride))
             curves["bond_correlation"] = _curve(
                 separation_bonds=persistence.separation,
                 correlation=persistence.correlation,
@@ -267,14 +274,13 @@ def _measure(
             "end-to-end relaxation",
         )
         if relaxation is not None:
-            name = "end_to_end_relaxation_time_ps"
-            value = (
+            record(
+                "end_to_end_relaxation_time_ps",
                 finite_or_none(relaxation.relaxation_time_ps)
                 if relaxation.decorrelated
-                else None
+                else None,
+                relaxation.n_origins,
             )
-            values[name], valid[name] = value, value is not None and value > 0
-            counts[name] = relaxation.n_origins
             curves["end_to_end_correlation"] = _curve(
                 lag_ps=relaxation.lag_ps, correlation=relaxation.correlation
             )
@@ -296,14 +302,13 @@ def _measure(
         "COM diffusion",
     )
     if displacement is not None:
-        name = "diffusion_coefficient_cm2_s"
-        value = (
+        record(
+            "diffusion_coefficient_cm2_s",
             finite_or_none(displacement.diffusion_coefficient_cm2_s)
             if displacement.diffusive
-            else None
+            else None,
+            displacement.n_origins,
         )
-        values[name], valid[name] = value, value is not None and value > 0
-        counts[name] = displacement.n_origins
         curves["centre_of_mass_msd"] = _curve(
             lag_ps=displacement.lag_ps, msd_nm2=displacement.msd_nm2
         )
@@ -469,8 +474,13 @@ def structural_window_convergence(
     heavy_atoms_only: bool = True,
     max_lag_fraction: float = 0.5,
     min_vectors_per_bin: int = MIN_WAVEVECTORS_PER_BIN,
+    conformation: ConformationSeries | None = None,
 ) -> StructuralWindowConvergence:
     """Refit trajectory prefixes using fixed bins, lags policy and sampling.
+
+    *conformation* is the chain-conformation series of the whole trajectory
+    at this *stride*, when the caller has already measured it; the
+    full-length prefix reuses it rather than measuring the trajectory twice.
 
     Pair/S(q) strides are chosen once from the entire trajectory. Their
     default caps match ordinary structural reports (50/8 frames), which
@@ -496,18 +506,15 @@ def structural_window_convergence(
             fit.
     """
     fractions = require_fractions(window_fractions)
-    relative_tolerance = require_positive(
-        relative_tolerance, None, name="relative_tolerance"
-    )
+    relative_tolerance = require_positive(relative_tolerance, name="relative_tolerance")
     min_frames = require_integer(min_frames, minimum=3, name="min_frames")
     stride = require_integer(stride, name="stride")
     require_integer(rdf_bins, name="rdf_bins")
     require_integer(q_bins, name="q_bins")
     require_integer(min_vectors_per_bin, name="min_vectors_per_bin")
-    require_positive(q_max_per_nm, None, name="q_max_per_nm")
+    require_positive(q_max_per_nm, name="q_max_per_nm")
     require_in_range(
         max_lag_fraction,
-        None,
         name="max_lag_fraction",
         minimum=0.0,
         maximum=0.5,
@@ -546,16 +553,19 @@ def structural_window_convergence(
         heavy_atoms_only=heavy_atoms_only,
         max_lag_fraction=max_lag_fraction,
     )
-    measured = [
-        _measure(
-            replace(ensemble, n_frames=max(1, int(ensemble.n_frames * fraction))),
-            path,
-            fraction=fraction,
-            first_frame=0,
-            **options,
+    measured = []
+    for fraction in fractions:
+        n_frames = max(1, int(ensemble.n_frames * fraction))
+        measured.append(
+            _measure(
+                ensemble.window(0, n_frames),
+                path,
+                fraction=fraction,
+                first_frame=0,
+                conformation=conformation if n_frames == ensemble.n_frames else None,
+                **options,
+            )
         )
-        for fraction in fractions
-    ]
     boundaries = np.linspace(ensemble.n_frames // 2, ensemble.n_frames, 4, dtype=int)
     blocks = [
         _measure(
@@ -585,22 +595,22 @@ def structural_window_convergence(
                 min_vectors_per_bin,
             )
     updated = []
-    for window, factor in all_measured:
+    for measured_window, factor in all_measured:
         if factor is not None and mask.any():
-            index = int(np.argmax(np.where(mask, factor.s_q, -np.inf)))
-            values, valid = dict(window.values), dict(window.valid)
+            index = masked_argmax(factor.s_q, mask)
+            values, valid = dict(measured_window.values), dict(measured_window.valid)
             for name, value in (
                 ("structure_factor_peak_per_nm", factor.q_per_nm[index]),
                 ("structure_factor_peak_height", factor.s_q[index]),
             ):
                 values[name] = finite_or_none(float(value))
                 valid[name] = values[name] is not None and float(value) > 0
-            window = replace(window, values=values, valid=valid)
+            window = replace(measured_window, values=values, valid=valid)
         else:
             window = replace(
-                window,
+                measured_window,
                 notes=(
-                    *window.notes,
+                    *measured_window.notes,
                     "No common adequately populated S(q) peak bins across all windows.",
                 ),
             )

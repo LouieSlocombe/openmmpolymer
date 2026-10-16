@@ -24,7 +24,6 @@ import numpy as np
 import pytest
 
 from openmmpolymer._fitting import standard_error_from_moments
-from openmmpolymer.elasticity import MPA_PER_BAR
 from openmmpolymer.relaxation import (
     KWW_BETA_BRACKET,
     MAX_EDGE_WEIGHT,
@@ -150,7 +149,7 @@ def test_the_baseline_is_subtracted_once_and_only_once(tmp_path: Path) -> None:
     expected = 500.0 * np.exp(-((curve.time_ps / 100.0) ** 0.5))
     assert np.allclose(curve.modulus_mpa, expected, rtol=0.0, atol=1e-9)
     measure = 2.0 * deviatoric_strain(0.03, 0.5)
-    assert curve.baseline_mpa == pytest.approx(250.0 * MPA_PER_BAR / measure)
+    assert curve.baseline_mpa == pytest.approx(250.0 * 0.1 / measure)
 
 
 def test_two_different_strains_are_not_read_as_one_curve(tmp_path: Path) -> None:

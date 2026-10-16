@@ -18,7 +18,7 @@ import numpy.typing as npt
 
 from ._files import ReportFiles, analysis_directory, figure_stem, write_report
 from ._validation import require_integer
-from ._workflow import optional
+from ._workflow import optional, report_header
 from .conformation import chain_conformation
 from .convergence import (
     DEFAULT_MIN_SAMPLES,
@@ -152,11 +152,10 @@ def analyse_convergence(
 
     def read_structure() -> StructuralWindowConvergence:
         ensemble = open_stage(files)
-        path, _, _ = resolve_backbone(
-            directory, manifest, ensemble, backbone, True, notes
-        )
+        path, _, _ = resolve_backbone(manifest, ensemble, backbone, True, notes)
         if ensemble.is_snapshot:
             notes.append(SNAPSHOT_REFUSAL)
+        series = None
         if path is not None:
             series = chain_conformation(ensemble, path, stride=stride)
             measure(
@@ -177,6 +176,7 @@ def analyse_convergence(
             window_fractions=fractions,
             relative_tolerance=relative_tolerance,
             stride=stride,
+            conformation=series,
         )
 
     structural = optional(read_structure, notes, "Structural convergence unavailable")
@@ -249,7 +249,7 @@ def write_convergence_report(
         ValueError: *figure_format* is not a plain filename extension.
     """
     directory = analysis_directory(report.run_dir, output_dir)
-    record = asdict(report)
+    record = {**report_header(report.run_dir), **asdict(report)}
     record["interpretation"] = (
         "Window stability is conditional on recorded observables and sampled times. "
         "Overlapping prefixes are not independent replicas; stationary traces also "

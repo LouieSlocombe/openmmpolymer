@@ -19,13 +19,13 @@ import itertools
 import logging
 import math
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import AbstractContextManager, ExitStack
 from copy import copy
 from dataclasses import dataclass, field, replace
 from functools import cached_property, partial
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import numpy as np
 import numpy.typing as npt
@@ -639,9 +639,9 @@ class Segment:
 
     def __post_init__(self) -> None:
         """Reject invalid holds before either budget estimation or execution."""
-        require_positive(self.temperature_k, None, name="temperature_k")
-        require_positive(self.duration_ps, None, name="duration_ps")
-        require_finite(self.pressure_bar, None, name="pressure_bar")
+        require_positive(self.temperature_k, name="temperature_k")
+        require_positive(self.duration_ps, name="duration_ps")
+        require_finite(self.pressure_bar, name="pressure_bar")
 
 
 #: Readings taken per segment unless a stage asks for more.
@@ -1037,9 +1037,23 @@ def _timestep_fs(
     """
     if timestep_fs is None:
         timestep_fs = safe_timestep_fs(temperature_k, spec)
-    require_positive(timestep_fs, None, name="timestep_fs")
+    require_positive(timestep_fs, name="timestep_fs")
     check_timestep(timestep_fs, temperature_k, spec)
     return timestep_fs
+
+
+def _pushoff_segments(
+    temperature_k: float, duration_ps: float, timesteps_fs: Sequence[float]
+) -> list[Segment]:
+    """One hold per timestep on the ladder, sharing *duration_ps* equally."""
+    require_positive(duration_ps, name="duration_ps")
+    if not timesteps_fs:
+        raise ValueError("timesteps_fs is empty, so there is no ladder to climb.")
+    share = duration_ps / len(timesteps_fs)
+    return [
+        Segment(temperature_k, share, label=f"{timestep:g} fs")
+        for timestep in timesteps_fs
+    ]
 
 
 def run_pushoff(
@@ -1073,19 +1087,20 @@ def run_pushoff(
     Returns:
         What the stage did.
     """
-    require_positive(duration_ps, None, name="duration_ps")
+    segments = _pushoff_segments(temperature_k, duration_ps, timesteps_fs)
     prefix = Path(output_prefix)
     started = time.monotonic()
     state: str | Path | None = state_in
     steps = 0
     results: list[StageResult] = []
-    share = duration_ps / len(timesteps_fs)
 
-    for index, timestep in enumerate(timesteps_fs):
+    for index, (timestep, segment) in enumerate(
+        zip(timesteps_fs, segments, strict=True)
+    ):
         result = run_segments(
             run,
             f"{prefix.name}[{timestep:g} fs]",
-            [Segment(temperature_k, share, label=f"{timestep:g} fs")],
+            [segment],
             prefix.with_name(f"{prefix.name}_{index}"),
             barostat=None,
             timestep_fs=timestep,
@@ -1104,6 +1119,18 @@ def run_pushoff(
         wall_seconds=time.monotonic() - started,
         temperature_k=temperature_k,
         samples={"timestep_fs": list(timesteps_fs)},
+    )
+
+
+def _segment_stage(
+    run: RunContext,
+    output_prefix: str | Path,
+    segments: Sequence[Segment],
+    **kwargs: Any,
+) -> StageResult:
+    """Run *segments* as the stage *output_prefix* names, forwarding *kwargs*."""
+    return run_segments(
+        run, Path(output_prefix).name, segments, output_prefix, **kwargs
     )
 
 
@@ -1131,11 +1158,10 @@ def run_nvt(
     Returns:
         What the stage did.
     """
-    return run_segments(
+    return _segment_stage(
         run,
-        Path(output_prefix).name,
-        [Segment(temperature_k, duration_ps)],
         output_prefix,
+        [Segment(temperature_k, duration_ps)],
         barostat=None,
         **kwargs,
     )
@@ -1165,11 +1191,10 @@ def run_npt(
     Returns:
         What the stage did.
     """
-    return run_segments(
+    return _segment_stage(
         run,
-        Path(output_prefix).name,
-        [Segment(temperature_k, duration_ps, pressure_bar)],
         output_prefix,
+        [Segment(temperature_k, duration_ps, pressure_bar)],
         barostat=barostat,
         **kwargs,
     )
@@ -1233,14 +1258,7 @@ def run_compress(
         pressures_bar=pressures_bar,
         duration_ps_each=duration_ps_each,
     )
-    result = run_segments(
-        run,
-        Path(output_prefix).name,
-        segments,
-        output_prefix,
-        barostat=barostat,
-        **kwargs,
-    )
+    result = _segment_stage(run, output_prefix, segments, barostat=barostat, **kwargs)
     result.samples["segment_pressure_bar"] = list(pressures_bar)
     return result
 
@@ -1329,14 +1347,7 @@ def run_anneal(
         hold_ps=hold_ps,
         pressure_bar=pressure_bar,
     )
-    return run_segments(
-        run,
-        Path(output_prefix).name,
-        segments,
-        output_prefix,
-        barostat=barostat,
-        **kwargs,
-    )
+    return _segment_stage(run, output_prefix, segments, barostat=barostat, **kwargs)
 
 
 def quench_temperatures(t_start: float, t_end: float, step_k: float) -> list[float]:
@@ -1362,9 +1373,9 @@ def quench_temperatures(t_start: float, t_end: float, step_k: float) -> list[flo
         ValueError: Endpoints are not finite, the step is not finite and
             positive, the ramp does not descend, or the step cannot advance it.
     """
-    t_start = require_finite(t_start, None, name="t_start")
-    t_end = require_finite(t_end, None, name="t_end")
-    step_k = require_positive(step_k, None, name="step_k")
+    t_start = require_finite(t_start, name="t_start")
+    t_end = require_finite(t_end, name="t_end")
+    step_k = require_positive(step_k, name="step_k")
     if t_end >= t_start:
         raise ValueError(
             f"t_end={t_end} must be below t_start={t_start}: a quench cools."
@@ -1389,7 +1400,7 @@ def _temperature_ladder(
 ) -> list[float]:
     """Validate an explicit thermal ladder, including a one-window chunk."""
     ladder = [
-        require_positive(value, None, name="temperatures_k") for value in temperatures_k
+        require_positive(value, name="temperatures_k") for value in temperatures_k
     ]
     if not ladder:
         raise ValueError("temperatures_k is empty, so there is nothing to hold.")
@@ -1417,8 +1428,8 @@ def _quench_segments(
     """Build a physical cooling ladder, including explicit resumable chunks."""
     temperatures = (
         quench_temperatures(
-            require_positive(t_start, None, name="t_start"),
-            require_positive(t_end, None, name="t_end"),
+            require_positive(t_start, name="t_start"),
+            require_positive(t_end, name="t_end"),
             step_k,
         )
         if temperatures_k is None
@@ -1484,14 +1495,7 @@ def run_quench(
         pressure_bar=pressure_bar,
         temperatures_k=temperatures_k,
     )
-    return run_segments(
-        run,
-        Path(output_prefix).name,
-        segments,
-        output_prefix,
-        barostat=barostat,
-        **kwargs,
-    )
+    return _segment_stage(run, output_prefix, segments, barostat=barostat, **kwargs)
 
 
 def heating_temperatures(t_start: float, t_end: float, step_k: float) -> list[float]:
@@ -1500,9 +1504,9 @@ def heating_temperatures(t_start: float, t_end: float, step_k: float) -> list[fl
     All arguments must be finite and positive, and ``t_end`` must exceed
     ``t_start``. The final interval may be shorter than ``step_k``.
     """
-    t_start = require_positive(t_start, None, name="t_start")
-    t_end = require_positive(t_end, None, name="t_end")
-    step_k = require_positive(step_k, None, name="step_k")
+    t_start = require_positive(t_start, name="t_start")
+    t_end = require_positive(t_end, name="t_end")
+    step_k = require_positive(step_k, name="step_k")
     if t_end <= t_start:
         raise ValueError(
             f"t_end={t_end} must exceed t_start={t_start}: a heating scan warms."
@@ -1536,8 +1540,8 @@ def _heat_segments(
         if temperatures_k is None
         else _temperature_ladder(temperatures_k, ascending=True)
     )
-    hold_ps = require_positive(hold_ps, None, name="hold_ps")
-    pressure_bar = require_positive(pressure_bar, None, name="pressure_bar")
+    hold_ps = require_positive(hold_ps, name="hold_ps")
+    pressure_bar = require_positive(pressure_bar, name="pressure_bar")
     return [
         Segment(value, hold_ps, pressure_bar, label=f"{value:.0f} K")
         for value in temperatures
@@ -1594,14 +1598,7 @@ def run_heat(
     )
     require_choice(barostat, tuple(BAROSTATS), name="barostat")
     kwargs["measure_enthalpy"] = True
-    return run_segments(
-        run,
-        Path(output_prefix).name,
-        segments,
-        output_prefix,
-        barostat=barostat,
-        **kwargs,
-    )
+    return _segment_stage(run, output_prefix, segments, barostat=barostat, **kwargs)
 
 
 def run_production(
@@ -1628,9 +1625,9 @@ def run_production(
     Returns:
         What the stage did.
     """
-    return run_segments(
+    return _segment_stage(
         run,
-        Path(output_prefix).name,
+        output_prefix,
         [
             Segment(
                 temperature_k,
@@ -1638,7 +1635,6 @@ def run_production(
                 1.0 if pressure_bar is None else pressure_bar,
             )
         ],
-        output_prefix,
         barostat=None if pressure_bar is None else "isotropic",
         trajectory=trajectory,
         **kwargs,
@@ -1744,6 +1740,80 @@ def _reference_box_nm(
     return reference
 
 
+def _deform_duration_ps(n_steps: int, relax_ps: float) -> float:
+    """Validate and price a strain ladder: *n_steps* holds of *relax_ps* each."""
+    return require_integer(n_steps, minimum=1, name="n_steps") * require_positive(
+        relax_ps, name="relax_ps"
+    )
+
+
+def _rungs(values: Sequence[float], *, name: str, verb: str) -> list[float]:
+    """A ladder's rungs as finite floats, refusing an empty ladder."""
+    rungs = [require_finite(value, name=name) for value in values]
+    if not rungs:
+        raise ValueError(f"{name} is empty, so there is nothing to {verb}.")
+    return rungs
+
+
+def _ladder_duration_ps(
+    values: Sequence[float], duration_ps_each: float, *, name: str, verb: str
+) -> float:
+    """Validate and price a ladder: one hold of *duration_ps_each* per rung."""
+    return len(_rungs(values, name=name, verb=verb)) * require_positive(
+        duration_ps_each, name="duration_ps_each"
+    )
+
+
+def _relax_duration_ps(
+    duration_ps: float,
+    baseline_ps: float,
+    ramp_ps: float,
+    time_offset_ps: float,
+    *,
+    strain_applied: bool,
+) -> float:
+    """Validate and price a relaxation: its baseline, ramp and hold.
+
+    A chunk that opens an already-strained cell repeats neither the baseline
+    nor the ramp, so counting them would price a resumed ladder as several
+    first chunks.
+    """
+    duration = require_positive(duration_ps, name="duration_ps")
+    for name, value in (
+        ("baseline_ps", baseline_ps),
+        ("ramp_ps", ramp_ps),
+        ("time_offset_ps", time_offset_ps),
+    ):
+        require_nonnegative(value, name=name)
+    if strain_applied:
+        return duration
+    return float(baseline_ps) + float(ramp_ps) + duration
+
+
+def _box_samples() -> dict[str, list[float]]:
+    """Empty per-axis cell-edge samples, in the order a stage records them."""
+    return {f"segment_box_{name}_nm": [] for name in "xyz"}
+
+
+def _record_box(
+    samples: dict[str, list[float]], edges: npt.NDArray[np.float64]
+) -> None:
+    """Append one set of cell edges to the per-axis samples."""
+    for which, name in enumerate("xyz"):
+        samples[f"segment_box_{name}_nm"].append(float(edges[which]))
+
+
+def _measured_cell(
+    live: _Live, run: RunContext, reference_box_nm: Sequence[float] | None
+) -> tuple[float, npt.NDArray[np.float64]]:
+    """Check the cell is still whole; return its cutoff and the strain origin."""
+    simulation = live.simulation
+    _check_molecules(live.name, simulation, run.box.n_molecules)
+    return nonbonded_cutoff_nm(simulation.system), _reference_box_nm(
+        simulation, reference_box_nm
+    )
+
+
 def run_deform(
     run: RunContext,
     output_prefix: str | Path = "06_deform",
@@ -1837,10 +1907,10 @@ def run_deform(
         ValueError: The axis or the increment is not usable.
     """
     require_axis(axis)
-    require_integer(n_steps, minimum=1, name="n_steps")
+    # Validated by what prices it, so a budget and a run cannot disagree.
+    _deform_duration_ps(n_steps, relax_ps)
     require_integer(samples_per_step, minimum=1, name="samples_per_step")
-    require_positive(relax_ps, None, name="relax_ps")
-    require_positive(abs(strain_increment), None, name="strain_increment")
+    require_positive(abs(strain_increment), name="strain_increment")
 
     scale_flags = [True, True, True]
     scale_flags[axis] = False
@@ -1859,9 +1929,7 @@ def run_deform(
     )
     simulation = live.simulation
 
-    _check_molecules(live.name, simulation, run.box.n_molecules)
-    cutoff_nm = nonbonded_cutoff_nm(simulation.system)
-    reference = _reference_box_nm(simulation, reference_box_nm)
+    cutoff_nm, reference = _measured_cell(live, run, reference_box_nm)
 
     total_steps = live.steps(relax_ps) * n_steps
     samples: dict[str, list[float]] = {
@@ -1870,9 +1938,7 @@ def run_deform(
         "segment_stress_xx_bar": [],
         "segment_stress_yy_bar": [],
         "segment_stress_zz_bar": [],
-        "segment_box_x_nm": [],
-        "segment_box_y_nm": [],
-        "segment_box_z_nm": [],
+        **_box_samples(),
     }
     waypoint_paths: list[str] = []
     log.info(
@@ -1922,7 +1988,7 @@ def run_deform(
                 samples[f"segment_stress_{name}{name}_bar"].append(
                     float(stress[which, which])
                 )
-                samples[f"segment_box_{name}_nm"].append(float(edges[which]))
+            _record_box(samples, edges)
             if waypoints:
                 waypoint_paths.append(
                     _save_waypoint(simulation, live.prefix, index, temperature_k)
@@ -2145,11 +2211,9 @@ def run_load(
         ValueError: The axis is not 0, 1 or 2, or no stresses were given.
     """
     require_axis(axis)
-    rungs = [require_finite(value, None, name="stresses_bar") for value in stresses_bar]
-    if not rungs:
-        raise ValueError("stresses_bar is empty, so there is nothing to pull with.")
+    rungs = _rungs(stresses_bar, name="stresses_bar", verb="pull with")
     require_integer(samples_per_step, minimum=1, name="samples_per_step")
-    require_positive(duration_ps_each, None, name="duration_ps_each")
+    require_positive(duration_ps_each, name="duration_ps_each")
 
     live = _open(
         run,
@@ -2169,9 +2233,7 @@ def run_load(
     samples: dict[str, list[float]] = {
         "segment_applied_stress_bar": [],
         "lateral_pressure_bar": [pressure_bar],
-        "segment_box_x_nm": [],
-        "segment_box_y_nm": [],
-        "segment_box_z_nm": [],
+        **_box_samples(),
     }
     log.info(
         "%s: %d applied stresses on axis %d, %.1f ps each at %.2f fs (%d steps).",
@@ -2206,8 +2268,7 @@ def run_load(
             # saying it several steps later about a box nobody set.
             _check_deformed_box(live.name, simulation, cutoff_nm, applied)
             samples["segment_applied_stress_bar"].append(applied)
-            for which, name in enumerate("xyz"):
-                samples[f"segment_box_{name}_nm"].append(float(edges[which]))
+            _record_box(samples, edges)
             log.info(
                 "  %g bar: box %s nm, %.4f g/cm3, ran at %.0f K.",
                 applied,
@@ -2276,11 +2337,9 @@ def run_shear(
         ValueError: The plane or the strain ladder is not usable.
     """
     driven, gradient = require_plane(plane)
-    ladder = [require_finite(value, None, name="strains") for value in strains]
-    if not ladder:
-        raise ValueError("strains is empty, so there is nothing to shear.")
+    ladder = _rungs(strains, name="strains", verb="shear")
     require_integer(samples_per_step, minimum=1, name="samples_per_step")
-    require_positive(duration_ps_each, None, name="duration_ps_each")
+    require_positive(duration_ps_each, name="duration_ps_each")
 
     live = _open(
         run,
@@ -2410,7 +2469,7 @@ def relax_bin_edges_ps(
     Raises:
         ValueError: The span is not positive, or *bins_per_decade* is not.
     """
-    require_positive(first_sample_ps, None, name="first_sample_ps")
+    require_positive(first_sample_ps, name="first_sample_ps")
     require_integer(bins_per_decade, minimum=1, name="bins_per_decade")
     if total_ps <= first_sample_ps:
         raise ValueError(
@@ -2584,6 +2643,137 @@ def _check_baseline(name: str, mean_bar: float, error_bar: float, samples: int) 
         )
 
 
+@dataclass
+class _Moments:
+    """A running count, sum and sum of squares of one scalar reading."""
+
+    n: int = 0
+    total: float = 0.0
+    total_sq: float = 0.0
+
+    def add(self, value: float) -> None:
+        """Take one reading."""
+        self.n += 1
+        self.total += value
+        self.total_sq += value * value
+
+    @property
+    def mean(self) -> float:
+        """The mean reading, or zero before the first."""
+        return self.total / self.n if self.n else 0.0
+
+    @property
+    def mean_sq(self) -> float:
+        """The mean square, which merges across chunks where an error does not."""
+        return self.total_sq / self.n if self.n else 0.0
+
+    @property
+    def standard_error(self) -> float:
+        """The standard error of the mean, or zero below two readings."""
+        if self.n < 2:
+            return 0.0
+        return standard_error_from_moments(self.mean, self.mean_sq, self.n)
+
+
+def _apply_step_strain(
+    simulation: Any,
+    *,
+    mode: str,
+    axis: int,
+    plane: tuple[int, int],
+    step_strain: float,
+    poisson: float,
+    ramp_ps: float,
+    sample_every_ps: float,
+    ramp_steps: int,
+) -> int:
+    """Apply a step strain at once, or ramp it in; return the steps run.
+
+    Composed from increments so that a ramp and a step are the same code
+    path. Engineering strain compounds, so a tensile increment is the root of
+    one plus the total; a shear tilt simply adds.
+    """
+    increments = max(1, round(ramp_ps / sample_every_ps)) if ramp_ps > 0 else 1
+    each = (
+        step_strain / increments
+        if mode == "shear"
+        else (1.0 + step_strain) ** (1.0 / increments) - 1.0
+    )
+    per_increment = ramp_steps // increments
+    ran_steps = 0
+    for _ in range(increments):
+        _strain_increment(
+            simulation,
+            mode=mode,
+            axis=axis,
+            plane=plane,
+            increment=each,
+            poisson=poisson,
+        )
+        if per_increment:
+            simulation.step(per_increment)
+            ran_steps += per_increment
+    return ran_steps
+
+
+def _sample_decay(
+    live: _Live,
+    bins: _LogBins,
+    read: Callable[[], tuple[npt.NDArray[np.float64], float]],
+    raw: TextIO | None,
+    *,
+    production_steps: int,
+    elapsed_ps: float,
+    sample_every_ps: float,
+    late_after_ps: float,
+    late_sample_every_ps: float,
+) -> tuple[float, int, list[float]]:
+    """Hold the locked cell for *production_steps*, binning every reading.
+
+    Returns the relaxation clock at the end, the steps run, and the
+    temperatures read along the way - at least one.
+    """
+    simulation = live.simulation
+    temperatures: list[float] = []
+    ran_steps = 0
+    remaining = production_steps
+    since_temperature = 0
+    rows = 0
+    while remaining > 0:
+        cadence = (
+            sample_every_ps if elapsed_ps < late_after_ps else late_sample_every_ps
+        )
+        taken = min(live.steps(cadence), remaining)
+        simulation.step(taken)
+        remaining -= taken
+        ran_steps += taken
+        elapsed_ps += taken * live.timestep_fs / 1000.0
+        diagonal, measure = read()
+        bins.add(elapsed_ps, measure, diagonal)
+        if raw is not None:
+            raw.write(
+                f"{elapsed_ps:.8g},{diagonal[0]:.8g},{diagonal[1]:.8g},"
+                f"{diagonal[2]:.8g},{measure:.8g}\n"
+            )
+            rows += 1
+            if rows % 1000 == 0:
+                # Flushed as it goes: the run this matters for is the one
+                # that gets killed, and a buffer is lost with the process.
+                raw.flush()
+        since_temperature += 1
+        if since_temperature >= 50:
+            temperatures.append(
+                temperature_k_of(simulation, degrees_of_freedom=live.degrees_of_freedom)
+            )
+            since_temperature = 0
+
+    if not temperatures:
+        temperatures.append(
+            temperature_k_of(simulation, degrees_of_freedom=live.degrees_of_freedom)
+        )
+    return elapsed_ps, ran_steps, temperatures
+
+
 def run_relax(
     run: RunContext,
     output_prefix: str | Path = "06_relax",
@@ -2711,16 +2901,13 @@ def run_relax(
     require_choice(mode, RELAX_MODES, name="mode")
     require_axis(axis)
     driven, gradient = require_plane(plane)
-    require_positive(duration_ps, None, name="duration_ps")
-    require_positive(sample_every_ps, None, name="sample_every_ps")
-    require_positive(late_sample_every_ps, None, name="late_sample_every_ps")
-    require_positive(abs(step_strain), None, name="step_strain")
-    for name, value in (
-        ("baseline_ps", baseline_ps),
-        ("ramp_ps", ramp_ps),
-        ("time_offset_ps", time_offset_ps),
-    ):
-        require_nonnegative(value, None, name=name)
+    # Validated by what prices it, so a budget and a run cannot disagree.
+    _relax_duration_ps(
+        duration_ps, baseline_ps, ramp_ps, time_offset_ps, strain_applied=strain_applied
+    )
+    require_positive(sample_every_ps, name="sample_every_ps")
+    require_positive(late_sample_every_ps, name="late_sample_every_ps")
+    require_positive(abs(step_strain), name="step_strain")
     timestep_fs = _timestep_fs(timestep_fs, temperature_k, run.spec)
 
     # A shear step measures G directly: sigma_xz = G gamma. A tensile step
@@ -2749,9 +2936,7 @@ def run_relax(
         barostat_frequency=0,
     )
     simulation = live.simulation
-    _check_molecules(live.name, simulation, run.box.n_molecules)
-    cutoff_nm = nonbonded_cutoff_nm(simulation.system)
-    reference = _reference_box_nm(simulation, reference_box_nm)
+    cutoff_nm, reference = _measured_cell(live, run, reference_box_nm)
 
     # Guarded rather than left to steps_for, which floors at one step: a
     # baseline of zero or an instantaneous strain would otherwise each run a
@@ -2805,10 +2990,7 @@ def run_relax(
         return diagonal, measure
 
     raw_path = live.prefix.parent / f"{live.name}_stress.csv"
-    baseline_n = 0
-    baseline_sum = 0.0
-    baseline_sum_sq = 0.0
-    temperatures: list[float] = []
+    baseline = _Moments()
     elapsed_ps = float(time_offset_ps)
     ran_steps = 0
 
@@ -2830,41 +3012,22 @@ def run_relax(
             remaining -= taken
             ran_steps += taken
             _, measure = read()
-            baseline_n += 1
-            baseline_sum += measure
-            baseline_sum_sq += measure * measure
+            baseline.add(measure)
 
-        baseline_mean = baseline_sum / baseline_n if baseline_n else 0.0
-        baseline_error = 0.0
-        if baseline_n > 1:
-            baseline_error = standard_error_from_moments(
-                baseline_mean, baseline_sum_sq / baseline_n, baseline_n
-            )
-        _check_baseline(live.name, baseline_mean, baseline_error, baseline_n)
+        _check_baseline(live.name, baseline.mean, baseline.standard_error, baseline.n)
 
         if not strain_applied:
-            # Composed from increments so that a ramp and a step are the same
-            # code path. Engineering strain compounds, so a tensile increment
-            # is the root of one plus the total; a shear tilt simply adds.
-            increments = max(1, round(ramp_ps / sample_every_ps)) if ramp_ps > 0 else 1
-            each = (
-                step_strain / increments
-                if mode == "shear"
-                else (1.0 + step_strain) ** (1.0 / increments) - 1.0
+            ran_steps += _apply_step_strain(
+                simulation,
+                mode=mode,
+                axis=axis,
+                plane=plane,
+                step_strain=step_strain,
+                poisson=poisson,
+                ramp_ps=ramp_ps,
+                sample_every_ps=sample_every_ps,
+                ramp_steps=ramp_steps,
             )
-            per_increment = ramp_steps // increments
-            for _ in range(increments):
-                _strain_increment(
-                    simulation,
-                    mode=mode,
-                    axis=axis,
-                    plane=plane,
-                    increment=each,
-                    poisson=poisson,
-                )
-                if per_increment:
-                    simulation.step(per_increment)
-                    ran_steps += per_increment
             _check_deformed_box(live.name, simulation, cutoff_nm, step_strain)
             # The response the moment the strain is complete - for a step,
             # before anything has moved: the affine part of the modulus, and
@@ -2879,43 +3042,18 @@ def run_relax(
         density = _density_g_cm3(simulation, run.total_mass_g_mol)
         locked = _box_lengths_nm(simulation)
 
-        remaining = production_steps
-        since_temperature = 0
-        rows = 0
-        while remaining > 0:
-            cadence = (
-                sample_every_ps if elapsed_ps < late_after_ps else late_sample_every_ps
-            )
-            taken = min(live.steps(cadence), remaining)
-            simulation.step(taken)
-            remaining -= taken
-            ran_steps += taken
-            elapsed_ps += taken * live.timestep_fs / 1000.0
-            diagonal, measure = read()
-            bins.add(elapsed_ps, measure, diagonal)
-            if raw is not None:
-                raw.write(
-                    f"{elapsed_ps:.8g},{diagonal[0]:.8g},{diagonal[1]:.8g},"
-                    f"{diagonal[2]:.8g},{measure:.8g}\n"
-                )
-                rows += 1
-                if rows % 1000 == 0:
-                    # Flushed as it goes: the run this matters for is the one
-                    # that gets killed, and a buffer is lost with the process.
-                    raw.flush()
-            since_temperature += 1
-            if since_temperature >= 50:
-                temperatures.append(
-                    temperature_k_of(
-                        simulation, degrees_of_freedom=live.degrees_of_freedom
-                    )
-                )
-                since_temperature = 0
-
-        if not temperatures:
-            temperatures.append(
-                temperature_k_of(simulation, degrees_of_freedom=live.degrees_of_freedom)
-            )
+        elapsed_ps, held_steps, temperatures = _sample_decay(
+            live,
+            bins,
+            read,
+            raw,
+            production_steps=production_steps,
+            elapsed_ps=elapsed_ps,
+            sample_every_ps=sample_every_ps,
+            late_after_ps=late_after_ps,
+            late_sample_every_ps=late_sample_every_ps,
+        )
+        ran_steps += held_steps
         moved = _box_lengths_nm(simulation)
         if not np.allclose(moved, locked, rtol=0.0, atol=1.0e-9):
             raise SimulationError(
@@ -2949,10 +3087,10 @@ def run_relax(
             samples["relax_poisson"] = [float(poisson)]
         if instant_bar is not None:
             samples["instant_stress_bar"] = [instant_bar]
-        if baseline_n:
-            samples["baseline_stress_bar"] = [baseline_mean]
-            samples["baseline_stress_sq_bar2"] = [baseline_sum_sq / baseline_n]
-            samples["baseline_samples"] = [float(baseline_n)]
+        if baseline.n:
+            samples["baseline_stress_bar"] = [baseline.mean]
+            samples["baseline_stress_sq_bar2"] = [baseline.mean_sq]
+            samples["baseline_samples"] = [float(baseline.n)]
 
         realised = float(np.mean(temperatures))
         log.info(
@@ -2963,8 +3101,8 @@ def run_relax(
             float(edges[-1]),
             realised,
             density,
-            f", baseline {baseline_mean:+.1f} +/- {baseline_error:.1f} bar"
-            if baseline_n
+            f", baseline {baseline.mean:+.1f} +/- {baseline.standard_error:.1f} bar"
+            if baseline.n
             else "",
         )
         return live.finish(
@@ -2975,3 +3113,108 @@ def run_relax(
             mean_temperature_k=realised,
             mean_density_g_cm3=density,
         )
+
+
+# --------------------------------------------------------------------------
+# Pricing a stage before it runs
+# --------------------------------------------------------------------------
+
+
+def _hold_segment(options: dict[str, Any]) -> Segment:
+    """The one hold an nvt, npt or production stage runs, as its runner builds it."""
+    pressure = options.get("pressure_bar")
+    return Segment(
+        options["temperature_k"],
+        options["duration_ps"],
+        1.0 if pressure is None else pressure,
+    )
+
+
+def _total_ps(segments: Iterable[Segment]) -> float:
+    return sum((segment.duration_ps for segment in segments), 0.0)
+
+
+def _pushoff_duration_ps(options: dict[str, Any]) -> float:
+    _pushoff_segments(
+        options["temperature_k"], options["duration_ps"], options["timesteps_fs"]
+    )
+    return float(options["duration_ps"])
+
+
+def _ramp_duration_ps(
+    build: Callable[..., list[Segment]], options: dict[str, Any]
+) -> float:
+    return _total_ps(
+        build(
+            t_start=options["t_start"],
+            t_end=options["t_end"],
+            step_k=options["step_k"],
+            hold_ps=options["hold_ps"],
+            pressure_bar=options["pressure_bar"],
+            temperatures_k=options["temperatures_k"],
+        )
+    )
+
+
+#: How much dynamics each kind of stage asks for, given its filled-in options.
+#: Every entry validates with the very code its runner validates with, so a
+#: budget refuses exactly what a run would refuse, with the same message.
+_STAGE_DURATIONS: dict[str, Callable[[dict[str, Any]], float]] = {
+    "minimise": lambda options: 0.0,
+    "pushoff": _pushoff_duration_ps,
+    "nvt": lambda options: _hold_segment(options).duration_ps,
+    "npt": lambda options: _hold_segment(options).duration_ps,
+    "production": lambda options: _hold_segment(options).duration_ps,
+    "compress": lambda options: _total_ps(
+        _compress_segments(
+            temperature_k=options["temperature_k"],
+            pressures_bar=options["pressures_bar"],
+            duration_ps_each=options["duration_ps_each"],
+        )
+    ),
+    "anneal": lambda options: _total_ps(
+        _anneal_segments(
+            t_low=options["t_low"],
+            t_high=options["t_high"],
+            n_cycles=options["n_cycles"],
+            ramp_windows=options["ramp_windows"],
+            window_ps=options["window_ps"],
+            hold_ps=options["hold_ps"],
+            pressure_bar=options["pressure_bar"],
+        )
+    ),
+    "quench": lambda options: _ramp_duration_ps(_quench_segments, options),
+    "heat": lambda options: _ramp_duration_ps(_heat_segments, options),
+    "deform": lambda options: _deform_duration_ps(
+        options["n_steps"], options["relax_ps"]
+    ),
+    "load": lambda options: _ladder_duration_ps(
+        options["stresses_bar"],
+        options["duration_ps_each"],
+        name="stresses_bar",
+        verb="pull with",
+    ),
+    "shear": lambda options: _ladder_duration_ps(
+        options["strains"], options["duration_ps_each"], name="strains", verb="shear"
+    ),
+    "relax": lambda options: _relax_duration_ps(
+        options["duration_ps"],
+        options["baseline_ps"],
+        options["ramp_ps"],
+        options["time_offset_ps"],
+        strain_applied=options["strain_applied"],
+    ),
+}
+
+
+def stage_duration_ps(kind: str, options: dict[str, Any]) -> float:
+    """How much dynamics a stage of *kind* asks for, from its filled-in options.
+
+    *options* are the stage's options with its runner's defaults filled in, as
+    :func:`openmmpolymer.protocols._stage_options` records them.
+
+    Raises:
+        ValueError: The schedule is one the runner would refuse, with the
+            runner's own message.
+    """
+    return _STAGE_DURATIONS[kind](options)

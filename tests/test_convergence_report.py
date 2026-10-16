@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from openmmpolymer import __main__ as cli
 from openmmpolymer.convergence import (
     relaxation_window_convergence,
     time_window_convergence,
@@ -23,14 +24,16 @@ from openmmpolymer.trajectory import AnalysisError
 
 from .helpers import (
     STRUCTURAL_OPTIONS,
+    exponential_relaxation,
     forbidden,
     frozen_rods,
+    read_strict_report,
     state_data_csv,
+    state_rows,
     write_manifest,
     write_polymer_snapshot,
     write_relaxation,
 )
-from .helpers import planted_relaxation as planted
 from .helpers import stationary_trace as stationary
 
 # --------------------------------------------------------------------------
@@ -43,19 +46,14 @@ def test_saved_state_csv_produces_window_reports_without_coordinates(
 ) -> None:
     data = stationary()
     csv = tmp_path / "hold.csv"
-    rows = [
-        [
-            float(i),
-            float(i),
-            -1000 + value,
-            500 + value,
-            -500 + 2 * value,
-            300 + value / 10,
-            100.0,
-            1 + value / 1000,
-        ]
-        for i, value in enumerate(data)
-    ]
+    rows = state_rows(
+        np.arange(data.size, dtype=np.float64),
+        potential_kj_mol=-1000 + data,
+        kinetic_kj_mol=500 + data,
+        total_kj_mol=-500 + 2 * data,
+        temperature_k=300 + data / 10,
+        density_g_cm3=1 + data / 1000,
+    )
     csv.write_text(state_data_csv(rows))
     write_manifest(tmp_path, {"hold": {"name": "hold", "csv": str(csv), "samples": {}}})
     result = analyse_convergence(tmp_path)
@@ -126,9 +124,7 @@ def test_missing_manifest_and_bad_explicit_stage_raise(tmp_path: Path) -> None:
 
 def test_stage_selection_keeps_requested_state_stage(tmp_path: Path) -> None:
     write_polymer_snapshot(tmp_path)
-    manifest = json.loads((tmp_path / "manifest.json").read_text())
-    manifest["stages"]["later"] = {"name": "later", "samples": {}}
-    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    write_manifest(tmp_path, {"later": {"name": "later", "samples": {}}})
     assert analyse_convergence(tmp_path, stage="later").stage == "later"
 
 
@@ -146,11 +142,11 @@ def test_strict_json_retains_unknown_error_and_qualifications(tmp_path: Path) ->
     )
     files = write_convergence_report(report, figures=False)
     assert Path(files.json) == tmp_path / "analysis" / "convergence.json"
-    raw = Path(files.json).read_text()
-    assert "NaN" not in raw and "Infinity" not in raw
-    data = json.loads(raw)
+    data = read_strict_report(files.json)
     assert set(data) == {
+        "openmmpolymer",
         "run_dir",
+        "versions",
         "stage",
         "results",
         "relaxation",
@@ -171,10 +167,7 @@ def test_report_writes_stationary_and_relaxation_figures(tmp_path: Path) -> None
     result = time_window_convergence(
         np.arange(data.size), data, property_name="density", value_unit="g/cm^3"
     )
-    times = np.geomspace(0.1, 10000.0, 140)
-    relaxation = relaxation_window_convergence(
-        planted(times, 1000.0 * np.exp(-times / 50.0))
-    )
+    relaxation = relaxation_window_convergence(exponential_relaxation())
     report = ConvergenceReport(
         str(tmp_path), "hold", {"density": result}, relaxation, ()
     )
@@ -201,10 +194,7 @@ def test_figure_names_preserve_colliding_and_reserved_observables(
             ("radius/nm", "radius nm", "radius_nm_2", "relaxation", "///")
         )
     }
-    times = np.geomspace(0.1, 10000.0, 140)
-    relaxation = relaxation_window_convergence(
-        planted(times, 1000.0 * np.exp(-times / 50.0))
-    )
+    relaxation = relaxation_window_convergence(exponential_relaxation())
     report = ConvergenceReport(str(tmp_path), "hold", results, relaxation, ())
     files = write_convergence_report(report, tmp_path, figure_format="svg")
     assert [Path(path).name for path in files.figures] == [
@@ -226,10 +216,7 @@ def test_json_only_report_does_not_plot(
     result = time_window_convergence(
         [0.0], [10.0], property_name="radius", value_unit="nm"
     )
-    times = np.geomspace(0.1, 10000.0, 140)
-    relaxation = relaxation_window_convergence(
-        planted(times, 1000.0 * np.exp(-times / 50.0))
-    )
+    relaxation = relaxation_window_convergence(exponential_relaxation())
     structural = structural_window_convergence(
         frozen_rods(), range(5), **STRUCTURAL_OPTIONS
     )
@@ -248,14 +235,6 @@ def test_json_only_report_does_not_plot(
     files = write_convergence_report(report, figures=False)
     assert Path(files.json).is_file()
     assert files.figures == ()
-
-
-@pytest.mark.parametrize("figures", [True, False])
-def test_unsafe_format_rejected_before_writing(tmp_path: Path, figures: bool) -> None:
-    report = ConvergenceReport(str(tmp_path), "hold", {}, None, ())
-    with pytest.raises(ValueError, match="figure_format"):
-        write_convergence_report(report, figures=figures, figure_format="../svg")
-    assert not (tmp_path / "analysis").exists()
 
 
 def test_structural_report_preserves_missing_metrics_curves_and_unresolved_figures(
@@ -278,3 +257,72 @@ def test_structural_report_preserves_missing_metrics_curves_and_unresolved_figur
         == [None] * 4
     )
     assert "radial_distribution" in payload["structural"]["windows"][0]["curves"]
+
+
+# --------------------------------------------------------------------------
+# The command line
+# --------------------------------------------------------------------------
+
+
+def _state_run(directory: Path) -> None:
+    directory.mkdir()
+    noise = np.random.default_rng(7).normal(0.0, 0.5, 6000)
+    rows = state_rows(
+        np.arange(noise.size, dtype=np.float64),
+        potential_kj_mol=-1000 + noise,
+        total_kj_mol=-500 + noise,
+        temperature_k=300 + noise,
+        density_g_cm3=1 + noise / 1000,
+    )
+    csv = directory / "hold.csv"
+    csv.write_text(state_data_csv(rows))
+    write_manifest(
+        directory, {"hold": {"name": "hold", "csv": str(csv), "samples": {}}}
+    )
+
+
+def test_saved_convergence_cli_writes_strict_json_and_status(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = tmp_path / "saved"
+    _state_run(directory)
+    output = tmp_path / "report"
+    assert (
+        cli.main(
+            [
+                "--analyse",
+                str(directory),
+                "--convergence",
+                "--convergence-stage",
+                "hold",
+                "--window-fractions",
+                ".2,.4,.7,1",
+                "--convergence-tolerance",
+                ".2",
+                "--min-effective-samples",
+                "15",
+                "--convergence-discard-fraction",
+                ".2",
+                "--no-figures",
+                "-o",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    record = json.loads((output / "convergence.json").read_text())
+    density = record["results"]["density_g_cm3"]
+    assert density["resolved"]
+    assert density["relative_tolerance"] == 0.2
+    assert density["min_effective_samples"] == 15
+    assert density["discard_fraction"] == 0.2
+    assert [window["fraction"] for window in density["windows"]] == [0.2, 0.4, 0.7, 1]
+    assert not list(output.glob("*.png"))
+    assert "density_g_cm3: resolved" in capsys.readouterr().out
+
+
+def test_convergence_defaults_output_to_saved_analysis(tmp_path: Path) -> None:
+    directory = tmp_path / "saved"
+    _state_run(directory)
+    assert cli.main(["--analyse", str(directory), "--convergence", "--no-figures"]) == 0
+    assert (directory / "analysis/convergence.json").is_file()

@@ -8,11 +8,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from openmmpolymer._fitting import MAX_EXTRAPOLATION_DECADES
 from openmmpolymer.reporters import CSV_COLUMNS
 from openmmpolymer.timeseries import (
     CSV_FIELDS,
     DSC_COOLING_RATE_K_PER_NS,
-    MAX_EXTRAPOLATION_DECADES,
     GlassTransition,
     cooling_rate_extrapolation,
     equilibration,
@@ -369,17 +369,18 @@ def test_two_identical_branches_are_not_a_transition(tmp_path: Path) -> None:
 def test_a_series_that_straddles_zero_is_scaled_by_its_spread() -> None:
     """A total energy averaging zero has no meaningful relative drift against
     its mean, and dividing by it would give an enormous number or a NaN."""
-    from openmmpolymer.timeseries import _scale_of
+    from openmmpolymer._fitting import TINY, series_scale
 
-    assert _scale_of(np.array([-1.0, 1.0, -1.0, 1.0])) == pytest.approx(1.0)
-    assert _scale_of(np.zeros(4)) > 0.0
+    assert series_scale(np.array([-1.0, 1.0, -1.0, 1.0]), floor=TINY) == pytest.approx(
+        1.0
+    )
+    assert series_scale(np.zeros(4), floor=TINY) > 0.0
 
 
 def test_a_single_row_has_no_spacing_and_no_drift() -> None:
     """Both are differences between rows, and there is only one."""
-    from openmmpolymer.timeseries import _relative_drift, _spacing_ps
+    from openmmpolymer.timeseries import _relative_drift
 
-    assert _spacing_ps(np.array([1.0])) == 0.0
     assert _relative_drift(np.array([1.0]), np.array([2.0]), 1.0) == 0.0
 
 

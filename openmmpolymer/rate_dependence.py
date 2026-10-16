@@ -70,7 +70,7 @@ class RateProperty:
         require_choice(self.trend, ("increasing", "decreasing", "any"), name="trend")
         for bound in (self.lower_bound, self.upper_bound):
             if bound is not None:
-                require_finite(bound, None, name="Property bounds")
+                require_finite(bound, name="Property bounds")
         if (
             self.lower_bound is not None
             and self.upper_bound is not None
@@ -187,6 +187,15 @@ class RateReport:
     target_rate: float | None = None
     max_extrapolation_decades: float = MAX_EXTRAPOLATION_DECADES
 
+    def model_difference(self) -> float | None:
+        """How far the two models disagree at the target, or None without both.
+
+        Sensitivity to the choice of model, not a confidence interval.
+        """
+        if self.log_linear is None or self.power_law is None:
+            return None
+        return abs(self.log_linear.value - self.power_law.value)
+
 
 def validate_rate_request(
     target_rate: float, max_extrapolation_decades: float
@@ -196,9 +205,9 @@ def validate_rate_request(
     Every rate workflow asks for these two, and refuses them before it reads
     or runs anything, rather than after the dynamics they would qualify.
     """
-    target = require_positive(target_rate, None, name="target_rate")
+    target = require_positive(target_rate, name="target_rate")
     maximum = require_nonnegative(
-        max_extrapolation_decades, None, name="max_extrapolation_decades"
+        max_extrapolation_decades, name="max_extrapolation_decades"
     )
     return target, maximum
 
@@ -284,7 +293,7 @@ def _pool_observations(
     temperatures: list[float] = []
     for index, observation in enumerate(observations):
         try:
-            require_positive(observation.rate, None, name="rate")
+            require_positive(observation.rate, name="rate")
         except ValueError as invalid:
             raise AnalysisError(
                 f"Observation {index} needs a finite positive rate."
@@ -302,13 +311,9 @@ def _pool_observations(
         temperature = observation.temperature_k
         try:
             if error is not None:
-                require_nonnegative(
-                    error, None, name=f"Observation {index} standard error"
-                )
+                require_nonnegative(error, name=f"Observation {index} standard error")
             if temperature is not None:
-                require_positive(
-                    temperature, None, name=f"Observation {index} temperature"
-                )
+                require_positive(temperature, name=f"Observation {index} temperature")
         except ValueError as invalid:
             raise AnalysisError(str(invalid)) from invalid
         if temperature is not None:

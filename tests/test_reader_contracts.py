@@ -3,9 +3,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
+import numpy as np
+import openmm as mm
 import pytest
+from openmm import unit
 
+from openmmpolymer._state import (
+    box_diagonal_nm,
+    box_vectors_nm,
+    positions_nm,
+    read_state,
+)
 from openmmpolymer.convergence_report import analyse_convergence
 from openmmpolymer.elastic_rates import analyse_elastic_rates
 from openmmpolymer.elasticity import stress_strain
@@ -17,6 +27,7 @@ from openmmpolymer.tm import heating_curve, heating_stages
 from openmmpolymer.trajectory import AnalysisError
 
 from .helpers import (
+    bare_simulation,
     planted_curve,
     write_bulk,
     write_deformation,
@@ -111,3 +122,25 @@ def test_melt_missing_stage_keeps_its_original_note(tmp_path: Path) -> None:
         result.unchecked[0]
         == "box volume: the manifest has no stage 'missing'. It records: nothing."
     )
+
+
+def test_state_readers_preserve_unwrapped_positions_and_box_components(
+    argon_run: Any, tmp_path: Path
+) -> None:
+    positions = argon_run.box.positions_nm.copy()
+    positions[0] += (3.0, 0.0, 0.0)
+    vectors = np.array([[3.0, 0.0, 0.0], [0.4, 2.8, 0.0], [0.2, 0.3, 2.6]])
+    simulation = bare_simulation(
+        mm.XmlSerializer.deserialize(argon_run.system_xml),
+        argon_run.box.topology,
+        positions,
+    )
+    simulation.context.setPeriodicBoxVectors(*(vectors * unit.nanometer))
+    path = tmp_path / "state.xml"
+    simulation.saveState(str(path))
+
+    state = read_state(path)
+    np.testing.assert_array_equal(positions_nm(state), positions)
+    np.testing.assert_array_equal(box_vectors_nm(state), vectors)
+    # Strain references use the diagonal, not the length of each tilted vector.
+    np.testing.assert_array_equal(box_diagonal_nm(state), [3.0, 2.8, 2.6])

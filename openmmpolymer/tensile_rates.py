@@ -16,28 +16,30 @@ from typing import Any, cast
 import numpy as np
 
 from ._files import write_json
-from ._fitting import MAX_EXTRAPOLATION_DECADES
+from ._fitting import MAX_EXTRAPOLATION_DECADES, PS_PER_NS
 from ._seeds import derive_seed
 from ._validation import require_choice
 from ._workflow import (
-    chain_options,
+    branch_runs,
+    checked_chain_options,
     enforce_budget,
     equilibrate,
     rate_request,
     record_scan_request,
+    record_start,
     require_distinct,
+    require_samples,
     resumable_record,
     run_branches,
     run_fingerprint,
-    start_fingerprint,
     strain_ladder,
     validate_hold_times,
 )
 from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .protocols import (
+    MANIFEST_NAME,
     Protocol,
     RunManifest,
-    check_chain_options,
     standard_melt_equilibration,
 )
 from .rate_dependence import (
@@ -159,7 +161,7 @@ def validate_tensile_rate_scan(
     cost = (
         settle.total_duration_ps
         + sum(item.n_replicas * tensile_schedule(item).total_ps for item in specs)
-    ) / 1000
+    ) / PS_PER_NS
     enforce_budget(
         cost,
         spec.max_total_ns,
@@ -195,7 +197,9 @@ def run_tensile_rate_scan(
     rerun (``resume=False``) replaces the saved request instead of comparing
     it.
     """
-    check_chain_options(run, chain_backbone, atoms_per_chain)
+    chains = checked_chain_options(
+        run, chain_backbone, atoms_per_chain, expected_characteristic_ratio
+    )
     measurement = _event(property_name)[0]
     selected: TensileSpec = measurement.spec() if spec is None else spec
     plan = validate_tensile_rate_scan(
@@ -224,12 +228,9 @@ def run_tensile_rate_scan(
         workflow,
         record,
         request,
-        [directory / "equilibration", *(directory / name for name in names)],
+        branch_runs(directory, names),
         resume=resume,
         run_dirs=names,
-    )
-    chains = chain_options(
-        chain_backbone, atoms_per_chain, expected_characteristic_ratio
     )
     start, origin = equilibrate(
         plan.equilibration,
@@ -240,11 +241,8 @@ def run_tensile_rate_scan(
         verb="strain",
         **chains,
     )
-    fingerprint = start_fingerprint(start, record, error=ValueError)
-    record.update(
-        start_state=start, start_state_sha256=fingerprint, reference_box_nm=origin
-    )
-    write_json(workflow, record)
+    record_start(workflow, record, start, error=ValueError, reference_box_nm=origin)
+    fingerprint = record["start_state_sha256"]
     timestep = safe_timestep_fs(selected.temperature_k, run.spec)
     for index, (name, rate_spec) in enumerate(zip(names, plan.specs, strict=True)):
         rate_dir = directory / name
@@ -326,7 +324,7 @@ def _directories(
                 )
         result.extend(candidate.resolve() for candidate in candidates)
     for candidate in result:
-        if not (candidate / "manifest.json").is_file():
+        if not (candidate / MANIFEST_NAME).is_file():
             raise AnalysisError(f"Missing rate manifest in {candidate}.")
     require_distinct(result, what="tensile measurements")
     return result
@@ -403,11 +401,11 @@ def analyse_tensile_rates(
                 )
             notes = list(fit.notes)
             notes.extend(report.notes)
-            for key in ("preparation", "system_sha256", "composition"):
-                if key not in conditions:
-                    notes.append(
-                        f"Recorded {key} is unavailable; cross-rate comparability is not fully verified."
-                    )
+            notes.extend(
+                f"Recorded {key} is unavailable; cross-rate comparability is not fully verified."
+                for key in ("preparation", "system_sha256", "composition")
+                if key not in conditions
+            )
             bracket = next(
                 (
                     getattr(fit, name)
@@ -470,13 +468,12 @@ def _validate_recorded_ladder(
                 raise AnalysisError(
                     f"{directory}/{stage.name} has a different recorded strain ladder."
                 )
-            holds = np.asarray(samples.get("segment_duration_ps", []), dtype=float)
-            if holds.shape != strains.shape or not np.allclose(
-                holds, spec.relax_ps, rtol=1e-8, atol=0
-            ):
-                raise AnalysisError(
-                    f"{directory}/{stage.name} has different recorded hold times."
-                )
+            require_samples(
+                samples,
+                "segment_duration_ps",
+                np.full(strains.shape, spec.relax_ps),
+                message=f"{directory}/{stage.name} has different recorded hold times.",
+            )
             if samples.get("deform_axis") != [spec.axis]:
                 raise AnalysisError(
                     f"{directory}/{stage.name} has a different recorded axis."

@@ -95,18 +95,16 @@ def test_the_state_reporter_alternates_and_points_at_the_last_complete_file(
     none.
     """
     reporter = AtomicStateReporter("stage", 10)
-    assert reporter.current_state() is None
+    assert not reporter.pointer_path.is_file()
     simulation = _simulation(argon_run)
 
     reporter.report(simulation, None)
-    assert reporter.current_state() == reporter.state_path("a")
+    assert reporter.pointer_path.read_text() == "a"
+    assert reporter.state_path("a").is_file()
     reporter.report(simulation, None)
-    assert reporter.current_state() == reporter.state_path("b")
+    assert reporter.pointer_path.read_text() == "b"
     assert reporter.state_path("a").is_file()
     mm.XmlSerializer.deserialize(reporter.state_path("b").read_text())
-
-    reporter.state_path("b").unlink()
-    assert reporter.current_state() is None
 
 
 def test_the_reporter_asks_openmm_for_the_right_interval(tmp_path: Path) -> None:

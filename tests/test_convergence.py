@@ -15,6 +15,7 @@ from openmmpolymer.convergence import (
 )
 from openmmpolymer.trajectory import AnalysisError
 
+from .helpers import exponential_relaxation
 from .helpers import planted_relaxation as planted
 from .helpers import stationary_trace as stationary
 
@@ -196,8 +197,7 @@ def test_invalid_series_cannot_be_filtered_to_appear_converged(
 
 
 def test_observed_exponential_decay_stabilises_time_and_viscosity() -> None:
-    time = np.geomspace(0.1, 10000.0, 140)
-    result = relaxation_window_convergence(planted(time, 1000.0 * np.exp(-time / 50.0)))
+    result = relaxation_window_convergence(exponential_relaxation())
     assert result.resolved
     assert result.metrics["kww_mean_tau_ps"].values[-1] == pytest.approx(50.0)
     assert result.metrics["kww_viscosity_pa_s"].values[-1] == pytest.approx(0.05)
@@ -209,10 +209,7 @@ def test_observed_exponential_decay_stabilises_time_and_viscosity() -> None:
 
 
 def test_stable_extrapolated_tau_is_unresolved_without_observed_decay() -> None:
-    time = np.geomspace(0.1, 10000.0, 140)
-    result = relaxation_window_convergence(
-        planted(time, 1000.0 * np.exp(-time / 10000.0))
-    )
+    result = relaxation_window_convergence(exponential_relaxation(10000.0))
     tau = result.metrics["kww_mean_tau_ps"]
     assert tau.relative_change < 0.001
     assert not tau.resolved
@@ -221,10 +218,7 @@ def test_stable_extrapolated_tau_is_unresolved_without_observed_decay() -> None:
 
 
 def test_solid_plateau_cannot_report_finite_liquid_viscosity() -> None:
-    time = np.geomspace(0.1, 10000.0, 140)
-    result = relaxation_window_convergence(
-        planted(time, 50.0 + 1000.0 * np.exp(-time / 50.0))
-    )
+    result = relaxation_window_convergence(exponential_relaxation(plateau_mpa=50.0))
     assert result.metrics["equilibrium_modulus_mpa"].resolved
     assert result.metrics["equilibrium_modulus_mpa"].values[-1] == pytest.approx(
         50.0, rel=0.05
@@ -234,10 +228,8 @@ def test_solid_plateau_cannot_report_finite_liquid_viscosity() -> None:
 
 
 def test_relaxation_duplicate_prefix_endpoints_cannot_resolve() -> None:
-    time = np.geomspace(0.1, 10000.0, 140)
     result = relaxation_window_convergence(
-        planted(time, 1000.0 * np.exp(-time / 50.0)),
-        window_fractions=(0.999999, 0.9999999, 1.0),
+        exponential_relaxation(), window_fractions=(0.999999, 0.9999999, 1.0)
     )
     assert not result.resolved
     assert all(not metric.resolved for metric in result.metrics.values())
@@ -267,11 +259,8 @@ def test_insufficient_relaxation_bins_retains_unresolved_refits() -> None:
 
 
 def test_precise_kww_decay_does_not_inherit_discrete_prony_fit_failure() -> None:
-    time = np.geomspace(0.1, 10000.0, 140)
     result = relaxation_window_convergence(
-        planted(
-            time, 1000.0 * np.exp(-time / 50.0), error_mpa=np.full(time.size, 0.001)
-        )
+        exponential_relaxation(error_mpa=np.full(140, 0.001))
     )
     assert result.metrics["kww_mean_tau_ps"].resolved
     assert result.metrics["kww_viscosity_pa_s"].resolved

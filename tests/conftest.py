@@ -11,7 +11,7 @@ only they can test.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -156,58 +156,88 @@ def fake_packmol(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
     yield script
 
 
-@pytest.fixture
-def staged_melt(monkeypatch: pytest.MonkeyPatch, argon_run: Any) -> dict[str, Any]:
-    """Stand in for the chemistry behind ``build_melt``, keeping its staging real.
+def _build_control() -> dict[str, Any]:
+    """The knobs a staged build exposes: what to break, and what it was given."""
+    return {"system_suffix": "", "fail": False, "builds": [], "options": {}}
 
-    Each preparation writes the four kinds of asset ``build_melt`` records,
-    adds an entry to the force-field cache it was handed, and returns the argon
-    run with its force-field reference in the build directory. Set
-    ``system_suffix`` to change the next preparation's Hamiltonian or ``fail``
-    to make it raise; ``builds`` lists every build directory used and
-    ``options`` the settings the last preparation was given.
+
+def _stage_build(
+    control: dict[str, Any],
+    argon_run: Any,
+    build_dir: Path,
+    cache_dir: Path,
+    options: dict[str, Any],
+    names: Sequence[str],
+    *,
+    extra_files: Sequence[str] = (),
+) -> tuple[tuple[Any, ...], Any]:
+    """Stand in for the chemistry behind a build, keeping its staging real.
+
+    Writes the kinds of asset a build records - a conformer and a PDB per
+    polymer in *names*, *extra_files*, the merged force field and the packed
+    cell - adds an entry to the force-field cache it was handed, and returns
+    the argon run with its force-field reference in the build directory.
     """
     from dataclasses import replace
 
-    from openmmpolymer import melt
     from openmmpolymer.chain import ChainResult
 
-    control: dict[str, Any] = {
-        "system_suffix": "",
-        "fail": False,
-        "builds": [],
-        "options": {},
-    }
-
-    def prepare(
-        spec: Any, n_chains: int, build_dir: Path, cache_dir: Path, **options: Any
-    ) -> Any:
-        control["builds"].append(build_dir)
-        control["options"] = options
-        number = len(control["builds"])
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        (cache_dir / f"entry_{number}.xml").write_text("parameters")
-        build_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("chain_0.sdf", "chain_0.pdb", "polymer_ff.xml", "packed.pdb"):
-            (build_dir / name).write_text(f"prepared artifact {number}")
-        if control["fail"]:
-            raise RuntimeError("preparation failed")
-        chain = ChainResult(
-            sdf_paths=(str(build_dir / "chain_0.sdf"),),
-            pdb_paths=(str(build_dir / "chain_0.pdb"),),
+    control["builds"].append(build_dir)
+    control["options"] = options
+    number = len(control["builds"])
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / f"entry_{number}.xml").write_text("parameters")
+    build_dir.mkdir(parents=True, exist_ok=True)
+    files = [
+        *(f"{name}_0.{suffix}" for name in names for suffix in ("sdf", "pdb")),
+        *extra_files,
+        "polymer_ff.xml",
+        "packed.pdb",
+    ]
+    for name in files:
+        (build_dir / name).write_text(f"prepared artifact {number}")
+    if control["fail"]:
+        raise RuntimeError("preparation failed")
+    chains = tuple(
+        ChainResult(
+            sdf_paths=(str(build_dir / f"{name}_0.sdf"),),
+            pdb_paths=(str(build_dir / f"{name}_0.pdb"),),
             smiles="[Ar]",
             n_atoms=1,
             molar_mass_g_mol=39.948,
         )
-        run = replace(
-            argon_run,
-            system_xml=argon_run.system_xml + control["system_suffix"],
-            forcefield=replace(
-                argon_run.forcefield,
-                forcefield_xml=str(build_dir / "polymer_ff.xml"),
-            ),
+        for name in names
+    )
+    run = replace(
+        argon_run,
+        system_xml=argon_run.system_xml + control["system_suffix"],
+        forcefield=replace(
+            argon_run.forcefield,
+            forcefield_xml=str(build_dir / "polymer_ff.xml"),
+        ),
+    )
+    return chains, run
+
+
+@pytest.fixture
+def staged_melt(monkeypatch: pytest.MonkeyPatch, argon_run: Any) -> dict[str, Any]:
+    """Stand in for the chemistry behind ``build_melt``, keeping its staging real.
+
+    Set ``system_suffix`` to change the next preparation's Hamiltonian or
+    ``fail`` to make it raise; ``builds`` lists every build directory used and
+    ``options`` the settings the last preparation was given.
+    """
+    from openmmpolymer import melt
+
+    control = _build_control()
+
+    def prepare(
+        spec: Any, n_chains: int, build_dir: Path, cache_dir: Path, **options: Any
+    ) -> Any:
+        chains, run = _stage_build(
+            control, argon_run, build_dir, cache_dir, options, ["chain"]
         )
-        return chain, run
+        return chains[0], run
 
     monkeypatch.setattr(melt, "_prepare", prepare)
     return control
@@ -222,59 +252,24 @@ def staged_blend(monkeypatch: pytest.MonkeyPatch, argon_run: Any) -> dict[str, A
     ``components`` holds the polymers the last preparation was given; the
     other controls are ``staged_melt``'s.
     """
-    from dataclasses import replace
-
     from openmmpolymer import melt
-    from openmmpolymer.chain import ChainResult
 
-    control: dict[str, Any] = {
-        "system_suffix": "",
-        "fail": False,
-        "builds": [],
-        "options": {},
-        "components": (),
-    }
+    control = {**_build_control(), "components": ()}
 
     def prepare(
         components: Any, build_dir: Path, cache_dir: Path, **options: Any
     ) -> Any:
-        control["builds"].append(build_dir)
-        control["options"] = options
         control["components"] = components
-        number = len(control["builds"])
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        (cache_dir / f"entry_{number}.xml").write_text("parameters")
-        build_dir.mkdir(parents=True, exist_ok=True)
         names = [component.spec.residue_name for component in components]
-        files = [
-            *(f"{name}_0.{suffix}" for name in names for suffix in ("sdf", "pdb")),
-            *(f"{name}_ff.xml" for name in names),
-            "polymer_ff.xml",
-            "packed.pdb",
-        ]
-        for name in files:
-            (build_dir / name).write_text(f"prepared artifact {number}")
-        if control["fail"]:
-            raise RuntimeError("preparation failed")
-        chains = tuple(
-            ChainResult(
-                sdf_paths=(str(build_dir / f"{name}_0.sdf"),),
-                pdb_paths=(str(build_dir / f"{name}_0.pdb"),),
-                smiles="[Ar]",
-                n_atoms=1,
-                molar_mass_g_mol=39.948,
-            )
-            for name in names
-        )
-        run = replace(
+        return _stage_build(
+            control,
             argon_run,
-            system_xml=argon_run.system_xml + control["system_suffix"],
-            forcefield=replace(
-                argon_run.forcefield,
-                forcefield_xml=str(build_dir / "polymer_ff.xml"),
-            ),
+            build_dir,
+            cache_dir,
+            options,
+            names,
+            extra_files=[f"{name}_ff.xml" for name in names],
         )
-        return chains, run
 
     monkeypatch.setattr(melt, "_prepare_blend", prepare)
     return control

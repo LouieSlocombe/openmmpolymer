@@ -13,7 +13,6 @@ import pytest
 from openmmpolymer import conformation, protocols
 from openmmpolymer.conformation import (
     DIFFUSIVE_SLOPE_RANGE,
-    NM2_PS_TO_CM2_S,
     centre_of_mass_msd,
     chain_conformation,
     end_to_end_relaxation,
@@ -24,6 +23,7 @@ from openmmpolymer.trajectory import AnalysisError
 
 from .helpers import (
     dimer_cell,
+    drifting_dimers,
     freely_rotating_chain,
     random_walk_frames,
     record_frame_reads,
@@ -324,18 +324,7 @@ def test_chains_of_zero_length_have_nothing_to_correlate() -> None:
 def test_uniform_drift_is_ballistic_and_earns_no_diffusion_coefficient() -> None:
     """``MSD = |v|^2 tau^2`` exactly, so the log-log slope is two - and a
     diffusion coefficient fitted to that would be meaningless."""
-    n_chains, n_frames, interval = 40, 60, 0.5
-    generator = np.random.default_rng(4)
-    velocities = generator.normal(0.0, 0.05, size=(n_chains, 3))
-    times = np.arange(n_frames, dtype=np.float64) * interval
-    frames = np.zeros((n_frames, n_chains * 2, 3), dtype=np.float64)
-    for index, time in enumerate(times):
-        frames[index, 0::2, :] = velocities * time
-        frames[index, 1::2, :] = velocities * time + np.array([0.0, 0.0, 0.6])
-    measured = centre_of_mass_msd(
-        synthetic_ensemble(frames, n_chains=n_chains, interval_ps=interval),
-        remove_box_scaling=False,
-    )
+    measured = centre_of_mass_msd(drifting_dimers(), remove_box_scaling=False)
     assert measured.log_slope == pytest.approx(2.0, rel=1e-6)
     assert not measured.diffusive
     assert measured.diffusion_coefficient_cm2_s is None
@@ -353,7 +342,7 @@ def test_a_random_walk_gives_back_the_diffusion_coefficient_it_was_built_with() 
     assert measured.diffusive
     assert DIFFUSIVE_SLOPE_RANGE[0] <= measured.log_slope <= DIFFUSIVE_SLOPE_RANGE[1]
     assert measured.diffusion_coefficient_cm2_s == pytest.approx(
-        expected * NM2_PS_TO_CM2_S, rel=0.1
+        expected * 1.0e-2, rel=0.1
     )
 
 

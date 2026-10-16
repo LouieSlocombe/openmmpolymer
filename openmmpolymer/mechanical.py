@@ -35,27 +35,26 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from ._cli_reports import _modulus_lines
 from ._files import ReportFiles, figure_stem
 from ._fitting import MAX_REPLICA_SPREAD as MAX_REPLICA_SPREAD
 from ._fitting import NEGLIGIBLE, PS_PER_NS
 from ._validation import require_axis, require_integer
 from ._workflow import (
+    MeasurementScan,
     StrainSchedule,
-    chain_options,
     deformation_stages,
-    enforce_budget,
     equilibration_at,
     group_by_stem,
     optional,
-    remaining_ps,
     require_positive_fields,
-    run_measurement_scan,
+    run_measurement,
     sample_spread,
     scan_listing,
     with_reference_box,
@@ -80,7 +79,7 @@ from .elasticity import (
     youngs_modulus,
 )
 from .plots import plot_moduli, plot_stress_strain
-from .protocols import Protocol, RunManifest, Stage, check_chain_options
+from .protocols import Protocol, RunManifest, Stage
 from .simulate import RunContext
 from .trajectory import AnalysisError
 
@@ -450,17 +449,11 @@ def mechanical_scan(spec: ModulusSpec = DEFAULT_SPEC, **equilibration: Any) -> P
 # --------------------------------------------------------------------------
 
 
-def _report_cost(
-    spec: ModulusSpec, settle: Protocol, manifest: RunManifest | None
+def _log_cost(
+    spec: ModulusSpec, settle: Protocol, listing: Protocol, remaining_ps: float
 ) -> None:
-    """Say what the whole scan costs before any of it runs.
-
-    Raises:
-        MechanicalError: The total is over ``max_total_ns``.
-    """
+    """Say what the whole scan costs before any of it runs."""
     schedule = deform_schedule(spec)
-    listing = scan_listing(PROTOCOL_NAME, [settle, *_branches(spec, timestep_fs=2.0)])
-    total_ps = listing.total_duration_ps
     log.info(
         "Mechanical scan: %.1f ns equilibration, %.1f ns of extension (%d "
         "replicas of %d steps to %.1f%% strain at %.3g /ns), %.1f ns of "
@@ -473,18 +466,8 @@ def _report_cost(
         schedule.strain_rate_per_ns,
         sum(stage.duration_ps for stage in extra_stages(spec, timestep_fs=2.0))
         / PS_PER_NS,
-        total_ps / PS_PER_NS,
-        remaining_ps(listing.stages, manifest) / PS_PER_NS,
-    )
-    enforce_budget(
-        total_ps / PS_PER_NS,
-        spec.max_total_ns,
-        error=MechanicalError,
-        message=lambda: (
-            f"The scan is {total_ps / PS_PER_NS:.1f} ns, over the "
-            f"{spec.max_total_ns:.1f} ns budget. Shorten relax_ps, drop a "
-            "replica, skip a pass, or raise max_total_ns."
-        ),
+        listing.total_duration_ps / PS_PER_NS,
+        remaining_ps / PS_PER_NS,
     )
 
 
@@ -526,75 +509,47 @@ def run_modulus_scan(
             run it cannot resume: another protocol's, one without a saved
             request, or one with different settings.
     """
-    check_chain_options(run, chain_backbone, atoms_per_chain)
-    directory = Path(run_dir)
-    settle = equilibration_protocol(spec, **equilibration)
-    _report_cost(spec, settle, RunManifest.load(directory) if resume else None)
-
-    return run_measurement_scan(
+    return run_measurement(
+        SCAN,
         run,
-        directory / WORKFLOW_NAME,
+        run_dir,
         spec,
-        settle,
-        lambda timestep_fs, origin: _branches(
-            spec, timestep_fs=timestep_fs, reference_box_nm=origin
-        ),
-        lambda directory: analyse_mechanics(
-            directory, strain_limit=spec.elastic_strain_limit
-        ),
-        lambda report: _log_result(report, deform_schedule(spec)),
         resume=resume,
-        error=MechanicalError,
-        verb="deform",
-        **chain_options(chain_backbone, atoms_per_chain, expected_characteristic_ratio),
+        chain_backbone=chain_backbone,
+        atoms_per_chain=atoms_per_chain,
+        expected_characteristic_ratio=expected_characteristic_ratio,
+        **equilibration,
     )
 
 
-def _log_result(report: ModulusReport, schedule: ModulusSchedule) -> None:
-    """One line per measured constant, each with what qualifies it."""
-    if report.youngs is None:
-        log.info("Mechanical scan: no extension to fit.")
-        return
-    log.info(
-        "Mechanical scan: E = %.0f MPa%s at %.3g strain/ns, %.0f K%s.",
-        report.youngs.modulus_mpa,
-        ""
-        if report.replica_spread_mpa is None
-        else f" +/- {report.replica_spread_mpa:.0f} over "
-        f"{len(report.replicas)} replicas",
-        schedule.strain_rate_per_ns,
-        report.youngs.temperature_k,
-        "" if report.resolved else " (not resolved)",
-    )
-    if report.poisson is not None:
-        log.info(
-            "  nu = %.3f%s.",
-            report.poisson.ratio,
-            "" if report.poisson.resolved else " (not resolved)",
-        )
-    for label, fit in (("K", report.bulk), ("G", report.shear)):
-        if fit is not None:
-            log.info(
-                "  %s = %.0f MPa%s.",
-                label,
-                fit.modulus_mpa,
-                "" if fit.resolved else " (not resolved)",
-            )
-    if report.consistency is not None:
-        check = report.consistency
-        gaps = ", ".join(f"{name} {100.0 * gap:.0f}%" for name, gap in check.gaps)
-        log.info(
-            "  E and nu imply K = %.0f, G = %.0f MPa; %s%s.",
-            check.bulk_implied_mpa,
-            check.shear_implied_mpa,
-            f"gaps {gaps}" if gaps else "nothing measured to check them against",
-            "" if check.consistent or not gaps else " - not consistent",
-        )
+def _log_result(report: ModulusReport) -> None:
+    """Log what the scan found, in the lines the command line prints."""
+    for line in _modulus_lines(report):
+        log.info("Mechanical scan: %s", line)
     if math.isfinite(report.method_gap):
         log.info(
             "  the constant-stress cross-check differs by %.0f%%.",
             100.0 * report.method_gap,
         )
+
+
+#: The mechanical scan, as :func:`~openmmpolymer._workflow.run_measurement` runs it.
+SCAN: MeasurementScan[ModulusReport] = MeasurementScan(
+    protocol=PROTOCOL_NAME,
+    workflow=WORKFLOW_NAME,
+    error=MechanicalError,
+    verb="deform",
+    budget_advice="skip a pass",
+    equilibration=equilibration_protocol,
+    branches=lambda spec, timestep_fs, origin: _branches(
+        spec, timestep_fs=timestep_fs, reference_box_nm=origin
+    ),
+    log_cost=_log_cost,
+    analyse=lambda directory, spec: analyse_mechanics(
+        directory, strain_limit=spec.elastic_strain_limit
+    ),
+    log_result=lambda report, spec: _log_result(report),
+)
 
 
 # --------------------------------------------------------------------------
@@ -792,17 +747,6 @@ def _modulus_record(fit: ElasticModulus) -> dict[str, Any]:
     }
 
 
-def _poisson_record(fit: PoissonRatio) -> dict[str, Any]:
-    """Poisson's ratio as plain JSON types."""
-    return {
-        "ratio": fit.ratio,
-        "standard_error": fit.standard_error,
-        "n_points": fit.n_points,
-        "strain_limit": fit.strain_limit,
-        "resolved": fit.resolved,
-    }
-
-
 def _bulk_record(fit: BulkModulus) -> dict[str, Any]:
     """The bulk modulus as plain JSON types."""
     return {
@@ -833,19 +777,6 @@ def _shear_record(fit: ShearModulus) -> dict[str, Any]:
     }
 
 
-def _consistency_record(check: ElasticConsistency) -> dict[str, Any]:
-    """The over-determination check as plain JSON types."""
-    return {
-        "bulk_implied_mpa": check.bulk_implied_mpa,
-        "shear_implied_mpa": check.shear_implied_mpa,
-        "bulk_measured_mpa": check.bulk_measured_mpa,
-        "shear_measured_mpa": check.shear_measured_mpa,
-        "bulk_gap": check.bulk_gap,
-        "shear_gap": check.shear_gap,
-        "consistent": check.consistent,
-    }
-
-
 def write_mechanical_report(
     report: ModulusReport,
     output_dir: str | Path | None = None,
@@ -860,7 +791,7 @@ def write_mechanical_report(
     fields: dict[str, Any] = {
         "stages": [curve.stage for curve in report.curves],
         "youngs": None if report.youngs is None else _modulus_record(report.youngs),
-        "poisson": None if report.poisson is None else _poisson_record(report.poisson),
+        "poisson": None if report.poisson is None else asdict(report.poisson),
         "bulk": None if report.bulk is None else _bulk_record(report.bulk),
         "shear": None if report.shear is None else _shear_record(report.shear),
         "load_modulus": (
@@ -872,9 +803,7 @@ def write_mechanical_report(
         "replica_spread_mpa": report.replica_spread_mpa,
         "method_gap": report.method_gap,
         "consistency": (
-            None
-            if report.consistency is None
-            else _consistency_record(report.consistency)
+            None if report.consistency is None else asdict(report.consistency)
         ),
         "resolved": report.resolved,
         "notes": list(report.notes),

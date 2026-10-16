@@ -21,11 +21,11 @@ import hashlib
 import json
 import logging
 import math
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, NoReturn, Self
 
 import numpy as np
 import numpy.typing as npt
@@ -45,6 +45,7 @@ from .protocols import (
     RunManifest,
     RunSummary,
     Stage,
+    check_chain_options,
     run_protocol,
     standard_melt_equilibration,
     validate_run_inputs,
@@ -88,7 +89,7 @@ def settled_state(
     through, and every branch has to start from the *equilibrated* cell.
     """
     state = summary.final_state
-    if state and state != "None" and Path(state).is_file():
+    if state and Path(state).is_file():
         return str(state)
     raise error(
         f"{directory} has no finished equilibration stage to {verb} from. Run "
@@ -138,7 +139,7 @@ def validate_hold_times(
     values: Sequence[float], *, name: str = "hold_times_ps"
 ) -> tuple[float, ...]:
     """Require at least three distinct positive holds, in their requested order."""
-    holds = tuple(require_positive(value, None, name=name) for value in values)
+    holds = tuple(require_positive(value, name=name) for value in values)
     if len(holds) < 3 or any(
         math.isclose(first, second, rel_tol=1e-8)
         for first, second in pairwise(sorted(holds))
@@ -156,11 +157,11 @@ def require_positive_fields(
     this" or "no limit".
     """
     for name in names:
-        require_positive(getattr(spec, name), None, name=name)
+        require_positive(getattr(spec, name), name=name)
     for name in optional:
         value = getattr(spec, name)
         if value is not None:
-            require_positive(value, None, name=name)
+            require_positive(value, name=name)
 
 
 def equilibration_at(
@@ -321,20 +322,21 @@ def rate_request(fields: dict[str, Any]) -> dict[str, Any]:
 
 
 def spec_request(
-    spec: Any, *, drop: Iterable[str] = (), **extra: Any
+    spec: Any, *, drop: Iterable[str] = (), strict: bool = False, **extra: Any
 ) -> dict[str, Any]:
     """What a scan was asked for, in the form its workflow record stores it.
 
     Round-tripped through JSON before it is compared with anything, because a
     tuple comes back from a file as a list, and comparing the two directly
     would make every resume look like a change of settings. *drop* leaves out
-    settings that do not change the dynamics, such as a budget.
+    settings that do not change the dynamics, such as a budget. A *strict*
+    request refuses a value JSON cannot encode; the others stringify it.
     """
     dropped = set(drop)
     settings = {key: value for key, value in asdict(spec).items() if key not in dropped}
-    stored: dict[str, Any] = json.loads(
-        json.dumps({"spec": settings, **extra}, default=str)
-    )
+    record = {"spec": settings, **extra}
+    text = json.dumps(record) if strict else json.dumps(record, default=str)
+    stored: dict[str, Any] = json.loads(text)
     return stored
 
 
@@ -390,6 +392,17 @@ def require_scan_protocol(
         )
 
 
+def _refuse_unrecorded_runs(
+    directory: Path, workflow: Path, *, error: type[Exception]
+) -> NoReturn:
+    """Refuse runs whose request was never recorded, so cannot be checked."""
+    raise error(
+        f"{directory} already holds runs without a request in {workflow.name}; "
+        "the workflow record is missing or incomplete, so their settings cannot "
+        "be verified. Use a fresh directory or rerun with resume=False."
+    )
+
+
 def check_scan_resume(
     run: RunContext,
     workflow: Path,
@@ -427,11 +440,7 @@ def check_scan_resume(
         and (manifest.stages or require_record_for_empty_manifest)
         and record.get("request") is None
     ):
-        raise error(
-            f"{directory} already holds runs without a request in {workflow.name}; "
-            "the workflow record is missing or incomplete, so their settings cannot "
-            "be verified. Use a fresh directory or rerun with resume=False."
-        )
+        _refuse_unrecorded_runs(directory, workflow, error=error)
     validate_run_inputs(run, directory)
     return record
 
@@ -586,38 +595,92 @@ def enforce_budget(
         raise error(message())
 
 
-def run_measurement_scan[T](
+@dataclass(frozen=True)
+class MeasurementScan[R]:
+    """A branched measurement: what names it, what it runs and what it reads.
+
+    Args:
+        protocol: The protocol name every stage of the scan runs under.
+        workflow: The record written beside the manifest.
+        error: What a refused scan raises.
+        verb: What a branch does to the equilibrated cell, for messages.
+        budget_advice: The scan-specific way out of an over-budget refusal.
+        equilibration: Builds the settle from a spec and the equilibration
+            keywords.
+        branches: The protocols that start from the equilibrated cell, given
+            the spec, a timestep and that cell - or None, for a listing.
+        log_cost: Says what the scan costs, given the spec, the settle, the
+            whole listing and how much of it is still to run.
+        analyse: Reads the finished run directory under the spec.
+        log_result: Says what was found.
+    """
+
+    protocol: str
+    workflow: str
+    error: type[Exception]
+    verb: str
+    budget_advice: str
+    equilibration: Callable[..., Protocol]
+    branches: Callable[[Any, float, Sequence[float] | None], list[Protocol]]
+    log_cost: Callable[[Any, Protocol, Protocol, float], None]
+    analyse: Callable[[Path, Any], R]
+    log_result: Callable[[R, Any], None]
+
+
+def run_measurement[R](
+    scan: MeasurementScan[R],
     run: RunContext,
-    workflow: Path,
+    run_dir: str | Path,
     spec: Any,
-    settle: Protocol,
-    branches: Callable[[float, Sequence[float]], Iterable[Protocol]],
-    analyse: Callable[[Path], T],
-    log_result: Callable[[T], None],
     *,
     resume: bool,
-    error: type[Exception],
-    verb: str,
-    **chains: Any,
-) -> T:
-    """Run and read a mechanical measurement with its recorded chain options."""
+    chain_backbone: Sequence[int] | None,
+    atoms_per_chain: int | None,
+    expected_characteristic_ratio: float,
+    **equilibration: Any,
+) -> R:
+    """Budget, record, equilibrate and branch a measurement, then read it back.
+
+    Nothing is written before the budget and a resumed directory's settings
+    have been checked. The request is saved before equilibration, and the
+    reference cell before the measurement branches run.
+    """
     from .simulate import safe_timestep_fs
 
+    chains = checked_chain_options(
+        run, chain_backbone, atoms_per_chain, expected_characteristic_ratio
+    )
+    directory = Path(run_dir)
+    settle = scan.equilibration(spec, **equilibration)
+    listing = scan_listing(scan.protocol, [settle, *scan.branches(spec, 2.0, None)])
+    manifest = RunManifest.load(directory) if resume else None
+    scan.log_cost(spec, settle, listing, remaining_ps(listing.stages, manifest))
+    total_ns = listing.total_duration_ps / PS_PER_NS
+    enforce_budget(
+        total_ns,
+        spec.max_total_ns,
+        error=scan.error,
+        message=lambda: (
+            f"The scan is {total_ns:.1f} ns, over the {spec.max_total_ns:.1f} ns "
+            f"budget. Shorten relax_ps, drop a replica, {scan.budget_advice}, or "
+            "raise max_total_ns."
+        ),
+    )
     timestep_fs = safe_timestep_fs(spec.temperature_k, run.spec)
     run_branched_scan(
         run,
-        workflow,
+        directory / scan.workflow,
         scan_request(run, spec, settle, **chains),
         settle,
-        lambda origin: branches(timestep_fs, origin),
+        lambda origin: scan.branches(spec, timestep_fs, origin),
         resume=resume,
-        error=error,
-        verb=verb,
+        error=scan.error,
+        verb=scan.verb,
         metadata={"timestep_fs": timestep_fs, "n_replicas": spec.n_replicas},
         **chains,
     )
-    report = analyse(workflow.parent)
-    log_result(report)
+    report = scan.analyse(directory, spec)
+    scan.log_result(report, spec)
     return report
 
 
@@ -634,8 +697,6 @@ def run_branched_scan(
     metadata: dict[str, Any],
     read_record: Callable[[], dict[str, Any]] | None = None,
     precheck: Callable[[dict[str, Any], RunManifest | None], None] | None = None,
-    record_builder: Callable[[str | None, list[float] | None], dict[str, Any]]
-    | None = None,
     require_record_for_empty_manifest: bool = True,
     **chains: Any,
 ) -> None:
@@ -646,16 +707,14 @@ def run_branched_scan(
     branch, so interruptions during dynamics or analysis cannot leave stages
     without their settings. A forced rerun discards the old manifest before
     replacing its request; only equilibration resets it, and the branches
-    preserve each other's results.
+    preserve each other's results. The record is rebuilt on every run, so a
+    resume carries nothing over from the previous record but what it checks.
 
     A custom reader retains a workflow's corrupt-record diagnostics, and
     *precheck* verifies domain-specific stage relationships before input checks.
-    *record_builder* rebuilds records that historically reset their metadata;
-    it receives no state for the first write and the equilibrated state for
-    the second, retaining the caller's field order.
     """
     directory = workflow.parent
-    record = check_scan_resume(
+    check_scan_resume(
         run,
         workflow,
         request,
@@ -666,18 +725,14 @@ def run_branched_scan(
         precheck=precheck,
         require_record_for_empty_manifest=require_record_for_empty_manifest,
     )
-    if record_builder is not None:
-        record = record_builder(None, None)
+    record: dict[str, Any] = {}
     record_scan_request(
         workflow, record, request, [directory], resume=resume, **metadata
     )
     start, origin = equilibrate(
         settle, run, directory, resume=resume, error=error, verb=verb, **chains
     )
-    if record_builder is None:
-        record.update(start_state=start, reference_box_nm=origin)
-    else:
-        record = record_builder(start, origin)
+    record.update(reference_box_nm=origin, start_state=start)
     write_json(workflow, record, strict=False)
     run_branches(branches(origin), run, directory, start, **chains)
 
@@ -714,22 +769,38 @@ def write_report_files(
     written as null, as every report writes it. Each ``(stem, figure)`` pair is saved as
     ``<stem>.<figure_format>``, in the order *figures* yields them.
     """
+    directory = analysis_directory(run_dir, output_dir)
+    record = {**report_header(run_dir), **fields}
+    return write_report(directory, name, record, figures, figure_format)
+
+
+def report_header(
+    run_dir: str | None, *, record_run_dir: bool = True
+) -> dict[str, Any]:
+    """What every report opens with: the version that wrote it, the run, the versions that produced it.
+
+    *run_dir* None is a report with no run behind it, which records no
+    versions; *record_run_dir* False keeps the versions but not the path, for
+    a report that lists its runs some other way.
+    """
     from . import __version__
 
-    directory = analysis_directory(run_dir, output_dir)
-    manifest = RunManifest.load(run_dir)
-    record = {
-        "openmmpolymer": __version__,
-        "run_dir": run_dir,
-        "versions": {} if manifest is None else manifest.versions,
-        **fields,
-    }
-    return write_report(directory, name, record, figures, figure_format)
+    header: dict[str, Any] = {"openmmpolymer": __version__}
+    if run_dir is not None and record_run_dir:
+        header["run_dir"] = run_dir
+    manifest = None if run_dir is None else RunManifest.load(run_dir)
+    header["versions"] = {} if manifest is None else manifest.versions
+    return header
 
 
 # --------------------------------------------------------------------------
 # Rate scans: one equilibration, every rate and replica branched from it
 # --------------------------------------------------------------------------
+
+
+def branch_runs(directory: Path, branches: Sequence[str]) -> list[Path]:
+    """The run directories a rate scan writes: its equilibration, then each branch."""
+    return [directory / "equilibration", *(directory / name for name in branches)]
 
 
 def resumable_record(
@@ -767,11 +838,8 @@ def resumable_record(
         and directory.is_dir()
         and any(directory.rglob(MANIFEST_NAME))
     ):
-        raise error(
-            f"{directory} already holds runs without a request in {workflow.name}, "
-            "so their settings cannot be verified. Use a fresh directory."
-        )
-    runs = [directory / "equilibration", *(directory / name for name in branches)]
+        _refuse_unrecorded_runs(directory, workflow, error=error)
+    runs = branch_runs(directory, branches)
     for path in runs:
         manifest = path / MANIFEST_NAME
         if (
@@ -820,6 +888,26 @@ def start_fingerprint(
     return digest
 
 
+def record_start(
+    workflow: Path,
+    record: dict[str, Any],
+    start: str,
+    *,
+    error: type[Exception],
+    **extra: Any,
+) -> None:
+    """Save the state every branch starts from, fingerprinted, and *extra* beside it.
+
+    The fingerprint refuses a start that changed since the record was written.
+    """
+    record.update(
+        start_state=start,
+        start_state_sha256=start_fingerprint(start, record, error=error),
+        **extra,
+    )
+    write_json(workflow, record)
+
+
 def strain_ladder(
     strain_start: float, strain_increment: float, n_steps: int
 ) -> npt.NDArray[np.float64]:
@@ -833,6 +921,41 @@ def strain_ladder(
         (1.0 + strain_start) * (1.0 + strain_increment) ** steps - 1.0,
         dtype=np.float64,
     )
+
+
+def require_samples(
+    samples: Mapping[str, Any],
+    key: str,
+    expected: Any,
+    *,
+    message: str,
+    rtol: float = 1.0e-8,
+    atol: float = 0.0,
+) -> npt.NDArray[np.float64]:
+    """The recorded ``samples[key]``, refusing one missing, short or different.
+
+    A resumed or hand-edited run can carry a stage whose samples no longer
+    match what the workflow asked for; the shape and the values are compared
+    together, and *message* names what differed.
+    """
+    recorded = np.asarray(samples.get(key, []), dtype=float)
+    wanted = np.asarray(expected, dtype=float)
+    if recorded.shape != wanted.shape or not np.allclose(
+        recorded, wanted, rtol=rtol, atol=atol
+    ):
+        raise AnalysisError(message)
+    return recorded
+
+
+def checked_chain_options(
+    run: RunContext,
+    chain_backbone: Sequence[int] | None,
+    atoms_per_chain: int | None,
+    expected_characteristic_ratio: float | None,
+) -> dict[str, Any]:
+    """The chain-measurement keywords, checked against the cell they describe."""
+    check_chain_options(run, chain_backbone, atoms_per_chain)
+    return chain_options(chain_backbone, atoms_per_chain, expected_characteristic_ratio)
 
 
 def require_distinct(directories: Sequence[Path], *, what: str) -> None:

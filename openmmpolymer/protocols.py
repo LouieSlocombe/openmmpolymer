@@ -35,18 +35,12 @@ from openmm import unit
 
 from ._files import file_sha256, write_json
 from ._state import positions_nm, read_state
-from ._validation import require_finite, require_nonnegative, require_positive
 from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .packing import blend_species, describe_species
 from .reporters import TrajectoryOptions
 from .simulate import (
     RunContext,
-    Segment,
     StageResult,
-    _anneal_segments,
-    _compress_segments,
-    _heat_segments,
-    _quench_segments,
     run_anneal,
     run_compress,
     run_deform,
@@ -61,6 +55,7 @@ from .simulate import (
     run_relax,
     run_segments,
     run_shear,
+    stage_duration_ps,
 )
 
 log = logging.getLogger(__name__)
@@ -121,76 +116,12 @@ class Stage:
 
     @property
     def duration_ps(self) -> float:
-        """How much dynamics this stage asks for, its runner's defaults included."""
-        options = _stage_options(self)
-        if self.kind in {"heat", "quench"}:
-            build = _heat_segments if self.kind == "heat" else _quench_segments
-            segments = build(
-                t_start=options["t_start"],
-                t_end=options["t_end"],
-                step_k=options["step_k"],
-                hold_ps=options["hold_ps"],
-                pressure_bar=options["pressure_bar"],
-                temperatures_k=options["temperatures_k"],
-            )
-        elif self.kind == "anneal":
-            segments = _anneal_segments(
-                t_low=options["t_low"],
-                t_high=options["t_high"],
-                n_cycles=options["n_cycles"],
-                ramp_windows=options["ramp_windows"],
-                window_ps=options["window_ps"],
-                hold_ps=options["hold_ps"],
-                pressure_bar=options["pressure_bar"],
-            )
-        elif self.kind == "compress":
-            segments = _compress_segments(
-                temperature_k=options["temperature_k"],
-                pressures_bar=options["pressures_bar"],
-                duration_ps_each=options["duration_ps_each"],
-            )
-        elif self.kind in {"nvt", "npt", "production", "pushoff"}:
-            pressure = options.get("pressure_bar")
-            segments = [
-                Segment(
-                    options["temperature_k"],
-                    options["duration_ps"],
-                    1.0 if pressure is None else pressure,
-                )
-            ]
-        else:
-            segments = None
-        if segments is not None:
-            return sum((segment.duration_ps for segment in segments), 0.0)
-        if self.kind == "deform":
-            return require_positive(options["relax_ps"], None, name="relax_ps") * int(
-                options["n_steps"]
-            )
-        if self.kind in {"load", "shear"}:
-            key = "stresses_bar" if self.kind == "load" else "strains"
-            for value in options[key]:
-                require_finite(value, None, name=key)
-            return require_positive(
-                options["duration_ps_each"], None, name="duration_ps_each"
-            ) * len(options[key])
-        if self.kind == "relax":
-            # A chunk that opens an already-strained cell repeats neither the
-            # baseline nor the ramp, so counting them would price a resumed
-            # ladder as several first chunks.
-            duration_ps = require_positive(
-                options["duration_ps"], None, name="duration_ps"
-            )
-            for key in ("baseline_ps", "ramp_ps", "time_offset_ps"):
-                require_nonnegative(options[key], None, name=key)
-            held = 0.0 if options["strain_applied"] else float(options["baseline_ps"])
-            ramp = 0.0 if options["strain_applied"] else float(options["ramp_ps"])
-            return held + ramp + duration_ps
-        duration = options.get("duration_ps")
-        return (
-            0.0
-            if duration is None
-            else require_positive(duration, None, name="duration_ps")
-        )
+        """How much dynamics this stage asks for, its runner's defaults included.
+
+        Priced by the code the runner validates with, so a budget refuses
+        exactly what a run would refuse.
+        """
+        return stage_duration_ps(self.kind, _stage_options(self))
 
 
 @dataclass(frozen=True)
@@ -1053,6 +984,7 @@ def run_protocol(
         # to survive whatever stops the run.
         manifest.save(directory)
 
+    assert state is not None  # a protocol has a stage, so a state was written
     dimensions = _measure_chains(
         run,
         state,
@@ -1082,13 +1014,13 @@ def run_protocol(
 
 def _measure_chains(
     run: RunContext,
-    state_path: str | Path | None,
+    state_path: str | Path,
     backbone: Sequence[int] | None,
     atoms_per_chain: int | None,
     expected_ratio: float,
 ) -> ChainDimensions | None:
     """Measure the final chain dimensions, when there is enough to do it with."""
-    if backbone is None or atoms_per_chain is None or state_path is None:
+    if backbone is None or atoms_per_chain is None:
         return None
 
     positions = positions_nm(read_state(state_path))

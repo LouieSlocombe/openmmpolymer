@@ -25,7 +25,7 @@ import numpy.typing as npt
 import openmm as mm
 from openmm import unit
 
-from ._files import ReportFiles, file_sha256, write_json
+from ._files import ReportFiles, file_sha256
 from ._fitting import PS_PER_NS
 from ._seeds import DEFAULT_SEED
 from ._state import box_vectors_nm, positions_nm, read_state
@@ -33,6 +33,7 @@ from ._validation import require_choice, require_integer
 from ._workflow import (
     check_scan_resume,
     enforce_budget,
+    record_scan_request,
     require_positive_fields,
     require_scan_protocol,
     resume_chunks,
@@ -783,15 +784,15 @@ def run_tm_scan(
         read_record=lambda: json.loads(path.read_text()) if path.is_file() else {},
         precheck=check_record,
     )
-    directory.mkdir(parents=True, exist_ok=True)
-    write_json(
+    record_scan_request(
         path,
-        {
-            "request": request,
-            "crystalline_supplied": True,
-            "method": "apparent melting from NPT heating",
-            "total_ns": total_ns,
-        },
+        {},
+        request,
+        [directory],
+        resume=resume,
+        crystalline_supplied=True,
+        method="apparent melting from NPT heating",
+        total_ns=total_ns,
     )
     summary = run_protocol(
         protocol,

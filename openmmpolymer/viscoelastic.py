@@ -38,13 +38,14 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from ._cli_reports import _relaxation_lines
 from ._files import ReportFiles
 from ._fitting import MAX_REPLICA_SPREAD as MAX_REPLICA_SPREAD
 from ._fitting import NEGLIGIBLE, PS_PER_NS
@@ -57,14 +58,12 @@ from ._validation import (
     require_positive,
 )
 from ._workflow import (
-    chain_options,
-    enforce_budget,
+    MeasurementScan,
     equilibration_at,
     group_by_stem,
     optional,
-    remaining_ps,
     require_positive_fields,
-    run_measurement_scan,
+    run_measurement,
     sample_spread,
     scan_listing,
     with_reference_box,
@@ -72,7 +71,7 @@ from ._workflow import (
 )
 from .chain import DEFAULT_CHARACTERISTIC_RATIO
 from .plots import plot_relaxation, plot_relaxation_spectrum
-from .protocols import Protocol, RunManifest, Stage, check_chain_options
+from .protocols import Protocol, RunManifest, Stage
 from .relaxation import (
     MIN_RELAXATION_POINTS,
     KWWFit,
@@ -204,13 +203,13 @@ class RelaxationSpec:
             ),
             optional=("max_total_ns",),
         )
-        require_positive(abs(self.step_strain), None, name="step_strain")
+        require_positive(abs(self.step_strain), name="step_strain")
         require_integer(self.n_replicas, minimum=1, name="n_replicas")
         require_integer(self.bins_per_decade, minimum=1, name="bins_per_decade")
         require_choice(self.mode, RELAX_MODES, name="mode")
         require_axis(self.axis)
         require_plane(self.plane)
-        require_nonnegative(self.ramp_ps, None, name="ramp_ps")
+        require_nonnegative(self.ramp_ps, name="ramp_ps")
         if self.sample_every_ps >= self.relax_ps:
             raise ValueError(
                 f"sample_every_ps={self.sample_every_ps} is not below "
@@ -507,16 +506,11 @@ def relaxation_scan(
 # --------------------------------------------------------------------------
 
 
-def _report_cost(
-    spec: RelaxationSpec, settle: Protocol, manifest: RunManifest | None
+def _log_cost(
+    spec: RelaxationSpec, settle: Protocol, listing: Protocol, remaining_ps: float
 ) -> None:
-    """Say what the whole scan costs before any of it runs.
-
-    Raises:
-        ViscoelasticError: The total is over ``max_total_ns``.
-    """
+    """Say what the whole scan costs before any of it runs."""
     schedule = relax_schedule(spec)
-    listing = scan_listing(PROTOCOL_NAME, [settle, *_branches(spec, timestep_fs=2.0)])
     total_ps = listing.total_duration_ps
     relax_ps = total_ps - settle.total_duration_ps
     passes = len(_strains(spec))
@@ -534,17 +528,7 @@ def _report_cost(
         schedule.n_bins,
         schedule.decades,
         total_ps / PS_PER_NS,
-        remaining_ps(listing.stages, manifest) / PS_PER_NS,
-    )
-    enforce_budget(
-        total_ps / PS_PER_NS,
-        spec.max_total_ns,
-        error=ViscoelasticError,
-        message=lambda: (
-            f"The scan is {total_ps / PS_PER_NS:.1f} ns, over the "
-            f"{spec.max_total_ns:.1f} ns budget. Shorten relax_ps, drop a "
-            "replica, skip the linearity pass, or raise max_total_ns."
-        ),
+        remaining_ps / PS_PER_NS,
     )
 
 
@@ -589,59 +573,23 @@ def run_relaxation_scan(
             from the settings, so resuming under changed ones would merge
             incompatible grids into one curve.
     """
-    check_chain_options(run, chain_backbone, atoms_per_chain)
-    directory = Path(run_dir)
-    settle = equilibration_protocol(spec, **equilibration)
-    _report_cost(spec, settle, RunManifest.load(directory) if resume else None)
-
-    return run_measurement_scan(
+    return run_measurement(
+        SCAN,
         run,
-        directory / WORKFLOW_NAME,
+        run_dir,
         spec,
-        settle,
-        lambda timestep_fs, origin: _branches(
-            spec, timestep_fs=timestep_fs, reference_box_nm=origin
-        ),
-        analyse_relaxation,
-        _log_result,
         resume=resume,
-        error=ViscoelasticError,
-        verb="strain",
-        **chain_options(chain_backbone, atoms_per_chain, expected_characteristic_ratio),
+        chain_backbone=chain_backbone,
+        atoms_per_chain=atoms_per_chain,
+        expected_characteristic_ratio=expected_characteristic_ratio,
+        **equilibration,
     )
 
 
 def _log_result(report: RelaxationReport) -> None:
-    """One line per measured quantity, each with what qualifies it."""
-    if report.mean is None:
-        log.info("Relaxation scan: nothing was strained.")
-        return
-    log.info(
-        "Relaxation scan: G(0) = %.1f MPa over %.1f decades from %d replicas, "
-        "at %+.3f strain, %.0f K%s.",
-        report.mean.initial_modulus_mpa,
-        report.mean.decades,
-        report.mean.n_replicas,
-        report.mean.step_strain,
-        report.mean.temperature_k,
-        "" if report.resolved else " (not resolved)",
-    )
-    if report.kww is not None:
-        log.info(
-            "  KWW: beta = %.3f, tau = %.4g ps, <tau> = %.4g ps%s.",
-            report.kww.beta,
-            report.kww.tau_ps,
-            report.kww.mean_tau_ps,
-            "" if report.kww.resolved else " (not resolved)",
-        )
-    if report.prony is not None:
-        log.info(
-            "  Prony: G_inf = %.2f MPa over %d of %d terms%s.",
-            report.prony.equilibrium_mpa,
-            report.prony.n_active,
-            report.prony.n_terms,
-            "" if report.prony.plateau_reached else " - the decay had not finished",
-        )
+    """Log what the scan found, in the lines the command line prints."""
+    for line in _relaxation_lines(report):
+        log.info("Relaxation scan: %s", line)
     if report.plateau_conflict:
         log.warning(
             "  The spectrum finds an equilibrium modulus but the stretched "
@@ -660,6 +608,23 @@ def _log_result(report: RelaxationReport) -> None:
             "  the cell started at %.0f%% of the initial response.",
             100.0 * report.baseline_fraction,
         )
+
+
+#: The relaxation scan, as :func:`~openmmpolymer._workflow.run_measurement` runs it.
+SCAN: MeasurementScan[RelaxationReport] = MeasurementScan(
+    protocol=PROTOCOL_NAME,
+    workflow=WORKFLOW_NAME,
+    error=ViscoelasticError,
+    verb="strain",
+    budget_advice="skip the linearity pass",
+    equilibration=equilibration_protocol,
+    branches=lambda spec, timestep_fs, origin: _branches(
+        spec, timestep_fs=timestep_fs, reference_box_nm=origin
+    ),
+    log_cost=_log_cost,
+    analyse=lambda directory, spec: analyse_relaxation(directory),
+    log_result=lambda report, spec: _log_result(report),
+)
 
 
 # --------------------------------------------------------------------------
@@ -865,45 +830,6 @@ def _curve_record(curve: RelaxationCurve) -> dict[str, Any]:
     }
 
 
-def _kww_record(fit: KWWFit) -> dict[str, Any]:
-    """A stretched exponential as plain JSON types."""
-    return {
-        "modulus_mpa": fit.modulus_mpa,
-        "tau_ps": fit.tau_ps,
-        "beta": fit.beta,
-        "mean_tau_ps": fit.mean_tau_ps,
-        "residual": fit.residual,
-        "half_disagreement": fit.half_disagreement,
-        "n_points": fit.n_points,
-        "window_ps": list(fit.window_ps),
-        "extrapolation_decades": fit.extrapolation_decades,
-        "at_bound": fit.at_bound,
-        "temperature_k": fit.temperature_k,
-        "step_strain": fit.step_strain,
-        "resolved": fit.resolved,
-    }
-
-
-def _prony_record(fit: PronyFit) -> dict[str, Any]:
-    """A relaxation spectrum as plain JSON types."""
-    return {
-        "tau_ps": fit.tau_ps.tolist(),
-        "weights_mpa": fit.weights_mpa.tolist(),
-        "equilibrium_mpa": fit.equilibrium_mpa,
-        "unrelaxed_mpa": fit.unrelaxed_mpa,
-        "residual_mpa": fit.residual_mpa,
-        "n_points": fit.n_points,
-        "n_terms": fit.n_terms,
-        "n_active": fit.n_active,
-        "edge_weight": fit.edge_weight,
-        "window_ps": list(fit.window_ps),
-        "plateau_reached": fit.plateau_reached,
-        "temperature_k": fit.temperature_k,
-        "step_strain": fit.step_strain,
-        "resolved": fit.resolved,
-    }
-
-
 def write_relaxation_report(
     report: RelaxationReport,
     output_dir: str | Path | None = None,
@@ -918,20 +844,11 @@ def write_relaxation_report(
     fields: dict[str, Any] = {
         "stages": [curve.stage for curve in report.curves],
         "mean": None if report.mean is None else _curve_record(report.mean),
-        "kww": None if report.kww is None else _kww_record(report.kww),
-        "prony": None if report.prony is None else _prony_record(report.prony),
+        "kww": None if report.kww is None else asdict(report.kww),
+        "prony": None if report.prony is None else asdict(report.prony),
         "replicas": [_curve_record(curve) for curve in report.curves],
         "replica_spread_mpa": report.replica_spread_mpa,
-        "linearity": (
-            None
-            if report.linearity is None
-            else {
-                "strains": list(report.linearity.strains),
-                "initial_mpa": list(report.linearity.initial_mpa),
-                "gap": report.linearity.gap,
-                "linear": report.linearity.linear,
-            }
-        ),
+        "linearity": None if report.linearity is None else asdict(report.linearity),
         "plateau_conflict": report.plateau_conflict,
         "baseline_fraction": report.baseline_fraction,
         "resolved": report.resolved,

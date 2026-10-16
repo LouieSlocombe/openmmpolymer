@@ -317,7 +317,6 @@ def _is_index_list(value: object) -> bool:
 
 
 def resolve_backbone(
-    directory: Path,
     manifest: RunManifest | None,
     ensemble: Ensemble,
     explicit: Sequence[int] | None,
@@ -490,7 +489,7 @@ def analyse_structure(
             "expected_characteristic_ratio", DEFAULT_CHARACTERISTIC_RATIO
         )
     expected_characteristic_ratio = require_positive(
-        expected_characteristic_ratio, None, name="expected_characteristic_ratio"
+        expected_characteristic_ratio, name="expected_characteristic_ratio"
     )
 
     if ensemble.is_snapshot:
@@ -511,7 +510,7 @@ def analyse_structure(
             )
 
     path, backbone_source, backbone_file = resolve_backbone(
-        directory, manifest, ensemble, backbone, infer_backbone, notes
+        manifest, ensemble, backbone, infer_backbone, notes
     )
 
     pair_stride = capped_stride(ensemble.n_frames, stride, MAX_DISTRIBUTION_FRAMES)
