@@ -164,6 +164,16 @@ complete Python and CLI examples:
 | Structure and dynamics | [Chain dimensions, correlations and relaxation](docs/guide.md#structure) |
 | Sampling checks | [Rate dependence](docs/guide.md#rate-dependence), [observation-window convergence](docs/guide.md#observation-window-convergence) |
 
+For the calculations behind those workflows, follow the
+[first-principles tutorial](docs/first_principles.md). It derives the properties
+from masses, coordinates, box dimensions and stresses, with a
+[runnable NumPy example](examples/first_principles.py) that checks the arithmetic
+on known data and reads density and chain dimensions from a saved run.
+
+The [step-by-step property examples](docs/main_properties.md) provide standalone
+scripts for **Tg, Tm, breaking strength, yield strength, elongation at break and
+Young's modulus**, from preparation through analysis and report writing.
+
 Before interpreting a result, read the [model assumptions](docs/guide.md#the-constraints-everything-follows-from)
 and [simulation conventions](docs/guide.md#things-worth-knowing). Equilibration
 is measured rather than assumed, replicas share a prepared structure, and

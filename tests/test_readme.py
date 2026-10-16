@@ -7,6 +7,7 @@ import inspect
 import re
 import shlex
 from pathlib import Path
+from textwrap import dedent
 
 import pytest
 
@@ -19,7 +20,7 @@ DOCUMENTATION = [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]
 
 def _blocks(language: str) -> list[str]:
     return [
-        block
+        dedent(block)
         for path in DOCUMENTATION
         for block in re.findall(
             rf"```{language}\n(.*?)```", path.read_text(), flags=re.DOTALL

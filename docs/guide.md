@@ -1,6 +1,8 @@
 # User guide
 
-[Installation and quickstart](../README.md) · [Reference benchmark](../benchmarks/README.md)
+[Installation and quickstart](../README.md) · [First-principles tutorial](first_principles.md) ·
+[Step-by-step property examples](main_properties.md) ·
+[Reference benchmark](../benchmarks/README.md)
 
 The examples below continue from the `chain` and `run` built in the
 [quickstart](../README.md#a-polyethylene-melt).
