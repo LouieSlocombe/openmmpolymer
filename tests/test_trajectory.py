@@ -8,7 +8,6 @@ from typing import Any
 import numpy as np
 import pytest
 
-from openmmpolymer.structural_convergence import _block
 from openmmpolymer.trajectory import (
     AnalysisError,
     Frame,
@@ -398,7 +397,7 @@ def test_frame_slices_keep_absolute_indices_and_times(
     ensemble = open_run(dimer_run_directory, "02_nvt")
     frames = list(ensemble.frames())
     if block:
-        ensemble = _block(ensemble, 3, 9)
+        ensemble = ensemble.window(3, 9)
         frames = frames[3:9]
     expected = frames[start:stop:stride]
     actual = list(ensemble.frames(start=start, stop=stop, stride=stride))

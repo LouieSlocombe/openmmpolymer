@@ -165,11 +165,6 @@ _PARAMETERS = {
 }
 
 
-def _block(ensemble: Ensemble, start: int, stop: int) -> Ensemble:
-    """Frames *start* to *stop* of *ensemble*, as an ensemble of their own."""
-    return ensemble.window(start, stop)
-
-
 def _curve(**columns: Any) -> dict[str, tuple[float, ...]]:
     """A curve's columns as plain floats, for the report."""
     return {
@@ -553,27 +548,45 @@ def structural_window_convergence(
         heavy_atoms_only=heavy_atoms_only,
         max_lag_fraction=max_lag_fraction,
     )
-    measured = []
-    for fraction in fractions:
-        n_frames = max(1, int(ensemble.n_frames * fraction))
-        measured.append(
-            _measure(
-                ensemble.window(0, n_frames),
+    intervals: dict[
+        tuple[int, int], tuple[StructuralWindow, StructureFactor | None]
+    ] = {}
+
+    def measure_interval(
+        start: int, stop: int, fraction: float
+    ) -> tuple[StructuralWindow, StructureFactor | None]:
+        # Short trajectories can round several fractions to the same interval.
+        key = (start, stop)
+        if key not in intervals:
+            intervals[key] = _measure(
+                ensemble.window(start, stop),
                 path,
                 fraction=fraction,
-                first_frame=0,
-                conformation=conformation if n_frames == ensemble.n_frames else None,
+                first_frame=start,
+                conformation=(
+                    conformation if start == 0 and stop == ensemble.n_frames else None
+                ),
                 **options,
             )
-        )
+        window, factor = intervals[key]
+        # Report windows own their mutable mappings even when measurements match.
+        return replace(
+            window,
+            fraction=fraction,
+            values=dict(window.values),
+            valid=dict(window.valid),
+            sample_counts=dict(window.sample_counts),
+            curves={name: dict(columns) for name, columns in window.curves.items()},
+        ), factor
+
+    measured = [
+        measure_interval(0, max(1, int(ensemble.n_frames * fraction)), fraction)
+        for fraction in fractions
+    ]
     boundaries = np.linspace(ensemble.n_frames // 2, ensemble.n_frames, 4, dtype=int)
     blocks = [
-        _measure(
-            _block(ensemble, int(start), int(stop)),
-            path,
-            fraction=float((stop - start) / ensemble.n_frames),
-            first_frame=int(start),
-            **options,
+        measure_interval(
+            int(start), int(stop), float((stop - start) / ensemble.n_frames)
         )
         for start, stop in pairwise(boundaries)
         if stop > start
