@@ -5,8 +5,9 @@ incompatible files. ``StateDataReporter`` renders progress as ``20.0%`` and a
 not-yet-known remaining time as ``--``, so a file carrying those columns is not
 a table of numbers however it is parsed - and it refuses to write progress at
 all without ``totalSteps``. The machine-readable CSV therefore carries only
-numeric columns, and the human log carries the rest. Restart states are
-written through :class:`AtomicStateReporter`.
+numeric columns, and the human log carries the rest. OpenMM's
+``CheckpointReporter(writeState=True)`` writes portable restart states
+safely, as supported by the minimum OpenMM version.
 """
 
 from __future__ import annotations
@@ -92,8 +93,9 @@ class ReporterPaths:
         trajectory: The trajectory, if one was written.
         topology: The topology written beside a binary trajectory. None for a
             PDB trajectory, which carries its own.
-        state: The pointer file naming the latest portable restart state -
-            see :class:`AtomicStateReporter`.
+        state: The latest portable restart state, written during the stage
+            to ``<prefix>.restart.xml``. Separate from the completed stage's
+            ``<prefix>.state.xml``.
     """
 
     csv: str
@@ -101,56 +103,6 @@ class ReporterPaths:
     trajectory: str | None
     topology: str | None
     state: str
-
-
-class AtomicStateReporter:
-    """Writes a portable restart state, alternating between two files.
-
-    Alternating between two files and recording which is current only after
-    the write completes means there is always one good state on disk. That
-    predates the OpenMM floor: at 8.6.1, ``Simulation.saveState`` - and so
-    ``CheckpointReporter``, given a path - already writes through a temporary
-    file and renames it into place, so a crash during a write no longer costs
-    the previous state either way.
-
-    Serialised state rather than a binary checkpoint because a checkpoint is
-    tied to the platform that wrote it, and a run that has to move from a GPU
-    queue to a CPU one should not have to start again.
-    """
-
-    def __init__(self, prefix: str | Path, interval: int) -> None:
-        """Set up the reporter.
-
-        Args:
-            prefix: Stem for the two state files and the pointer beside them.
-            interval: Steps between writes.
-        """
-        self._prefix = Path(prefix)
-        self._interval = interval
-        self._next = "a"
-
-    @property
-    def pointer_path(self) -> Path:
-        """The file naming whichever state file is current."""
-        return self._prefix.with_suffix(".state.which")
-
-    def state_path(self, slot: str) -> Path:
-        """Return the path of state file *slot*."""
-        return self._prefix.with_suffix(f".state.{slot}.xml")
-
-    def describeNextReport(self, simulation: Any) -> dict[str, Any]:
-        """Tell OpenMM when this reporter next wants to be called."""
-        steps = self._interval - simulation.currentStep % self._interval
-        return {"steps": steps, "periodic": None, "include": []}
-
-    def report(self, simulation: Any, state: Any) -> None:
-        """Write the state, then point at it."""
-        del state
-        slot = self._next
-        simulation.saveState(str(self.state_path(slot)))
-        # Only now is the file complete, so only now does the pointer move.
-        self.pointer_path.write_text(slot)
-        self._next = "b" if slot == "a" else "a"
 
 
 def steps_for(duration_ps: float, timestep_fs: float) -> int:
@@ -267,7 +219,7 @@ def reporting(
     log_path = prefix.with_suffix(".log")
     trajectory_file: Path | None = None
     topology_file: Path | None = None
-    state_reporter = AtomicStateReporter(prefix, max(1, total_steps // 10))
+    state_path = prefix.with_suffix(".restart.xml")
 
     with ExitStack() as stack:
         # The file objects are opened here rather than inside the reporters so
@@ -323,14 +275,18 @@ def reporting(
                 )
             )
 
-        simulation.reporters.append(state_reporter)
+        simulation.reporters.append(
+            app.CheckpointReporter(
+                str(state_path), max(1, total_steps // 10), writeState=True
+            )
+        )
         try:
             yield ReporterPaths(
                 csv=str(csv_path),
                 log=str(log_path),
                 trajectory=None if trajectory_file is None else str(trajectory_file),
                 topology=None if topology_file is None else str(topology_file),
-                state=str(state_reporter.pointer_path),
+                state=str(state_path),
             )
         finally:
             simulation.reporters.clear()
