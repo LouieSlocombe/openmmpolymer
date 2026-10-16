@@ -1349,18 +1349,14 @@ def _group_passes(
     if manifest is None:
         manifest = load_manifest(run_dir)
     grouped: dict[tuple[float, float], list[str]] = {}
-    order: list[tuple[float, float]] = []
     for name in names:
         curve = quench_curve(run_dir, name, manifest=manifest)
         key = (
             round(curve.temperature_step_k, 6),
             round(-1.0 if curve.hold_ps is None else curve.hold_ps, 6),
         )
-        if key not in grouped:
-            grouped[key] = []
-            order.append(key)
-        grouped[key].append(name)
-    return [tuple(grouped[key]) for key in order]
+        grouped.setdefault(key, []).append(name)
+    return [tuple(group) for group in grouped.values()]
 
 
 def _rate_fits(
