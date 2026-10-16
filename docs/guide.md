@@ -158,8 +158,7 @@ While a stage runs, OpenMM periodically saves a portable XML State to
 stage writes `<stage>.state.xml`, which the manifest uses for automatic resume;
 an interrupted stage is rerun from its recorded input. The periodic snapshot
 is available for manual recovery and is kept separate from that completed
-state. Older runs' `.state.a.xml`, `.state.b.xml` and `.state.which` files remain
-untouched; new runs use the single `.restart.xml` file instead.
+state.
 
 ### Glass transition
 

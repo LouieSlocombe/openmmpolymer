@@ -69,27 +69,6 @@ replica standard error, equilibration diagnostics and reference provenance. A
 full command exits with status 1 when the comparison fails or remains
 unresolved.
 
-## Recorded results
-
-[`results/pe_c44_smoke.json`](results/pe_c44_smoke.json) is the unmodified
-report of a real CPU execution, on 2026-09-23, of:
-
-```bash
-OPENMM_CPU_THREADS=1 python -m benchmarks.pe_melt \
-  --output /tmp/openmmpolymer-pe-c44-audit-smoke-loose \
-  --smoke --seeds 11 --platform CPU
-```
-
-It took the 4,020-atom C44H90 system through chain construction, Gasteiger
-charges, OpenFF parameterisation, Packmol, minimisation, dynamics, trajectory
-reading and analysis, and records the package versions, the effective
-protocol, the case digest and the relative manifest path. Build intermediates,
-trajectories and manifests are not checked in; rerun the command to regenerate
-them and a new report.
-
-This is integration evidence only: the initial packing is deliberately sparse,
-production lasts 0.5 ps, and the report correctly states `smoke_only`, with
-insufficient sampling and no reference-density agreement. No full 10 ns,
-three-replica reference result is claimed - not from this report, and not from
-passing the unit tests. The full comparison should be run and its report
-reviewed before relying on quantitative material predictions.
+Run the full comparison and review its report before relying on quantitative
+material predictions; passing the smoke test or unit tests does not establish
+reference agreement.

@@ -1,4 +1,4 @@
-"""Pin the full stage records and workflow requests before consolidation (#40)."""
+"""Protect saved-run compatibility of stage records and workflow requests."""
 
 from __future__ import annotations
 
@@ -27,7 +27,6 @@ from openmmpolymer.protocols import (
 
 from .helpers import argon_context
 
-# Recorded twice at the pre-consolidation baseline (audit Appendix A).
 # Stage names seed the RNG and the full options/requests are compared on resume:
 # changing one refuses the resume of every affected run already on disk.
 RECORDED_BUILDERS_SHA256 = {
@@ -91,11 +90,8 @@ def test_every_builder_and_workflow_request_keeps_its_recorded_digest() -> None:
     modulus = mechanical.ModulusSpec()
     relaxation = viscoelastic.RelaxationSpec()
     glass = tg.TgSpec()
-    # Freeze the original nominal offset ladder so this remains a resume guard.
-    # 86d6e5c (#33) widened nominal_fine_schedule's budget estimate from 25 to
-    # 30 holds (120..0 K to 145..0 K); real fine passes use fine_schedule instead.
-    # The same explicit ladder still has the recorded names and filled-in options,
-    # including after 67a736c (#34)'s short-stage and irregular-tail chunking fix.
+    # Freeze an explicit ladder so the resume guard is independent of changes
+    # to the nominal budget estimate.
     fine_ladder = tg.fine_schedule(120.0, 0.0, glass)
     recorded = {
         "standard_melt_equilibration": _digest(_stages(standard_melt_equilibration())),
