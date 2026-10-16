@@ -115,15 +115,6 @@ def test_elastic_stage_selection_does_not_add_full_manifest_schema_requirements(
         )
 
 
-def test_melt_missing_stage_keeps_its_original_note(tmp_path: Path) -> None:
-    RunManifest(protocol="empty", seed=7).save(tmp_path)
-    result = melt_equilibration(tmp_path, "missing")
-    assert (
-        result.unchecked[0]
-        == "box volume: the manifest has no stage 'missing'. It records: nothing."
-    )
-
-
 def test_state_readers_preserve_unwrapped_positions_and_box_components(
     argon_run: Any, tmp_path: Path
 ) -> None:

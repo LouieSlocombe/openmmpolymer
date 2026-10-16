@@ -133,14 +133,9 @@ def test_check_target_density_uses_the_compressed_cell_not_the_packed_one() -> N
     """
     spec = SystemSpec(nonbonded_cutoff_nm=1.2)
     check_box((4.5, 4.5, 4.5), spec)
-    with pytest.raises(SystemAssemblyError, match="compresses to"):
+    with pytest.raises(SystemAssemblyError, match="compresses to") as refusal:
         check_target_density([20], [563.1], 0.85, spec)
-
-
-def test_check_target_density_says_how_much_more_material_is_needed() -> None:
-    """A message that names the fix is worth more than one that names the fault."""
-    with pytest.raises(SystemAssemblyError, match="times as many chains"):
-        check_target_density([20], [563.1], 0.85, SystemSpec())
+    assert "times as many chains" in str(refusal.value)
 
 
 def test_check_target_density_returns_the_compressed_edge() -> None:

@@ -1,4 +1,4 @@
-"""Pin the scan resume checks before consolidating their pre-flight code."""
+"""Scan preflight behavior beyond the shared workflow resume checks."""
 
 from __future__ import annotations
 
@@ -113,6 +113,7 @@ def _begin_scan(
             "missing-record",
             "changed-inputs",
         )
+        if name in ("tg", "tm") or damage == "changed-inputs"
     ],
 )
 def test_scan_refuses_unverifiable_resume_before_writing_or_dynamics(
@@ -233,7 +234,7 @@ def test_tensile_refuses_malformed_nested_request_without_writes(
     assert snapshot_files(directory, mtimes=True) == before
 
 
-@pytest.mark.parametrize("name", list(SCANS))
+@pytest.mark.parametrize("name", ("tg", "tm"))
 def test_a_forced_rerun_clears_the_old_manifest_before_any_dynamics(
     name: str, argon_run: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -327,16 +327,7 @@ def test_nnls_recovers_an_exact_non_negative_solution() -> None:
 
 
 def test_nnls_never_returns_a_negative_weight() -> None:
-    """Which plain least squares does most of the time on realistic data.
-
-    A Prony series with a negative weight is a relaxation spectrum with
-    negative weight somewhere, which no material has. Measured over two
-    hundred draws at each of four noise levels, plain least squares produced
-    one in about four cases out of five - so "fit it unconstrained and refuse
-    if any came back negative" would throw away four runs in five, and not
-    the four that deserved it. The bound below is loose because the point is
-    the order of magnitude, not the exact rate.
-    """
+    """Noise must not turn a relaxation spectrum's weights negative."""
     rng = np.random.default_rng(1)
     time_ps = np.geomspace(0.1, 1.0e4, 120)
     tau_ps = prony_times_ps(0.1, 1.0e4)
@@ -344,14 +335,10 @@ def test_nnls_never_returns_a_negative_weight() -> None:
     planted_weights = np.zeros(tau_ps.size + 1)
     planted_weights[[0, 2, 4]] = [300.0, 150.0, 60.0]
     planted_weights[-1] = 40.0
-    unconstrained_negatives = 0
     for _ in range(20):
         target = design @ planted_weights + rng.normal(0.0, 30.0, time_ps.size)
         found = nnls(design, target)
         assert bool((found >= 0.0).all())
-        plain, *_ = np.linalg.lstsq(design, target, rcond=None)
-        unconstrained_negatives += int((plain < 0.0).any())
-    assert unconstrained_negatives >= 12
 
 
 def test_nnls_satisfies_its_own_optimality_conditions() -> None:

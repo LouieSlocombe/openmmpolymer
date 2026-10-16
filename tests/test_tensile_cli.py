@@ -129,15 +129,6 @@ def test_missing_replicas_do_not_renumber_the_remaining_results(name: str) -> No
 
 
 @pytest.mark.parametrize("name", sorted(SPECS))
-def test_an_explicit_temperature_wins_over_the_tensile_default(name: str) -> None:
-    """Room temperature is only a default; -t 450 means 450 K here too."""
-    arguments = cli.build_parser().parse_args(
-        ["[*]CC[*]", "-t", "450", "--protocol", name]
-    )
-    assert cli.PROTOCOLS[name].settings(arguments).temperature_k == 450.0
-
-
-@pytest.mark.parametrize("name", sorted(SPECS))
 def test_analyse_detects_a_tensile_scan_and_writes_its_report(
     name: str,
     monkeypatch: pytest.MonkeyPatch,

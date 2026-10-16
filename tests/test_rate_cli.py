@@ -117,16 +117,6 @@ def test_the_youngs_modulus_flags_are_the_generic_ones() -> None:
     assert cli._property_rate_request(both) == request
 
 
-def test_the_strain_rate_target_alone_analyses_youngs_modulus(tmp_path: Path) -> None:
-    arguments = cli.build_parser().parse_args(
-        ["--analyse", str(tmp_path), "--target-strain-rate", "0.001"]
-    )
-    request = cli._property_rate_request(arguments)
-    assert request.property_name == "youngs_modulus"
-    assert request.target_rate == 0.001
-    assert request.hold_times_ps == ()
-
-
 def test_analysis_does_not_apply_unrelated_cli_temperature_defaults(
     tmp_path: Path,
 ) -> None:

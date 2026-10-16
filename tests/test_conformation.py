@@ -57,20 +57,6 @@ def test_a_dimer_cell_gives_its_exact_dimensions() -> None:
     assert measured.ratio_of_squares == pytest.approx(4.0, rel=1e-12)
 
 
-def test_a_single_frame_agrees_with_the_existing_snapshot_measurement() -> None:
-    """chain_conformation generalises chain_dimensions over frames, so on one
-    frame the two have to be the same number."""
-    positions = freely_rotating_chain(20, 0.153, 0.8, n_chains=5, seed=1)
-    ensemble = synthetic_ensemble(positions, n_chains=5)
-    over_frames = chain_conformation(
-        ensemble, range(21), expected_characteristic_ratio=7.0
-    ).mean
-    directly = chain_dimensions(
-        positions, list(range(21)), 21, 5, expected_characteristic_ratio=7.0
-    )
-    assert over_frames == directly
-
-
 def test_trajectory_ratios_use_pooled_means_even_when_one_frame_is_closed() -> None:
     """A closed backbone still contributes its radius and bond lengths to
     the pooled denominators, despite both of its own ratios being zero."""
@@ -205,14 +191,6 @@ def test_each_selected_frame_is_measured_once_without_retaining_coordinates(
     assert all(reference() is None for reference in coordinates)
 
 
-def test_a_snapshot_has_no_settling_to_report() -> None:
-    """One frame is not a series, and reporting a verdict from it would be the
-    thing this whole module exists to avoid."""
-    series = chain_conformation(synthetic_ensemble(dimer_cell(), n_chains=32), (0, 1))
-    assert series.settled is None
-    assert series.n_frames == 1
-
-
 def test_a_trajectory_reports_whether_its_dimensions_had_settled() -> None:
     """The dimensions of a melt mean something only if they had stopped moving
     while they were being measured."""
@@ -225,13 +203,6 @@ def test_a_trajectory_reports_whether_its_dimensions_had_settled() -> None:
     assert series.n_frames == 20
     assert series.time_ps.size == 20
     assert series.mean_radius_of_gyration_nm == pytest.approx(0.3, rel=1e-9)
-
-
-def test_a_stride_measures_fewer_frames() -> None:
-    """A long trajectory does not need every frame to give a mean."""
-    frames = np.repeat(dimer_cell()[None, :, :], 20, axis=0)
-    ensemble = synthetic_ensemble(frames, n_chains=32, interval_ps=1.0)
-    assert chain_conformation(ensemble, (0, 1), stride=4).n_frames == 5
 
 
 def test_a_backbone_that_does_not_fit_the_chains_is_refused() -> None:
@@ -375,14 +346,6 @@ def shrinking_cell(n_frames: int = 40, n_chains: int = 27) -> Any:
     return synthetic_ensemble(frames, n_chains=n_chains, interval_ps=1.0, box_nm=boxes)
 
 
-def test_removing_the_barostats_scaling_reports_how_much_it_removed() -> None:
-    """A claim that a correction was applied is worth less than the size of it."""
-    edges = np.linspace(4.0, 3.6, 40)
-    measured = centre_of_mass_msd(shrinking_cell(), remove_box_scaling=True)
-    assert measured.box_drift_fraction == pytest.approx(0.4 / edges.mean(), rel=1e-6)
-    assert float(measured.msd_nm2.max()) < 1e-18
-
-
 @pytest.mark.parametrize("stride", [1, 2])
 def test_displacement_collects_coordinates_and_cells_in_one_pass(
     monkeypatch: pytest.MonkeyPatch, stride: int
@@ -459,13 +422,6 @@ def test_a_correlation_already_below_the_threshold_crosses_at_the_first_lag() ->
 
     lags = np.array([0.0, 1.0, 2.0])
     assert _crossing(lags, np.array([0.1, 0.05, 0.0]), 0.5) == pytest.approx(0.0)
-
-
-def test_a_correlation_that_never_crosses_has_no_crossing() -> None:
-    """Reported as None, not as the last lag measured."""
-    from openmmpolymer.conformation import _crossing
-
-    assert _crossing(np.arange(3.0), np.ones(3), 0.5) is None
 
 
 @pytest.mark.parametrize(

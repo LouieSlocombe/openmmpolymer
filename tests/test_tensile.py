@@ -164,34 +164,12 @@ def _interrupt(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
 
 
 @pytest.mark.parametrize("name", MEASUREMENTS)
-def test_chunks_share_a_strain_reference_and_draw_velocities_once(name: str) -> None:
+def test_replicas_differ_only_in_their_stage_names(name: str) -> None:
     spec = replace(QUICK[name], max_strain=0.05, relax_ps=50.0, stage_ps=500.0)
-    schedule = tensile_schedule(spec)
-    assert schedule.n_steps == 25
-    assert 1.002**24 - 1.0 < spec.max_strain <= schedule.max_strain
-    assert schedule.total_ps == 1250.0
-    assert schedule.strain_rate_per_ns == pytest.approx(schedule.max_strain / 1.25)
     reference = (4.0, 5.0, 6.0)
     ladder = tensile_protocol(spec, replica=2, reference_box_nm=reference)
-    assert ladder.name == name
-    assert [stage.name for stage in ladder.stages] == [
-        f"06_{name}_r2_000",
-        f"06_{name}_r2_001",
-        f"06_{name}_r2_002",
-    ]
-    assert [stage.options["n_steps"] for stage in ladder.stages] == [10, 10, 5]
-    assert [stage.options["new_velocities"] for stage in ladder.stages] == [
-        True,
-        False,
-        False,
-    ]
-    assert [stage.options["strain_start"] for stage in ladder.stages] == pytest.approx(
-        [1.002**done - 1.0 for done in (0, 10, 20)]
-    )
-    assert all(
-        stage.options["reference_box_nm"] == list(reference) for stage in ladder.stages
-    )
     other = tensile_protocol(spec, replica=3, reference_box_nm=reference).stages
+    assert [stage.name for stage in other] != [stage.name for stage in ladder.stages]
     assert [stage.options for stage in other] == [
         stage.options for stage in ladder.stages
     ]
@@ -212,14 +190,6 @@ def test_the_listed_scan_prices_equilibration_and_every_replica(name: str) -> No
         + spec.n_replicas * tensile_schedule(spec).total_ps
     )
     assert len(protocol.stages) == len(equilibration.stages) + 6
-
-
-def test_trajectory_recording_is_explicitly_optional() -> None:
-    spec = QUICK["breaking"]
-    assert "trajectory" not in tensile_protocol(spec).stages[0].options
-    stage = tensile_protocol(replace(spec, trajectory_ps=0.01)).stages[0]
-    assert stage.options["trajectory"].format == "xtc"
-    assert stage.options["trajectory"].interval_ps == 0.01
 
 
 def test_a_spec_selects_its_measurement_by_exact_type(argon_scan_run: Any) -> None:

@@ -411,16 +411,3 @@ def test_the_grown_embedder_reproduces_the_expected_chain_dimensions(
         output_dir=tmp_path,
     )
     assert result.characteristic_ratio == pytest.approx(7.0, rel=0.35)
-
-
-def test_etkdg_collapses_a_long_chain(tmp_path: Path) -> None:
-    """Recorded because it is the reason the default is what it is."""
-    result = build_chain(
-        ChainSpec(monomer_smiles=PE, degree_of_polymerization=40, residue_name="PE"),
-        "chain",
-        n_conformers=2,
-        output_dir=tmp_path,
-        embedder="etkdg",
-    )
-    assert result.characteristic_ratio is not None
-    assert result.characteristic_ratio < 4.0

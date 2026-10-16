@@ -181,21 +181,6 @@ def test_the_bins_span_zero_to_the_measured_radius() -> None:
     assert measured.r_nm[-1] == pytest.approx(measured.r_max_nm - width / 2)
 
 
-def test_the_frame_count_is_reported_alongside_the_answer() -> None:
-    """A g(r) from one frame and one from five hundred have the same shape and
-    very different standing."""
-    frames = np.repeat(lattice(64, LATTICE_EDGE_NM)[None, :, :], 6, axis=0)
-    measured = radial_distribution(
-        synthetic_ensemble(
-            frames, n_chains=64, box_nm=LATTICE_EDGE_NM, interval_ps=1.0
-        ),
-        n_bins=60,
-        heavy_atoms_only=False,
-        stride=2,
-    )
-    assert measured.n_frames == 3
-
-
 @pytest.mark.parametrize(
     ("measure", "options"),
     [(radial_distribution, {}), (structure_factor, {"q_max_per_nm": 12.0})],

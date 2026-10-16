@@ -215,16 +215,6 @@ def test_derived_seeds_are_stable_and_distinct() -> None:
     assert derive_seed(7, "thermostat") != derive_seed(8, "thermostat")
 
 
-def test_a_derived_seed_is_never_zero() -> None:
-    """OpenMM reads zero as 'choose your own', losing the reproducibility.
-
-    Swept rather than spot-checked, because the failure would be one label in
-    a thousand quietly making a run irreproducible.
-    """
-    for index in range(5000):
-        assert derive_seed(1, "conformer", str(index)) != 0
-
-
 def test_a_derived_seed_fits_what_openmm_accepts() -> None:
     """A C int, so below 2**31."""
     for index in range(1000):

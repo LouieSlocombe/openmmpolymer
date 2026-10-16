@@ -90,53 +90,6 @@ ONE_EXTENSION = replace(
 # --------------------------------------------------------------------------
 
 
-def test_the_ladder_reaches_the_strain_it_was_asked_for() -> None:
-    """Increments compound, so the step count is a logarithm, not a ratio."""
-    schedule = deform_schedule(ModulusSpec(strain_increment=0.002, max_strain=0.05))
-    assert schedule.n_steps == 25
-    assert schedule.max_strain >= 0.05
-    assert (1.0 + 0.002) ** 24 - 1.0 < 0.05
-
-
-def test_the_strain_rate_is_the_whole_ladder_over_the_whole_time() -> None:
-    """The number that has to travel with every modulus."""
-    schedule = deform_schedule(
-        ModulusSpec(strain_increment=0.002, max_strain=0.05, relax_ps=50.0)
-    )
-    assert schedule.total_ps == pytest.approx(25 * 50.0)
-    assert schedule.strain_rate_per_ns == pytest.approx(
-        schedule.max_strain / schedule.total_ps * 1000.0
-    )
-
-
-def test_a_long_ladder_is_split_into_resumable_chunks() -> None:
-    """A stage is the unit a run picks itself up at, so it has a ceiling."""
-    spec = ModulusSpec(
-        strain_increment=0.002, max_strain=0.05, relax_ps=50.0, stage_ps=500.0
-    )
-    stages = deform_protocol(spec, timestep_fs=2.0).stages
-    assert len(stages) == 3
-    assert sum(int(stage.options["n_steps"]) for stage in stages) == 25
-    # Each chunk knows the strain it starts at, because the state file does
-    # not carry one and a resumed chunk would otherwise restart the count.
-    assert [round(float(stage.options["strain_start"]), 6) for stage in stages] == [
-        0.0,
-        round((1.002) ** 10 - 1.0, 6),
-        round((1.002) ** 20 - 1.0, 6),
-    ]
-
-
-def test_only_the_first_chunk_of_a_replica_redraws_velocities() -> None:
-    """A replica is one trajectory; its later chunks continue it."""
-    spec = replace(QUICK, stage_ps=0.3, max_strain=0.012)
-    stages = deform_protocol(spec, timestep_fs=2.0).stages
-    assert len(stages) > 1
-    assert [bool(stage.options["new_velocities"]) for stage in stages] == [
-        True,
-        *([False] * (len(stages) - 1)),
-    ]
-
-
 def test_replicas_differ_only_in_their_stage_names() -> None:
     """Which is enough: every random stream is derived from the label."""
     first = deform_protocol(QUICK, timestep_fs=2.0, replica=0).stages

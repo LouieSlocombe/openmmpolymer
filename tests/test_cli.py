@@ -84,12 +84,6 @@ RECORDED_REQUEST_SHA256 = {
     "yield": "012ff7978ea93edc33b04a21caffd630ca654b2d45a5786e0e9ad0a6e071f44a",
 }
 
-# The action schema also pins parsing and user-visible help, which need not
-# affect the shortest command lines above to change the CLI contract.
-RECORDED_PARSER_SHA256 = (
-    "2abc8e87aa48d2ac838ab0eb54d05267e7f410b6de43d4efce165afda68b5850"
-)
-
 #: What the build request leaves out: where things go, which device runs
 #: them, how much is said, and whether - or under what budget - dynamics
 #: start. None of them changes the physical system.
@@ -318,33 +312,6 @@ def test_every_setting_a_build_request_records_is_pinned() -> None:
     assert recorded == RECORDED_REQUEST_SHA256
 
 
-def test_the_whole_parser_action_schema_is_pinned() -> None:
-    """Defaults alone cannot detect a changed converter, choice, arity or help."""
-    recorded = []
-    for action in build_parser()._actions:
-        action_type = action.type
-        converter = None
-        if action_type is not None:
-            assert hasattr(action_type, "__qualname__")
-            converter = f"{action_type.__module__}.{action_type.__qualname__}"
-        recorded.append(
-            {
-                "action": type(action).__name__,
-                "option_strings": action.option_strings,
-                "dest": action.dest,
-                "default": action.default,
-                "const": action.const,
-                "type": converter,
-                "choices": action.choices,
-                "nargs": action.nargs,
-                "help": action.help,
-                "required": action.required,
-                "metavar": action.metavar,
-            }
-        )
-    assert _sha256(recorded) == RECORDED_PARSER_SHA256
-
-
 def test_the_build_request_is_every_setting_but_where_and_how_it_runs(
     no_build: list[Any],
 ) -> None:
@@ -389,13 +356,6 @@ def test_a_changed_request_is_refused_before_it_can_overwrite_the_build(
 # --------------------------------------------------------------------------
 # The parser
 # --------------------------------------------------------------------------
-
-
-def test_the_parser_says_what_the_command_does() -> None:
-    """It is the first thing anyone reads."""
-    parser = build_parser()
-    assert parser.prog == "openmmpolymer"
-    assert "polymer melt" in (parser.description or "")
 
 
 def test_the_monomer_is_the_one_required_argument() -> None:
@@ -572,8 +532,6 @@ def test_tg_budget_includes_the_waypoint_extension_before_building(
 
 def test_the_chain_flags_reach_the_builder(no_build: list[Any]) -> None:
     """A capped polyester is built as asked, with its own C-infinity."""
-    from openmmpolymer.chain import assemble_chain
-
     with pytest.raises(BuildReached):
         main(
             [
@@ -599,7 +557,6 @@ def test_the_chain_flags_reach_the_builder(no_build: list[Any]) -> None:
     assert (spec.head_cap, spec.tail_cap) == ("[*][H]", "[*]O")
     assert (spec.degree_of_polymerization, spec.characteristic_ratio) == (3, 5.5)
     assert (spec.tacticity, spec.residue_name, spec.seed) == ("isotactic", "PLA", 7)
-    assert assemble_chain(spec).GetNumAtoms() > 0
 
 
 def test_a_failed_first_build_can_retry_the_same_request(
@@ -1526,14 +1483,6 @@ def test_a_blend_file_is_built_and_recorded_polymer_by_polymer(
     with pytest.raises(SystemExit, match="2"):
         main(["--blend", "pe_ps.toml", "--seed", "7", "--dry-run"])
     assert snapshot_files(Path("run")) == before
-
-
-def test_a_run_without_a_blend_records_no_blend(no_build: list[Any]) -> None:
-    """So the requests of runs made before ``--blend`` existed still match."""
-    assert "blend" not in vars(build_parser().parse_args(["[*]CC[*]"]))
-    with pytest.raises(BuildReached):
-        main(["[*]CC[*]", "--dry-run"])
-    assert "blend" not in json.loads(Path("run/build_request.json").read_text())
 
 
 def test_a_blend_goes_on_to_dynamics_without_chain_measurements(

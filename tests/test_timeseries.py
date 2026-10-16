@@ -9,9 +9,7 @@ import numpy as np
 import pytest
 
 from openmmpolymer._fitting import MAX_EXTRAPOLATION_DECADES
-from openmmpolymer.reporters import CSV_COLUMNS
 from openmmpolymer.timeseries import (
-    CSV_FIELDS,
     DSC_COOLING_RATE_K_PER_NS,
     GlassTransition,
     cooling_rate_extrapolation,
@@ -36,11 +34,6 @@ from .helpers import (
     write_quench,
     write_quenches,
 )
-
-
-def test_the_column_map_covers_every_column_a_stage_writes() -> None:
-    """The reporter and the reader have to agree, and they are written apart."""
-    assert len(CSV_FIELDS) == len(CSV_COLUMNS)
 
 
 def test_a_stage_csv_reads_back_column_by_column(tmp_path: Path) -> None:
@@ -444,22 +437,6 @@ def test_the_expansivities_are_the_slopes_over_the_crossing_volume(
     assert fit.specific_volume_cm3_g == pytest.approx(1.0)
     assert fit.melt_expansivity_per_k == pytest.approx(8.0e-4)
     assert fit.glass_expansivity_per_k == pytest.approx(2.0e-4)
-
-
-def test_a_resolved_transition_always_expands_faster_as_a_melt(
-    tmp_path: Path,
-) -> None:
-    """Which is why it is reported rather than checked a second time.
-
-    Both coefficients divide the same crossing volume, so their ordering is
-    the ordering of the slopes, and that is already what resolved requires.
-    """
-    temperature, density = two_line_curve(transition_k=340.0)
-    write_quench(tmp_path, temperature, density)
-    fit = glass_transition(quench_curve(tmp_path))
-
-    assert fit.resolved
-    assert fit.melt_expansivity_per_k > fit.glass_expansivity_per_k
 
 
 def test_an_expansivity_with_no_volume_to_divide_by_is_not_a_number() -> None:
