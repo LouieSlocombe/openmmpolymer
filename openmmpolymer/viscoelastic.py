@@ -723,15 +723,14 @@ def analyse_relaxation(
     by_strain: dict[float, list[RelaxationCurve]] = {}
     for curve in curves:
         by_strain.setdefault(round(curve.step_strain, 9), []).append(curve)
-    ensemble = by_strain[_primary_strain(by_strain)]
-
-    mean = mean_curve(ensemble)
+    primary_strain = _primary_strain(by_strain)
+    ensemble = by_strain[primary_strain]
+    means = {value: mean_curve(group) for value, group in by_strain.items()}
+    mean = means[primary_strain]
     kww = fit_kww(mean, min_points=min_points)
     prony = fit_prony(mean, min_points=min_points)
     spread = sample_spread([curve.initial_modulus_mpa for curve in ensemble])
-    linearity = _linearity(
-        {value: mean_curve(group) for value, group in by_strain.items()}
-    )
+    linearity = _linearity(means)
 
     initial = mean.initial_modulus_mpa
     measurable = math.isfinite(initial) and abs(initial) > NEGLIGIBLE

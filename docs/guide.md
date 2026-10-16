@@ -153,6 +153,14 @@ Every measurement follows the same pattern:
 - Molecular dynamics rates are some ten decades faster than experiment, so
   every number is an apparent one at its rate, and the rate travels with it.
 
+While a stage runs, OpenMM periodically saves a portable XML State to
+`<stage>.restart.xml`, replacing the previous snapshot safely. The completed
+stage writes `<stage>.state.xml`, which the manifest uses for automatic resume;
+an interrupted stage is rerun from its recorded input. The periodic snapshot
+is available for manual recovery and is kept separate from that completed
+state. Older runs' `.state.a.xml`, `.state.b.xml` and `.state.which` files remain
+untouched; new runs use the single `.restart.xml` file instead.
+
 ### Glass transition
 
 Resolving a transition to a few kelvin needs small steps and long holds, and

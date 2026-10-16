@@ -129,10 +129,7 @@ def test_property_names_become_safe_file_names(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("figures", [True, False])
-def test_missing_output_directory_and_unsafe_format_fail_before_writing(
-    tmp_path: Path,
-    figures: bool,
-) -> None:
+def test_missing_output_directory_fails_before_writing(figures: bool) -> None:
     with pytest.raises(ValueError, match="output_dir"):
         write_rate_report(planted_rate_report(), figures=figures)
 

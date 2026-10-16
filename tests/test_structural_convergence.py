@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
 
 from openmmpolymer import structural_convergence as convergence
 from openmmpolymer.conformation import centre_of_mass_msd
+from openmmpolymer.correlations import radial_distribution
 from openmmpolymer.structural_convergence import structural_window_convergence
 from openmmpolymer.trajectory import AnalysisError
 
@@ -48,13 +50,13 @@ def test_disjoint_blocks_read_tail_frames_and_have_no_overlap() -> None:
     ensemble = frozen_rods()
     for index in range(72):
         ensemble.universe.positions_angstrom[index, :, 2] += index
-    block = convergence._block(ensemble, 24, 36)
+    block = ensemble.window(24, 36)
     frames = list(block.frames())
     assert len(frames) == 12
     assert [frame.index for frame in frames] == list(range(24, 36))
     assert frames[0].positions_nm[0, 2] == pytest.approx(2.4)
     assert frames[-1].positions_nm[0, 2] == pytest.approx(3.5)
-    nested = convergence._block(block, 2, 5)
+    nested = block.window(2, 5)
     assert nested.first_frame == 26
     assert [frame.index for frame in nested.frames()] == [26, 27, 28]
     assert [frame.time_ps for frame in nested.frames()] == [27.0, 28.0, 29.0]
@@ -74,6 +76,51 @@ def test_one_snapshot_cannot_resolve_any_window_stability() -> None:
     assert not any(parameter.resolved for parameter in report.parameters.values())
     assert any("snapshot" in note for note in report.notes)
     assert all(window.n_frames == 1 for window in report.windows)
+
+
+@pytest.mark.parametrize(
+    ("n_frames", "intervals"),
+    [
+        (1, [(0, 1)]),
+        (2, [(0, 1), (0, 2), (1, 2)]),
+        (3, [(0, 1), (0, 2), (0, 3), (1, 2), (2, 3)]),
+    ],
+)
+def test_short_trajectories_measure_each_interval_once_without_merging_windows(
+    n_frames: int, intervals: list[tuple[int, int]]
+) -> None:
+    ensemble = frozen_rods(n_frames)
+    for index in range(n_frames):
+        ensemble.universe.positions_angstrom[index] *= 1.0 + index * 0.1
+    with patch.object(convergence, "_measure", wraps=convergence._measure) as measure:
+        report = structural_window_convergence(ensemble, range(5), **STRUCTURAL_OPTIONS)
+    assert [
+        (call.args[0].first_frame, call.args[0].first_frame + call.args[0].n_frames)
+        for call in measure.call_args_list
+    ] == intervals
+    assert tuple(window.fraction for window in report.windows) == (0.25, 0.5, 0.75, 1.0)
+    assert not report.resolved
+    for window in (*report.windows, *report.blocks):
+        direct = radial_distribution(
+            ensemble.window(window.first_frame, window.first_frame + window.n_frames),
+            r_max_nm=report.settings["r_max_nm"],
+            n_bins=report.settings["rdf_bins"],
+            stride=report.settings["pair_stride"],
+        )
+        assert window.curves["radial_distribution"]["g_r"] == pytest.approx(direct.g_r)
+        assert window.sample_counts["rdf_first_peak_nm"] == direct.n_frames
+    first, repeated = report.windows[:2]
+    assert first.values == repeated.values
+    for field in ("values", "valid", "sample_counts", "curves"):
+        assert getattr(first, field) is not getattr(repeated, field)
+    for name in first.curves:
+        assert first.curves[name] is not repeated.curves[name]
+    if n_frames == 1:
+        block = report.blocks[0]
+        assert block.fraction == 1.0
+        assert block.values == first.values
+        assert block.values is not first.values
+        assert not any(parameter.resolved for parameter in report.parameters.values())
 
 
 def test_absent_backbone_keeps_chain_measures_missing_but_retains_pair_curves() -> None:

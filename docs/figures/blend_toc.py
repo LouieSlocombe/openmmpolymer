@@ -1,4 +1,4 @@
-"""Make the README's showcase figure: a polyethylene/polystyrene blend.
+"""Make a standalone showcase figure of a polyethylene/polystyrene blend.
 
 Three steps, run from the repository root:
 
@@ -80,7 +80,7 @@ FIGURE_EQUILIBRATION = Protocol(
     ),
 )
 
-#: The README's file-size limit is pre-commit's check-added-large-files.
+#: Leave room below pre-commit's check-added-large-files limit.
 MAX_BYTES = 450_000
 
 

@@ -14,7 +14,6 @@ from openmm.app.internal.xtc_utils import get_xtc_nframes
 
 from openmmpolymer.reporters import (
     CSV_COLUMNS,
-    AtomicStateReporter,
     TrajectoryOptions,
     reporting,
     rotate_existing,
@@ -85,38 +84,77 @@ def test_rotate_existing_ignores_an_empty_file(tmp_path: Path) -> None:
     assert rotate_existing(target) is None
 
 
-def test_the_state_reporter_alternates_and_points_at_the_last_complete_file(
+def test_reporting_keeps_the_latest_portable_restart_state(
     argon_run: Any,
 ) -> None:
-    """A crash during a write must not destroy the only checkpoint there was.
-
-    The pointer moves only once a file is complete, and a pointer to a file
-    that is not there reads as no state at all: half a restart is worse than
-    none.
-    """
-    reporter = AtomicStateReporter("stage", 10)
-    assert not reporter.pointer_path.is_file()
+    """The reported path opens directly as a State and advances during the run."""
     simulation = _simulation(argon_run)
+    with reporting(
+        simulation, "stage", total_steps=100, report_interval=50, trajectory="none"
+    ) as paths:
+        assert paths.state == "stage.restart.xml"
+        path = Path(paths.state)
+        assert not path.exists()
+        simulation.step(10)
+        first = mm.XmlSerializer.deserialize(path.read_text())
+        assert first.getStepCount() == 10
+        simulation.step(10)
+        latest = mm.XmlSerializer.deserialize(path.read_text())
+        assert latest.getStepCount() == 20
+        assert latest.getTime() > first.getTime()
+        np.testing.assert_array_equal(
+            latest.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+            simulation.context.getState(getPositions=True)
+            .getPositions(asNumpy=True)
+            .value_in_unit(unit.nanometer),
+        )
+    assert not Path("stage.state.which").exists()
+    assert not Path("stage.state.xml").exists()
 
-    reporter.report(simulation, None)
-    assert reporter.pointer_path.read_text() == "a"
-    assert reporter.state_path("a").is_file()
-    reporter.report(simulation, None)
-    assert reporter.pointer_path.read_text() == "b"
-    assert reporter.state_path("a").is_file()
-    mm.XmlSerializer.deserialize(reporter.state_path("b").read_text())
+
+def test_a_failed_restart_replacement_preserves_the_last_complete_state(
+    argon_run: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The supported OpenMM reporter keeps the previous snapshot on write failure."""
+    from openmm.app.internal import safesave
+
+    def fail_replacement(source: str, destination: str) -> None:
+        assert Path(destination) == Path("stage.restart.xml")
+        raise OSError("interrupted state replacement")
+
+    simulation = _simulation(argon_run)
+    with (
+        pytest.raises(OSError, match="interrupted state replacement"),
+        reporting(
+            simulation, "stage", total_steps=100, report_interval=50, trajectory="none"
+        ) as paths,
+    ):
+        simulation.step(10)
+        previous = Path(paths.state).read_bytes()
+        with monkeypatch.context() as patch:
+            patch.setattr(safesave.os, "rename", fail_replacement)
+            simulation.step(10)
+    assert Path(paths.state).read_bytes() == previous
+    restored = mm.XmlSerializer.deserialize(Path(paths.state).read_text())
+    assert restored.getStepCount() == 10
+    assert simulation.reporters == []
 
 
-def test_the_reporter_asks_openmm_for_the_right_interval(tmp_path: Path) -> None:
-    """The modern reporter protocol is a dict, not a tuple."""
-
-    class FakeSimulation:
-        currentStep = 7
-
-    described = AtomicStateReporter(tmp_path / "stage", 10).describeNextReport(
-        FakeSimulation()
+def test_periodic_restart_and_completed_stage_states_have_distinct_files(
+    argon_run: Any,
+) -> None:
+    """An in-progress snapshot must never replace a completed stage's state."""
+    result = run_nvt(
+        argon_run,
+        "stage",
+        temperature_k=120.0,
+        duration_ps=0.1,
+        trajectory="none",
     )
-    assert described == {"steps": 3, "periodic": None, "include": []}
+    assert result.final_state == "stage.state.xml"
+    for path in (Path(result.final_state), Path("stage.restart.xml")):
+        state = mm.XmlSerializer.deserialize(path.read_text())
+        assert state.getStepCount() == result.steps
 
 
 def test_trajectory_options_default_to_unwrapped_xtc() -> None:

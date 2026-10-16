@@ -28,5 +28,5 @@ htmlcov/
 .DS_Store
 .ipynb_checkpoints/
 
-# The README figure's simulation: python docs/figures/blend_toc.py build toc-run
+# The showcase figure's simulation: python docs/figures/blend_toc.py build toc-run
 toc-run/

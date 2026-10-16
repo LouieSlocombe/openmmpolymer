@@ -1,4 +1,4 @@
-# The README's showcase render: a polyethylene/polystyrene blend in its
+# A showcase render: a polyethylene/polystyrene blend in its
 # periodic cell, with the corner nearest the camera cut away so the chains
 # can be followed into the bulk.
 #
