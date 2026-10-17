@@ -30,3 +30,6 @@ htmlcov/
 
 # Local simulation output
 toc-run/
+
+# Local Claude Code guidance
+CLAUDE.md
