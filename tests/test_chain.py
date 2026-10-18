@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -211,6 +212,325 @@ def test_tacticity_preserves_side_chain_and_cap_stereochemistry(
             assert Chem.MolToSmiles(molecule) == Chem.MolToSmiles(
                 assemble_chain(spec, n_units=n_units)
             )
+
+
+#: Monomers whose SMILES write stereocentres where a build used to lose them,
+#: with the tail cap each needs.
+WRITTEN_STEREO = {
+    # On the tail anchor, written with the dummy before the ring and after it:
+    # joining units inverted one spelling and not the other.
+    "tail-anchor": ("[*]C[C@H]([*])c1ccccc1", None),
+    "tail-anchor-dummy-last": ("[*]C[C@@H](c1ccccc1)[*]", None),
+    # On a head anchor the hydrogen cap closes.
+    "capped-head-anchor": ("[*][C@](C)(F)CC[*]", None),
+    # Inside the unit, on the backbone: poly(L-lactide).
+    "in-unit": ("[*]O[C@@H](C)C(=O)[*]", "[*]O"),
+    # Four on the backbone path through a bicyclic: an isosorbide carbonate.
+    "isohexide": ("[*]O[C@@H]1CO[C@@H]2[C@H](OC([*])=O)CO[C@H]12", "[*]O"),
+    # A ketal-linked sugar, with centres on the backbone, off it and on a
+    # tail anchor that sits in a ring.
+    "sugar-ketal": ("[*]OC[C@@H]1O[C@@]2(C)OC[C@H]([*])[C@@H]2O1", None),
+}
+
+
+def _zipped(spec: ChainSpec, units: int) -> str:
+    """The capped chain joined by RDKit's ``molzip``, which keeps written stereo.
+
+    A route to the right answer independent of :func:`assemble_chain`.
+    """
+    pieces = []
+    for unit in range(units):
+        piece = Chem.RWMol(Chem.MolFromSmiles(spec.monomer_smiles))
+        head, tail = chain._dummies(piece)
+        piece.GetAtomWithIdx(head).SetAtomMapNum(100 + unit)
+        piece.GetAtomWithIdx(tail).SetAtomMapNum(101 + unit)
+        pieces.append(piece)
+    for cap, label in ((spec.head_cap, 100), (spec.tail_cap, 100 + units)):
+        piece = Chem.RWMol(
+            Chem.MolFromSmiles(cap or chain.HYDROGEN_CAP, sanitize=cap is not None)
+        )
+        piece.GetAtomWithIdx(chain._dummies(piece)[0]).SetAtomMapNum(label)
+        pieces.append(piece)
+    combined = pieces[0]
+    for piece in pieces[1:]:
+        combined = Chem.CombineMols(combined, piece)
+    # A hydrogen cap that defined a double bond's stereo goes too: the end
+    # then carries two hydrogens and the bond has none. Any, because the
+    # stubs give each attribute the parameters' type.
+    params: Any = Chem.RemoveHsParameters()
+    params.removeDefiningBondStereo = True
+    zipped = Chem.RemoveHs(Chem.molzip(combined), params)
+    # A round trip drops tags left on centres the joins made non-chiral.
+    return Chem.MolToSmiles(Chem.MolFromSmiles(Chem.MolToSmiles(zipped)))
+
+
+@pytest.mark.parametrize("tacticity", chain.TACTICITIES)
+@pytest.mark.parametrize(
+    ("monomer", "tail_cap"), WRITTEN_STEREO.values(), ids=WRITTEN_STEREO.keys()
+)
+def test_written_stereochemistry_survives_assembly(
+    monomer: str, tail_cap: str | None, tacticity: str
+) -> None:
+    """Every unit keeps the configuration its SMILES writes, in every mode.
+
+    Tacticity sets only the backbone centres the SMILES leaves open, and
+    neither joining units nor capping an end may change what a written chiral
+    tag means.
+    """
+    spec = ChainSpec(
+        monomer_smiles=monomer,
+        degree_of_polymerization=4,
+        tacticity=tacticity,
+        tail_cap=tail_cap,
+    )
+    assert Chem.MolToSmiles(assemble_chain(spec)) == _zipped(spec, 4)
+
+
+@pytest.mark.parametrize("monomer", ["[*][Si](C)(C)O[*]", "[*][C@H](C)CC[*]"])
+def test_a_hydrogen_cap_on_a_bracket_atom_is_a_hydrogen(monomer: str) -> None:
+    """A bracket atom's hydrogen count is fixed: dropping the dummy left a radical."""
+    molecule = assemble_chain(ChainSpec(monomer_smiles=monomer))
+    assert not any(
+        atom.GetNumRadicalElectrons()
+        for atom in molecule.GetAtoms()  # type: ignore[no-untyped-call]
+    )
+
+
+#: Monomers whose SMILES give a double bond's geometry with a ``/`` or ``\``
+#: a build used to drop, with the caps each needs.
+WRITTEN_DOUBLE_BONDS = {
+    # The dummy is the stereo atom at the tail end, or at the head end.
+    "trans-ppv": ("[*]c1ccc(cc1)/C=C/[*]", None, None),
+    "cis-ppv": ("[*]c1ccc(cc1)/C=C\\[*]", None, None),
+    "trans-ppv-head": ("[*]/C=C/c1ccc([*])cc1", None, None),
+    # The dummy carries the only direction at its end without being the
+    # stereo atom there.
+    "trisubstituted": ("[*]/C(C)=C(/F)C[*]", None, None),
+    # Conjugated, so one direction serves two bonds across the junction.
+    "polyacetylene": ("[*]/C=C/C=C/[*]", None, None),
+    "alternating-diene": ("[*]/C=C\\C=C/[*]", None, None),
+    # Fumarate and maleate polyesters.
+    "fumarate": ("[*]C(=O)/C=C/C(=O)OCCO[*]", "[*]OC", None),
+    "maleate": ("[*]C(=O)/C=C\\C(=O)OCCO[*]", "[*]OC", None),
+    # Beside a written stereocentre.
+    "beside-a-centre": ("[*]/C=C/[C@H](C)[*]", None, None),
+    # On a cap.
+    "cap": ("[*]CC[*]", None, "[*]/C=C/F"),
+}
+
+
+@pytest.mark.parametrize(
+    ("monomer", "head_cap", "tail_cap"),
+    WRITTEN_DOUBLE_BONDS.values(),
+    ids=WRITTEN_DOUBLE_BONDS.keys(),
+)
+def test_written_double_bond_geometry_survives_assembly(
+    monomer: str, head_cap: str | None, tail_cap: str | None
+) -> None:
+    """A dummy that defines a double bond's E/Z must not take it away with it."""
+    spec = ChainSpec(
+        monomer_smiles=monomer,
+        degree_of_polymerization=3,
+        head_cap=head_cap,
+        tail_cap=tail_cap,
+    )
+    assert Chem.MolToSmiles(assemble_chain(spec)) == _zipped(spec, 3)
+
+
+def test_a_hydrogen_cap_hands_a_double_bond_to_the_other_neighbour() -> None:
+    """The end's other substituent takes over, on the far side from the cap.
+
+    RDKit's own perception never makes a dummy the stereo atom when the end
+    has a heavier neighbour, so the bond is set up that way by hand.
+    """
+    mol = Chem.RWMol(Chem.MolFromSmiles("F/C=C(\\C)[*]"))
+    dummy = chain._dummies(mol)[0]
+    double = mol.GetBondBetweenAtoms(1, 2)
+    double.SetStereoAtoms(0, dummy)
+    double.SetStereo(Chem.BondStereo.STEREOTRANS)
+    chain._keep_double_bonds(mol, dummy, None)
+    mol.RemoveAtom(dummy)
+    capped = mol.GetMol()
+    Chem.SanitizeMol(capped)
+    Chem.SetDoubleBondNeighborDirections(capped)
+    Chem.AssignStereochemistry(capped, cleanIt=True, force=True)
+    assert Chem.MolToSmiles(capped) == Chem.MolToSmiles(Chem.MolFromSmiles("F/C=C\\C"))
+
+
+def test_syndiotactic_says_so_when_every_backbone_centre_is_written(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A request the written stereochemistry overrules is not silently dropped."""
+    monomer, tail_cap = WRITTEN_STEREO["in-unit"]
+    spec = ChainSpec(
+        monomer_smiles=monomer,
+        degree_of_polymerization=4,
+        tacticity="syndiotactic",
+        tail_cap=tail_cap,
+    )
+    with caplog.at_level(logging.WARNING, logger=chain.__name__):
+        assert Chem.MolToSmiles(assemble_chain(spec)) == _zipped(spec, 4)
+    assert "nothing to alternate" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("monomer", "tacticity", "templates"),
+    [
+        # Nothing for tacticity to set: one template, as there always was.
+        (PE, "syndiotactic", 1),
+        (WRITTEN_STEREO["tail-anchor"][0], "atactic", 1),
+        (PS, "isotactic", 1),
+        # Alternating units need a template interior of each configuration.
+        (PS, "syndiotactic", 2),
+    ],
+)
+def test_each_interior_configuration_gets_a_template_of_its_own(
+    monomer: str,
+    tacticity: str,
+    templates: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built = []
+    build_template = chain._build_template
+
+    def counted(spec: ChainSpec, choices: Any, seed: int) -> Any:
+        built.append(tuple(choices))
+        return build_template(spec, choices, seed)
+
+    monkeypatch.setattr(chain, "_build_template", counted)
+    spec = ChainSpec(
+        monomer_smiles=monomer, degree_of_polymerization=7, tacticity=tacticity
+    )
+    choices = chain._tacticity_choices(spec, 7)
+    blocks = chain._unit_blocks(
+        spec, chain._add_hydrogens(chain._assemble(spec, choices)), choices
+    )
+    assert len(blocks) == 7
+    assert len(built) == templates
+
+
+@pytest.mark.parametrize(
+    ("monomer", "tail_cap", "tacticity", "units", "seed"),
+    [
+        # Interior units all took one template unit's configuration.
+        (PS, None, "syndiotactic", 7, 3),
+        # Spinning the next unit about the tail anchor swapped it with one of
+        # the anchor's own substituents.
+        (*WRITTEN_STEREO["tail-anchor"], "atactic", 7, 3),
+        # Spinning it about a head-to-tail line that is not a bond pushed it
+        # into the centre beside the anchor. Intermittent, so these seeds are
+        # ones that fail without the fix.
+        (PLA, "[*]O", "atactic", 7, 4),
+        (*WRITTEN_STEREO["in-unit"], "atactic", 9, 4),
+        # A ring anchor has no torsion to turn, and a unit this bulky grows
+        # through the one behind it unless that is tested too.
+        (*WRITTEN_STEREO["sugar-ketal"], "atactic", 7, 3),
+    ],
+)
+def test_grown_conformers_are_the_stereoisomer_asked_for(
+    monomer: str,
+    tail_cap: str | None,
+    tacticity: str,
+    units: int,
+    seed: int,
+    tmp_path: Path,
+) -> None:
+    """The coordinates are what the simulation runs, whatever the tags say."""
+    result = build_chain(
+        ChainSpec(
+            monomer_smiles=monomer,
+            degree_of_polymerization=units,
+            tacticity=tacticity,
+            tail_cap=tail_cap,
+            seed=seed,
+        ),
+        n_conformers=3,
+        output_dir=tmp_path,
+        embedder="grown",
+    )
+    _assert_built_as_recorded(result)
+
+
+def _assert_built_as_recorded(result: ChainResult) -> None:
+    """Every conformer's coordinates are the stereoisomer its SMILES records."""
+    for path in result.sdf_paths:
+        conformer = _conformer(path)
+        Chem.AssignStereochemistryFrom3D(conformer)
+        assert Chem.MolToSmiles(Chem.RemoveHs(conformer)) == result.smiles
+
+
+@pytest.mark.parametrize(
+    ("name", "units", "seed"),
+    [
+        # Spinning the next unit about a line that is not a bond twisted a
+        # double bond close by, and the relaxation settled it the other way.
+        # Intermittent, so these seeds are ones that fail without the fix.
+        ("cis-polybutadiene", 5, 17),
+        ("polyacetylene", 5, 1),
+        ("fumarate", 5, 0),
+        ("trisubstituted", 5, 3),
+        # A tail anchor at one end of the bond: it has no torsion to turn.
+        ("trans-ppv", 7, 3),
+    ],
+)
+def test_grown_double_bonds_have_the_geometry_asked_for(
+    name: str, units: int, seed: int, tmp_path: Path
+) -> None:
+    monomer, head_cap, tail_cap = {
+        "cis-polybutadiene": ("[*]C/C=C\\C[*]", None, None),
+        **WRITTEN_DOUBLE_BONDS,
+    }[name]
+    result = build_chain(
+        ChainSpec(
+            monomer_smiles=monomer,
+            degree_of_polymerization=units,
+            head_cap=head_cap,
+            tail_cap=tail_cap,
+            seed=seed,
+        ),
+        n_conformers=3,
+        output_dir=tmp_path,
+        embedder="grown",
+    )
+    _assert_built_as_recorded(result)
+
+
+def test_a_twisted_double_bond_is_caught() -> None:
+    """Trans coordinates on a cis chain are the other stereoisomer."""
+    cis, trans = (
+        chain._add_hydrogens(
+            assemble_chain(
+                ChainSpec(monomer_smiles=monomer, degree_of_polymerization=3)
+            )
+        )
+        for monomer in ("[*]C/C=C\\C[*]", "[*]C/C=C/C[*]")
+    )
+    assert chain._embed_etkdg(trans, 1)
+    assert chain._misbuilt_units(trans) == []
+    chain._set_conformer(cis, chain._positions(trans))
+    assert chain._misbuilt_units(cis) == [0, 1, 2]
+
+
+def test_a_conformer_that_contradicts_its_tags_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mirror-image conformer is the other stereoisomer, so it is not written."""
+    optimise = chain._optimise
+
+    def mirrored(molecule: Chem.Mol, max_iters: int) -> None:
+        optimise(molecule, max_iters)
+        chain._set_conformer(molecule, chain._positions(molecule) * [-1.0, 1.0, 1.0])
+
+    monkeypatch.setattr(chain, "_optimise", mirrored)
+    with pytest.raises(ChainError, match="different stereoisomer"):
+        build_chain(
+            ChainSpec(monomer_smiles=PS, degree_of_polymerization=3),
+            output_dir=tmp_path,
+        )
+    # Polyethylene has no configuration for a mirror to change.
+    build_chain(
+        ChainSpec(monomer_smiles=PE, degree_of_polymerization=3), output_dir=tmp_path
+    )
 
 
 def test_atom_names_are_unique_and_fit_four_columns() -> None:

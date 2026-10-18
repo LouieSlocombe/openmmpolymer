@@ -19,6 +19,11 @@ is grown unit by unit instead. A hard-core self-avoiding walk like that errs
 the other way, swelling the chain past the melt's unperturbed dimensions.
 :func:`build_chain` therefore measures the characteristic ratio it produced,
 and says so when it drifts either way.
+
+Stereochemistry the monomer SMILES writes is kept in every unit; tacticity only
+fills in the backbone centres it leaves open. Every conformer is checked
+against its chiral tags and double-bond geometry before it is written, because
+forcefill and the simulation see the coordinates, not the labels.
 """
 
 from __future__ import annotations
@@ -55,6 +60,16 @@ TACTICITIES = ("atactic", "isotactic", "syndiotactic")
 #: The cap that means "just fill the valence with hydrogen".
 HYDROGEN_CAP = "[*][H]"
 
+#: The two tetrahedral chiral tags, in the order tacticity choices index them.
+_TETRAHEDRAL = (Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
+
+#: Double-bond stereo stated against the bond's stereo atoms rather than by
+#: CIP rank, as :func:`_keep_double_bonds` leaves it: cis, then trans.
+_RELATIVE = (Chem.BondStereo.STEREOCIS, Chem.BondStereo.STEREOTRANS)
+
+#: Every way a double bond's configuration can be stated.
+_STATED = (Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOZ, *_RELATIVE)
+
 #: Ways to produce 3D coordinates. ``auto`` grows anything long enough to
 #: stamp a template down - four units - and falls back to ETKDG below that.
 EMBEDDERS = ("auto", "etkdg", "grown")
@@ -76,6 +91,13 @@ _BOND_ANGLE_DEG = 112.0
 #: growth, in angstrom. Below a real van der Waals contact, because the geometry
 #: is relaxed afterwards and a stricter test rejects almost everything.
 _OVERLAP_ANGSTROM = 2.6
+
+#: Closest approach allowed between heavy atoms of adjacent units more than
+#: three bonds apart, in angstrom. Looser than :data:`_OVERLAP_ANGSTROM`
+#: because rigid units joined at fixed torsion states sit closer than that in
+#: a crowded backbone - poly(methyl methacrylate)'s esters, say - and what this
+#: guards against is one unit grown through the next, not crowding.
+_ADJACENT_OVERLAP_ANGSTROM = 2.0
 
 #: Torsion draws per unit before growth backs up two units, and back-ups before
 #: it gives up.
@@ -109,8 +131,10 @@ class ChainSpec:
             first in atom order is the head, the last the tail.
         degree_of_polymerization: Number of repeat units.
         tacticity: One of ``atactic``, ``isotactic``, ``syndiotactic``. Applies
-            only to backbone stereocentres; side-chain and cap stereochemistry
-            is left unchanged. A no-op for a monomer with no backbone
+            only to backbone stereocentres the monomer SMILES leaves
+            unspecified; a configuration written with ``@``/``@@`` is kept in
+            every unit, on the backbone or off it, and cap stereochemistry is
+            left unchanged. A no-op for a monomer with no open backbone
             stereocentre.
         head_cap: SMILES fragment with one ``[*]`` closing the first unit's open
             head, or None to choose one from the attachment chemistry.
@@ -190,6 +214,11 @@ class ChainResult:
 def _atoms(mol: Chem.Mol) -> list[Chem.Atom]:
     """Return *mol*'s atoms in order: RDKit's stubs leave ``GetAtoms`` untyped."""
     return list(mol.GetAtoms())  # type: ignore[no-untyped-call]
+
+
+def _bonds(mol: Chem.Mol) -> list[Chem.Bond]:
+    """Return *mol*'s bonds in order: RDKit's stubs leave ``GetBonds`` untyped."""
+    return list(mol.GetBonds())  # type: ignore[no-untyped-call]
 
 
 def _dummies(mol: Chem.Mol) -> list[int]:
@@ -323,17 +352,80 @@ def _find_role(mol: Chem.Mol, role: str) -> int:
     raise ChainError(f"No atom tagged {role!r}.")
 
 
+def _keep_configuration(mol: Chem.Mol, dummy_idx: int) -> None:
+    """Fix the chiral tag of the dummy's neighbour before the dummy is replaced.
+
+    RDKit reads a chiral tag against the order of the atom's bonds, counting an
+    implicit hydrogen last. Whatever takes the dummy's place ends up last too:
+    ``AddBond`` appends the bond to the next unit, and a hydrogen cap becomes an
+    implicit hydrogen. Moving the dummy's slot to the end of the list is an odd
+    permutation about half the time, depending on how the SMILES was written,
+    and then the same tag means the other configuration unless it is inverted.
+    """
+    atom = mol.GetAtomWithIdx(_attachment_neighbour(mol, dummy_idx))
+    order = [bond.GetOtherAtomIdx(atom.GetIdx()) for bond in atom.GetBonds()]
+    if (len(order) - 1 - order.index(dummy_idx)) % 2:
+        atom.InvertChirality()
+
+
+def _keep_double_bonds(mol: Chem.Mol, dummy_idx: int, replacement: int | None) -> None:
+    """Restate the dummy's neighbour's double-bond stereo before the dummy goes.
+
+    RDKit reads a double bond's configuration from the ``/`` and ``\\`` on the
+    single bonds around it and records it against one neighbour at each end.
+    A SMILES such as ``[*]/C=C/c1ccc([*])cc1`` puts the only direction at one
+    end on the dummy's bond, and may make the dummy that end's neighbour, so
+    removing the dummy drops the configuration. Each such bond is restated as
+    cis or trans across its stereo atoms instead. Whatever replaces the dummy
+    sits where it sat: the next unit's atom takes over its relation to the far
+    end, and a hydrogen cap hands it to the end's other neighbour, on the
+    opposite side. An end left with two hydrogens is no longer a stereo bond.
+
+    Args:
+        mol: The molecule holding the dummy.
+        dummy_idx: The dummy about to be removed.
+        replacement: The atom now bonded where the dummy was, or None for a
+            hydrogen cap.
+    """
+    anchor = mol.GetAtomWithIdx(_attachment_neighbour(mol, dummy_idx))
+    for bond in anchor.GetBonds():
+        if bond.GetStereo() not in _STATED:
+            continue
+        # A label read off the SMILES is E or Z with the stereo atoms its
+        # highest-ranked neighbours, so E is trans across them.
+        trans = bond.GetStereo() in (Chem.BondStereo.STEREOE, _RELATIVE[True])
+        stereo_atoms = list(bond.GetStereoAtoms())
+        if dummy_idx in stereo_atoms:
+            stand_in = replacement
+            if stand_in is None:
+                far = bond.GetOtherAtomIdx(anchor.GetIdx())
+                others = [
+                    int(neighbour.GetIdx())
+                    for neighbour in anchor.GetNeighbors()
+                    if neighbour.GetIdx() not in (dummy_idx, far)
+                ]
+                if not others:
+                    bond.SetStereo(Chem.BondStereo.STEREONONE)
+                    continue
+                stand_in, trans = others[0], not trans
+            stereo_atoms[stereo_atoms.index(dummy_idx)] = stand_in
+            bond.SetStereoAtoms(*stereo_atoms)
+        bond.SetStereo(_RELATIVE[trans])
+
+
 def _splice(
     left: Chem.Mol, left_dummy: int, right: Chem.Mol, right_dummy: int
 ) -> Chem.RWMol:
     """Bond *left* to *right* where their dummies were, and drop both dummies."""
     combined = Chem.RWMol(Chem.CombineMols(left, right))
     right_dummy += left.GetNumAtoms()
-    combined.AddBond(
-        _attachment_neighbour(combined, left_dummy),
-        _attachment_neighbour(combined, right_dummy),
-        Chem.BondType.SINGLE,
-    )
+    for dummy in (left_dummy, right_dummy):
+        _keep_configuration(combined, dummy)
+    left_anchor = _attachment_neighbour(combined, left_dummy)
+    right_anchor = _attachment_neighbour(combined, right_dummy)
+    combined.AddBond(left_anchor, right_anchor, Chem.BondType.SINGLE)
+    _keep_double_bonds(combined, left_dummy, right_anchor)
+    _keep_double_bonds(combined, right_dummy, left_anchor)
     for idx in sorted((left_dummy, right_dummy), reverse=True):
         combined.RemoveAtom(idx)
     return combined
@@ -345,7 +437,14 @@ def _attach_cap(chain: Chem.RWMol, role: str, cap_smiles: str) -> Chem.RWMol:
 
     if cap_smiles == HYDROGEN_CAP:
         # Removing the dummy leaves a free valence that RDKit fills with an
-        # implicit hydrogen on the next sanitize, which is exactly the cap.
+        # implicit hydrogen on the next sanitize, which is exactly the cap -
+        # except on an atom written in brackets, as every stereocentre is,
+        # whose hydrogen count is fixed and which would be left a radical.
+        _keep_configuration(chain, dummy)
+        _keep_double_bonds(chain, dummy, None)
+        anchor = chain.GetAtomWithIdx(_attachment_neighbour(chain, dummy))
+        if anchor.GetNoImplicit():
+            anchor.SetNumExplicitHs(anchor.GetNumExplicitHs() + 1)
         chain.RemoveAtom(dummy)
         return chain
 
@@ -382,8 +481,19 @@ def assemble_chain(spec: ChainSpec, n_units: int | None = None) -> Chem.Mol:
         ChainError: The monomer or a cap is malformed, or an end on a carbonyl
             carbon was left to the default cap.
     """
-    monomer = _parse_monomer(spec.monomer_smiles)
     units = spec.degree_of_polymerization if n_units is None else n_units
+    return _assemble(spec, _tacticity_choices(spec, units))
+
+
+def _assemble(spec: ChainSpec, choices: Sequence[int]) -> Chem.Mol:
+    """Build the capped chain of ``len(choices)`` units; see :func:`assemble_chain`.
+
+    *choices* gives each unit's configuration for the backbone stereocentres
+    tacticity sets, which lets the grown embedder build a template oligomer
+    whose units match any chosen units of the chain.
+    """
+    monomer = _parse_monomer(spec.monomer_smiles)
+    units = len(choices)
 
     chain = _tagged_unit(monomer, 0)
     for unit in range(1, units):
@@ -396,46 +506,73 @@ def assemble_chain(spec: ChainSpec, n_units: int | None = None) -> Chem.Mol:
 
     molecule = chain.GetMol()
     Chem.SanitizeMol(molecule)
-    _apply_tacticity(molecule, spec, units)
+    # RDKit reads double-bond stereo back from the ``/`` and ``\`` directions
+    # of the neighbouring single bonds, and removing a dummy cleared them
+    # wherever _keep_double_bonds restated a configuration.
+    if any(bond.GetStereo() in _RELATIVE for bond in _bonds(molecule)):
+        Chem.SetDoubleBondNeighborDirections(molecule)
+    _apply_tacticity(molecule, spec, choices)
     return molecule
 
 
-def _apply_tacticity(mol: Chem.Mol, spec: ChainSpec, units: int) -> None:
-    """Set backbone chiral tags according to ``spec.tacticity``.
+def _tacticity_choices(spec: ChainSpec, units: int) -> list[int]:
+    """Return which of the two configurations each unit takes, per ``spec.tacticity``.
+
+    One draw per unit, in unit order, whether or not the monomer has anything
+    for tacticity to set.
+    """
+    rng = random.Random(derive_seed(spec.seed, "tacticity"))
+    choices: list[int] = []
+    for unit in range(units):
+        if spec.tacticity == "isotactic":
+            choices.append(0)
+        elif spec.tacticity == "syndiotactic":
+            choices.append(unit % 2)
+        else:
+            choices.append(rng.randint(0, 1))
+    return choices
+
+
+def _apply_tacticity(mol: Chem.Mol, spec: ChainSpec, choices: Sequence[int]) -> None:
+    """Set the chiral tags the monomer leaves open on the backbone, per *choices*.
 
     A monomer with no backbone stereocentre - polyethylene, say - has nothing
-    to set, and that is not an error. Side chains and caps share repeat-unit
-    tags with the backbone, but their stereochemistry must remain unchanged.
+    to set, and that is not an error. Nor does tacticity touch a centre the
+    monomer SMILES writes a configuration for, on the backbone or off it: a
+    sugar-derived repeat unit's stereochemistry is the point of using it.
     """
+    units = len(choices)
     Chem.AssignStereochemistry(
         mol, cleanIt=True, force=True, flagPossibleStereoCenters=True
     )
     backbone = set(backbone_path(mol, units))
     centres: dict[int, list[Chem.Atom]] = {}
+    written = False
     for atom in _atoms(mol):
-        if (
-            atom.GetIdx() in backbone
-            and atom.HasProp("_ChiralityPossible")
-            and atom.HasProp("_omp_unit")
-        ):
+        if atom.GetIdx() not in backbone or not atom.HasProp("_omp_unit"):
+            continue
+        if atom.GetChiralTag() in _TETRAHEDRAL:
+            written = True
+        elif atom.HasProp("_ChiralityPossible"):
             centres.setdefault(atom.GetIntProp("_omp_unit"), []).append(atom)
     if not centres:
-        log.debug(
-            "%s has no backbone stereocentre; tacticity is a no-op.", spec.residue_name
-        )
+        if written and spec.tacticity == "syndiotactic":
+            log.warning(
+                "%s: every backbone stereocentre has its configuration written "
+                "in the monomer SMILES, so tacticity='syndiotactic' has nothing "
+                "to alternate and every unit keeps the written one.",
+                spec.residue_name,
+            )
+        else:
+            log.debug(
+                "%s has no open backbone stereocentre; tacticity is a no-op.",
+                spec.residue_name,
+            )
         return
 
-    rng = random.Random(derive_seed(spec.seed, "tacticity"))
-    tags = (Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
     for unit in range(units):
-        if spec.tacticity == "isotactic":
-            which = 0
-        elif spec.tacticity == "syndiotactic":
-            which = unit % 2
-        else:
-            which = rng.randint(0, 1)
         for atom in centres.get(unit, ()):
-            atom.SetChiralTag(tags[which])
+            atom.SetChiralTag(_TETRAHEDRAL[choices[unit]])
     Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
 
 
@@ -661,18 +798,24 @@ def _positions(mol: Chem.Mol) -> npt.NDArray[np.float64]:
     return np.asarray(mol.GetConformer().GetPositions(), dtype=np.float64)
 
 
-def _build_template(spec: ChainSpec, seed: int) -> _Template:
+def _build_template(spec: ChainSpec, choices: Sequence[int], seed: int) -> _Template:
     """Relax a capped tetramer and reduce it to per-unit local geometry.
 
     Four units is the shortest oligomer that shows every junction the grown
     embedder has to make: first-to-second, interior-to-interior, and
     interior-to-last.
 
+    Args:
+        spec: What is being built.
+        choices: The tetramer's four tacticity choices; see
+            :func:`_tacticity_choices`.
+        seed: Seed for the embedding.
+
     Raises:
         ChainError: Even a tetramer would not embed, which means the monomer
             itself is the problem.
     """
-    template_mol = _add_hydrogens(assemble_chain(spec, n_units=4))
+    template_mol = _add_hydrogens(_assemble(spec, choices))
     if not _embed_etkdg(template_mol, seed, optimise_iters=2000):
         raise ChainError(
             f"A tetramer of {spec.monomer_smiles!r} would not embed in 3D. "
@@ -700,11 +843,259 @@ def _build_template(spec: ChainSpec, seed: int) -> _Template:
     )
 
 
-def _clashes(grid: CellList, points: npt.NDArray[np.float64], cutoff: float) -> bool:
-    """Whether any of *points* lies within *cutoff* of a point in *grid*."""
+def _unit_blocks(
+    spec: ChainSpec, mol: Chem.Mol, choices: Sequence[int]
+) -> list[npt.NDArray[np.float64]]:
+    """Return the template geometry each unit of *mol* is stamped from.
+
+    A template unit's coordinates carry its configuration, so stamping one
+    interior unit down the whole chain gives every interior unit the same
+    stereochemistry, whatever its own chiral tags say. Each distinct set of
+    tags among the interior units therefore gets a template of its own, built
+    with that unit's choice in the interior and the chain's own at the ends.
+    A chain whose interior units all carry the same tags - any without a
+    stereocentre for tacticity to set - has the one template it always had.
+
+    Args:
+        spec: What is being built.
+        mol: The chain, with explicit hydrogens and its chiral tags set.
+        choices: The chain's tacticity choices, one per unit.
+
+    Returns:
+        One block per unit, in unit order, in the frame :func:`_grow_conformer`
+        places it in.
+    """
+    units = len(choices)
+    groups = _unit_atoms(mol, units)
+    templates: dict[tuple[Chem.ChiralType, ...], _Template] = {}
+    interior: list[npt.NDArray[np.float64]] = []
+    for unit in range(2, units - 1):
+        tags = tuple(mol.GetAtomWithIdx(index).GetChiralTag() for index in groups[unit])
+        if tags not in templates:
+            labels = ("template",) if not templates else ("template", str(unit))
+            templates[tags] = _build_template(
+                spec,
+                (choices[0], choices[1], choices[unit], choices[-1]),
+                derive_seed(spec.seed, *labels),
+            )
+        interior.append(templates[tags].interior)
+    ends = next(iter(templates.values()))
+    return [ends.first, ends.second, *interior, ends.last]
+
+
+@dataclass(frozen=True)
+class _TailAnchor:
+    """A unit's tail anchor, and what turning the next unit past it moves.
+
+    Args:
+        anchor: The tail anchor's atom index.
+        previous: The backbone atom bonded to the anchor on the head side. The
+            torsion turns about the bond from it to the anchor.
+        before: The backbone atom before *previous*, which the torsion is
+            measured from, or None when *previous* starts the chain.
+        bonded: The anchor's neighbours within its own unit, *previous*
+            included: everything but the next unit's head.
+        carried: Every atom of the unit on the anchor's side of that bond,
+            which turns with the next unit; None when the bond is not a single
+            bond free to turn - a double bond, or one closing a ring.
+    """
+
+    anchor: int
+    previous: int
+    before: int | None
+    bonded: tuple[int, ...]
+    carried: tuple[int, ...] | None
+
+
+def _tail_anchors(
+    mol: Chem.Mol, n_units: int, tails: Sequence[int]
+) -> list[_TailAnchor | None]:
+    """Describe each unit's tail anchor, if the chain has stated stereochemistry.
+
+    That is a stereocentre, or a double bond with its E/Z given. A chain with
+    neither is grown by spinning the new unit alone, as it always was, and
+    gets None throughout: there is no configuration to lose, and changing how
+    it grows would change every such build on disk.
+    """
+    if not any(atom.GetChiralTag() in _TETRAHEDRAL for atom in _atoms(mol)) and not any(
+        bond.GetStereo() in _STATED for bond in _bonds(mol)
+    ):
+        return [None] * len(tails)
+    backbone = backbone_path(mol, n_units)
+    position = {index: at for at, index in enumerate(backbone)}
+    found: list[_TailAnchor | None] = []
+    for unit, tail in enumerate(tails):
+        at = position[tail]
+        previous = backbone[at - 1]
+        bonded = tuple(
+            int(neighbour.GetIdx())
+            for neighbour in mol.GetAtomWithIdx(tail).GetNeighbors()
+            if neighbour.GetIntProp("_omp_unit") == unit
+        )
+        seen = {tail}
+        stack = [index for index in bonded if index != previous]
+        bond = mol.GetBondBetweenAtoms(previous, tail)
+        closed = bond.GetBondType() != Chem.BondType.SINGLE
+        while stack and not closed:
+            index = stack.pop()
+            closed = index == previous
+            if index in seen or closed:
+                continue
+            seen.add(index)
+            stack.extend(
+                int(neighbour.GetIdx())
+                for neighbour in mol.GetAtomWithIdx(index).GetNeighbors()
+                if neighbour.GetIntProp("_omp_unit") == unit
+            )
+        found.append(
+            _TailAnchor(
+                anchor=tail,
+                previous=previous,
+                before=backbone[at - 2] if at >= 2 else None,
+                bonded=bonded,
+                carried=None if closed else tuple(sorted(seen - {tail})),
+            )
+        )
+    return found
+
+
+def _turn_past_anchor(
+    coords: npt.NDArray[np.float64],
+    trial: npt.NDArray[np.float64],
+    head: int,
+    tail: _TailAnchor,
+    reference: npt.NDArray[np.float64],
+    torsion: float,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64] | None]:
+    """Turn a new unit about the bond into the previous unit's tail anchor.
+
+    Spinning the new unit alone about the previous unit's head-to-tail line
+    leaves its head anywhere around the anchor: in the place of one of the
+    anchor's own substituents, or, where that line is not a bond, against the
+    backbone atom before it. The relaxation then sorts the atoms out, and
+    where one of them is a stereocentre or the end of a stereo double bond it
+    picks the configuration. Instead
+    the head goes first into the anchor's open valence - opposite the sum of
+    the bonds it already has - and then the head and the anchor's
+    substituents turn together about the real bond into the anchor, so the
+    torsion changes and nothing else does.
+
+    Args:
+        coords: Positions placed so far.
+        trial: The new unit's positions.
+        head: The new unit's head anchor, as an index into *trial*.
+        tail: The previous unit's tail anchor.
+        reference: What to measure the torsion from when *tail* has no
+            backbone atom before its previous one.
+        torsion: The dihedral wanted, in degrees.
+
+    Returns:
+        The new unit's positions, and the anchor's carried atoms moved with
+        it, or None when the bond has nothing to turn.
+    """
+    pivot = coords[tail.anchor]
+    bonds = coords[list(tail.bonded)] - pivot
+    valence = -(bonds / np.linalg.norm(bonds, axis=1)[:, None]).sum(axis=0)
+    current = trial[head] - pivot
+    axis = np.cross(current, valence)
+    sine = float(np.linalg.norm(axis))
+    if sine > 1e-9 * float(np.linalg.norm(current) * np.linalg.norm(valence)):
+        rotation = _axis_rotation(
+            axis / sine, math.atan2(sine, float(current @ valence))
+        )
+        trial = (trial - pivot) @ rotation.T + pivot
+    if tail.carried is None:
+        return trial, None
+
+    moved = np.vstack((trial, coords[list(tail.carried)]))
+    previous = coords[tail.previous]
+    moved = _set_torsion(
+        moved,
+        pivot=pivot,
+        axis=pivot - previous,
+        current=_dihedral(
+            coords[tail.before] if tail.before is not None else reference,
+            previous,
+            pivot,
+            trial[head],
+        ),
+        target=torsion,
+    )
+    return moved[: len(trial)], moved[len(trial) :]
+
+
+def _adjacent_pairs(
+    mol: Chem.Mol,
+    groups: Sequence[Sequence[int]],
+    heads: Sequence[int],
+    tails: Sequence[int],
+) -> list[tuple[npt.NDArray[np.int_], npt.NDArray[np.int_]]]:
+    """Return each unit's heavy-atom pairs with the unit behind, more than three bonds apart.
+
+    Units meet only at the junction bond, so a pair's separation is the bond
+    distance from one atom to its unit's tail anchor, one for the junction, and
+    the bond distance from the next unit's head anchor to the other. Closer
+    pairs are held where they are by bonds, angles and the torsions growth
+    sets; further ones have no business overlapping.
+
+    Returns:
+        One pair of arrays per unit: positions in the previous unit and the
+        matching positions in this one. Both are empty for the first unit.
+    """
+
+    def separations(start: int, group: Sequence[int]) -> dict[int, int]:
+        members = set(group)
+        found = {start: 0}
+        frontier = [start]
+        while frontier:
+            following = []
+            for index in frontier:
+                for neighbour in mol.GetAtomWithIdx(index).GetNeighbors():
+                    other = int(neighbour.GetIdx())
+                    if other in members and other not in found:
+                        found[other] = found[index] + 1
+                        following.append(other)
+            frontier = following
+        return found
+
+    def heavy(group: Sequence[int]) -> list[tuple[int, int]]:
+        return [
+            (position, index)
+            for position, index in enumerate(group)
+            if mol.GetAtomWithIdx(index).GetAtomicNum() > 1
+        ]
+
+    none = np.array([], dtype=int)
+    pairs = [(none, none)]
+    for unit in range(1, len(groups)):
+        behind = separations(tails[unit - 1], groups[unit - 1])
+        ahead = separations(heads[unit], groups[unit])
+        rows: list[int] = []
+        columns: list[int] = []
+        for row, first in heavy(groups[unit - 1]):
+            for column, second in heavy(groups[unit]):
+                if behind[first] + 1 + ahead[second] > 3:
+                    rows.append(row)
+                    columns.append(column)
+        pairs.append((np.array(rows, dtype=int), np.array(columns, dtype=int)))
+    return pairs
+
+
+def _clashes(
+    grid: CellList,
+    points: npt.NDArray[np.float64],
+    cutoff: float,
+    limit: int | None = None,
+) -> bool:
+    """Whether any of *points* lies within *cutoff* of a point in *grid*.
+
+    Only the grid's first *limit* points are considered, when it is given.
+    """
     squared = cutoff * cutoff
     for point in points:
         for index in grid.neighbours(point):
+            if limit is not None and index >= limit:
+                continue
             delta = point - grid.points[index]
             if delta @ delta < squared:
                 return True
@@ -743,17 +1134,20 @@ def _set_torsion(
 def _grow_conformer(
     mol: Chem.Mol,
     spec: ChainSpec,
-    template: _Template,
+    blocks: Sequence[npt.NDArray[np.float64]],
     n_units: int,
     seed: int,
 ) -> npt.NDArray[np.float64]:
-    """Grow a self-avoiding conformer by stamping the template down the chain.
+    """Grow a self-avoiding conformer by stamping template units down the chain.
 
     Each unit is placed by one rigid transform from the previous unit's frame,
     then spun about the previous unit's backbone bond and about the junction
     bond joining the two, each by a torsion drawn from the trans/gauche set -
     except the second unit's first spin, which has nothing before it to be
-    trans to and is drawn uniformly. A placement that puts a heavy atom within
+    trans to and is drawn uniformly. In a chain with stated stereochemistry the
+    first spin is :func:`_turn_past_anchor` instead, which keeps it;
+    see :func:`_tail_anchors` for why the rest keep the plain spin. A
+    placement that puts a heavy atom within
     :data:`_OVERLAP_ANGSTROM` of a heavy atom two or more units back is
     rejected and redrawn; when a unit runs out of draws, growth backs up two
     units and tries again.
@@ -761,7 +1155,7 @@ def _grow_conformer(
     Args:
         mol: The chain, with explicit hydrogens.
         spec: The chain spec, for the torsion statistics.
-        template: Per-unit geometry from :func:`_build_template`.
+        blocks: Each unit's geometry, from :func:`_unit_blocks`.
         n_units: Degree of polymerization.
         seed: Seed for the torsion draws.
 
@@ -789,8 +1183,26 @@ def _grow_conformer(
     ]
     heads = _anchors(mol, n_units, "head")
     tails = _anchors(mol, n_units, "tail")
+    tail_anchors = _tail_anchors(mol, n_units, tails)
+    stereo = any(tail is not None for tail in tail_anchors)
+    # What turning past each unit's tail anchor moves of that unit, as
+    # positions in the unit, and which of those are heavy, for clash tests.
+    carried = [
+        np.array(
+            [group.index(index) for index in (tail.carried or ())]
+            if tail is not None
+            else [],
+            dtype=int,
+        )
+        for group, tail in zip(groups, tail_anchors, strict=True)
+    ]
+    carried_heavy = [
+        np.intersect1d(moved, heavy, assume_unique=True)
+        for moved, heavy in zip(carried, heavy_local, strict=True)
+    ]
+    adjacent = _adjacent_pairs(mol, groups, heads, tails) if stereo else None
 
-    for unit, block in ((1, template.second), (n_units - 1, template.last)):
+    for unit, block in enumerate(blocks):
         if len(groups[unit]) != len(block):
             raise ChainError(  # pragma: no cover - guards the ordering contract
                 f"Unit {unit} has {len(groups[unit])} atoms but its template "
@@ -803,10 +1215,13 @@ def _grow_conformer(
     weights = (p_trans, (1.0 - p_trans) / 2.0, (1.0 - p_trans) / 2.0)
 
     coords = np.zeros((mol.GetNumAtoms(), 3), dtype=np.float64)
-    coords[groups[0]] = template.first
+    coords[groups[0]] = blocks[0]
 
     grid = CellList(_OVERLAP_ANGSTROM)
     grid_upto = -1
+    # How many points the grid holds once each unit is in, so a test can stop
+    # short of the most recent unit.
+    grid_sizes: list[int] = []
     unit = 1
     restarts = 0
 
@@ -817,9 +1232,11 @@ def _grow_conformer(
         if grid_upto > target:
             grid = CellList(_OVERLAP_ANGSTROM)
             grid_upto = -1
+            grid_sizes = []
         while grid_upto < target:
             grid_upto += 1
             grid.add(coords[heavy_global[grid_upto]])
+            grid_sizes.append(len(grid.points))
 
         reference = (
             coords[tails[unit - 2]]
@@ -827,38 +1244,46 @@ def _grow_conformer(
             else coords[tails[unit - 1]] + _SEED_REFERENCE
         )
         frame = _frame(coords[heads[unit - 1]], coords[tails[unit - 1]], reference)
-        if unit == 1:
-            block = template.second
-        elif unit == n_units - 1:
-            block = template.last
-        else:
-            block = template.interior
+        block = blocks[unit]
         head_in_block = groups[unit].index(heads[unit])
         tail_in_block = groups[unit].index(tails[unit])
+        tail_anchor = tail_anchors[unit - 1]
+        # The carried atoms belong to the unit behind, so only units three or
+        # more back are tested against them.
+        carried_limit = grid_sizes[unit - 3] if unit >= 3 else 0
 
         for _ in range(_MAX_TRIES):
             trial = _to_world(frame, block)
+            torsion = (
+                rng.uniform(-180.0, 180.0)
+                if unit == 1
+                else rng.choices(_TORSION_TARGETS_DEG, weights=weights)[0]
+            )
             # Two backbone bonds are opened by adding a unit: the previous
             # unit's own head-to-tail bond, and the junction bond joining the
             # two. Sampling only one of them leaves every second torsion frozen
             # at whatever the template relaxed into, which is how a chain ends
             # up a third too compact with the statistics apparently right.
-            trial = _set_torsion(
-                trial,
-                pivot=coords[tails[unit - 1]],
-                axis=coords[tails[unit - 1]] - coords[heads[unit - 1]],
-                current=_dihedral(
-                    reference,
-                    coords[heads[unit - 1]],
-                    coords[tails[unit - 1]],
-                    trial[head_in_block],
-                ),
-                target=(
-                    rng.uniform(-180.0, 180.0)
-                    if unit == 1
-                    else rng.choices(_TORSION_TARGETS_DEG, weights=weights)[0]
-                ),
-            )
+            previous = coords[groups[unit - 1]]
+            if tail_anchor is None:
+                trial = _set_torsion(
+                    trial,
+                    pivot=coords[tails[unit - 1]],
+                    axis=coords[tails[unit - 1]] - coords[heads[unit - 1]],
+                    current=_dihedral(
+                        reference,
+                        coords[heads[unit - 1]],
+                        coords[tails[unit - 1]],
+                        trial[head_in_block],
+                    ),
+                    target=torsion,
+                )
+            else:
+                trial, turned = _turn_past_anchor(
+                    coords, trial, head_in_block, tail_anchor, reference, torsion
+                )
+                if turned is not None:
+                    previous[carried[unit - 1]] = turned
             trial = _set_torsion(
                 trial,
                 pivot=trial[head_in_block],
@@ -871,11 +1296,30 @@ def _grow_conformer(
                 ),
                 target=rng.choices(_TORSION_TARGETS_DEG, weights=weights)[0],
             )
-            if target < 0 or not _clashes(
+            if target >= 0 and _clashes(
                 grid, trial[heavy_local[unit]], _OVERLAP_ANGSTROM
             ):
-                coords[groups[unit]] = trial
-                break
+                continue
+            if carried_limit and _clashes(
+                grid,
+                previous[carried_heavy[unit - 1]],
+                _OVERLAP_ANGSTROM,
+                carried_limit,
+            ):
+                continue
+            # The unit behind is bonded to this one, so only pairs more than
+            # three bonds apart are tested, and only in a chain with stated
+            # stereochemistry: a centre or a double bond caught between
+            # interpenetrating units is one the relaxation can turn over.
+            if adjacent is not None:
+                behind, ahead = adjacent[unit]
+                gaps = previous[behind] - trial[ahead]
+                squared = np.einsum("ij,ij->i", gaps, gaps)
+                if np.any(squared < _ADJACENT_OVERLAP_ANGSTROM**2):
+                    continue
+            coords[groups[unit]] = trial
+            coords[groups[unit - 1]] = previous
+            break
         else:
             restarts += 1
             if restarts > _MAX_RESTARTS:
@@ -890,6 +1334,33 @@ def _grow_conformer(
         unit += 1
 
     return coords
+
+
+def _misbuilt_units(mol: Chem.Mol) -> list[int]:
+    """Return the units whose conformer contradicts their stated stereochemistry.
+
+    That is a chiral tag, or a double bond's E/Z. The SDF goes to forcefill
+    with coordinates, and the simulation runs on them, so a centre or a double
+    bond whose geometry disagrees with its label is built as the other
+    stereoisomer whatever the label and the recorded SMILES say.
+    """
+    tagged = [atom for atom in _atoms(mol) if atom.GetChiralTag() in _TETRAHEDRAL]
+    stated = [bond for bond in _bonds(mol) if bond.GetStereo() in _STATED]
+    if not tagged and not stated:
+        return []
+    perceived = Chem.Mol(mol)
+    Chem.AssignStereochemistryFrom3D(perceived)
+    wrong = {
+        atom.GetIntProp("_omp_unit")
+        for atom in tagged
+        if perceived.GetAtomWithIdx(atom.GetIdx()).GetChiralTag() != atom.GetChiralTag()
+    }
+    wrong.update(
+        bond.GetBeginAtom().GetIntProp("_omp_unit")
+        for bond in stated
+        if perceived.GetBondWithIdx(bond.GetIdx()).GetStereo() != bond.GetStereo()
+    )
+    return sorted(wrong)
 
 
 def _set_conformer(mol: Chem.Mol, coords: npt.NDArray[np.float64]) -> None:
@@ -1010,7 +1481,8 @@ def build_chain(
     directory.mkdir(parents=True, exist_ok=True)
 
     units = spec.degree_of_polymerization
-    molecule = _add_hydrogens(assemble_chain(spec))
+    choices = _tacticity_choices(spec, units)
+    molecule = _add_hydrogens(_assemble(spec, choices))
     _label_atoms(molecule, spec.residue_name)
     n_atoms = molecule.GetNumAtoms()
     backbone = backbone_path(molecule, units)
@@ -1021,9 +1493,7 @@ def build_chain(
             f"chain has {units}. Use embedder='etkdg' or 'auto'."
         )
     grown = embedder == "grown" or (embedder == "auto" and units >= _MIN_GROWN_UNITS)
-    template = (
-        _build_template(spec, derive_seed(spec.seed, "template")) if grown else None
-    )
+    blocks = _unit_blocks(spec, molecule, choices) if grown else None
     log.info(
         "Building %d conformer(s) of %s: %d units, %d atoms, %s embedder.",
         n_conformers,
@@ -1042,8 +1512,8 @@ def build_chain(
     for index in range(n_conformers):
         seed = derive_seed(spec.seed, "conformer", str(index))
         conformer_mol = Chem.Mol(molecule)
-        if template is not None:
-            coords = _grow_conformer(conformer_mol, spec, template, units, seed)
+        if blocks is not None:
+            coords = _grow_conformer(conformer_mol, spec, blocks, units, seed)
             _set_conformer(conformer_mol, coords)
             # Short, so the junction torsions survive: an unconstrained vacuum
             # relaxation run to convergence collapses the coil.
@@ -1053,6 +1523,14 @@ def build_chain(
                 f"ETKDG could not embed conformer {index} of "
                 f"{spec.residue_name} ({n_atoms} atoms). Pass "
                 "embedder='grown' to build it unit by unit instead."
+            )
+        wrong = _misbuilt_units(conformer_mol)
+        if wrong:
+            raise ChainError(
+                f"Conformer {index} of {spec.residue_name} contradicts the "
+                "configuration asked for at a stereocentre or double bond in "
+                f"unit(s) {wrong}, so its coordinates are a different "
+                "stereoisomer. Try another seed, or the other embedder."
             )
 
         coords = _positions(conformer_mol)
