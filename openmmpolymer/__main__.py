@@ -881,7 +881,7 @@ def build_parser() -> argparse.ArgumentParser:
         parser,
         "--tacticity",
         "atactic",
-        "backbone stereochemistry",
+        "configuration of the backbone stereocentres the monomer leaves unspecified",
         choices=("atactic", "isotactic", "syndiotactic"),
     )
     parser.add_argument(

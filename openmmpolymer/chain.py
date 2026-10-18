@@ -55,6 +55,9 @@ TACTICITIES = ("atactic", "isotactic", "syndiotactic")
 #: The cap that means "just fill the valence with hydrogen".
 HYDROGEN_CAP = "[*][H]"
 
+#: The two tetrahedral chiral tags, in the order tacticity choices index them.
+_TETRAHEDRAL = (Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
+
 #: Ways to produce 3D coordinates. ``auto`` grows anything long enough to
 #: stamp a template down - four units - and falls back to ETKDG below that.
 EMBEDDERS = ("auto", "etkdg", "grown")
@@ -109,8 +112,10 @@ class ChainSpec:
             first in atom order is the head, the last the tail.
         degree_of_polymerization: Number of repeat units.
         tacticity: One of ``atactic``, ``isotactic``, ``syndiotactic``. Applies
-            only to backbone stereocentres; side-chain and cap stereochemistry
-            is left unchanged. A no-op for a monomer with no backbone
+            only to backbone stereocentres the monomer SMILES leaves
+            unspecified; a configuration written with ``@``/``@@`` is kept in
+            every unit, on the backbone or off it, and cap stereochemistry is
+            left unchanged. A no-op for a monomer with no open backbone
             stereocentre.
         head_cap: SMILES fragment with one ``[*]`` closing the first unit's open
             head, or None to choose one from the attachment chemistry.
@@ -323,12 +328,30 @@ def _find_role(mol: Chem.Mol, role: str) -> int:
     raise ChainError(f"No atom tagged {role!r}.")
 
 
+def _keep_configuration(mol: Chem.Mol, dummy_idx: int) -> None:
+    """Fix the chiral tag of the dummy's neighbour before the dummy is replaced.
+
+    RDKit reads a chiral tag against the order of the atom's bonds, counting an
+    implicit hydrogen last. Whatever takes the dummy's place ends up last too:
+    ``AddBond`` appends the bond to the next unit, and a hydrogen cap becomes an
+    implicit hydrogen. Moving the dummy's slot to the end of the list is an odd
+    permutation about half the time, depending on how the SMILES was written,
+    and then the same tag means the other configuration unless it is inverted.
+    """
+    atom = mol.GetAtomWithIdx(_attachment_neighbour(mol, dummy_idx))
+    order = [bond.GetOtherAtomIdx(atom.GetIdx()) for bond in atom.GetBonds()]
+    if (len(order) - 1 - order.index(dummy_idx)) % 2:
+        atom.InvertChirality()
+
+
 def _splice(
     left: Chem.Mol, left_dummy: int, right: Chem.Mol, right_dummy: int
 ) -> Chem.RWMol:
     """Bond *left* to *right* where their dummies were, and drop both dummies."""
     combined = Chem.RWMol(Chem.CombineMols(left, right))
     right_dummy += left.GetNumAtoms()
+    for dummy in (left_dummy, right_dummy):
+        _keep_configuration(combined, dummy)
     combined.AddBond(
         _attachment_neighbour(combined, left_dummy),
         _attachment_neighbour(combined, right_dummy),
@@ -345,7 +368,13 @@ def _attach_cap(chain: Chem.RWMol, role: str, cap_smiles: str) -> Chem.RWMol:
 
     if cap_smiles == HYDROGEN_CAP:
         # Removing the dummy leaves a free valence that RDKit fills with an
-        # implicit hydrogen on the next sanitize, which is exactly the cap.
+        # implicit hydrogen on the next sanitize, which is exactly the cap -
+        # except on an atom written in brackets, as every stereocentre is,
+        # whose hydrogen count is fixed and which would be left a radical.
+        _keep_configuration(chain, dummy)
+        anchor = chain.GetAtomWithIdx(_attachment_neighbour(chain, dummy))
+        if anchor.GetNoImplicit():
+            anchor.SetNumExplicitHs(anchor.GetNumExplicitHs() + 1)
         chain.RemoveAtom(dummy)
         return chain
 
@@ -382,8 +411,19 @@ def assemble_chain(spec: ChainSpec, n_units: int | None = None) -> Chem.Mol:
         ChainError: The monomer or a cap is malformed, or an end on a carbonyl
             carbon was left to the default cap.
     """
-    monomer = _parse_monomer(spec.monomer_smiles)
     units = spec.degree_of_polymerization if n_units is None else n_units
+    return _assemble(spec, _tacticity_choices(spec, units))
+
+
+def _assemble(spec: ChainSpec, choices: Sequence[int]) -> Chem.Mol:
+    """Build the capped chain of ``len(choices)`` units; see :func:`assemble_chain`.
+
+    *choices* gives each unit's configuration for the backbone stereocentres
+    tacticity sets, which lets the grown embedder build a template oligomer
+    whose units match any chosen units of the chain.
+    """
+    monomer = _parse_monomer(spec.monomer_smiles)
+    units = len(choices)
 
     chain = _tagged_unit(monomer, 0)
     for unit in range(1, units):
@@ -396,46 +436,68 @@ def assemble_chain(spec: ChainSpec, n_units: int | None = None) -> Chem.Mol:
 
     molecule = chain.GetMol()
     Chem.SanitizeMol(molecule)
-    _apply_tacticity(molecule, spec, units)
+    _apply_tacticity(molecule, spec, choices)
     return molecule
 
 
-def _apply_tacticity(mol: Chem.Mol, spec: ChainSpec, units: int) -> None:
-    """Set backbone chiral tags according to ``spec.tacticity``.
+def _tacticity_choices(spec: ChainSpec, units: int) -> list[int]:
+    """Return which of the two configurations each unit takes, per ``spec.tacticity``.
+
+    One draw per unit, in unit order, whether or not the monomer has anything
+    for tacticity to set.
+    """
+    rng = random.Random(derive_seed(spec.seed, "tacticity"))
+    choices: list[int] = []
+    for unit in range(units):
+        if spec.tacticity == "isotactic":
+            choices.append(0)
+        elif spec.tacticity == "syndiotactic":
+            choices.append(unit % 2)
+        else:
+            choices.append(rng.randint(0, 1))
+    return choices
+
+
+def _apply_tacticity(mol: Chem.Mol, spec: ChainSpec, choices: Sequence[int]) -> None:
+    """Set the chiral tags the monomer leaves open on the backbone, per *choices*.
 
     A monomer with no backbone stereocentre - polyethylene, say - has nothing
-    to set, and that is not an error. Side chains and caps share repeat-unit
-    tags with the backbone, but their stereochemistry must remain unchanged.
+    to set, and that is not an error. Nor does tacticity touch a centre the
+    monomer SMILES writes a configuration for, on the backbone or off it: a
+    sugar-derived repeat unit's stereochemistry is the point of using it.
     """
+    units = len(choices)
     Chem.AssignStereochemistry(
         mol, cleanIt=True, force=True, flagPossibleStereoCenters=True
     )
     backbone = set(backbone_path(mol, units))
     centres: dict[int, list[Chem.Atom]] = {}
+    written = False
     for atom in _atoms(mol):
-        if (
-            atom.GetIdx() in backbone
-            and atom.HasProp("_ChiralityPossible")
-            and atom.HasProp("_omp_unit")
-        ):
+        if atom.GetIdx() not in backbone or not atom.HasProp("_omp_unit"):
+            continue
+        if atom.GetChiralTag() in _TETRAHEDRAL:
+            written = True
+        elif atom.HasProp("_ChiralityPossible"):
             centres.setdefault(atom.GetIntProp("_omp_unit"), []).append(atom)
     if not centres:
-        log.debug(
-            "%s has no backbone stereocentre; tacticity is a no-op.", spec.residue_name
-        )
+        if written and spec.tacticity == "syndiotactic":
+            log.warning(
+                "%s: every backbone stereocentre has its configuration written "
+                "in the monomer SMILES, so tacticity='syndiotactic' has nothing "
+                "to alternate and every unit keeps the written one.",
+                spec.residue_name,
+            )
+        else:
+            log.debug(
+                "%s has no open backbone stereocentre; tacticity is a no-op.",
+                spec.residue_name,
+            )
         return
 
-    rng = random.Random(derive_seed(spec.seed, "tacticity"))
-    tags = (Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
     for unit in range(units):
-        if spec.tacticity == "isotactic":
-            which = 0
-        elif spec.tacticity == "syndiotactic":
-            which = unit % 2
-        else:
-            which = rng.randint(0, 1)
         for atom in centres.get(unit, ()):
-            atom.SetChiralTag(tags[which])
+            atom.SetChiralTag(_TETRAHEDRAL[choices[unit]])
     Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
 
 

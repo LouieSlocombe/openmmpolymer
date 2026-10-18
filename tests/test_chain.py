@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -211,6 +212,99 @@ def test_tacticity_preserves_side_chain_and_cap_stereochemistry(
             assert Chem.MolToSmiles(molecule) == Chem.MolToSmiles(
                 assemble_chain(spec, n_units=n_units)
             )
+
+
+#: Monomers whose SMILES write stereocentres where a build used to lose them,
+#: with the tail cap each needs.
+WRITTEN_STEREO = {
+    # On the tail anchor, written with the dummy before the ring and after it:
+    # joining units inverted one spelling and not the other.
+    "tail-anchor": ("[*]C[C@H]([*])c1ccccc1", None),
+    "tail-anchor-dummy-last": ("[*]C[C@@H](c1ccccc1)[*]", None),
+    # On a head anchor the hydrogen cap closes.
+    "capped-head-anchor": ("[*][C@](C)(F)CC[*]", None),
+    # Inside the unit, on the backbone: poly(L-lactide).
+    "in-unit": ("[*]O[C@@H](C)C(=O)[*]", "[*]O"),
+    # Four on the backbone path through a bicyclic: an isosorbide carbonate.
+    "isohexide": ("[*]O[C@@H]1CO[C@@H]2[C@H](OC([*])=O)CO[C@H]12", "[*]O"),
+    # A ketal-linked sugar, with centres on the backbone, off it and on a
+    # tail anchor that sits in a ring.
+    "sugar-ketal": ("[*]OC[C@@H]1O[C@@]2(C)OC[C@H]([*])[C@@H]2O1", None),
+}
+
+
+def _zipped(spec: ChainSpec, units: int) -> str:
+    """The capped chain joined by RDKit's ``molzip``, which keeps written stereo.
+
+    A route to the right answer independent of :func:`assemble_chain`.
+    """
+    pieces = []
+    for unit in range(units):
+        piece = Chem.RWMol(Chem.MolFromSmiles(spec.monomer_smiles))
+        head, tail = chain._dummies(piece)
+        piece.GetAtomWithIdx(head).SetAtomMapNum(100 + unit)
+        piece.GetAtomWithIdx(tail).SetAtomMapNum(101 + unit)
+        pieces.append(piece)
+    for cap, label in ((spec.head_cap, 100), (spec.tail_cap, 100 + units)):
+        piece = Chem.RWMol(
+            Chem.MolFromSmiles(cap or chain.HYDROGEN_CAP, sanitize=False)
+        )
+        piece.GetAtomWithIdx(chain._dummies(piece)[0]).SetAtomMapNum(label)
+        pieces.append(piece)
+    combined = pieces[0]
+    for piece in pieces[1:]:
+        combined = Chem.CombineMols(combined, piece)
+    zipped = Chem.RemoveHs(Chem.molzip(combined))
+    # A round trip drops tags left on centres the joins made non-chiral.
+    return Chem.MolToSmiles(Chem.MolFromSmiles(Chem.MolToSmiles(zipped)))
+
+
+@pytest.mark.parametrize("tacticity", chain.TACTICITIES)
+@pytest.mark.parametrize(
+    ("monomer", "tail_cap"), WRITTEN_STEREO.values(), ids=WRITTEN_STEREO.keys()
+)
+def test_written_stereochemistry_survives_assembly(
+    monomer: str, tail_cap: str | None, tacticity: str
+) -> None:
+    """Every unit keeps the configuration its SMILES writes, in every mode.
+
+    Tacticity sets only the backbone centres the SMILES leaves open, and
+    neither joining units nor capping an end may change what a written chiral
+    tag means.
+    """
+    spec = ChainSpec(
+        monomer_smiles=monomer,
+        degree_of_polymerization=4,
+        tacticity=tacticity,
+        tail_cap=tail_cap,
+    )
+    assert Chem.MolToSmiles(assemble_chain(spec)) == _zipped(spec, 4)
+
+
+@pytest.mark.parametrize("monomer", ["[*][Si](C)(C)O[*]", "[*][C@H](C)CC[*]"])
+def test_a_hydrogen_cap_on_a_bracket_atom_is_a_hydrogen(monomer: str) -> None:
+    """A bracket atom's hydrogen count is fixed: dropping the dummy left a radical."""
+    molecule = assemble_chain(ChainSpec(monomer_smiles=monomer))
+    assert not any(
+        atom.GetNumRadicalElectrons()
+        for atom in molecule.GetAtoms()  # type: ignore[no-untyped-call]
+    )
+
+
+def test_syndiotactic_says_so_when_every_backbone_centre_is_written(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A request the written stereochemistry overrules is not silently dropped."""
+    monomer, tail_cap = WRITTEN_STEREO["in-unit"]
+    spec = ChainSpec(
+        monomer_smiles=monomer,
+        degree_of_polymerization=4,
+        tacticity="syndiotactic",
+        tail_cap=tail_cap,
+    )
+    with caplog.at_level(logging.WARNING, logger=chain.__name__):
+        assert Chem.MolToSmiles(assemble_chain(spec)) == _zipped(spec, 4)
+    assert "nothing to alternate" in caplog.text
 
 
 def test_atom_names_are_unique_and_fit_four_columns() -> None:
