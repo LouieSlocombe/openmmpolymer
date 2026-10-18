@@ -307,6 +307,109 @@ def test_syndiotactic_says_so_when_every_backbone_centre_is_written(
     assert "nothing to alternate" in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("monomer", "tacticity", "templates"),
+    [
+        # Nothing for tacticity to set: one template, as there always was.
+        (PE, "syndiotactic", 1),
+        (WRITTEN_STEREO["tail-anchor"][0], "atactic", 1),
+        (PS, "isotactic", 1),
+        # Alternating units need a template interior of each configuration.
+        (PS, "syndiotactic", 2),
+    ],
+)
+def test_each_interior_configuration_gets_a_template_of_its_own(
+    monomer: str,
+    tacticity: str,
+    templates: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built = []
+    build_template = chain._build_template
+
+    def counted(spec: ChainSpec, choices: Any, seed: int) -> Any:
+        built.append(tuple(choices))
+        return build_template(spec, choices, seed)
+
+    monkeypatch.setattr(chain, "_build_template", counted)
+    spec = ChainSpec(
+        monomer_smiles=monomer, degree_of_polymerization=7, tacticity=tacticity
+    )
+    choices = chain._tacticity_choices(spec, 7)
+    blocks = chain._unit_blocks(
+        spec, chain._add_hydrogens(chain._assemble(spec, choices)), choices
+    )
+    assert len(blocks) == 7
+    assert len(built) == templates
+
+
+@pytest.mark.parametrize(
+    ("monomer", "tail_cap", "tacticity", "units", "seed"),
+    [
+        # Interior units all took one template unit's configuration.
+        (PS, None, "syndiotactic", 7, 3),
+        # Spinning the next unit about the tail anchor swapped it with one of
+        # the anchor's own substituents.
+        (*WRITTEN_STEREO["tail-anchor"], "atactic", 7, 3),
+        # Spinning it about a head-to-tail line that is not a bond pushed it
+        # into the centre beside the anchor. Intermittent, so these seeds are
+        # ones that fail without the fix.
+        (PLA, "[*]O", "atactic", 7, 4),
+        (*WRITTEN_STEREO["in-unit"], "atactic", 9, 4),
+        # A ring anchor has no torsion to turn, and a unit this bulky grows
+        # through the one behind it unless that is tested too.
+        (*WRITTEN_STEREO["sugar-ketal"], "atactic", 7, 3),
+    ],
+)
+def test_grown_conformers_are_the_stereoisomer_asked_for(
+    monomer: str,
+    tail_cap: str | None,
+    tacticity: str,
+    units: int,
+    seed: int,
+    tmp_path: Path,
+) -> None:
+    """The coordinates are what the simulation runs, whatever the tags say."""
+    result = build_chain(
+        ChainSpec(
+            monomer_smiles=monomer,
+            degree_of_polymerization=units,
+            tacticity=tacticity,
+            tail_cap=tail_cap,
+            seed=seed,
+        ),
+        n_conformers=3,
+        output_dir=tmp_path,
+        embedder="grown",
+    )
+    for path in result.sdf_paths:
+        conformer = _conformer(path)
+        Chem.AssignStereochemistryFrom3D(conformer)
+        assert Chem.MolToSmiles(Chem.RemoveHs(conformer)) == result.smiles
+
+
+def test_a_conformer_that_contradicts_its_tags_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mirror-image conformer is the other stereoisomer, so it is not written."""
+    optimise = chain._optimise
+
+    def mirrored(molecule: Chem.Mol, max_iters: int) -> None:
+        optimise(molecule, max_iters)
+        chain._set_conformer(molecule, chain._positions(molecule) * [-1.0, 1.0, 1.0])
+
+    monkeypatch.setattr(chain, "_optimise", mirrored)
+    with pytest.raises(ChainError, match="different stereoisomer"):
+        build_chain(
+            ChainSpec(monomer_smiles=PS, degree_of_polymerization=3),
+            output_dir=tmp_path,
+        )
+    # Polyethylene has no configuration for a mirror to change.
+    build_chain(
+        ChainSpec(monomer_smiles=PE, degree_of_polymerization=3), output_dir=tmp_path
+    )
+
+
 def test_atom_names_are_unique_and_fit_four_columns() -> None:
     """PDB atom names are truncated to four without complaint, so they must fit."""
     molecule = Chem.AddHs(
