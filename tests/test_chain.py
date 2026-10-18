@@ -247,14 +247,19 @@ def _zipped(spec: ChainSpec, units: int) -> str:
         pieces.append(piece)
     for cap, label in ((spec.head_cap, 100), (spec.tail_cap, 100 + units)):
         piece = Chem.RWMol(
-            Chem.MolFromSmiles(cap or chain.HYDROGEN_CAP, sanitize=False)
+            Chem.MolFromSmiles(cap or chain.HYDROGEN_CAP, sanitize=cap is not None)
         )
         piece.GetAtomWithIdx(chain._dummies(piece)[0]).SetAtomMapNum(label)
         pieces.append(piece)
     combined = pieces[0]
     for piece in pieces[1:]:
         combined = Chem.CombineMols(combined, piece)
-    zipped = Chem.RemoveHs(Chem.molzip(combined))
+    # A hydrogen cap that defined a double bond's stereo goes too: the end
+    # then carries two hydrogens and the bond has none. Any, because the
+    # stubs give each attribute the parameters' type.
+    params: Any = Chem.RemoveHsParameters()
+    params.removeDefiningBondStereo = True
+    zipped = Chem.RemoveHs(Chem.molzip(combined), params)
     # A round trip drops tags left on centres the joins made non-chiral.
     return Chem.MolToSmiles(Chem.MolFromSmiles(Chem.MolToSmiles(zipped)))
 
@@ -289,6 +294,67 @@ def test_a_hydrogen_cap_on_a_bracket_atom_is_a_hydrogen(monomer: str) -> None:
         atom.GetNumRadicalElectrons()
         for atom in molecule.GetAtoms()  # type: ignore[no-untyped-call]
     )
+
+
+#: Monomers whose SMILES give a double bond's geometry with a ``/`` or ``\``
+#: a build used to drop, with the caps each needs.
+WRITTEN_DOUBLE_BONDS = {
+    # The dummy is the stereo atom at the tail end, or at the head end.
+    "trans-ppv": ("[*]c1ccc(cc1)/C=C/[*]", None, None),
+    "cis-ppv": ("[*]c1ccc(cc1)/C=C\\[*]", None, None),
+    "trans-ppv-head": ("[*]/C=C/c1ccc([*])cc1", None, None),
+    # The dummy carries the only direction at its end without being the
+    # stereo atom there.
+    "trisubstituted": ("[*]/C(C)=C(/F)C[*]", None, None),
+    # Conjugated, so one direction serves two bonds across the junction.
+    "polyacetylene": ("[*]/C=C/C=C/[*]", None, None),
+    "alternating-diene": ("[*]/C=C\\C=C/[*]", None, None),
+    # Fumarate and maleate polyesters.
+    "fumarate": ("[*]C(=O)/C=C/C(=O)OCCO[*]", "[*]OC", None),
+    "maleate": ("[*]C(=O)/C=C\\C(=O)OCCO[*]", "[*]OC", None),
+    # Beside a written stereocentre.
+    "beside-a-centre": ("[*]/C=C/[C@H](C)[*]", None, None),
+    # On a cap.
+    "cap": ("[*]CC[*]", None, "[*]/C=C/F"),
+}
+
+
+@pytest.mark.parametrize(
+    ("monomer", "head_cap", "tail_cap"),
+    WRITTEN_DOUBLE_BONDS.values(),
+    ids=WRITTEN_DOUBLE_BONDS.keys(),
+)
+def test_written_double_bond_geometry_survives_assembly(
+    monomer: str, head_cap: str | None, tail_cap: str | None
+) -> None:
+    """A dummy that defines a double bond's E/Z must not take it away with it."""
+    spec = ChainSpec(
+        monomer_smiles=monomer,
+        degree_of_polymerization=3,
+        head_cap=head_cap,
+        tail_cap=tail_cap,
+    )
+    assert Chem.MolToSmiles(assemble_chain(spec)) == _zipped(spec, 3)
+
+
+def test_a_hydrogen_cap_hands_a_double_bond_to_the_other_neighbour() -> None:
+    """The end's other substituent takes over, on the far side from the cap.
+
+    RDKit's own perception never makes a dummy the stereo atom when the end
+    has a heavier neighbour, so the bond is set up that way by hand.
+    """
+    mol = Chem.RWMol(Chem.MolFromSmiles("F/C=C(\\C)[*]"))
+    dummy = chain._dummies(mol)[0]
+    double = mol.GetBondBetweenAtoms(1, 2)
+    double.SetStereoAtoms(0, dummy)
+    double.SetStereo(Chem.BondStereo.STEREOTRANS)
+    chain._keep_double_bonds(mol, dummy, None)
+    mol.RemoveAtom(dummy)
+    capped = mol.GetMol()
+    Chem.SanitizeMol(capped)
+    Chem.SetDoubleBondNeighborDirections(capped)
+    Chem.AssignStereochemistry(capped, cleanIt=True, force=True)
+    assert Chem.MolToSmiles(capped) == Chem.MolToSmiles(Chem.MolFromSmiles("F/C=C\\C"))
 
 
 def test_syndiotactic_says_so_when_every_backbone_centre_is_written(
@@ -382,10 +448,67 @@ def test_grown_conformers_are_the_stereoisomer_asked_for(
         output_dir=tmp_path,
         embedder="grown",
     )
+    _assert_built_as_recorded(result)
+
+
+def _assert_built_as_recorded(result: ChainResult) -> None:
+    """Every conformer's coordinates are the stereoisomer its SMILES records."""
     for path in result.sdf_paths:
         conformer = _conformer(path)
         Chem.AssignStereochemistryFrom3D(conformer)
         assert Chem.MolToSmiles(Chem.RemoveHs(conformer)) == result.smiles
+
+
+@pytest.mark.parametrize(
+    ("name", "units", "seed"),
+    [
+        # Spinning the next unit about a line that is not a bond twisted a
+        # double bond close by, and the relaxation settled it the other way.
+        # Intermittent, so these seeds are ones that fail without the fix.
+        ("cis-polybutadiene", 5, 17),
+        ("polyacetylene", 5, 1),
+        ("fumarate", 5, 0),
+        ("trisubstituted", 5, 3),
+        # A tail anchor at one end of the bond: it has no torsion to turn.
+        ("trans-ppv", 7, 3),
+    ],
+)
+def test_grown_double_bonds_have_the_geometry_asked_for(
+    name: str, units: int, seed: int, tmp_path: Path
+) -> None:
+    monomer, head_cap, tail_cap = {
+        "cis-polybutadiene": ("[*]C/C=C\\C[*]", None, None),
+        **WRITTEN_DOUBLE_BONDS,
+    }[name]
+    result = build_chain(
+        ChainSpec(
+            monomer_smiles=monomer,
+            degree_of_polymerization=units,
+            head_cap=head_cap,
+            tail_cap=tail_cap,
+            seed=seed,
+        ),
+        n_conformers=3,
+        output_dir=tmp_path,
+        embedder="grown",
+    )
+    _assert_built_as_recorded(result)
+
+
+def test_a_twisted_double_bond_is_caught() -> None:
+    """Trans coordinates on a cis chain are the other stereoisomer."""
+    cis, trans = (
+        chain._add_hydrogens(
+            assemble_chain(
+                ChainSpec(monomer_smiles=monomer, degree_of_polymerization=3)
+            )
+        )
+        for monomer in ("[*]C/C=C\\C[*]", "[*]C/C=C/C[*]")
+    )
+    assert chain._embed_etkdg(trans, 1)
+    assert chain._misbuilt_units(trans) == []
+    chain._set_conformer(cis, chain._positions(trans))
+    assert chain._misbuilt_units(cis) == [0, 1, 2]
 
 
 def test_a_conformer_that_contradicts_its_tags_is_refused(

@@ -22,8 +22,8 @@ and says so when it drifts either way.
 
 Stereochemistry the monomer SMILES writes is kept in every unit; tacticity only
 fills in the backbone centres it leaves open. Every conformer is checked
-against its chiral tags before it is written, because forcefill and the
-simulation see the coordinates, not the tags.
+against its chiral tags and double-bond geometry before it is written, because
+forcefill and the simulation see the coordinates, not the labels.
 """
 
 from __future__ import annotations
@@ -62,6 +62,13 @@ HYDROGEN_CAP = "[*][H]"
 
 #: The two tetrahedral chiral tags, in the order tacticity choices index them.
 _TETRAHEDRAL = (Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
+
+#: Double-bond stereo stated against the bond's stereo atoms rather than by
+#: CIP rank, as :func:`_keep_double_bonds` leaves it: cis, then trans.
+_RELATIVE = (Chem.BondStereo.STEREOCIS, Chem.BondStereo.STEREOTRANS)
+
+#: Every way a double bond's configuration can be stated.
+_STATED = (Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOZ, *_RELATIVE)
 
 #: Ways to produce 3D coordinates. ``auto`` grows anything long enough to
 #: stamp a template down - four units - and falls back to ETKDG below that.
@@ -207,6 +214,11 @@ class ChainResult:
 def _atoms(mol: Chem.Mol) -> list[Chem.Atom]:
     """Return *mol*'s atoms in order: RDKit's stubs leave ``GetAtoms`` untyped."""
     return list(mol.GetAtoms())  # type: ignore[no-untyped-call]
+
+
+def _bonds(mol: Chem.Mol) -> list[Chem.Bond]:
+    """Return *mol*'s bonds in order: RDKit's stubs leave ``GetBonds`` untyped."""
+    return list(mol.GetBonds())  # type: ignore[no-untyped-call]
 
 
 def _dummies(mol: Chem.Mol) -> list[int]:
@@ -356,6 +368,51 @@ def _keep_configuration(mol: Chem.Mol, dummy_idx: int) -> None:
         atom.InvertChirality()
 
 
+def _keep_double_bonds(mol: Chem.Mol, dummy_idx: int, replacement: int | None) -> None:
+    """Restate the dummy's neighbour's double-bond stereo before the dummy goes.
+
+    RDKit reads a double bond's configuration from the ``/`` and ``\\`` on the
+    single bonds around it and records it against one neighbour at each end.
+    A SMILES such as ``[*]/C=C/c1ccc([*])cc1`` puts the only direction at one
+    end on the dummy's bond, and may make the dummy that end's neighbour, so
+    removing the dummy drops the configuration. Each such bond is restated as
+    cis or trans across its stereo atoms instead. Whatever replaces the dummy
+    sits where it sat: the next unit's atom takes over its relation to the far
+    end, and a hydrogen cap hands it to the end's other neighbour, on the
+    opposite side. An end left with two hydrogens is no longer a stereo bond.
+
+    Args:
+        mol: The molecule holding the dummy.
+        dummy_idx: The dummy about to be removed.
+        replacement: The atom now bonded where the dummy was, or None for a
+            hydrogen cap.
+    """
+    anchor = mol.GetAtomWithIdx(_attachment_neighbour(mol, dummy_idx))
+    for bond in anchor.GetBonds():
+        if bond.GetStereo() not in _STATED:
+            continue
+        # A label read off the SMILES is E or Z with the stereo atoms its
+        # highest-ranked neighbours, so E is trans across them.
+        trans = bond.GetStereo() in (Chem.BondStereo.STEREOE, _RELATIVE[True])
+        stereo_atoms = list(bond.GetStereoAtoms())
+        if dummy_idx in stereo_atoms:
+            stand_in = replacement
+            if stand_in is None:
+                far = bond.GetOtherAtomIdx(anchor.GetIdx())
+                others = [
+                    int(neighbour.GetIdx())
+                    for neighbour in anchor.GetNeighbors()
+                    if neighbour.GetIdx() not in (dummy_idx, far)
+                ]
+                if not others:
+                    bond.SetStereo(Chem.BondStereo.STEREONONE)
+                    continue
+                stand_in, trans = others[0], not trans
+            stereo_atoms[stereo_atoms.index(dummy_idx)] = stand_in
+            bond.SetStereoAtoms(*stereo_atoms)
+        bond.SetStereo(_RELATIVE[trans])
+
+
 def _splice(
     left: Chem.Mol, left_dummy: int, right: Chem.Mol, right_dummy: int
 ) -> Chem.RWMol:
@@ -364,11 +421,11 @@ def _splice(
     right_dummy += left.GetNumAtoms()
     for dummy in (left_dummy, right_dummy):
         _keep_configuration(combined, dummy)
-    combined.AddBond(
-        _attachment_neighbour(combined, left_dummy),
-        _attachment_neighbour(combined, right_dummy),
-        Chem.BondType.SINGLE,
-    )
+    left_anchor = _attachment_neighbour(combined, left_dummy)
+    right_anchor = _attachment_neighbour(combined, right_dummy)
+    combined.AddBond(left_anchor, right_anchor, Chem.BondType.SINGLE)
+    _keep_double_bonds(combined, left_dummy, right_anchor)
+    _keep_double_bonds(combined, right_dummy, left_anchor)
     for idx in sorted((left_dummy, right_dummy), reverse=True):
         combined.RemoveAtom(idx)
     return combined
@@ -384,6 +441,7 @@ def _attach_cap(chain: Chem.RWMol, role: str, cap_smiles: str) -> Chem.RWMol:
         # except on an atom written in brackets, as every stereocentre is,
         # whose hydrogen count is fixed and which would be left a radical.
         _keep_configuration(chain, dummy)
+        _keep_double_bonds(chain, dummy, None)
         anchor = chain.GetAtomWithIdx(_attachment_neighbour(chain, dummy))
         if anchor.GetNoImplicit():
             anchor.SetNumExplicitHs(anchor.GetNumExplicitHs() + 1)
@@ -448,6 +506,11 @@ def _assemble(spec: ChainSpec, choices: Sequence[int]) -> Chem.Mol:
 
     molecule = chain.GetMol()
     Chem.SanitizeMol(molecule)
+    # RDKit reads double-bond stereo back from the ``/`` and ``\`` directions
+    # of the neighbouring single bonds, and removing a dummy cleared them
+    # wherever _keep_double_bonds restated a configuration.
+    if any(bond.GetStereo() in _RELATIVE for bond in _bonds(molecule)):
+        Chem.SetDoubleBondNeighborDirections(molecule)
     _apply_tacticity(molecule, spec, choices)
     return molecule
 
@@ -847,13 +910,16 @@ class _TailAnchor:
 def _tail_anchors(
     mol: Chem.Mol, n_units: int, tails: Sequence[int]
 ) -> list[_TailAnchor | None]:
-    """Describe each unit's tail anchor, if the chain has a stereocentre.
+    """Describe each unit's tail anchor, if the chain has stated stereochemistry.
 
-    A chain without one is grown by spinning the new unit alone, as it always
-    was, and gets None throughout: there is no configuration to lose, and
-    changing how it grows would change every such build on disk.
+    That is a stereocentre, or a double bond with its E/Z given. A chain with
+    neither is grown by spinning the new unit alone, as it always was, and
+    gets None throughout: there is no configuration to lose, and changing how
+    it grows would change every such build on disk.
     """
-    if not any(atom.GetChiralTag() in _TETRAHEDRAL for atom in _atoms(mol)):
+    if not any(atom.GetChiralTag() in _TETRAHEDRAL for atom in _atoms(mol)) and not any(
+        bond.GetStereo() in _STATED for bond in _bonds(mol)
+    ):
         return [None] * len(tails)
     backbone = backbone_path(mol, n_units)
     position = {index: at for at, index in enumerate(backbone)}
@@ -907,7 +973,8 @@ def _turn_past_anchor(
     leaves its head anywhere around the anchor: in the place of one of the
     anchor's own substituents, or, where that line is not a bond, against the
     backbone atom before it. The relaxation then sorts the atoms out, and
-    where one of them is a stereocentre it picks the configuration. Instead
+    where one of them is a stereocentre or the end of a stereo double bond it
+    picks the configuration. Instead
     the head goes first into the anchor's open valence - opposite the sum of
     the bonds it already has - and then the head and the anchor's
     substituents turn together about the real bond into the anchor, so the
@@ -1077,8 +1144,8 @@ def _grow_conformer(
     then spun about the previous unit's backbone bond and about the junction
     bond joining the two, each by a torsion drawn from the trans/gauche set -
     except the second unit's first spin, which has nothing before it to be
-    trans to and is drawn uniformly. In a chain with a stereocentre the first
-    spin is :func:`_turn_past_anchor` instead, which keeps every configuration;
+    trans to and is drawn uniformly. In a chain with stated stereochemistry the
+    first spin is :func:`_turn_past_anchor` instead, which keeps it;
     see :func:`_tail_anchors` for why the rest keep the plain spin. A
     placement that puts a heavy atom within
     :data:`_OVERLAP_ANGSTROM` of a heavy atom two or more units back is
@@ -1241,9 +1308,9 @@ def _grow_conformer(
             ):
                 continue
             # The unit behind is bonded to this one, so only pairs more than
-            # three bonds apart are tested, and only in a chain with a
-            # stereocentre: one caught between interpenetrating units is one
-            # the relaxation can turn inside out.
+            # three bonds apart are tested, and only in a chain with stated
+            # stereochemistry: a centre or a double bond caught between
+            # interpenetrating units is one the relaxation can turn over.
             if adjacent is not None:
                 behind, ahead = adjacent[unit]
                 gaps = previous[behind] - trial[ahead]
@@ -1270,25 +1337,30 @@ def _grow_conformer(
 
 
 def _misbuilt_units(mol: Chem.Mol) -> list[int]:
-    """Return the units whose conformer contradicts one of their chiral tags.
+    """Return the units whose conformer contradicts their stated stereochemistry.
 
-    The SDF goes to forcefill with coordinates, and the simulation runs on
-    them, so a centre whose geometry disagrees with its tag is built as the
-    other stereoisomer whatever the tag and the recorded SMILES say.
+    That is a chiral tag, or a double bond's E/Z. The SDF goes to forcefill
+    with coordinates, and the simulation runs on them, so a centre or a double
+    bond whose geometry disagrees with its label is built as the other
+    stereoisomer whatever the label and the recorded SMILES say.
     """
     tagged = [atom for atom in _atoms(mol) if atom.GetChiralTag() in _TETRAHEDRAL]
-    if not tagged:
+    stated = [bond for bond in _bonds(mol) if bond.GetStereo() in _STATED]
+    if not tagged and not stated:
         return []
     perceived = Chem.Mol(mol)
-    Chem.AssignAtomChiralTagsFromStructure(perceived)
-    return sorted(
-        {
-            atom.GetIntProp("_omp_unit")
-            for atom in tagged
-            if perceived.GetAtomWithIdx(atom.GetIdx()).GetChiralTag()
-            != atom.GetChiralTag()
-        }
+    Chem.AssignStereochemistryFrom3D(perceived)
+    wrong = {
+        atom.GetIntProp("_omp_unit")
+        for atom in tagged
+        if perceived.GetAtomWithIdx(atom.GetIdx()).GetChiralTag() != atom.GetChiralTag()
+    }
+    wrong.update(
+        bond.GetBeginAtom().GetIntProp("_omp_unit")
+        for bond in stated
+        if perceived.GetBondWithIdx(bond.GetIdx()).GetStereo() != bond.GetStereo()
     )
+    return sorted(wrong)
 
 
 def _set_conformer(mol: Chem.Mol, coords: npt.NDArray[np.float64]) -> None:
@@ -1456,9 +1528,9 @@ def build_chain(
         if wrong:
             raise ChainError(
                 f"Conformer {index} of {spec.residue_name} contradicts the "
-                f"configuration asked for at a stereocentre in unit(s) {wrong}, "
-                "so its coordinates are a different stereoisomer. Try another "
-                "seed, or the other embedder."
+                "configuration asked for at a stereocentre or double bond in "
+                f"unit(s) {wrong}, so its coordinates are a different "
+                "stereoisomer. Try another seed, or the other embedder."
             )
 
         coords = _positions(conformer_mol)

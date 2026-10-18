@@ -89,8 +89,10 @@ openmmpolymer '[*]OC(C)C(=O)[*]' -n 20 -c 40 -r PLA \
 `--head-cap` and `--tail-cap` each take a fragment with one `[*]`.
 `--tacticity` sets only the backbone stereocentres the monomer SMILES leaves
 unspecified. A configuration written with `@` or `@@` is kept in every unit,
-on the backbone or off it, so a sugar-derived repeat unit builds as written;
-cap stereochemistry is never assigned or overwritten.
+on the backbone or off it, so a sugar-derived repeat unit builds as written,
+and so is a double bond's `/` or `\` geometry, even across a `[*]`: trans-PPV
+is `'[*]c1ccc(cc1)/C=C/[*]'`. Cap stereochemistry is never assigned or
+overwritten.
 `--characteristic-ratio` sets the C-infinity the chains are grown to and
 checked against; the default, 7.0, is polyethylene's.
 
