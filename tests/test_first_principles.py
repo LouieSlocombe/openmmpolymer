@@ -46,17 +46,6 @@ def saved_run(dimer_argon_run: Any, tmp_path: Path) -> Path:
     return tmp_path
 
 
-def _example(*arguments: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, str(EXAMPLE), *arguments],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
-
-
 def test_density_converts_units_before_averaging_fluctuating_volumes() -> None:
     """602.214076 amu in 1 nm³ is 1 g/cm³; averaging 1/V matters."""
     density = example["density_g_cm3"](602.214076, np.array([1.0, 2.0]))
@@ -76,7 +65,14 @@ def test_chain_sizes_weight_all_atoms_and_use_backbone_endpoints() -> None:
 
 def test_the_standalone_demo_recovers_its_known_properties() -> None:
     """Exercise the documented command, including slope signs and unit conversion."""
-    result = _example()
+    result = subprocess.run(
+        [sys.executable, str(EXAMPLE)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
     assert result.returncode == 0, result.stderr
     expected = {
         "Density = 0.996323 g/cm³",
@@ -100,28 +96,30 @@ def test_the_standalone_demo_recovers_its_known_properties() -> None:
 
 def test_a_saved_run_uses_retained_rows_and_real_trajectory_frames(
     saved_run: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     with edited_json(saved_run / "manifest.json") as manifest:
         manifest["chains"] = {"backbone": [0, 1]}
     state = read_state_data(saved_run / manifest["stages"]["02_nvt"]["csv"])
-    result = _example("--run", str(saved_run), "--stage", "02_nvt")
+    example["main"](["--run", str(saved_run), "--stage", "02_nvt"])
 
-    assert result.returncode == 0, result.stderr
-    assert "Saved stage: 02_nvt" in result.stdout
-    assert "Rows retained: 1/2" in result.stdout
-    assert "Frames retained: 5/10" in result.stdout
-    assert _number(result.stdout, "Mean reported density") == pytest.approx(
+    output = capsys.readouterr().out
+    assert "Saved stage: 02_nvt" in output
+    assert "Rows retained: 1/2" in output
+    assert "Frames retained: 5/10" in output
+    assert _number(output, "Mean reported density") == pytest.approx(
         state.density_g_cm3[-1], abs=5e-7
     )
     # Equal-mass dimers obey R² = 4 Rg² at every frame, including moving dimers.
-    assert _number(result.stdout, "Mean R²") == pytest.approx(
-        4.0 * _number(result.stdout, "Mean Rg²"), abs=3e-6
+    assert _number(output, "Mean R²") == pytest.approx(
+        4.0 * _number(output, "Mean Rg²"), abs=3e-6
     )
-    assert "does not establish equilibration" in result.stdout
+    assert "does not establish equilibration" in output
 
 
 def test_a_saved_snapshot_keeps_its_only_frame_and_marks_the_limitation(
     saved_run: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     from openmm import app, unit
 
@@ -134,41 +132,43 @@ def test_a_saved_snapshot_keeps_its_only_frame_and_marks_the_limitation(
     positions[1::2, 0] = np.tile([0.2, 0.6], 16)
     with snapshot.open("w") as handle:
         app.PDBFile.writeFile(pdb.topology, positions * unit.nanometer, handle)
-    result = _example("--run", str(saved_run), "--discard-fraction", "0.9")
+    example["main"](["--run", str(saved_run), "--discard-fraction", "0.9"])
 
-    assert result.returncode == 0, result.stderr
-    assert "Frames retained: 1/1" in result.stdout
+    output = capsys.readouterr().out
+    assert "Frames retained: 1/1" in output
     assert "One saved snapshot: chain sizes only; no time average or uncertainty." in (
-        result.stdout
+        output
     )
-    assert "No recorded backbone: R² skipped" in result.stdout
-    assert "Mean R² =" not in result.stdout
-    assert _number(result.stdout, "Mean Rg") == pytest.approx(0.2, abs=5e-7)
-    assert _number(result.stdout, "RMS Rg") == pytest.approx(np.sqrt(0.05), abs=5e-7)
+    assert "No recorded backbone: R² skipped" in output
+    assert "Mean R² =" not in output
+    assert _number(output, "Mean Rg") == pytest.approx(0.2, abs=5e-7)
+    assert _number(output, "RMS Rg") == pytest.approx(np.sqrt(0.05), abs=5e-7)
 
 
 @pytest.mark.parametrize("missing", ("coordinates", "csv"))
 def test_missing_saved_data_are_reported_without_inventing_results(
-    saved_run: Path, missing: str
+    saved_run: Path, missing: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
     extensions = ("*.xtc", "*.pdb") if missing == "coordinates" else ("*.csv",)
     for extension in extensions:
         for artifact in saved_run.glob(extension):
             artifact.unlink()
-    result = _example("--run", str(saved_run))
-
     if missing == "coordinates":
-        assert result.returncode == 0, result.stderr
-        assert "Mean reported density =" in result.stdout
+        example["main"](["--run", str(saved_run)])
+        output = capsys.readouterr()
+        assert "Mean reported density =" in output.out
         notice = (
             "No saved coordinates: mass-based density and chain dimensions skipped."
         )
-        assert notice in result.stdout
-        assert "Mean Rg² =" not in result.stdout
+        assert notice in output.out
+        assert "Mean Rg² =" not in output.out
     else:
-        assert result.returncode == 2
-        assert "CSV" in result.stderr
-        assert "Mean reported density =" not in result.stdout
+        with pytest.raises(SystemExit) as raised:
+            example["main"](["--run", str(saved_run)])
+        assert raised.value.code == 2
+        output = capsys.readouterr()
+        assert "CSV" in output.err
+        assert "Mean reported density =" not in output.out
 
 
 def _number(output: str, label: str) -> float:

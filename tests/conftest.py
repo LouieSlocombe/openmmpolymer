@@ -11,7 +11,11 @@ only they can test.
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Iterator, Sequence
+from copy import deepcopy
+from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +27,7 @@ os.environ.setdefault("OPENMM_CPU_THREADS", "1")
 
 from openmmpolymer.forcefield import PolymerForceField
 from openmmpolymer.mdsystem import PackedBox
+from openmmpolymer.simulate import StageResult
 
 from .helpers import DIMER_FFXML, argon_cell, argon_context, write_manifest
 
@@ -69,36 +74,70 @@ def argon_scan_run() -> Any:
 
 
 @pytest.fixture
+def short_pushoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep real scan preparation without a polymer-length push-off on argon.
+
+    The lattice has no packing overlaps. Exercise all three timestep rungs in
+    0.06 ps instead of spending 10 ps preparing every workflow test. A partial
+    keeps the runner's signature, so budgets and resume fingerprints see the
+    duration that actually runs. Tests of production defaults do not opt in.
+    """
+    from openmmpolymer.protocols import STAGE_RUNNERS
+
+    monkeypatch.setitem(
+        STAGE_RUNNERS, "pushoff", partial(STAGE_RUNNERS["pushoff"], duration_ps=0.06)
+    )
+
+
+@pytest.fixture
 def dimer_argon_run() -> Any:
     """A cell of 32 bonded two-atom molecules: enough for a chain measurement."""
     return argon_context(64, 2.4, atoms_per_molecule=2)
 
 
-@pytest.fixture
-def dimer_trajectory(dimer_argon_run: Any) -> Any:
-    """A real ten-frame XTC and its topology, written by a real stage.
+@pytest.fixture(scope="session")
+def _dimer_trajectory_template(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Path, StageResult]:
+    """Generate the analysis tests' real ten-frame trajectory once.
 
-    The analysis layer's job is reading what this package writes, so the
-    fixture is this package writing it rather than a hand-made file. Sixty-four
-    argon atoms on the CPU platform run at some thousands of steps a second, so
-    a two-picosecond stage costs a quarter of a second.
-
-    ``interval_ps`` is set explicitly: left alone, frames land at ten times the
-    state-data interval, and the ten-picosecond default would put the first one
-    after the stage had ended.
+    Each consumer gets its own copy below, so it can remove files or edit the
+    manifest without changing another test's input. The trajectory still comes
+    from the production writer, including its topology and final snapshot.
     """
     from openmmpolymer.reporters import TrajectoryOptions
     from openmmpolymer.simulate import run_minimise, run_nvt
 
-    minimised = run_minimise(dimer_argon_run, "00_minimise")
-    return run_nvt(
-        dimer_argon_run,
-        "02_nvt",
+    directory = tmp_path_factory.mktemp("dimer_trajectory")
+    run = argon_context(64, 2.4, atoms_per_molecule=2)
+    minimised = run_minimise(run, directory / "00_minimise")
+    measured = run_nvt(
+        run,
+        directory / "02_nvt",
         temperature_k=120.0,
         duration_ps=2.0,
         friction_ps=20.0,
         trajectory=TrajectoryOptions("xtc", interval_ps=0.2),
         state_in=minimised.final_state,
+    )
+    return directory, measured
+
+
+@pytest.fixture
+def dimer_trajectory(
+    _dimer_trajectory_template: tuple[Path, StageResult], tmp_path: Path
+) -> StageResult:
+    """A private copy of the real trajectory and its mutable stage metadata."""
+    directory, measured = _dimer_trajectory_template
+    assert measured.final_pdb is not None
+    assert measured.csv is not None
+    shutil.copytree(directory, tmp_path, dirs_exist_ok=True)
+    return replace(
+        measured,
+        final_state=str(tmp_path / Path(measured.final_state).name),
+        final_pdb=str(tmp_path / Path(measured.final_pdb).name),
+        csv=str(tmp_path / Path(measured.csv).name),
+        samples=deepcopy(measured.samples),
     )
 
 
@@ -178,8 +217,6 @@ def _stage_build(
     cell - adds an entry to the force-field cache it was handed, and returns
     the argon run with its force-field reference in the build directory.
     """
-    from dataclasses import replace
-
     from openmmpolymer.chain import ChainResult
 
     control["builds"].append(build_dir)

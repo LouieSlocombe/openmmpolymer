@@ -748,35 +748,33 @@ def freely_rotating_chain(
     """
     angle = math.acos(math.exp(-bond_length_nm / persistence_length_nm))
     generator = np.random.default_rng(seed)
-    chains = []
-    for _ in range(n_chains):
-        directions = np.zeros((n_bonds, 3), dtype=np.float64)
-        first = generator.normal(size=3)
-        directions[0] = first / np.linalg.norm(first)
-        for index in range(1, n_bonds):
-            previous = directions[index - 1]
-            away = (
-                np.array([1.0, 0.0, 0.0])
-                if abs(previous[0]) < 0.9
-                else np.array([0.0, 1.0, 0.0])
-            )
-            first_axis = np.cross(previous, away)
-            first_axis /= np.linalg.norm(first_axis)
-            second_axis = np.cross(previous, first_axis)
-            torsion = generator.uniform(0.0, 2.0 * math.pi)
-            step = math.cos(angle) * previous + math.sin(angle) * (
-                math.cos(torsion) * first_axis + math.sin(torsion) * second_axis
-            )
-            directions[index] = step / np.linalg.norm(step)
-        chains.append(
-            np.concatenate(
-                [
-                    np.zeros((1, 3), dtype=np.float64),
-                    np.cumsum(directions * bond_length_nm, axis=0),
-                ]
-            )
+    first = np.empty((n_chains, 3), dtype=np.float64)
+    torsions = np.empty((n_chains, n_bonds - 1), dtype=np.float64)
+    # Keep each chain's seeded draws together, then grow all chains in parallel.
+    # This retains the sample while avoiding a Python loop per chain and bond.
+    for index in range(n_chains):
+        first[index] = generator.normal(size=3)
+        torsions[index] = generator.uniform(0.0, 2.0 * math.pi, size=n_bonds - 1)
+    directions = np.empty((n_chains, n_bonds, 3), dtype=np.float64)
+    directions[:, 0] = first / np.linalg.norm(first, axis=1, keepdims=True)
+    cosine, sine = math.cos(angle), math.sin(angle)
+    for index in range(1, n_bonds):
+        previous = directions[:, index - 1]
+        away = np.zeros_like(previous)
+        use_x = np.abs(previous[:, 0]) < 0.9
+        away[:, 0] = use_x
+        away[:, 1] = ~use_x
+        first_axis = np.cross(previous, away)
+        first_axis /= np.linalg.norm(first_axis, axis=1, keepdims=True)
+        second_axis = np.cross(previous, first_axis)
+        torsion = torsions[:, index - 1, None]
+        step = cosine * previous + sine * (
+            np.cos(torsion) * first_axis + np.sin(torsion) * second_axis
         )
-    return np.concatenate(chains, axis=0)
+        directions[:, index] = step / np.linalg.norm(step, axis=1, keepdims=True)
+    positions = np.zeros((n_chains, n_bonds + 1, 3), dtype=np.float64)
+    positions[:, 1:] = np.cumsum(directions * bond_length_nm, axis=1)
+    return positions.reshape(-1, 3)
 
 
 def random_walk_frames(

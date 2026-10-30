@@ -160,6 +160,7 @@ def test_a_scan_over_its_budget_stops_before_it_creates_anything(
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("short_pushoff")
 def test_one_extension_moves_the_box_by_exactly_the_strain_it_records(
     argon_scan_run: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -199,6 +200,7 @@ def test_one_extension_moves_the_box_by_exactly_the_strain_it_records(
 
 
 @pytest.mark.parametrize("initial_resume", [True, False])
+@pytest.mark.usefixtures("short_pushoff")
 def test_the_whole_scan_runs_and_then_resumes_without_repeating_itself(
     argon_scan_run: Any,
     initial_resume: bool,
@@ -227,6 +229,7 @@ def test_the_whole_scan_runs_and_then_resumes_without_repeating_itself(
     assert Path("run/manifest.json").read_bytes() == before
 
 
+@pytest.mark.usefixtures("short_pushoff")
 def test_every_pass_starts_from_the_equilibrated_cell_even_on_a_resume(
     argon_scan_run: Any,
 ) -> None:

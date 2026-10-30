@@ -636,6 +636,7 @@ def test_a_resume_cannot_mix_new_predecessors_with_saved_descendants(
 
 
 @pytest.mark.slow
+@pytest.mark.usefixtures("short_pushoff")
 def test_a_real_scan_branches_its_replicas_and_survives_rerun_and_resume(
     argon_scan_run: Any,
 ) -> None:

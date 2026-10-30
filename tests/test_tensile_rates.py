@@ -247,6 +247,7 @@ def test_recorded_physics_must_match_saved_settings(
 @pytest.mark.parametrize(
     "property_name", ["breaking_strength", "elongation_at_break", "yield_strength"]
 )
+@pytest.mark.usefixtures("short_pushoff")
 def test_real_rate_workflow_round_trip_and_resume(
     tmp_path: Path, argon_run: Any, property_name: str
 ) -> None:

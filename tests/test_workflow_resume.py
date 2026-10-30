@@ -391,6 +391,7 @@ def test_unverifiable_runs_require_an_explicit_fresh_start(
     assert len(protocols) == 2
 
 
+@pytest.mark.usefixtures("short_pushoff")
 def test_interrupted_replicas_resume_consistently_and_force_rerun_replaces_them(
     scan: Scan, argon_scan_run: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

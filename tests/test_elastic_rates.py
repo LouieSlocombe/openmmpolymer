@@ -418,6 +418,7 @@ def test_all_passes_start_from_common_state_and_force_rerun_keeps_replicas(
 
 @pytest.mark.slow
 @pytest.mark.parametrize("name", ("shear_modulus", "bulk_modulus", "load_modulus"))
+@pytest.mark.usefixtures("short_pushoff")
 def test_real_elastic_scan_records_metadata_and_resumes(
     tmp_path: Path, argon_run: Any, monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:
@@ -992,6 +993,7 @@ def test_recorded_scan_refuses_an_incomplete_replica_or_ladder(
 
 
 @pytest.mark.slow
+@pytest.mark.usefixtures("short_pushoff")
 def test_real_youngs_scan_retains_replicas_common_reference_and_resume(
     tmp_path: Path, argon_run: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

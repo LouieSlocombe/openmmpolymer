@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
-import subprocess
+import runpy
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -130,18 +130,20 @@ def _workflow(
 
 
 @pytest.mark.parametrize("example", EXAMPLES, ids=lambda example: example.filename)
-def test_property_example_help_needs_no_simulation_inputs(example: Example) -> None:
-    result = subprocess.run(
-        [sys.executable, str(ROOT / "examples" / f"{example.filename}.py"), "--help"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "--analyse-only" in result.stdout
-    assert "--no-figures" in result.stdout
+def test_property_example_help_needs_no_simulation_inputs(
+    example: Example,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = ROOT / "examples" / f"{example.filename}.py"
+    monkeypatch.setattr(sys, "argv", [str(path), "--help"])
+    with pytest.raises(SystemExit) as raised:
+        runpy.run_path(str(path), run_name="__main__")
+    assert raised.value.code == 0
+    output = capsys.readouterr()
+    assert not output.err
+    assert "--analyse-only" in output.out
+    assert "--no-figures" in output.out
 
 
 @pytest.mark.parametrize("example", EXAMPLES, ids=lambda example: example.filename)

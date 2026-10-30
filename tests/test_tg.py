@@ -211,6 +211,7 @@ def test_an_invalid_explicit_window_stops_before_files_or_dynamics(
     assert not Path("run").exists()
 
 
+@pytest.mark.usefixtures("short_pushoff")
 def test_an_unresolved_coarse_fit_refuses_and_names_the_ways_out(
     argon_scan_run: Any,
 ) -> None:
@@ -286,6 +287,7 @@ def test_two_passes_at_the_same_rate_are_refused(argon_run: Any) -> None:
 
 
 @pytest.mark.parametrize("initial_resume", [True, False])
+@pytest.mark.usefixtures("short_pushoff")
 def test_the_whole_scan_runs_records_what_it_derived_and_resumes(
     argon_scan_run: Any,
     initial_resume: bool,
@@ -356,6 +358,7 @@ def test_the_whole_scan_runs_records_what_it_derived_and_resumes(
         )
 
 
+@pytest.mark.usefixtures("short_pushoff")
 def test_a_deleted_waypoint_falls_back_to_a_pre_cool_from_the_melt(
     argon_scan_run: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -381,6 +384,7 @@ def test_a_deleted_waypoint_falls_back_to_a_pre_cool_from_the_melt(
     assert PRECOOL_STEM in {result.name for result in again.fine_summary.results}
 
 
+@pytest.mark.usefixtures("short_pushoff")
 def test_several_cooling_rates_start_from_one_configuration() -> None:
     """Independent histories from a common melt, which is what makes them
     comparable at all.
