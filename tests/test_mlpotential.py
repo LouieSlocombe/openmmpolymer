@@ -14,6 +14,7 @@ import functools
 import json
 import os
 import sys
+from collections import defaultdict
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -545,3 +546,66 @@ def test_a_real_model_reaches_openmm_unchanged() -> None:
     np.testing.assert_allclose(
         forces, direct["forces"] * ml.KJ_PER_MOL_PER_EV * 10.0, rtol=1e-6, atol=1e-4
     )
+
+
+EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "mace_off_melt.py"
+
+
+def test_the_mace_off_example_hands_the_classical_state_to_mace_off(
+    model: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Classical build and equilibration, then MACE-OFF from its final state."""
+    import importlib.util
+    from unittest.mock import create_autospec
+
+    import openmmpolymer
+
+    chain, classical, mace = (
+        SimpleNamespace(backbone=(0, 1), n_atoms=8),
+        object(),
+        object(),
+    )
+    records = {"mean_density_g_cm3": 0.77, "wall_seconds": 86.4}
+    results = {
+        "build_melt": (chain, classical),
+        "run_protocol": SimpleNamespace(final_state="classical/final.xml"),
+        "use_turbomace": mace,
+    }
+    mocks = {}
+    for name, result in results.items():
+        mocks[name] = create_autospec(getattr(openmmpolymer, name), return_value=result)
+        monkeypatch.setattr(openmmpolymer, name, mocks[name])
+
+    def load(directory: Any) -> SimpleNamespace:
+        return SimpleNamespace(stages=defaultdict(lambda: records))
+
+    monkeypatch.setattr(openmmpolymer.RunManifest, "load", staticmethod(load))
+    spec = importlib.util.spec_from_file_location("mace_off_example", EXAMPLE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    module.main(["--model", str(model.path), "--output", "out", "--production-ps", "1"])
+
+    first, second = mocks["run_protocol"].call_args_list
+    assert first.args[1:] == (classical, Path("out/classical"))
+    assert second.args[1:] == (mace, Path("out/mace-off"))
+    assert second.kwargs["state_in"] == "classical/final.xml"
+    assert mocks["use_turbomace"].call_args.args == (classical, model.spec)
+    output = capsys.readouterr().out
+    assert "MACE-OFF:    0.7700 g/cm3, mean of 1 ps" in output
+    assert "ran at 1.0 ns/day" in output
+
+
+def test_the_mace_off_example_needs_a_model(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import runpy
+
+    monkeypatch.setattr(sys, "argv", [str(EXAMPLE)])
+    with pytest.raises(SystemExit) as raised:
+        runpy.run_path(str(EXAMPLE), run_name="__main__")
+    assert raised.value.code == 2
+    assert "--model" in capsys.readouterr().err
