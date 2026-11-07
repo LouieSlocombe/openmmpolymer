@@ -114,6 +114,13 @@ from .mechanical import (
 )
 from .melt import BlendComponent, build_blend, build_melt
 from .melt_check import MeltEquilibration, melt_equilibration
+from .mlpotential import (
+    TURBOMACE_PRECISIONS,
+    TurboMACEError,
+    TurboMACESpec,
+    apply_turbomace,
+    use_turbomace,
+)
 from .packing import (
     DEFAULT_PACKING_DENSITY,
     PackedComponent,
@@ -362,6 +369,7 @@ __all__ = [
     "RELAX_MODES",
     "TENSILE_RATE_PROPERTIES",
     "THERMAL_RATE_PROPERTIES",
+    "TURBOMACE_PRECISIONS",
     "AnalysisError",
     "BlendComponent",
     "BreakingError",
@@ -459,6 +467,8 @@ __all__ = [
     "TmResult",
     "TmSpec",
     "TrajectoryOptions",
+    "TurboMACEError",
+    "TurboMACESpec",
     "ViscoelasticError",
     "WindowConvergence",
     "WindowEstimate",
@@ -481,6 +491,7 @@ __all__ = [
     "analyse_tg",
     "analyse_thermal_rates",
     "analyse_yield",
+    "apply_turbomace",
     "assemble_box",
     "assign_charges",
     "box_edge_nm",
@@ -604,6 +615,7 @@ __all__ = [
     "tg_coarse_scan",
     "tg_fine_scan",
     "time_window_convergence",
+    "use_turbomace",
     "validate_elastic_rate_scan",
     "validate_property_rate_scan",
     "validate_tensile_rate_scan",

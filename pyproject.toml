@@ -113,3 +113,10 @@ ignore_missing_imports = true
 module = ["forcefill", "forcefill.*"]
 follow_imports = "silent"
 ignore_missing_imports = true
+
+# TurboMACE is optional and built from source, so CI has neither it nor the
+# ASE and torch it runs through. Treated as untyped wherever they are present.
+[[tool.mypy.overrides]]
+module = ["turbomace", "turbomace.*", "ase", "ase.*", "torch", "torch.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
