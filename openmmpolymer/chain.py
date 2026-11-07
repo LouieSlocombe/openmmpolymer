@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import math
 import random
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -103,6 +103,9 @@ _ADJACENT_OVERLAP_ANGSTROM = 2.0
 #: it gives up.
 _MAX_TRIES = 40
 _MAX_RESTARTS = 200
+
+#: Embeddings a template oligomer gets before the build gives up on it.
+_TEMPLATE_TRIES = 10
 
 #: The reference direction used for the very first unit, which has no
 #: predecessor to take one from. Any fixed choice does, as long as the template
@@ -212,13 +215,13 @@ class ChainResult:
 
 
 def _atoms(mol: Chem.Mol) -> list[Chem.Atom]:
-    """Return *mol*'s atoms in order: RDKit's stubs leave ``GetAtoms`` untyped."""
-    return list(mol.GetAtoms())  # type: ignore[no-untyped-call]
+    """Return *mol*'s atoms in order, as a list."""
+    return list(mol.GetAtoms())
 
 
 def _bonds(mol: Chem.Mol) -> list[Chem.Bond]:
-    """Return *mol*'s bonds in order: RDKit's stubs leave ``GetBonds`` untyped."""
-    return list(mol.GetBonds())  # type: ignore[no-untyped-call]
+    """Return *mol*'s bonds in order, as a list."""
+    return list(mol.GetBonds())
 
 
 def _dummies(mol: Chem.Mol) -> list[int]:
@@ -798,29 +801,55 @@ def _positions(mol: Chem.Mol) -> npt.NDArray[np.float64]:
     return np.asarray(mol.GetConformer().GetPositions(), dtype=np.float64)
 
 
-def _build_template(spec: ChainSpec, choices: Sequence[int], seed: int) -> _Template:
+def _build_template(
+    spec: ChainSpec, choices: Sequence[int], seed: int, kept: Collection[int]
+) -> _Template:
     """Relax a capped tetramer and reduce it to per-unit local geometry.
 
     Four units is the shortest oligomer that shows every junction the grown
     embedder has to make: first-to-second, interior-to-interior, and
     interior-to-last.
 
+    The relaxation now and then turns over a double bond the embedding had
+    right - a distorted one in a conjugated chain most readily - and every
+    unit stamped from that template would then be the other stereoisomer.
+    Such a template is embedded again from a seed derived from *seed*; one
+    that comes out right keeps *seed*, so the chains it has always built do
+    not change.
+
     Args:
         spec: What is being built.
         choices: The tetramer's four tacticity choices; see
             :func:`_tacticity_choices`.
-        seed: Seed for the embedding.
+        seed: Seed for the first embedding.
+        kept: The tetramer's units the chain is stamped from: only their
+            stereochemistry has to be right.
 
     Raises:
         ChainError: Even a tetramer would not embed, which means the monomer
-            itself is the problem.
+            itself is the problem, or every embedding relaxed into the wrong
+            stereoisomer.
     """
-    template_mol = _add_hydrogens(_assemble(spec, choices))
-    if not _embed_etkdg(template_mol, seed, optimise_iters=2000):
+    oligomer = _add_hydrogens(_assemble(spec, choices))
+    for attempt in range(_TEMPLATE_TRIES):
+        template_mol = Chem.Mol(oligomer)
+        if not _embed_etkdg(
+            template_mol,
+            derive_seed(seed, "retry", str(attempt)) if attempt else seed,
+            optimise_iters=2000,
+        ):
+            raise ChainError(
+                f"A tetramer of {spec.monomer_smiles!r} would not embed in 3D. "
+                "Check the monomer SMILES and the caps: if four units cannot be "
+                "built, neither can the chain."
+            )
+        if not set(kept).intersection(_misbuilt_units(template_mol)):
+            break
+    else:
         raise ChainError(
-            f"A tetramer of {spec.monomer_smiles!r} would not embed in 3D. "
-            "Check the monomer SMILES and the caps: if four units cannot be "
-            "built, neither can the chain."
+            f"All {_TEMPLATE_TRIES} tetramers of {spec.monomer_smiles!r} relaxed "
+            "into a different stereoisomer from the one asked for. Try another "
+            "seed, or embedder='etkdg'."
         )
 
     positions = _positions(template_mol)
@@ -877,6 +906,8 @@ def _unit_blocks(
                 spec,
                 (choices[0], choices[1], choices[unit], choices[-1]),
                 derive_seed(spec.seed, *labels),
+                # The first template supplies the end units as well.
+                (2,) if templates else range(4),
             )
         interior.append(templates[tags].interior)
     ends = next(iter(templates.values()))
