@@ -121,6 +121,70 @@ rather than average over the wrong atoms.
 random, and polymers demix over times far beyond molecular dynamics. A blend
 here is a mixed cell, not a phase-separated morphology.
 
+## Machine-learned potentials: TurboMACE
+
+A [TurboMACE](https://github.com/SMTG-Bham/TurboMACE) model takes over the
+interactions of a cell built here. `use_turbomace` converts a run context, so a
+classically equilibrated state can start a MACE run (the
+[README](../README.md#machine-learned-potentials) shows that route);
+`build_melt` and `build_blend` take `potential` to build under the model from
+the start, and so does `--turbomace` on the command line:
+
+```python
+from openmmpolymer import ChainSpec, TurboMACESpec, build_melt
+
+chain, run = build_melt(
+    ChainSpec(
+        monomer_smiles="[*]CC[*]", degree_of_polymerization=20, residue_name="PE"
+    ),
+    n_chains=40,
+    directory="pe-mace",
+    target_density_g_cm3=0.85,
+    potential=TurboMACESpec("MACE-OFF23_small.tmace", precision="fp32"),
+)
+```
+
+```bash
+openmmpolymer "[*]CC[*]" --turbomace MACE-OFF23_small.tmace --turbomace-precision fp32 -o pe-mace
+```
+
+**What is replaced and what is kept.** Every interaction force goes. The
+particles, masses (hydrogen repartitioning included), constraints, cell and
+centre-of-mass remover stay, and one `openmm.PythonForce` evaluates the model on
+the whole periodic cell at every step. A zero-stiffness bond force over the
+topology keeps each chain one OpenMM molecule, so the barostat still moves
+chains rigidly and the stress is still the molecular virial. Constraint
+lengths stay the force field's X-H equilibrium lengths and MACE sets
+everything else; the timestep follows the same constraint rules as for the
+force field.
+
+**The model is part of the fingerprint.** The serialised System records the
+model's absolute path, its SHA-256, the precision and the atomic numbers. A run
+resumes only under the same file: a replaced or missing model stops the next
+stage with a message that says so, and a directory built under one model
+refuses another, or none. That is why the classical and MACE runs above live in
+separate directories.
+
+**Chosen at run time, not recorded.** TurboMACE runs on CUDA when its build has
+it and a GPU is visible, else on the CPU; `CUDA_VISIBLE_DEVICES=` sends OpenMM
+and TurboMACE alike to the CPU. fp32, the default, suits consumer GPUs, whose
+double precision runs at a small fraction of their single precision. fp64 is a
+different Hamiltonian as far as resume is concerned.
+
+**What it refuses.** Elements the model was not trained on; polar models, whose
+long-range electrostatics need the cell's total charge; and a System that
+already carries virtual sites or a barostat.
+
+**Energies are absolute.** MACE energies include the atomic reference energies,
+so a polyethylene cell reports a potential energy near -10⁸ kJ/mol. Only
+differences mean anything, and nothing here reads the absolute value.
+
+**Cost.** With MACE-OFF23 small in fp32 on an RTX 4080 SUPER, a 3100-atom
+polyethylene cell takes about 3.9 ms a step, 0.45 ms of it OpenMM passing
+positions and forces through Python. The force field runs the same cell far
+faster, so packing relief, compression and annealing are better done
+classically and handed over, as `examples/mace_off_melt.py` does.
+
 ## Measuring properties
 
 Every measurement follows the same pattern:
