@@ -12,6 +12,7 @@ import pytest
 from rdkit import Chem
 
 from openmmpolymer import chain
+from openmmpolymer._seeds import derive_seed
 from openmmpolymer.chain import (
     ChainError,
     ChainResult,
@@ -139,7 +140,7 @@ def test_tacticity_sets_the_backbone_stereocentres(
     Chem.AssignStereochemistry(molecule, cleanIt=True, force=True)
     tags = {
         atom.GetChiralTag()
-        for atom in molecule.GetAtoms()  # type: ignore[no-untyped-call]
+        for atom in molecule.GetAtoms()
         if atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
     }
     assert len(tags) == distinct_tags
@@ -180,7 +181,7 @@ def test_tacticity_preserves_side_chain_and_cap_stereochemistry(
     expected = {11: ccw, 21: ccw, 22: cw}
     counts = dict.fromkeys(expected, 0)
     backbone_tags = []
-    for atom in molecule.GetAtoms():  # type: ignore[no-untyped-call]
+    for atom in molecule.GetAtoms():
         mapped = atom.GetAtomMapNum()
         if mapped in expected:
             counts[mapped] += 1
@@ -290,10 +291,7 @@ def test_written_stereochemistry_survives_assembly(
 def test_a_hydrogen_cap_on_a_bracket_atom_is_a_hydrogen(monomer: str) -> None:
     """A bracket atom's hydrogen count is fixed: dropping the dummy left a radical."""
     molecule = assemble_chain(ChainSpec(monomer_smiles=monomer))
-    assert not any(
-        atom.GetNumRadicalElectrons()
-        for atom in molecule.GetAtoms()  # type: ignore[no-untyped-call]
-    )
+    assert not any(atom.GetNumRadicalElectrons() for atom in molecule.GetAtoms())
 
 
 #: Monomers whose SMILES give a double bond's geometry with a ``/`` or ``\``
@@ -393,9 +391,9 @@ def test_each_interior_configuration_gets_a_template_of_its_own(
     built = []
     build_template = chain._build_template
 
-    def counted(spec: ChainSpec, choices: Any, seed: int) -> Any:
+    def counted(spec: ChainSpec, choices: Any, seed: int, kept: Any) -> Any:
         built.append(tuple(choices))
-        return build_template(spec, choices, seed)
+        return build_template(spec, choices, seed, kept)
 
     monkeypatch.setattr(chain, "_build_template", counted)
     spec = ChainSpec(
@@ -531,6 +529,52 @@ def test_a_conformer_that_contradicts_its_tags_is_refused(
     build_chain(
         ChainSpec(monomer_smiles=PE, degree_of_polymerization=3), output_dir=tmp_path
     )
+
+
+def _mirror_embeddings(monkeypatch: pytest.MonkeyPatch, count: int) -> list[int]:
+    """Mirror the first *count* ETKDG embeddings; return every seed embedded."""
+    embed = chain._embed_etkdg
+    seeds: list[int] = []
+
+    def mirrored(molecule: Chem.Mol, seed: int, **options: Any) -> bool:
+        embedded = embed(molecule, seed, **options)
+        if len(seeds) < count:
+            positions = chain._positions(molecule) * [-1.0, 1.0, 1.0]
+            chain._set_conformer(molecule, positions)
+        seeds.append(seed)
+        return embedded
+
+    monkeypatch.setattr(chain, "_embed_etkdg", mirrored)
+    return seeds
+
+
+def test_a_template_of_the_wrong_stereoisomer_is_embedded_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every unit stamped from it would be wrong, so only a new embedding helps."""
+    seeds = _mirror_embeddings(monkeypatch, 1)
+    spec = ChainSpec(
+        monomer_smiles=PS, degree_of_polymerization=5, tacticity="isotactic"
+    )
+    result = build_chain(spec, output_dir=tmp_path, embedder="grown")
+    _assert_built_as_recorded(result)
+    # The first seed is the one a template that came out right always had.
+    first = derive_seed(spec.seed, "template")
+    assert seeds == [first, derive_seed(first, "retry", "1")]
+
+
+def test_a_template_is_judged_on_the_units_the_chain_takes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seeds = _mirror_embeddings(monkeypatch, 1 + chain._TEMPLATE_TRIES)
+    spec = ChainSpec(monomer_smiles=PS, tacticity="isotactic")
+    choices = chain._tacticity_choices(spec, 4)
+    # A later template supplies one interior unit; this one supplies none.
+    chain._build_template(spec, choices, 1, ())
+    assert seeds == [1]
+    with pytest.raises(ChainError, match="different stereoisomer"):
+        chain._build_template(spec, choices, 1, range(4))
+    assert len(seeds) == 1 + chain._TEMPLATE_TRIES
 
 
 def test_atom_names_are_unique_and_fit_four_columns() -> None:
