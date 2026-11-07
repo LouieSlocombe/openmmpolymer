@@ -1,16 +1,17 @@
 """Running a cell under a TurboMACE model.
 
 A stand-in model - argon's Lennard-Jones, evaluated in TurboMACE's units of eV
-and Angstrom - goes through the real ``PythonForce``, the real pickling and the
-real stages, and is held to the same potential written as an OpenMM
-``NonbondedForce``. Only TurboMACE itself is faked. One test runs a real model
-through the real engine when both are available: set
+and Angstrom - goes through the real ``PythonForce``, the real pickling, the
+real stages and the command line, and is held to the same potential written as
+an OpenMM ``NonbondedForce``. Only TurboMACE itself is faked. One test runs
+a real model through the real engine when both are available: set
 ``OPENMMPOLYMER_TURBOMACE_MODEL`` to a ``.tmace`` file, MACE-OFF for instance.
 """
 
 from __future__ import annotations
 
 import functools
+import json
 import os
 import sys
 from importlib.metadata import PackageNotFoundError
@@ -37,12 +38,13 @@ from openmmpolymer import (
     use_turbomace,
 )
 from openmmpolymer import mlpotential as ml
+from openmmpolymer.__main__ import main
 from openmmpolymer.forcefield import PolymerForceField
 from openmmpolymer.mdsystem import make_barostat
 from openmmpolymer.protocols import Protocol, Stage
 from openmmpolymer.stress import stress_tensor_bar
 
-from .helpers import argon_cell, bare_simulation
+from .helpers import argon_cell, bare_simulation, write_crystal
 
 #: argon_system's Lennard-Jones, in the units TurboMACE returns.
 SIGMA_A = 3.4
@@ -384,6 +386,88 @@ def test_build_melt_hands_the_model_to_the_build(
         potential=model.spec,
     )
     assert staged_melt["options"]["potential"] == model.spec
+
+
+def test_the_command_line_builds_under_the_model_and_records_it(
+    model: SimpleNamespace, staged_melt: dict[str, Any]
+) -> None:
+    arguments = ["[*]CC[*]", "-o", "run", "--dry-run", "--turbomace", str(model.path)]
+    assert main([*arguments, "--turbomace-precision", "fp64"]) == 0
+    assert staged_melt["options"]["potential"] == TurboMACESpec(
+        str(model.path), precision="fp64"
+    )
+    recorded = json.loads(Path("run/build_request.json").read_text())
+    assert recorded["turbomace"] == str(model.path)
+    assert recorded["turbomace_precision"] == "fp64"
+    assert recorded["runtime_versions"]["turbomace"] == "0.1.0"
+    # The model is part of what was asked for.
+    with pytest.raises(SystemExit, match="2"):
+        main(arguments)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["[*]CC[*]", "--turbomace-precision", "fp32"], "requires --turbomace"),
+        (["--analyse", "run", "--turbomace", "MODEL"], "--analyse runs none"),
+        (["[*]CC[*]", "--turbomace", "missing.tmace"], "does not exist"),
+        (["[*]CC[*]", "--turbomace", "MODEL", "--turbomace-precision", "fp8"], "fp8"),
+    ],
+)
+def test_the_command_line_refuses_turbomace_flags_that_cannot_apply(
+    model: SimpleNamespace,
+    no_build: list[Any],
+    capsys: pytest.CaptureFixture[str],
+    arguments: list[str],
+    message: str,
+) -> None:
+    resolved = [str(model.path) if item == "MODEL" else item for item in arguments]
+    with pytest.raises(SystemExit, match="2"):
+        main(resolved)
+    assert message in capsys.readouterr().err
+    assert no_build == []
+
+
+def test_the_command_line_refuses_a_model_without_turbomace(
+    model: SimpleNamespace,
+    no_build: list[Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def absent(package: str) -> str:
+        raise PackageNotFoundError(package)
+
+    monkeypatch.setattr(ml, "version", absent)
+    with pytest.raises(SystemExit, match="2"):
+        main(["[*]CC[*]", "--turbomace", str(model.path)])
+    assert "TurboMACE is not installed" in capsys.readouterr().err
+    assert no_build == []
+    assert not Path("run").exists()
+
+
+def test_a_crystal_is_heated_under_the_model_too(
+    model: SimpleNamespace,
+    argon_box: tuple[Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openmmpolymer import __main__ as cli
+
+    converted: list[Any] = []
+
+    def recording(run: Any, spec: TurboMACESpec) -> Any:
+        converted.append(spec)
+        return use_turbomace(run, spec)
+
+    monkeypatch.setattr(cli, "use_turbomace", recording)
+    pdb, xml = write_crystal(*argon_box, Path("."))
+    crystal = ["--crystal-pdb", str(pdb), "--system-xml", str(xml)]
+    assert (
+        main(
+            ["--protocol", "tm", *crystal, "--turbomace", str(model.path), "--dry-run"]
+        )
+        == 0
+    )
+    assert converted == [TurboMACESpec(str(model.path))]
 
 
 def test_loaded_models_are_let_go_at_exit(model: SimpleNamespace) -> None:
