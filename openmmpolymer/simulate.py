@@ -56,6 +56,7 @@ from .mdsystem import (
     max_timestep_fs,
     select_platform,
 )
+from .mlpotential import TurboMACESpec, apply_turbomace
 from .packing import AVOGADRO, NM3_PER_CM3
 from .reporters import (
     ReporterPaths,
@@ -186,6 +187,7 @@ def prepare_run(
     precision: str = "mixed",
     seed: int = DEFAULT_SEED,
     system: Any | None = None,
+    potential: TurboMACESpec | None = None,
 ) -> RunContext:
     """Build the System once and wrap it up for the stages to use.
 
@@ -200,6 +202,9 @@ def prepare_run(
         system: A System to use instead of building one. For a System prepared
             some other way - and for tests, which can then exercise every stage
             without a force-field file.
+        potential: A TurboMACE model to replace the System's interactions
+            with, or None for the force field's own. See
+            :func:`openmmpolymer.mlpotential.apply_turbomace`.
 
     Returns:
         The context every stage takes.
@@ -207,6 +212,8 @@ def prepare_run(
     settings = spec or SystemSpec()
     if system is None:
         system = build_system(box, forcefield, settings)
+    if potential is not None:
+        system = apply_turbomace(system, box.topology, potential)
     total_mass = sum(
         system.getParticleMass(index).value_in_unit_system(mm.unit.md_unit_system)
         for index in range(system.getNumParticles())

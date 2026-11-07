@@ -68,10 +68,11 @@ from .helpers import (
 #: defaults are filled in. The request is ``vars(arguments)``, compared whole
 #: when a run resumes, so renaming, removing or re-defaulting a flag - or
 #: changing what a protocol fills in - makes every run already on disk refuse
-#: to resume. Change one of these only knowing that. ``--blend`` defaults to
-#: ``argparse.SUPPRESS``, so adding it moved ``defaults`` and no namespace.
+#: to resume. Change one of these only knowing that. ``--blend``,
+#: ``--turbomace`` and ``--turbomace-precision`` default to
+#: ``argparse.SUPPRESS``, so adding each moved ``defaults`` and no namespace.
 RECORDED_REQUEST_SHA256 = {
-    "defaults": "df481884887c691a2fbe3815c2385c6acda89ad9d2e85e7e7155c406732b22be",
+    "defaults": "3fb5310f38cda773906a2f1ed99d4b39a93c97e136b0d490a0cc69295eb8b340",
     "analyse": "de0816302b550e30bbd6bab0569f077527562e7294cbecfac7bfb72a469930e9",
     "breaking": "1c0733748e93a35670c4f69ff0579045da4a0f640cb4386adfdf9bb4826d1a6f",
     "elongation": "2be7461048f580a378bef14b4a703814d77baa0768e0ff8b425f4aa1ca8a86de",

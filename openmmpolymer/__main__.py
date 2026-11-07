@@ -72,6 +72,12 @@ from .mechanical import (
     write_mechanical_report,
 )
 from .melt import BlendComponent, build_blend, build_melt, check_blend
+from .mlpotential import (
+    TURBOMACE_PRECISIONS,
+    TurboMACESpec,
+    turbomace_version,
+    use_turbomace,
+)
 from .packing import DEFAULT_PACKING_DENSITY
 from .property_rates import (
     RATE_PROPERTIES,
@@ -887,6 +893,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--platform", help="OpenMM platform (default: the fastest that works)"
     )
+    # SUPPRESS, as for --blend: the requests of runs made under the force
+    # field still match theirs.
+    parser.add_argument(
+        "--turbomace",
+        default=argparse.SUPPRESS,
+        metavar="MODEL",
+        help="run the dynamics under this TurboMACE model, a .tmace file "
+        "converted with turbomace-export (MACE-OFF for organic polymers), "
+        "instead of the classical force field, which still supplies the "
+        "masses and constraints",
+    )
+    parser.add_argument(
+        "--turbomace-precision",
+        default=argparse.SUPPRESS,
+        choices=TURBOMACE_PRECISIONS,
+        help="precision TurboMACE evaluates the model in (default: fp32)",
+    )
     parser.add_argument(
         "-o",
         "--output-dir",
@@ -1471,6 +1494,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     blend_file: str | None = getattr(arguments, "blend", None)
     if blend_file is not None:
         _check_blend_flags(parser, arguments)
+    _check_potential_flags(parser, arguments)
 
     if arguments.convergence:
         return _convergence(parser, arguments)
@@ -1638,6 +1662,32 @@ def _check_inputs(
             )
 
 
+def _check_potential_flags(
+    parser: argparse.ArgumentParser, arguments: argparse.Namespace
+) -> None:
+    """Refuse TurboMACE flags that cannot apply, before anything is read."""
+    if "turbomace" not in arguments:
+        if "turbomace_precision" in arguments:
+            parser.error("--turbomace-precision requires --turbomace")
+        return
+    if arguments.analyse:
+        parser.error(
+            "--turbomace chooses the potential dynamics run under; --analyse runs none"
+        )
+    with _refusals(parser):
+        _potential(arguments)
+        turbomace_version()
+
+
+def _potential(arguments: argparse.Namespace) -> TurboMACESpec | None:
+    """The TurboMACE model the dynamics run under, or None for the force field."""
+    if "turbomace" not in arguments:
+        return None
+    return TurboMACESpec(
+        arguments.turbomace, getattr(arguments, "turbomace_precision", "fp32")
+    )
+
+
 def _prepare_cell(
     parser: argparse.ArgumentParser,
     arguments: argparse.Namespace,
@@ -1658,6 +1708,9 @@ def _prepare_cell(
                 platform=arguments.platform,
                 seed=arguments.seed,
             )
+            potential = _potential(arguments)
+            if potential is not None:
+                run = use_turbomace(run, potential)
         return run, {"state_in": arguments.state_in, "crystalline": True}
     if blend is not None:
         run = _build_blend(parser, arguments, *blend, output)
@@ -1788,6 +1841,8 @@ def _record_build_request(
     }
     request.update(settled)
     request["runtime_versions"] = {package: version(package) for package in _RUNTIME}
+    if "turbomace" in arguments:
+        request["runtime_versions"]["turbomace"] = turbomace_version()
     record_build_request(output, request)
 
 
@@ -1816,6 +1871,7 @@ def _build_blend(
             pack_density_g_cm3=arguments.pack_density,
             platform=arguments.platform,
             seed=arguments.seed,
+            potential=_potential(arguments),
             progress=print,
         )
     except ProtocolError as error:
@@ -1851,6 +1907,7 @@ def _build(
             backend=arguments.backend,
             pack_density_g_cm3=arguments.pack_density,
             platform=arguments.platform,
+            potential=_potential(arguments),
             progress=print,
         )
     except ProtocolError as error:

@@ -148,6 +148,60 @@ Every measurement over the whole cell works on a blend. Measurements that
 treat every chain as a copy of one chain refuse a blend. The
 [guide](docs/guide.md#blends) says which those are.
 
+## Machine-learned potentials
+
+A [TurboMACE](https://github.com/SMTG-Bham/TurboMACE) model can replace the
+force field's interactions. MACE-OFF23, for example, covers H, C, N, O, F, P,
+S, Cl, Br and I. The force field still supplies the masses and the X-H
+constraints, and every stage, barostat, stress reading and measurement runs
+unchanged. TurboMACE is built from source into the same environment
+(`pip install '.[ase]'` in its checkout; CUDA needs `nvcc` and PyTorch). Convert
+the mace-torch model once:
+
+```bash
+turbomace-export MACE-OFF23_small.model -o MACE-OFF23_small.tmace
+```
+
+The cheap route equilibrates with the force field, then hands the final state
+to MACE-OFF in a directory of its own:
+
+```python
+from openmmpolymer import (
+    Protocol,
+    Stage,
+    TurboMACESpec,
+    run_protocol,
+    standard_melt_equilibration,
+    use_turbomace,
+)
+
+equilibrated = run_protocol(standard_melt_equilibration(), run, "run")
+mace = use_turbomace(run, TurboMACESpec("MACE-OFF23_small.tmace"))
+run_protocol(
+    Protocol(
+        name="mace_off_npt",
+        stages=(
+            Stage("00_minimise", "minimise"),
+            Stage("01_npt", "npt", {"temperature_k": 450.0, "duration_ps": 200.0}),
+        ),
+    ),
+    mace,
+    "run-mace",
+    state_in=equilibrated.final_state,
+)
+```
+
+`build_melt(..., potential=TurboMACESpec(...))`, or `--turbomace` on the
+command line, runs every stage under the model instead:
+
+```bash
+openmmpolymer "[*]CC[*]" --turbomace MACE-OFF23_small.tmace -o pe-mace
+```
+
+[examples/mace_off_melt.py](examples/mace_off_melt.py) runs the first route end
+to end, and the [guide](docs/guide.md#machine-learned-potentials-turbomace)
+covers what is kept, what is replaced and what is recorded.
+
 ## Measurements and analysis
 
 Each measurement prepares the cell, records its request and resumes from intact
@@ -188,7 +242,7 @@ molecular-dynamics rates are far faster than experimental ones.
 | Layer | Modules |
 |---|---|
 | Building a cell | `chain` (monomer SMILES to grown chains), `charges`, `forcefield` (forcefill to an ffxml, cached), `packing` (packmol and the checks that catch a bad cell), `mdsystem` (topology, System, barostats, platforms), `melt` (all of it in one call: `build_melt` for one polymer, `build_blend` for several) |
-| Running it | `simulate` (the stages), `protocols` (named stage sequences, the manifest and resume), `reporters`, `stress` |
+| Running it | `simulate` (the stages), `protocols` (named stage sequences, the manifest and resume), `reporters`, `stress`, `mlpotential` (a TurboMACE model in place of the force field's interactions) |
 | Reading it back | `trajectory`, `timeseries`, `conformation`, `correlations`, `elasticity`, `strength`, `relaxation`, `melt_check`, `plots` |
 | Workflows | `tg`, `tm`, `mechanical`, `tensile`, `viscoelastic`, `structure` |
 | Rate and window checks | `rate_dependence`, `property_rates`, `elastic_rates`, `tensile_rates`, `thermal_rates`, `rate_reports`, `convergence`, `structural_convergence`, `convergence_report` |

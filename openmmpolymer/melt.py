@@ -44,6 +44,7 @@ from .forcefield import (
     merge_polymer_forcefields,
 )
 from .mdsystem import SystemSpec, assemble_box, check_target_density, prepare_box
+from .mlpotential import TurboMACESpec
 from .packing import (
     DEFAULT_PACKING_DENSITY,
     PACKMOL_TIMEOUT_S,
@@ -96,6 +97,7 @@ def build_melt(
     packmol_timeout_s: float | None = PACKMOL_TIMEOUT_S,
     platform: str | None = None,
     cache_dir: str | Path | None = None,
+    potential: TurboMACESpec | None = None,
     progress: Callable[[str], object] = log.info,
 ) -> tuple[ChainResult, RunContext]:
     """Build a cell of *n_chains* chains of *spec*, ready for a protocol.
@@ -122,6 +124,10 @@ def build_melt(
         platform: OpenMM platform, or None for the fastest that works.
         cache_dir: The force-field cache, ``<directory>/cache`` by default.
             Share one to parameterise a chain once for several runs.
+        potential: A TurboMACE model to run the dynamics under instead of
+            the force field, which still supplies the masses and constraints.
+            It is part of the run's fingerprint, so a directory built with
+            one model refuses another, or none.
         progress: Called with one line of news as each layer finishes.
 
     Returns:
@@ -150,6 +156,7 @@ def build_melt(
             pack_density_g_cm3=pack_density_g_cm3,
             packmol_timeout_s=packmol_timeout_s,
             platform=platform,
+            potential=potential,
             progress=progress,
         )
 
@@ -176,6 +183,7 @@ def build_blend(
     platform: str | None = None,
     cache_dir: str | Path | None = None,
     seed: int = DEFAULT_SEED,
+    potential: TurboMACESpec | None = None,
     progress: Callable[[str], object] = log.info,
 ) -> tuple[tuple[ChainResult, ...], RunContext]:
     """Build a cell holding chains of several polymers, ready for a protocol.
@@ -211,6 +219,7 @@ def build_blend(
         cache_dir: The force-field cache, ``<directory>/cache`` by default.
         seed: Seeds the packing and the run. Each chain's own seed is its
             spec's, as for a melt.
+        potential: A TurboMACE model, as for :func:`build_melt`.
         progress: Called with one line of news as each layer finishes.
 
     Returns:
@@ -242,6 +251,7 @@ def build_blend(
             packmol_timeout_s=packmol_timeout_s,
             platform=platform,
             seed=seed,
+            potential=potential,
             progress=progress,
         )
 
@@ -299,6 +309,14 @@ def check_blend(components: Sequence[BlendComponent], backend: str) -> None:
             "types are shared classes, so merging two chains' parameters "
             "would silently keep one chain's bonded terms for both."
         )
+
+
+def _say_potential(
+    potential: TurboMACESpec | None, progress: Callable[[str], object]
+) -> None:
+    """Report the model the dynamics will run under, when it is not the force field."""
+    if potential is not None:
+        progress(f"potential: TurboMACE {potential.model_path} ({potential.precision})")
 
 
 def _chain_record(chain: ChainResult) -> dict[str, object]:
@@ -450,6 +468,7 @@ def _prepare(
     pack_density_g_cm3: float,
     packmol_timeout_s: float | None,
     platform: str | None,
+    potential: TurboMACESpec | None,
     progress: Callable[[str], object],
 ) -> tuple[ChainResult, RunContext]:
     """Run the four layers into *build_dir*.
@@ -500,7 +519,9 @@ def _prepare(
         system,
         platform=platform,
         seed=spec.seed,
+        potential=potential,
     )
+    _say_potential(potential, progress)
     return chain, run
 
 
@@ -517,6 +538,7 @@ def _prepare_blend(
     packmol_timeout_s: float | None,
     platform: str | None,
     seed: int,
+    potential: TurboMACESpec | None,
     progress: Callable[[str], object],
 ) -> tuple[tuple[ChainResult, ...], RunContext]:
     """Run the four layers for every polymer of a blend into *build_dir*.
@@ -592,5 +614,7 @@ def _prepare_blend(
         system,
         platform=platform,
         seed=seed,
+        potential=potential,
     )
+    _say_potential(potential, progress)
     return tuple(chains), run
