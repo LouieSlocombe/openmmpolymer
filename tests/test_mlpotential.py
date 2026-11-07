@@ -25,9 +25,11 @@ import pytest
 from openmm import app, unit
 
 from openmmpolymer import (
+    ChainSpec,
     TurboMACEError,
     TurboMACESpec,
     apply_turbomace,
+    build_melt,
     prepare_run,
     run_minimise,
     run_npt,
@@ -371,6 +373,19 @@ def test_a_single_stage_runs_from_a_classical_state(
     assert result.steps > 0
 
 
+def test_build_melt_hands_the_model_to_the_build(
+    model: SimpleNamespace, staged_melt: dict[str, Any]
+) -> None:
+    build_melt(
+        ChainSpec(monomer_smiles="[*]CC[*]", degree_of_polymerization=2),
+        1,
+        "melt",
+        target_density_g_cm3=0.85,
+        potential=model.spec,
+    )
+    assert staged_melt["options"]["potential"] == model.spec
+
+
 def test_loaded_models_are_let_go_at_exit(model: SimpleNamespace) -> None:
     """Before TurboMACE's extension module is torn down, and reloaded if needed."""
     box, system = argon_cell(64, 2.4)
@@ -386,6 +401,15 @@ def test_loaded_models_are_let_go_at_exit(model: SimpleNamespace) -> None:
 
     assert all(computation._evaluate is None for computation in ml._LOADED)
     assert simulation.context.getState(getEnergy=True).getPotentialEnergy() == before
+
+
+def test_a_build_says_which_model_it_runs_under(model: SimpleNamespace) -> None:
+    from openmmpolymer import melt
+
+    lines: list[str] = []
+    melt._say_potential(None, lines.append)
+    melt._say_potential(model.spec, lines.append)
+    assert lines == [f"potential: TurboMACE {model.path} (fp32)"]
 
 
 #: A real model for the test below, which is skipped without one.
